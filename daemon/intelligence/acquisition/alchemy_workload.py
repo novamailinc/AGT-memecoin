@@ -281,7 +281,14 @@ class AlchemyWorkload:
         """Per-signature cached: an ok result is never re-fetched
         while the cache entry is fresh (TX_CACHE_TTL_S). A cache hit
         returns a copy of the stored result with ``cached=True`` and
-        makes no router call."""
+        makes no router call.
+
+        A null result (the signature is not indexed YET) is never
+        cached (2026-11-22 audit fix): ``{"result": null}`` classifies
+        as kind "ok" in the adapter, and caching it would serve the
+        stale null for the whole TTL — the Alchemy null-transaction
+        caching defect. The tx can land seconds later, so the next
+        poll must reach the provider again."""
         now = self._time()
         entry = self._tx_cache.get(signature)
         if entry is not None:
@@ -298,7 +305,8 @@ class AlchemyWorkload:
                          "maxSupportedTransactionVersion":
                              max_supported_transaction_version}],
             priority=priority, hints=hints)
-        if result.get("kind") == "ok":
+        if result.get("kind") == "ok" \
+                and result.get("result") is not None:
             self._tx_cache[signature] = (now + TX_CACHE_TTL_S,
                                           dict(result))
             if len(self._tx_cache) > 10000:

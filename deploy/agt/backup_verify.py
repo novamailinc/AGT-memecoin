@@ -15,7 +15,13 @@ it writes under $FOREX_AGENT_HOME/backups/):
         ``killswitch/state.json`` parses as JSON;
      e. the killswitch shadow ``killswitch/state.json.bak`` exists;
      f. ``local.db`` is present, non-empty, and passes
-        ``PRAGMA quick_check``.
+        ``PRAGMA quick_check``;
+     g. ``intelligence_events.db``, when present, is non-empty and
+        passes ``PRAGMA quick_check`` (absence is a pass-with-note:
+        pre-coverage-fix archives and fresh deployments may not have
+        one);
+     h. ``verdict_ledger/*.jsonl``, when present, parse line by line
+        (absence is a pass-with-note, same reason).
    Any failure fails the whole verify (exit 1) and is named in the
    report. The hourly backup job runs this right after the backup
    step, so a bad archive is loud within the hour instead of being
@@ -179,6 +185,60 @@ def verify_archive(archive):
             except sqlite3.Error as exc:
                 step("local_db_integrity", False,
                      "sqlite error: %s" % exc)
+
+        # Coverage additions (2026-11-22 audit): the intelligence
+        # event store, the verdict chain and the discovery recorder
+        # are now staged by forex-backup. Absence is a pass-with-note
+        # (a deployment may legitimately have none yet, and archives
+        # from before the coverage fix never contain them); a present
+        # but corrupt copy fails.
+        ev = os.path.join(tmp, "intelligence_events.db")
+        if not os.path.isfile(ev):
+            step("event_store_integrity", True,
+                 "no intelligence_events.db in archive (absence ok)")
+        elif os.path.getsize(ev) == 0:
+            step("event_store_integrity", False,
+                 "intelligence_events.db is empty in archive")
+        else:
+            try:
+                conn = sqlite3.connect("file:%s?mode=ro" % ev, uri=True,
+                                       timeout=10)
+                try:
+                    row = conn.execute("PRAGMA quick_check").fetchone()
+                    ok = bool(row) and str(row[0]).lower() == "ok"
+                    step("event_store_integrity", ok,
+                         "quick_check=%s (%d bytes)" % (
+                             row[0] if row else None,
+                             os.path.getsize(ev)))
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                step("event_store_integrity", False,
+                     "sqlite error: %s" % exc)
+
+        vl = os.path.join(tmp, "verdict_ledger")
+        if not os.path.isdir(vl):
+            step("verdict_ledger_present", True,
+                 "no verdict_ledger/ in archive (absence ok)")
+        else:
+            events = [f for f in os.listdir(vl)
+                      if f.endswith(".jsonl") and not f.startswith(".")]
+            bad_vl = []
+            for name in events:
+                p = os.path.join(vl, name)
+                try:
+                    with open(p) as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line:
+                                json.loads(line)
+                except (OSError, ValueError) as exc:
+                    bad_vl.append("%s: %s" % (name, exc))
+            step("verdict_ledger_present", not bad_vl,
+                 "%d jsonl files checked%s" % (
+                     len(events),
+                     ("; unparsable: " + "; ".join(bad_vl))
+                     if bad_vl else ""))
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

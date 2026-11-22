@@ -102,11 +102,51 @@ else
     echo "warning: no DB at $DB_SRC" >&2
 fi
 
+# 1b. Intelligence event store (coverage audit 2026-11-22): the
+# intelligence pipeline's SQLite event store (events, stream
+# checkpoints, retry queue) lives at $HOME_DIR/intelligence_events.db
+# — a HOME-root .db the staging globs never picked up. Same
+# SQLite-safe online snapshot as local.db; NEVER a plain cp of an
+# active database. A missing store is a warning (the pipeline may
+# never have run here); a FAILED snapshot of an existing store
+# aborts before an archive is written, exactly like the main DB.
+EV_SRC="$HOME_DIR/intelligence_events.db"
+if [ -f "$EV_SRC" ]; then
+    if ! timeout "$BACKUP_TIMEOUT" python3 - "$EV_SRC" "$WORK/intelligence_events.db" "$BACKUP_PAGES" "$BACKUP_SLEEP" <<'PYEOF'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1])
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst, pages=int(sys.argv[3]), sleep=float(sys.argv[4]))
+dst.close(); src.close()
+PYEOF
+    then
+        echo "ERROR: event-store snapshot failed for $EV_SRC — aborting, no archive written" >&2
+        exit 1
+    fi
+    if [ ! -s "$WORK/intelligence_events.db" ]; then
+        echo "ERROR: event-store snapshot is empty for $EV_SRC — aborting, no archive written" >&2
+        exit 1
+    fi
+    echo "event store snapshot ok"
+else
+    echo "warning: no event store at $EV_SRC" >&2
+fi
+
 # 2. Stage files (never secrets.env)
 STAGE="$WORK/stage"
 mkdir -p "$STAGE"
 [ -f "$WORK/local.db" ] && cp "$WORK/local.db" "$STAGE/local.db"
+[ -f "$WORK/intelligence_events.db" ] && cp "$WORK/intelligence_events.db" "$STAGE/intelligence_events.db"
 [ -d "$HOME_DIR/data" ] && cp -r "$HOME_DIR/data" "$STAGE/data"
+# Verdict chain + discovery recorder (coverage audit 2026-11-22):
+# verdict_ledger/ holds the pre-registered verdict history;
+# recorder/ holds the discovery-event journal the grad_select
+# filters index from. A restore without them loses both. Junk tmp
+# files are dropped from the staged copies.
+[ -d "$HOME_DIR/verdict_ledger" ] && cp -r "$HOME_DIR/verdict_ledger" "$STAGE/verdict_ledger"
+[ -d "$HOME_DIR/recorder" ] && cp -r "$HOME_DIR/recorder" "$STAGE/recorder"
+find "$STAGE/verdict_ledger" "$STAGE/recorder" -name "*.tmp*" -delete 2>/dev/null || true
 [ -d "$HOME_DIR/launch_scanner" ] && cp -r "$HOME_DIR/launch_scanner" "$STAGE/launch_scanner"
 # Killswitch halt states (audit 2026-10-18): safety-critical. A restore
 # without these would resurrect halted lanes as UNHALTED.

@@ -503,6 +503,14 @@ class ResponseCache:
 
     Only kind == "ok" results are stored. A cache hit consumes no
     quota and is recorded as cached (cost None) in usage.
+
+    A null payload is NEVER stored (2026-11-22 audit fix): a null
+    result (e.g. getTransaction for a not-yet-indexed signature,
+    getAccountInfo for a not-yet-created account) is a transient
+    answer, not a fact. Caching it would serve the stale null to
+    every caller until the TTL lapsed — the Alchemy null-tx caching
+    defect. A re-fetch costs one quota unit; a poisoned lookup can
+    cost a missed transaction.
     """
 
     def __init__(self, ttl_overrides=None, capacity=1000, now=None):
@@ -538,6 +546,9 @@ class ResponseCache:
         if method not in self._ttl:
             return
         if result.get("kind") != "ok":
+            return
+        if result.get("result") is None:
+            # Transient null — see the class docstring. Never cached.
             return
         key = self._key(provider, method, params)
         if key not in self._entries:

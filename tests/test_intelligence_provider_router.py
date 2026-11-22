@@ -389,6 +389,23 @@ check("cache: second identical getTransaction served from cache, "
 check("cache: cached result matches the recorded fixture",
       res6b["result"]["slot"] == tx_fx["result"]["slot"]
       and res6b["result"]["transaction"]["signatures"][0] == sig)
+
+# Null results are never cached (2026-11-22 audit fix): a
+# getTransaction for a not-yet-indexed signature returns
+# {"result": null}, which the adapter classifies as kind "ok";
+# caching it would serve the stale null until the TTL lapsed (the
+# Alchemy null-transaction caching defect, bounded form).
+t6n = HostTransport({"alchemy": [ok(None), ok(None)],
+                     "chainstack": [ok(0)], "public": [ok(0)]})
+r6n = router(transport=t6n)
+nul1 = r6n.call("getTransaction", ["NotYetIndexedSig111"],
+                priority=PRIORITY_CARD)
+nul2 = r6n.call("getTransaction", ["NotYetIndexedSig111"],
+                priority=PRIORITY_CARD)
+check("cache: null getTransaction result is never cached",
+      nul1["kind"] == "ok" and nul1.get("result") is None
+      and nul2["kind"] == "ok" and nul2.get("cached") is not True
+      and t6n.by_host.get("alchemy", 0) == 2)
 check("cache: getSlot is never cached",
       PR.CACHE_TTL_S.get("getSlot") is None)
 slot_fx = load_fixture("live_getSlot")

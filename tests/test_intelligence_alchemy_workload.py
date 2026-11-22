@@ -289,6 +289,23 @@ check("signatures paging recovers across pages with before cursor",
       sigs == ["s3", "s2", "s1"] and npages == 2
       and stub.calls[1][1][1].get("before") == "s2")
 
+# A null result (signature not indexed yet) is never cached
+# (2026-11-22 audit fix): {"result": null} classifies as kind "ok",
+# and caching it would serve the stale null for the whole
+# TX_CACHE_TTL_S — the Alchemy null-transaction caching defect.
+null_stub = StubRouter([
+    {"kind": "ok", "result": None},
+    {"kind": "ok", "result": None},
+])
+wl_null = AW.AlchemyWorkload(router=null_stub)
+nul1 = wl_null.get_transaction("NotYetIndexedSig111")
+nul2 = wl_null.get_transaction("NotYetIndexedSig111")
+check("null getTransaction result is never cached (null-tx fix)",
+      nul1["kind"] == "ok" and nul1.get("result") is None
+      and nul2.get("cached") is not True
+      and len([c for c in null_stub.calls
+               if c[0] == "getTransaction"]) == 2)
+
 # -- slot / block reads -------------------------------------------------
 # Fresh quota bucket: the section above already spent the alchemy
 # burst (10 tokens) — the scheduler refusing further calls here

@@ -138,6 +138,23 @@ def _fixture_home(tmp):
     with open(os.path.join(home, "launch_scanner",
                            "registry.json"), "w") as fh:
         json.dump({"wallets": []}, fh)
+    # Coverage fixtures (2026-11-22 audit): the intelligence event
+    # store, the verdict chain and the discovery recorder — the
+    # three state families the backup coverage fix added.
+    ev = sqlite3.connect(os.path.join(home, "intelligence_events.db"))
+    with ev:
+        ev.execute("CREATE TABLE events (event_id TEXT PRIMARY KEY)")
+        ev.execute("INSERT INTO events VALUES ('e1')")
+    ev.close()
+    os.makedirs(os.path.join(home, "verdict_ledger"), exist_ok=True)
+    with open(os.path.join(home, "verdict_ledger",
+                           "events.jsonl"), "w") as fh:
+        fh.write(json.dumps({"lane": "grad_select",
+                             "kind": "verdict", "ts": NOW}) + "\n")
+    os.makedirs(os.path.join(home, "recorder"), exist_ok=True)
+    with open(os.path.join(home, "recorder",
+                           "events-20261122.jsonl"), "w") as fh:
+        fh.write(json.dumps({"mint": "M1", "ts": NOW}) + "\n")
     return home
 
 
@@ -191,6 +208,13 @@ with tempfile.TemporaryDirectory() as tmp:
         check("drill: fixture archive stores local.db at its root "
               "(live layout quirk)",
               "./local.db" in names or "local.db" in names)
+        check("drill: archive carries the event store, verdict "
+              "ledger and recorder (2026-11-22 coverage fix)",
+              any(n.endswith("intelligence_events.db") for n in names)
+              and any("verdict_ledger/events.jsonl" in n
+                      for n in names)
+              and any("recorder/events-20261122.jsonl" in n
+                      for n in names))
         check("drill: fixture archive carries no credential "
               "material",
               not any(n.endswith("secrets.env")
@@ -292,6 +316,14 @@ with tempfile.TemporaryDirectory() as tmp:
         check("drill: killswitch shadow survived the restore",
               os.path.isfile(os.path.join(
                   restore_home, "killswitch", "state.json.bak")))
+        check("drill: coverage state survived the restore (event "
+              "store, verdict ledger, recorder)",
+              os.path.isfile(os.path.join(
+                  restore_home, "intelligence_events.db"))
+              and os.path.isfile(os.path.join(
+                  restore_home, "verdict_ledger", "events.jsonl"))
+              and os.path.isfile(os.path.join(
+                  restore_home, "recorder", "events-20261122.jsonl")))
         # Dashboard on the RESTORED home applies the void list:
         # raw Live10 $14,336.93, void-excluded $9,095.86.
         bal = DASH.read_balances(restore_home)

@@ -42,6 +42,11 @@ chain data itself cannot be fetched or parsed. It only ever replaces
 "unknown because RugCheck hasn't indexed it" with a verdict computed
 from primary data — never with a guess.
 
+An unknown report carries passed=False (2026-11-22 contract
+hardening): every current consumer checks unknown first and skips,
+so the value is never read today — but a future consumer that reads
+passed alone must never wave an unscored token through.
+
 RugCheck remains the second layer: whenever its report exists it
 governs (it adds insider graphs, creator history and sell-path
 intelligence this module cannot see), because callers only invoke
@@ -356,7 +361,7 @@ def check(mint: str, timeout: float = 8.0) -> Dict[str, Any]:
     itself could not be fetched (callers keep their fail-closed
     behavior for that case).
     """
-    unknown = {"passed": True, "score": 0, "flags": [], "fails": [],
+    unknown = {"passed": False, "score": 0, "flags": [], "fails": [],
                "unknown": True, "source": "instant-onchain"}
     if not mint:
         return dict(unknown)
@@ -382,7 +387,7 @@ def check(mint: str, timeout: float = 8.0) -> Dict[str, Any]:
 
 
 def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
-    unknown = {"passed": True, "score": 0, "flags": [], "fails": [],
+    unknown = {"passed": False, "score": 0, "flags": [], "fails": [],
                "unknown": True, "source": "instant-onchain"}
     per_call = max(1.0, timeout / 3.0)
 

@@ -362,8 +362,13 @@ def last_rpc_source():
     return getattr(_LAST_SOURCE, "value", None)
 
 
-def _rpc_impl(method, params, timeout=12, exempt=False):
-    """One JSON-RPC call with endpoint failover. None on failure.
+def _rpc_impl_typed(method, params, timeout=12, exempt=False):
+    """One JSON-RPC call with endpoint failover.
+
+    Returns (result, kind): kind is "ok" (a result payload), "null"
+    (an endpoint answered JSON null — a definitive empty answer, not
+    a failure) or "error" (every endpoint failed). _rpc_impl keeps
+    the historical result-or-None contract for the fleet.
 
     Failures are LOGGED per endpoint (host + exception type + HTTP
     code when present) instead of swallowed silently: the old bare
@@ -447,7 +452,7 @@ def _rpc_impl(method, params, timeout=12, exempt=False):
             acquired = (url, bucket)
             break
     if acquired is None and helius_pairs:
-        return _try_public(body, method, public_urls, timeout)
+        return _try_public_typed(body, method, public_urls, timeout)
     if acquired is not None:
         url, bucket = acquired
         host = urllib.parse.urlparse(url).hostname or "unknown"
@@ -457,11 +462,19 @@ def _rpc_impl(method, params, timeout=12, exempt=False):
             pacer.report(bucket, True)
             _LAST_SOURCE.value = "helius"
             _note_helius_restored()
-            return result
+            return result, "ok"
+        if kind == "null":
+            # Definitive empty answer: the provider is healthy and
+            # the same index backs every key, so failing over would
+            # just re-ask the same question.
+            pacer.report(bucket, True)
+            _LAST_SOURCE.value = "helius"
+            _note_helius_restored()
+            return None, "null"
         if kind == "429":
             pacer.report(bucket, False)
             # Helius failed closed: one budgeted public attempt.
-            return _try_public(body, method, public_urls, timeout)
+            return _try_public_typed(body, method, public_urls, timeout)
         # Non-429 failure: fall through to the next key below.
         # (The token for the failed key is spent; the next key
         # needs its own token.)
@@ -477,17 +490,32 @@ def _rpc_impl(method, params, timeout=12, exempt=False):
                 pacer.report(bucket2, True)
                 _LAST_SOURCE.value = "helius"
                 _note_helius_restored()
-                return result
+                return result, "ok"
+            if kind == "null":
+                pacer.report(bucket2, True)
+                _LAST_SOURCE.value = "helius"
+                _note_helius_restored()
+                return None, "null"
             if kind == "429":
                 pacer.report(bucket2, False)
-                return _try_public(body, method, public_urls, timeout)
+                return _try_public_typed(body, method, public_urls, timeout)
             break
-    return _try_public(body, method, public_urls, timeout)
+    return _try_public_typed(body, method, public_urls, timeout)
 
 
-def rpc(method, params, timeout=12, exempt=False):
-    """One JSON-RPC call with endpoint failover. Return contract
-    unchanged: result or None (see _rpc_impl).
+def _rpc_impl(method, params, timeout=12, exempt=False):
+    """Back-compat wrapper: result or None (see _rpc_impl_typed)."""
+    result, _kind = _rpc_impl_typed(method, params, timeout=timeout,
+                                    exempt=exempt)
+    return result
+
+
+def rpc_typed(method, params, timeout=12, exempt=False):
+    """(result, kind) variant of rpc() for callers that must tell a
+    null ANSWER from a FAILURE (e.g. the provider adapter, which
+    used to report every null payload as an outage). kind is "ok",
+    "null" or "error". Same transport, pacer, failover and shadow
+    observation as rpc().
 
     Phase 3 (shadow-first wiring): after the live call executes
     EXACTLY as before, the central router's routing decision for
@@ -498,18 +526,30 @@ def rpc(method, params, timeout=12, exempt=False):
     sends, retries, or changes a request. The hook is best-effort
     and can never break the live path: any failure disables the
     observer for the process and the result is returned untouched.
+    A null answer is journaled as "ok" (the provider answered),
+    never as "error" (2026-11-22 null-vs-error fix).
     """
     import time as _time
     _start = _time.monotonic()
-    result = _rpc_impl(method, params, timeout=timeout, exempt=exempt)
+    result, kind = _rpc_impl_typed(method, params, timeout=timeout,
+                                   exempt=exempt)
     try:
         from daemon.intelligence.acquisition import shadow_observer
         shadow_observer.observe_live_call(
             method, params, served=last_rpc_source(),
-            kind=("ok" if result is not None else "error"),
+            kind=("error" if kind == "error" else "ok"),
             elapsed=_time.monotonic() - _start)
     except Exception:
         pass
+    return result, kind
+
+
+def rpc(method, params, timeout=12, exempt=False):
+    """One JSON-RPC call with endpoint failover. Return contract
+    unchanged: result or None (see _rpc_impl_typed). Null-vs-error
+    callers use rpc_typed()."""
+    result, _kind = rpc_typed(method, params, timeout=timeout,
+                              exempt=exempt)
     return result
 
 
@@ -555,8 +595,10 @@ def _note_helius_restored():
         pass
 
 
-def _try_public(body, method, public_urls, timeout):
-    """One budgeted attempt at the public mainnet-beta endpoint.
+def _try_public_typed(body, method, public_urls, timeout):
+    """(result, kind) variant of _try_public: kind is "ok", "null"
+    or "error". One budgeted attempt at the public mainnet-beta
+    endpoint.
 
     The last-resort leg when Helius fails closed: a single attempt
     under the cross-process 1-call-per-2s budget, hard stop on 429.
@@ -565,7 +607,7 @@ def _try_public(body, method, public_urls, timeout):
     read is not a rate limit, and the 2026-11-18 probe measured
     first-try 6/8, with one retry 7/8 (fleet-wide first-try ~60%,
     so the retry lifts the fallback to ~85% per call). A 429 is
-    never retried. Returns the result or None. Every attempt is
+    never retried. Every attempt is
     logged with source=public-rpc, and a success stamps
     last_rpc_source() so the journal records which provider
     answered. Never raises."""
@@ -575,7 +617,7 @@ def _try_public(body, method, public_urls, timeout):
         if not _public_budget().acquire():
             logger.debug("reserves rpc %s: public-rpc budget spent, "
                          "skipping fallback", method)
-            return None
+            return None, "error"
         logger.warning("reserves rpc %s: Helius failed closed, "
                        "trying public-rpc (source=public-rpc)",
                        method)
@@ -585,12 +627,17 @@ def _try_public(body, method, public_urls, timeout):
             _LAST_SOURCE.value = "public-rpc"
             logger.warning("reserves rpc %s: public-rpc answered "
                            "(source=public-rpc)", method)
-            return result
+            return result, "ok"
+        if kind == "null":
+            # Definitive empty answer: no retry, nothing to fail
+            # over to.
+            _LAST_SOURCE.value = "public-rpc"
+            return None, "null"
         if kind == "429":
             # Rate limit: hard stop, never retry a 429.
             logger.warning("reserves rpc %s: public-rpc failed (429), "
                            "no retry", method)
-            return None
+            return None, "error"
         # Transport failure: one retry, same URL, same budget slot.
         logger.warning("reserves rpc %s: public-rpc failed (%s), "
                        "one retry", method, kind)
@@ -600,17 +647,29 @@ def _try_public(body, method, public_urls, timeout):
             _LAST_SOURCE.value = "public-rpc"
             logger.warning("reserves rpc %s: public-rpc answered "
                            "on retry (source=public-rpc)", method)
-            return result
+            return result, "ok"
+        if kind == "null":
+            _LAST_SOURCE.value = "public-rpc"
+            return None, "null"
         logger.warning("reserves rpc %s: public-rpc failed on retry "
                        "(%s), no further retry", method, kind)
-        return None
-    return None
+        return None, "error"
+    return None, "error"
+
+
+def _try_public(body, method, public_urls, timeout):
+    """Back-compat wrapper: result or None (see _try_public_typed)."""
+    result, _kind = _try_public_typed(body, method, public_urls,
+                                      timeout)
+    return result
 
 
 def _rpc_attempt(url, body, method, host, timeout):
     """One HTTP attempt. Returns (result, kind, elapsed_s) where
-    kind is "ok" (result usable), "429" (rate-limited), or "fail"
-    (anything else, already logged). Never raises.
+    kind is "ok" (result usable), "null" (the provider answered
+    JSON null — a definitive empty answer, not a failure), "429"
+    (rate-limited), or "fail" (anything else, already logged).
+    Never raises.
 
     Transport is a curl subprocess (2026-11-20): urllib POSTs to
     these endpoints flap on this VM (HTTP 308, IncompleteRead,
@@ -689,6 +748,17 @@ def _rpc_attempt(url, body, method, host, timeout):
             # and re-burning the next key (2026-11-17 pacing fix).
             if code in (-32005, -32029):
                 return None, "429", time.time() - t0
+            # Any other JSON-RPC error is a failure even when the
+            # body also carries "result": null.
+            return None, "fail", time.time() - t0
+        if isinstance(d, dict) and "result" in d:
+            # A completed call whose answer is JSON null (e.g.
+            # getTransaction for a signature the node has not
+            # indexed yet): the provider ANSWERED. Classifying it
+            # as "fail" burned the second Helius key and the
+            # public-RPC budget on every not-yet-indexed lookup
+            # (2026-11-22 null-vs-error fix).
+            return None, "null", time.time() - t0
         return None, "fail", time.time() - t0
     except Exception as e:
         logger.warning("reserves rpc %s: %s failed (%s)",

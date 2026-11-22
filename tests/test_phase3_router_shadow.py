@@ -433,12 +433,13 @@ check("D-16 probe math: vs public lag processed 29",
 # ---------------- reserves shadow hook ----------------
 import daemon.launch_scanner.reserves as reserves
 from daemon.intelligence.acquisition import shadow_observer as SO
-old_impl = reserves._rpc_impl
+old_impl = reserves._rpc_impl_typed
 old_last = reserves.last_rpc_source
 calls = []
 _shadow_off = os.environ.pop("ROUTER_SHADOW_OFF", None)
 try:
-    reserves._rpc_impl = lambda m, p, timeout=12, exempt=False: "RES"
+    reserves._rpc_impl_typed = lambda m, p, timeout=12, exempt=False: (
+        "RES", "ok")
     reserves.last_rpc_source = lambda: "helius"
     SO._OBSERVER = ShadowObserver(home=HOME, router=FakeRouter())
     out = reserves.rpc("getSlot", [])
@@ -456,7 +457,7 @@ try:
     check("observer exception never breaks reserves.rpc",
           out2 == "RES")
 finally:
-    reserves._rpc_impl = old_impl
+    reserves._rpc_impl_typed = old_impl
     reserves.last_rpc_source = old_last
     SO._OBSERVER = None
     if _shadow_off is not None:

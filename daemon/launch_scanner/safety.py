@@ -188,7 +188,7 @@ def _check_solana(mint: str, timeout: float = _TIMEOUT,
             rep = None
         if rep and not rep.get("unknown"):
             return rep
-        return {"passed": True, "score": 0, "flags": [],
+        return {"passed": False, "score": 0, "flags": [],
                 "fails": [], "unknown": True}
     if data.get("rugged"):
         fails.append("already rugged")
@@ -323,7 +323,7 @@ def _check_evm(chain: str, mint: str, timeout: float = _TIMEOUT,
     limits = limits or {}
     chain_id = _CHAIN_IDS.get(chain)
     if not chain_id:
-        return {"passed": True, "score": 0, "flags": [],
+        return {"passed": False, "score": 0, "flags": [],
                 "fails": [], "unknown": True}
     data = _get_json(_GOPLUS_URL.format(chain_id=chain_id, mint=mint), timeout)
     result = (data or {}).get("result") or {}
@@ -334,7 +334,7 @@ def _check_evm(chain: str, mint: str, timeout: float = _TIMEOUT,
             info = val or {}
             break
     if not info:
-        return {"passed": True, "score": 0, "flags": [],
+        return {"passed": False, "score": 0, "flags": [],
                 "fails": [], "unknown": True}
 
     if str(info.get("is_honeypot")) == "1":
@@ -388,9 +388,13 @@ def check_token(chain: str, mint: str, timeout: float = _TIMEOUT,
     cluster hard-fail share, EVM sell simulation) — see ``daemon``
     config.
     """
+    # Unknown reports carry passed=False (2026-11-22 contract
+    # hardening): consumers check unknown first and skip, so the
+    # value is never read today — but a passed-only reader must
+    # never wave an unscored token through.
     chain = (chain or "").lower()
     if not mint:
-        return {"passed": True, "score": 0, "flags": [],
+        return {"passed": False, "score": 0, "flags": [],
                 "fails": [], "unknown": True}
     try:
         if chain == "solana":
@@ -398,7 +402,7 @@ def check_token(chain: str, mint: str, timeout: float = _TIMEOUT,
         return _check_evm(chain, mint, timeout, limits)
     except Exception as exc:  # never let screening crash the loop
         logger.warning("safety check crashed for %s: %s", mint, exc)
-        return {"passed": True, "score": 0, "flags": [],
+        return {"passed": False, "score": 0, "flags": [],
                 "fails": [], "unknown": True}
 
 

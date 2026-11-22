@@ -293,6 +293,8 @@ saved_res = sys.modules.get("daemon.launch_scanner.reserves")
 try:
     fake_reserves = types.ModuleType("daemon.launch_scanner.reserves")
     fake_reserves.rpc = lambda method, params, timeout=12: {"slot": 999}
+    fake_reserves.rpc_typed = lambda method, params, timeout=12: (
+        {"slot": 999}, "ok")
     fake_reserves.rpc_url_pairs = lambda: [("https://example.invalid",
                                             "k")]
     fake_pkg = types.ModuleType("daemon.launch_scanner")
@@ -304,19 +306,26 @@ try:
     check("helius adapter configured when reserves holds keys",
           had.configured())
     res_h = had.call("getSlot", [])
-    check("helius adapter delegates to reserves.rpc (stubbed)",
+    check("helius adapter delegates to reserves.rpc_typed (stubbed)",
           res_h["kind"] == "ok" and res_h["result"] == {"slot": 999}
           and res_h["provider"] == "helius")
 
-    fake_reserves.rpc = lambda method, params, timeout=12: None
+    fake_reserves.rpc_typed = lambda method, params, timeout=12: (
+        None, "null")
+    res_null = had.call("getSlot", [])
+    check("helius adapter: null answer -> kind ok, null payload "
+          "(an answer, not an outage; 2026-11-22 null-vs-error)",
+          res_null["kind"] == "ok" and res_null["result"] is None)
+
+    fake_reserves.rpc_typed = lambda method, params, timeout=12: (
+        None, "error")
     res_none = had.call("getSlot", [])
-    check("helius adapter: reserves None -> kind error (honest, "
-          "cannot distinguish 429 from timeout)",
+    check("helius adapter: transport failure -> kind error",
           res_none["kind"] == "error")
 
     def _boom(method, params, timeout=12):
         raise RuntimeError("boom")
-    fake_reserves.rpc = _boom
+    fake_reserves.rpc_typed = _boom
     check("helius adapter: reserves raising -> kind error, no raise",
           had.call("getSlot", []).kind == "error")
 

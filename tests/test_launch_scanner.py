@@ -1143,7 +1143,11 @@ class SafetyTest(unittest.TestCase):
         with patch.object(safety, "_get_json", return_value=None):
             r = safety.check_token("solana", "MINT1")
         self.assertTrue(r["unknown"])
-        self.assertTrue(r["passed"])  # fail-open; gate decides
+        # 2026-11-22 contract hardening: unknown never carries a
+        # pass. Every gate checks unknown first and skips, so this
+        # changes nothing at the gates — it stops a passed-only
+        # reader from waving an unscored token through.
+        self.assertFalse(r["passed"])
 
     def test_concentrated_holders_fail(self):
         from daemon.launch_scanner import safety

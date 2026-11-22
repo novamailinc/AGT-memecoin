@@ -139,7 +139,7 @@ importlib.reload(PA)  # picks up FOREX_AGENT_HOME paths as-is
 ps, _mv, _ms = _fresh()
 # Drain the shared account to $1.50 via a direct debit so the next
 # $1 grad entry fits but a second one cannot.
-ok, _ = PA.try_debit("other-lane", "DRAIN1", 8.50)
+ok, _, _pid = PA.try_debit("other-lane", "DRAIN1", 8.50)
 check("fixture: shared account drained to $1.50",
       ok and PA.snapshot()["cash"] == 1.50)
 
@@ -178,7 +178,7 @@ check("fixture: legacy entry opened with flag on", opened3)
 # Simulate a position opened before the flag existed by removing
 # its shared-account record, then closing.
 with PA._lock():
-    led, healthy = PA._load_locked()
+    led, healthy, _degraded = PA._load_locked()
     led["lanes"]["grad"]["open"].pop("LEGACY1pump", None)
     PA._save_locked(led)
 _close_open("LEGACY1pump", mult=1.5)

@@ -1120,9 +1120,12 @@ def _consider_candidate(cand, now):
         # cash freed by another lane's close re-enables entries.
         _pa = _paper_account()
         if _pa is not None:
-            _ok, _why = _pa.try_debit(LANE, mint, _stake)
+            _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake)
             if not _ok:
                 return _skip(mint, "paper account: " + _why, False)
+            # Pin the open instance so the close can never settle
+            # a later reopen of the same mint.
+            pos["pa_pos_id"] = _pid
         d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
         d["positions"][mint] = pos
         d["watchlist"].pop(mint, None)
@@ -1484,7 +1487,8 @@ def _finalize(d, mint, pos, closed_reason):
     # account module and never blocks the lane's own settle.
     _pa = _paper_account()
     if _pa is not None:
-        _ok, _why = _pa.credit(LANE, mint, realized)
+        _ok, _why = _pa.credit(LANE, mint, realized,
+                               pos_id=pos.get("pa_pos_id"))
         if not _ok:
             logger.warning("grad: shared paper account credit "
                            "for %s failed: %s (journaled)", mint, _why)

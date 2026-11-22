@@ -30,15 +30,60 @@ try:
 except Exception as e:
     check("dex live (%s)" % str(e)[:40], False)
 
-# 2. Fail-fast on 404 (no retry storm): should raise quickly
+# 2. Fail-fast on 404 (no retry storm): should raise quickly.
+# Hermetic: a local 404 responder, not a live API — the live version of
+# this check flaked in CI when shared egress got 429-rate-limited first
+# (urllib retried, then the curl fallback returned the 404's JSON error
+# body as if it were data — the bug fixed alongside this test).
+import threading, http.server
+
+class _H404(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"errors":[{"status":"404"}]}')
+    def log_message(self, *a):
+        pass
+
+_srv = http.server.HTTPServer(("127.0.0.1", 0), _H404)
+threading.Thread(target=_srv.serve_forever, daemon=True).start()
 t0 = time.time()
 try:
-    rh.get_json("https://api.geckoterminal.com/api/v2/networks/solana/pools/INVALIDPOOL123/ohlcv/hour",
+    rh.get_json("http://127.0.0.1:%d/never-existed" % _srv.server_port,
                 tries=5, timeout=10)
     check("404 fail-fast", False)
 except Exception:
     dt = time.time() - t0
     check("404 fail-fast (%.1fs, no 5x backoff)" % dt, dt < 25)
+_srv.shutdown()
+
+# 2b. The curl fallback must never return an HTTP error body as data.
+# Sequence: urllib gets retryable 429s, curl fallback then gets a 404;
+# get_json must raise, not hand back the error payload.
+class _H429Then404(http.server.BaseHTTPRequestHandler):
+    n = 0
+    def do_GET(self):
+        type(self).n += 1
+        code = 429 if type(self).n <= 2 else 404
+        body = ('{"errors":[{"status":"%d"}]}' % code).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+_H429Then404.n = 0
+_srv2 = http.server.HTTPServer(("127.0.0.1", 0), _H429Then404)
+threading.Thread(target=_srv2.serve_forever, daemon=True).start()
+try:
+    d = rh.get_json("http://127.0.0.1:%d/flaky" % _srv2.server_port,
+                    tries=2, timeout=5, backoff_base=0.1)
+    check("curl fallback never returns error bodies as data (got %r)" % (d,), False)
+except Exception:
+    check("curl fallback never returns error bodies as data", True)
+_srv2.shutdown()
 
 # 3. Circuit breaker: directly test open/close logic
 rh._circuit_fails.clear(); rh._circuit_open.clear()

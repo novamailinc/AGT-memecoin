@@ -108,7 +108,10 @@ def _curl_json(url, timeout, headers):
     curl = shutil.which("curl")
     if not curl:
         return None
-    cmd = [curl, "-sS", "--max-time", str(int(timeout))]
+    # -w appends the HTTP status on its own line: without it, an error body
+    # (eg the JSON payload of a 404 after urllib was rate-limited) parses
+    # cleanly and would be returned to callers as if it were data.
+    cmd = [curl, "-sS", "--max-time", str(int(timeout)), "-w", "\n%{http_code}"]
     for k, v in headers.items():
         cmd += ["-H", "%s: %s" % (k, v)]
     cmd.append(url)
@@ -120,7 +123,13 @@ def _curl_json(url, timeout, headers):
     if out.returncode != 0 or not out.stdout:
         return None
     try:
-        raw = out.stdout
+        raw, _, status_s = out.stdout.rpartition(b"\n")
+        status = int(status_s.strip() or b"0")
+    except Exception:
+        return None
+    if status < 200 or status >= 400:
+        return None  # any HTTP error (or a failed transfer) is a miss, not data
+    try:
         # curl doesn't auto-decompress unless --compressed; handle gzip magic
         if raw[:2] == b"\x1f\x8b":
             raw = gzip.decompress(raw)

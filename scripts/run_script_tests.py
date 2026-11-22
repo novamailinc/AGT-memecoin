@@ -16,6 +16,8 @@ import ast
 import glob
 import os
 import subprocess
+import shutil
+import tempfile
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -59,12 +61,18 @@ def main():
     if not scripts:
         print("no script-style tests found")
         return 0
-    env = dict(os.environ)
-    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    base_env = dict(os.environ)
+    base_env["PYTHONPATH"] = REPO + os.pathsep + base_env.get("PYTHONPATH", "")
     failures = []
     for path in scripts:
         rel = os.path.relpath(path, REPO)
         print("=== %s ===" % rel, flush=True)
+        # Repo modules default FOREX_AGENT_HOME to the original dev VM's
+        # home and create it at import time, so every script gets an
+        # isolated scratch home (also keeps tests off any real state).
+        env = dict(base_env)
+        scratch_home = tempfile.mkdtemp(prefix="agt-test-home-")
+        env["FOREX_AGENT_HOME"] = scratch_home
         try:
             proc = subprocess.run([sys.executable, path], cwd=REPO, env=env,
                                   capture_output=True, text=True,
@@ -72,7 +80,10 @@ def main():
         except subprocess.TimeoutExpired:
             print("TIMEOUT after %ds" % PER_TEST_TIMEOUT_S)
             failures.append(rel + " (timeout)")
+            shutil.rmtree(scratch_home, ignore_errors=True)
             continue
+        finally:
+            shutil.rmtree(scratch_home, ignore_errors=True)
         out = proc.stdout + proc.stderr
         # Show the FAIL lines and the tail unconditionally so CI logs
         # carry the diagnosis; keep passing scripts to a one-line summary.

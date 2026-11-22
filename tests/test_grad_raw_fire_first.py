@@ -29,6 +29,17 @@ from daemon.launch_scanner import grad_raw as GR
 from daemon.launch_scanner import killswitch as KS
 from daemon.launch_scanner import saturation as _S
 
+
+def _scan_cycle(eng, **kw):
+    """One scan as its own cycle: the 2026-11-21 cadence gate
+    (scan_schedule, piece 9) rate-limits back-to-back scans, but this
+    test drives each scan deliberately, so reset the lane's clock."""
+    if GR._select is not None:
+        GR._select._SCAN_SCHEDULE_STATE["last_scan_ts"].pop(
+            GR.LANE, None)
+    _orig = GR.scan_once
+    return _orig(eng, **kw)
+
 fails = []
 
 
@@ -213,7 +224,7 @@ check("tx parse: garbage mcap (0.85 SOL pool) refused by bounds",
       info3 is None and "outside graduation bounds" in why3)
 
 # ---------------- instant entry ----------------
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(MINT)]),
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT)]),
                    now=time.time())
 check("instant: stream candidate opened", res["opened"] == 1)
 d = eng._read()
@@ -253,7 +264,7 @@ check("verify: 50% deviation -> dq_deviation + entry_dq flag",
       and d["positions"][MINT].get("entry_dq") is True
       and MINT not in eng._ff_pending)
 
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(MINT2)]),
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT2)]),
                    now=time.time())
 check("instant: second payload entry opened", res["opened"] == 1)
 LIVE["px"] = 8.3e-5  # 3.75% off the payload — inside tolerance
@@ -264,7 +275,7 @@ check("verify: small deviation -> ok, no dq flag",
       (ef2.get("payload_verify") or {}).get("status") == "ok"
       and "entry_dq" not in d["positions"][MINT2])
 
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(MINT3)]),
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT3)]),
                    now=time.time())
 check("instant: third payload entry opened", res["opened"] == 1)
 LIVE["px"] = 0.0  # pool unquotable on every source
@@ -283,7 +294,7 @@ eng._ff_tx_price_override = \
 LIVE["px"] = 0.001
 # Pool address present (as the GT backfill merge would supply);
 # the tx simply cannot price yet, so the classic quote path enters.
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(
     MINT4, market_id="PoolFallback111111111111111111111111")]),
     now=time.time())
 d = eng._read()
@@ -298,7 +309,7 @@ check("fallback: price source + reason journaled",
 # ---------------- fallback: no signature in payload ----------------
 item5 = mig_item(MINT5, market_id="PoolClassic11111111111111111111111")
 del item5["extra"]["signature"]
-res = GR.scan_once(eng, feed=FakeFeed([item5]), now=time.time())
+res = _scan_cycle(eng, feed=FakeFeed([item5]), now=time.time())
 d = eng._read()
 ef5 = d["positions"][MINT5]["entry_features"]
 check("fallback: signature-less payload uses the classic path",
@@ -310,11 +321,11 @@ check("fallback: signature-less payload uses the classic path",
 
 # ---------------- dedupe + killswitch on the instant path ----------------
 eng._ff_tx_price_override = lambda sig, mint: (dict(PAYLOAD_INFO), "")
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(MINT)]),
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT)]),
                    now=time.time())
 check("dedupe: instant path never re-enters a mint", res["opened"] == 0)
 KS.halt_lane("grad_raw", "fire-first test halt")
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(MINT6)]),
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT6)]),
                    now=time.time())
 d = eng._read()
 check("killswitch: halted lane blocks instant entries too",
@@ -325,21 +336,21 @@ if hasattr(KS, "reenable"):
 # ---------------- fresh_only stream-wake scans ----------------
 LIVE["px"] = 0.0  # classic path cannot price anything right now
 gt_row = {"mint": MINT7, "symbol": "FIRE7",
-          "created_ts": time.time() - 60, "dex": "pumpswap",
+          "created_ts": time.time() - 5, "dex": "pumpswap",
           "pool_address": "PoolBackfill111111111111111111111111",
           "reserve_usd": 9000.0, "fdv_usd": 80000.0}
-GR.scan_once(eng, gt_rows=[gt_row], now=time.time())
+_scan_cycle(eng, gt_rows=[gt_row], now=time.time())
 d = eng._read()
 check("fresh_only setup: unquotable backfill row waits on watchlist",
       MINT7 in d["watchlist"] and MINT7 not in d["positions"])
 LIVE["px"] = 0.001
-res = GR.scan_once(eng, feed=FakeFeed([mig_item(MINT8)]),
+res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT8)]),
                    now=time.time(), fresh_only=True)
 d = eng._read()
 check("fresh_only: stream candidate enters, watchlist retry untouched",
       res["opened"] == 1 and MINT8 in d["positions"]
       and MINT7 in d["watchlist"] and MINT7 not in d["positions"])
-res = GR.scan_once(eng, now=time.time())
+res = _scan_cycle(eng, now=time.time())
 d = eng._read()
 ef7 = d["positions"][MINT7]["entry_features"]
 check("main scan: backfill retry enters via the classic path",

@@ -57,7 +57,7 @@ snap = pa.snapshot()
 check("first run creates the account at $10.00 default",
       snap is not None and snap["cash"] == 10.00
       and snap["start_balance"] == 10.00
-      and snap["exposure"] == 0.0 and snap["equity"] == 10.00)
+      and snap["cost_exposure"] == 0.0 and snap["book_value"] == 10.00)
 
 # ---- debit / credit conservation -----------------------------------
 ok, why = pa.try_debit("grad", "MINT_A", 1.00)
@@ -71,8 +71,8 @@ ok, why = pa.try_debit("ceo", "MINT_B", 9.00)
 check("debit $9 ok", ok)
 snap = pa.snapshot()
 check("exposure/cash/equity reconcile after debits",
-      snap["cash"] == 0.0 and snap["exposure"] == 10.00
-      and snap["equity"] == 10.00)
+      snap["cash"] == 0.0 and snap["cost_exposure"] == 10.00
+      and snap["book_value"] == 10.00)
 
 ok, why = pa.credit("grad", "MINT_A", 2.50)
 check("credit $2.50 proceeds ok", ok)
@@ -86,7 +86,7 @@ check("pnl math: +1.50 on grad close",
       and snap["lanes"]["grad"]["n_entries"] == 1
       and snap["lanes"]["grad"]["n_closes"] == 1)
 check("conservation: cash + exposure == start + realized",
-      abs(snap["cash"] + snap["exposure"]
+      abs(snap["cash"] + snap["cost_exposure"]
           - (10.00 + snap["realized_pnl"])) < 1e-9)
 
 # ---- restart persistence -------------------------------------------
@@ -175,8 +175,8 @@ snap = pa5.snapshot()
 check("3 processes x 20 debits: exactly 10 win, 50 refused",
       sum(wins) == 10)
 check("race conservation: cash 0, exposure 10, equity 10",
-      snap["cash"] == 0.0 and snap["exposure"] == 10.00
-      and snap["equity"] == 10.00)
+      snap["cash"] == 0.0 and snap["cost_exposure"] == 10.00
+      and snap["book_value"] == 10.00)
 os.unlink(racer)
 
 # ---- lane cap env knob ----------------------------------------------
@@ -191,6 +191,77 @@ ok3, _ = pa6.try_debit("ceo", "M3", 5.0)
 check("lane cap is per-lane (ceo unaffected, $5 == cap ok)", ok3)
 ok4, _ = pa6.try_debit("ceo", "M4", 0.5)
 check("ceo at cap now refused too", not ok4)
+
+# ---- crash window: journaled debit, unsaved state ----------------
+# Simulates a crash between the journal write and the state save:
+# the journal is the write-ahead log, so recovery must replay the
+# mutation — the cash must NOT come back.
+HOME4 = tempfile.mkdtemp(prefix="paper-account-crash-")
+pa7 = fresh(HOME4, start=10.0)
+check("crash fixture: account created cleanly",
+      pa7.snapshot() is not None and pa7.snapshot()["cash"] == 10.0)
+_real_save = pa7._save_locked
+pa7._save_locked = lambda led: (_ for _ in ()).throw(
+    RuntimeError("simulated crash between journal and save"))
+try:
+    pa7.try_debit("grad", "CRASH1", 2.0)
+    check("crash debit raises mid-write", False)
+except RuntimeError:
+    pass
+pa7._save_locked = _real_save
+snap = pa7.snapshot()  # reload path reconciles against the journal
+check("crash window: journaled debit replayed (cash stays spent)",
+      snap is not None and snap["cash"] == 8.0
+      and snap["lanes"]["grad"]["open_count"] == 1)
+
+# ---- stale shadow: no duplicate credit on restore ------------------
+# Craft the exact failure shape: live file holds the PRE-CLOSE state
+# (position open, cash pre-credit), shadow corrupt. The journaled
+# close must replay EXACTLY ONCE: no resurrected position, no
+# second credit.
+pa8 = fresh(HOME4)
+with pa8._lock():
+    led, healthy = pa8._load_locked()
+    assert healthy
+    pre_close = json.loads(json.dumps(led))  # state before close
+ok, _ = pa8.credit("grad", "CRASH1", 3.0)
+check("fixture: close settles (cash 11.00)",
+      ok and pa8.snapshot()["cash"] == 11.0)
+with open(pa8.LEDGER_PATH, "w") as f:
+    json.dump(pre_close, f)          # live = stale pre-close state
+with open(pa8.LEDGER_PATH + ".bak", "w") as f:
+    f.write("{corrupt")              # shadow unusable
+snap = pa8.snapshot()
+check("stale state: close replays once (no duplicate credit)",
+      snap is not None and snap["cash"] == 11.0
+      and snap["lanes"]["grad"]["n_closes"] == 1
+      and snap["lanes"]["grad"]["open_count"] == 0)
+# And replaying again changes nothing (idempotent).
+snap = fresh(HOME4).snapshot()
+check("reconciliation is idempotent across reloads",
+      snap["cash"] == 11.0 and snap["lanes"]["grad"]["n_closes"] == 1)
+
+# ---- marks: book value vs marked equity ----------------------------
+HOME5 = tempfile.mkdtemp(prefix="paper-account-marks-")
+pa9 = fresh(HOME5, start=10.0)
+pa9.try_debit("grad", "DOWN1", 5.0)
+snap = pa9.snapshot()
+check("no marks: marked fields None, status unavailable",
+      snap["marked_equity"] is None and snap["marked_exposure"] is None
+      and snap["unrealized_pnl"] is None
+      and snap["marks_status"] == "unavailable")
+check("book value ignores the unrealized loss (10.00)",
+      snap["book_value"] == 10.00 and snap["cost_exposure"] == 5.0)
+snap = pa9.snapshot(marks={"grad": {"DOWN1": 1.0}})
+check("marked equity shows the -80% unrealized loss (6.00)",
+      snap["marked_equity"] == 6.0 and snap["marked_exposure"] == 1.0
+      and snap["unrealized_pnl"] == -4.0
+      and snap["marks_status"] == "ok")
+snap = pa9.snapshot(marks={"grad": {}})
+check("missing mark: marked fields None, status partial "
+      "(gate must fail closed, never fall back to cost)",
+      snap["marked_equity"] is None
+      and snap["marks_status"].startswith("partial"))
 
 print()
 if FAILS:

@@ -87,6 +87,7 @@ def _new_ledger() -> Dict[str, Any]:
     now = time.time()
     return {
         "created_ts": now,
+        "seq": 0,
         "start_balance": start_balance(),
         "cash": start_balance(),
         "realized_pnl": 0.0,
@@ -166,11 +167,111 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _journal_entries() -> list:
+    try:
+        with open(JOURNAL_PATH) as f:
+            out = []
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+            return out
+    except Exception:
+        return []
+
+
+def _reconcile(led: Dict[str, Any]) -> Dict[str, Any]:
+    """Replay journaled mutations the ledger has not reached.
+
+    The journal is the write-ahead log (every mutation is journaled
+    BEFORE the state save), so after a crash the ledger can be BEHIND
+    the journal — and a stale .bak shadow can be behind by more.
+    Without reconciliation, restoring that shadow would RESURRECT a
+    settled position, and its later close would credit the money a
+    second time. Every mutation carries a monotonic seq (the state
+    version AFTER the mutation); replay applies journaled entries
+    past the ledger's seq, idempotently:
+
+      debit  — skipped when the position is already open (the state
+               already has it), applied otherwise;
+      credit — skipped when the position is NOT open (already
+               settled), applied otherwise;
+      orphan/dropped credit records and the create marker carry no
+      state effect and are never replayed.
+
+    Entries without a seq predate this scheme and cannot be ordered
+    against the state; reconciliation runs only when BOTH sides
+    carry seqs, and anything ambiguous is logged, never guessed.
+    """
+    led_seq = led.get("seq")
+    if not isinstance(led_seq, int):
+        return led
+    pending = []
+    for ev in _journal_entries():
+        ev_seq = ev.get("seq")
+        if not isinstance(ev_seq, int):
+            continue
+        if ev_seq > led_seq:
+            pending.append((ev_seq, ev))
+    if not pending:
+        return led
+    pending.sort(key=lambda t: t[0])
+    replayed = 0
+    for ev_seq, ev in pending:
+        kind = ev.get("event")
+        lane, mint = ev.get("lane"), ev.get("mint")
+        if kind == "debit" and lane and mint:
+            st = _lane(led, lane)
+            if mint in st["open"]:
+                continue  # state already has it: idempotent skip
+            stake = float(ev.get("stake") or 0)
+            if stake <= 0 or float(led["cash"]) < stake:
+                logger.error("paper_account: reconcile cannot replay "
+                             "debit %s/%s (bad stake or cash); "
+                             "stopping replay", lane, mint)
+                break
+            led["cash"] = round(float(led["cash"]) - stake, 6)
+            st["open"][mint] = {"stake": stake,
+                                "ts": ev.get("ts") or time.time()}
+            st["n_entries"] += 1
+            replayed += 1
+        elif kind == "credit" and lane and mint:
+            st = _lane(led, lane)
+            pos = st["open"].pop(mint, None)
+            if pos is None:
+                continue  # already settled: idempotent skip
+            proceeds = float(ev.get("proceeds") or 0)
+            stake = float(pos["stake"])
+            pnl = round(proceeds - stake, 6)
+            led["cash"] = round(float(led["cash"]) + proceeds, 6)
+            led["realized_pnl"] = round(
+                float(led["realized_pnl"]) + pnl, 6)
+            led["day_realized_pnl"] = round(
+                float(led.get("day_realized_pnl") or 0.0) + pnl, 6)
+            st["realized_pnl"] = round(
+                float(st["realized_pnl"]) + pnl, 6)
+            st["n_closes"] += 1
+            replayed += 1
+        led["seq"] = ev_seq
+    if replayed:
+        logger.warning("paper_account: reconciled %d journaled "
+                       "mutation(s) the ledger had not reached",
+                       replayed)
+    return led
+
+
 def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool]:
     """Read the ledger under the lock. Returns (ledger, healthy).
     First run creates it; a corrupt live file falls back to the
     .bak shadow; both unreadable -> (None, False) so callers fail
-    closed. Caller must hold _lock()."""
+    closed. A loaded ledger is reconciled against the journal
+    (write-ahead log) so a crash or stale shadow can never
+    resurrect spendable cash or a settled position. Caller must
+    hold _lock()."""
     if not os.path.exists(LEDGER_PATH):
         led = _new_ledger()
         _journal({"event": "create", "start_balance":
@@ -187,6 +288,14 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool]:
                          "failing closed (debits refused)")
             return None, False
         logger.warning("paper_account: restored from shadow copy")
+    seq_before = led.get("seq")
+    led = _reconcile(led)
+    if led.get("seq") != seq_before:
+        # Persist the reconciled state: otherwise the on-disk file
+        # stays behind the journal and the NEXT load replays the
+        # same mutations over the same stale state (a credit would
+        # count twice).
+        _save_locked(led)
     # Day rollover: reset the daily counter, keep the cumulative.
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if led.get("day") != today:
@@ -256,8 +365,10 @@ def try_debit(lane: str, mint: str, stake: float,
         led["cash"] = round(cash - stake, 6)
         st["open"][mint] = {"stake": stake, "ts": ts or time.time()}
         st["n_entries"] += 1
+        led["seq"] = int(led.get("seq") or 0) + 1
         _journal({"event": "debit", "lane": lane, "mint": mint,
-                  "stake": stake, "cash_after": led["cash"], "ts": ts})
+                  "stake": stake, "cash_after": led["cash"],
+                  "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
 
@@ -304,19 +415,40 @@ def credit(lane: str, mint: str, proceeds: float,
         st["realized_pnl"] = round(
             float(st["realized_pnl"]) + pnl, 6)
         st["n_closes"] += 1
+        led["seq"] = int(led.get("seq") or 0) + 1
         _journal({"event": "credit", "lane": lane, "mint": mint,
                   "stake": stake, "proceeds": proceeds, "pnl": pnl,
-                  "cash_after": led["cash"], "ts": ts})
+                  "cash_after": led["cash"],
+                  "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
 
 
-def snapshot() -> Optional[Dict[str, Any]]:
+def snapshot(marks: Optional[Dict[str, Dict[str, float]]] = None
+             ) -> Optional[Dict[str, Any]]:
     """Read-only account view. None when the ledger is unreadable.
 
-    cash: uncommitted dollars. exposure: open cost basis. equity:
-    cash + exposure (marks open positions at COST — honest paper
-    accounting; marks are the lanes' own business)."""
+    ACCOUNTING CONTRACT (2026-11-22 review): cash + open cost basis
+    is BOOK value, NOT liquidation equity — a position down 80%
+    still carries its full cost in book_value, so a drawdown gate
+    reading book_value would miss the unrealized loss. The four
+    quantities are kept explicitly separate:
+
+      cash            uncommitted dollars
+      cost_exposure   open positions at entry cost
+      book_value      cash + cost_exposure (accounting identity,
+                      never a drawdown input)
+      realized_pnl    settled P/L only (cumulative + daily)
+
+    `marks` optionally supplies current executable values as
+    {lane: {mint: value_usd}} (the lanes own honest-fill marks;
+    this module never fabricates them). With complete marks the
+    view adds marked_exposure, marked_equity and unrealized_pnl
+    and marks_status "ok". With any open position unmarked the
+    marked fields are None and marks_status says "partial" — a
+    stale or missing mark must degrade a gate to fail-closed,
+    never silently fall back to cost.
+    """
     try:
         with _lock():
             led, healthy = _load_locked()
@@ -324,9 +456,12 @@ def snapshot() -> Optional[Dict[str, Any]]:
                 return None
             out_lanes = {}
             exposure = 0.0
+            open_positions = []
             for name, st in led.get("lanes", {}).items():
-                basis = sum(float(p["stake"])
-                            for p in st.get("open", {}).values())
+                basis = 0.0
+                for mint, p in st.get("open", {}).items():
+                    basis += float(p["stake"])
+                    open_positions.append((name, mint))
                 exposure += basis
                 out_lanes[name] = {
                     "open_count": len(st.get("open", {})),
@@ -336,16 +471,45 @@ def snapshot() -> Optional[Dict[str, Any]]:
                     "n_closes": st.get("n_closes", 0),
                 }
             cash = float(led["cash"])
-            return {
+            out = {
                 "start_balance": led["start_balance"],
                 "cash": round(cash, 6),
-                "exposure": round(exposure, 6),
-                "equity": round(cash + exposure, 6),
+                "cost_exposure": round(exposure, 6),
+                "book_value": round(cash + exposure, 6),
                 "realized_pnl": led.get("realized_pnl", 0.0),
                 "day": led.get("day"),
                 "day_realized_pnl": led.get("day_realized_pnl", 0.0),
                 "lanes": out_lanes,
             }
+            marked = None
+            missing = []
+            if marks:
+                total = 0.0
+                for lane, mint in open_positions:
+                    v = (marks.get(lane) or {}).get(mint)
+                    if v is None:
+                        missing.append("%s/%s" % (lane, mint))
+                    else:
+                        total += float(v)
+                if not missing:
+                    marked = round(total, 6)
+            if marked is not None:
+                out["marks_status"] = "ok"
+                out["marked_exposure"] = marked
+                out["marked_equity"] = round(cash + marked, 6)
+                out["unrealized_pnl"] = round(marked - exposure, 6)
+            elif marks:
+                out["marks_status"] = ("partial: no mark for %s"
+                                       % ", ".join(missing))
+                out["marked_exposure"] = None
+                out["marked_equity"] = None
+                out["unrealized_pnl"] = None
+            else:
+                out["marks_status"] = "unavailable"
+                out["marked_exposure"] = None
+                out["marked_equity"] = None
+                out["unrealized_pnl"] = None
+            return out
     except Exception:
         logger.exception("paper_account: snapshot failed")
         return None

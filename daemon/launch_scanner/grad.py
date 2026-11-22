@@ -256,6 +256,27 @@ MAX_OPEN = 20
 # increments for journaling but never refuses an entry.
 DAILY_ENTRY_CAP = None
 LANE = "grad"
+
+
+def _paper_account():
+    """The shared cross-lane paper account (Stage 1, 2026-11-22),
+    or None when disabled. Opt-in via PAPER_ACCOUNT_ENABLED=1: when
+    on, the shared account is the authoritative capital gate for
+    entries and closes credit it the same realized proceeds the
+    lane books. The lane's private bankroll and verdict accounting
+    are unchanged either way. Default OFF preserves historical
+    behavior until the runtime config opts in. paper_account is
+    stdlib-only; a defensive failure here disables the gate rather
+    than breaking the lane."""
+    if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1":
+        return None
+    try:
+        from . import paper_account
+        return paper_account
+    except Exception:
+        logger.exception("grad: paper account unavailable; shared "
+                         "gate disabled for this call")
+        return None
 CHAIN = "solana"
 # Venue for cost accounting (P3 fee audit, 2026-10-23): graduation
 # trades execute on pump.fun venues — the bonding curve at 1.25% per
@@ -1088,6 +1109,20 @@ def _consider_candidate(cand, now):
                          % DAILY_ENTRY_CAP, False)
         ed["count"] = int(ed.get("count") or 0) + 1
         d["entries_day"] = ed
+        # Shared cross-lane paper account (Stage 1, 2026-11-22,
+        # owner-approved shared demo account): when enabled it is
+        # the AUTHORITATIVE capital gate — the entry happens only
+        # if the shared cash covers the stake, so two lanes can
+        # never spend the same dollars. Lock order is always
+        # lane-ledger -> account (the account never calls back),
+        # and the debit lands immediately before the position
+        # insert, which cannot fail. Fail-closed and transient:
+        # cash freed by another lane's close re-enables entries.
+        _pa = _paper_account()
+        if _pa is not None:
+            _ok, _why = _pa.try_debit(LANE, mint, _stake)
+            if not _ok:
+                return _skip(mint, "paper account: " + _why, False)
         d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
         d["positions"][mint] = pos
         d["watchlist"].pop(mint, None)
@@ -1443,6 +1478,16 @@ def _finalize(d, mint, pos, closed_reason):
     entry_notional = float(pos.get("notional_usd") or NOTIONAL_USD)
     pnl = round(realized - entry_notional, 4)
     d["bankroll"] = round(float(d["bankroll"]) + realized, 6)
+    # Shared account settle (same flag as the entry gate): the
+    # close credits the exact proceeds the lane books. A failure
+    # (e.g. a position that predates the flag) is journaled by the
+    # account module and never blocks the lane's own settle.
+    _pa = _paper_account()
+    if _pa is not None:
+        _ok, _why = _pa.credit(LANE, mint, realized)
+        if not _ok:
+            logger.warning("grad: shared paper account credit "
+                           "for %s failed: %s (journaled)", mint, _why)
     # Minimum fundable stake is the COLD stake (base x 0.5): the
     # lane can still enter while the bankroll covers it, so the
     # exhausted flag must use the COLD stake, not the base.

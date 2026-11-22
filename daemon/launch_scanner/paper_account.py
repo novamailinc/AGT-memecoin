@@ -146,6 +146,76 @@ def mark_ttl_s() -> float:
     return _env_f("PAPER_ACCOUNT_MARK_TTL_S", DEFAULT_MARK_TTL_S)
 
 
+# ---- Stage 2 account-level risk gates -------------------------------
+# PROVISIONAL, INACTIVE BY DEFAULT (PAPER_ACCOUNT_GATES_ENABLED=1
+# opts in, on top of PAPER_ACCOUNT_ENABLED). The default thresholds
+# below are agent-chosen engineering placeholders for the $10 demo
+# account, NOT owner-approved operational limits; the owner sets real
+# numbers before any runtime enabling.
+
+def gates_enabled() -> bool:
+    return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
+
+
+def max_daily_loss_usd() -> float:
+    return _env_f("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", 5.00)  # provisional
+
+
+def max_drawdown_pct() -> float:
+    return _env_f("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT", 50.0)  # provisional
+
+
+def max_exposure_pct() -> float:
+    return _env_f("PAPER_ACCOUNT_MAX_EXPOSURE_PCT", 60.0)  # provisional
+
+
+def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
+                       new_stake: float) -> Optional[str]:
+    """Account-level entry gate, evaluated UNDER the account lock as
+    part of the debit's critical section: the evaluation and the
+    reservation are atomic, so two lanes can never each pass on the
+    same available capacity. Returns None when entry is allowed,
+    else the refusal reason. Fail-closed: anything untrusted blocks
+    new risk. Exits never pass through here (risk reduction is
+    always allowed; credit() enforces ownership, quantity, op
+    idempotency and ledger integrity instead).
+
+    Gates (all thresholds provisional, see above):
+      * degraded WAL (handled by the caller before this),
+      * marks: with any position open, every mark must be present,
+        fresh, finite and provenanced (marks_status "ok"), else the
+        equity figure is untrusted and entries block; an empty
+        account is fully marked by definition (equity == cash),
+      * daily loss vs the persisted day-start equity baseline,
+      * drawdown vs the persisted peak equity,
+      * total exposure after this entry vs marked equity.
+    book_value is NEVER a gate input (cost basis hides unrealized
+    losses).
+    """
+    if view["marks_status"] != "ok":
+        return ("gate: marks not trustworthy (%s); entry blocked "
+                "fail-closed" % view["marks_status"])
+    me = view["marked_equity"]
+    dl = view.get("daily_loss")
+    if dl is None or view.get("drawdown_pct") is None:
+        return ("gate: no trustworthy day-start/peak baseline yet; "
+                "entry blocked fail-closed")
+    if dl > max_daily_loss_usd():
+        return ("gate: daily loss $%.2f > limit $%.2f (provisional)"
+                % (dl, max_daily_loss_usd()))
+    if view["drawdown_pct"] > max_drawdown_pct():
+        return ("gate: drawdown %.1f%% > limit %.1f%% (provisional)"
+                % (view["drawdown_pct"], max_drawdown_pct()))
+    if me <= 0:
+        return "gate: marked equity $%.2f; no capacity" % me
+    after = view["cost_exposure"] + new_stake
+    if after > max_exposure_pct() / 100.0 * me:
+        return ("gate: exposure $%.2f after entry > %.0f%% of marked "
+                "equity $%.2f (provisional)"
+                % (after, max_exposure_pct(), me))
+    return None
+
+
 def _new_ledger() -> Dict[str, Any]:
     now = time.time()
     return {
@@ -645,7 +715,8 @@ def _op_lookup(led: Dict[str, Any], op_id: str, kind: str,
 
 
 def try_debit(lane: str, mint: str, stake: float, qty: float,
-              op_id: str, ts: Optional[float] = None
+              op_id: str, ts: Optional[float] = None,
+              marks: Optional[Dict[str, Dict[str, Any]]] = None
               ) -> Tuple[bool, str, Optional[str]]:
     """Reserve `stake` paper dollars for `lane` buying `qty` units
     of `mint`. op_id is the caller's stable operation ID: an
@@ -659,6 +730,13 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
     same mint. Fail-closed: any corruption, degradation or
     inconsistency refuses the debit — a refused paper entry costs
     nothing, a doubled one quietly invents money.
+
+    When PAPER_ACCOUNT_GATES_ENABLED=1 (PROVISIONAL, default OFF),
+    `marks` must carry the caller's current liquidation marks and
+    the account-level risk gates run INSIDE the same lock as the
+    reservation (see _gate_check_locked): evaluation and debit are
+    one atomic section, so two lanes cannot each pass on the same
+    available capacity.
     """
     if not _valid_amount(stake) or stake <= 0:
         return False, "stake must be a positive finite number", None
@@ -699,6 +777,13 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
                 return (False, ("lane cap $%.2f would be exceeded "
                                 "($%.2f open + $%.2f new)"
                                 % (cap, open_basis, stake)), None)
+        if gates_enabled():
+            view = _view_locked(led, marks, degraded)
+            _update_baselines_locked(led, view)
+            view.update(_gate_fields(led, view))
+            refusal = _gate_check_locked(led, view, stake)
+            if refusal is not None:
+                return False, refusal, None
         led["seq"] = int(led.get("seq") or 0) + 1
         pid = _pos_id(lane, mint, led["seq"])
         _apply_debit(led, lane, mint, stake, qty, pid, ts)
@@ -850,6 +935,141 @@ def _mark_value(mark: Any, now: float, ttl: float
     return float(v), None
 
 
+def _view_locked(led: Dict[str, Any],
+                 marks: Optional[Dict[str, Dict[str, Any]]],
+                 degraded: Optional[str]) -> Dict[str, Any]:
+    """Account view from an already-loaded ledger. Caller holds the
+    lock. Shared by snapshot() and the gated debit path so both see
+    IDENTICAL numbers (the gate never evaluates a different view
+    than the one an observer would read)."""
+    out_lanes = {}
+    exposure = 0.0
+    open_positions = []
+    for name, st in led.get("lanes", {}).items():
+        basis = 0.0
+        positions = []
+        for mint, p in st.get("open", {}).items():
+            pb = _pos_basis(p)
+            basis += pb
+            open_positions.append((name, mint))
+            positions.append({"mint": mint, "qty": _pos_qty(p),
+                              "basis": round(pb, 6)})
+        exposure += basis
+        out_lanes[name] = {
+            "open_count": len(st.get("open", {})),
+            "open_basis": round(basis, 6),
+            "realized_pnl": st.get("realized_pnl", 0.0),
+            "n_entries": st.get("n_entries", 0),
+            "n_closes": st.get("n_closes", 0),
+            "positions": positions,
+        }
+    cash = float(led["cash"])
+    out = {
+        "start_balance": led["start_balance"],
+        "cash": round(cash, 6),
+        "cost_exposure": round(exposure, 6),
+        "book_value": round(cash + exposure, 6),
+        "realized_pnl": led.get("realized_pnl", 0.0),
+        "day": led.get("day"),
+        "day_realized_pnl": led.get("day_realized_pnl", 0.0),
+        "degraded": degraded,
+        "lanes": out_lanes,
+    }
+    marked = None
+    problems = []
+    if not open_positions:
+        # Nothing to mark: equity is exactly cash, fully trusted.
+        marked = 0.0
+    elif marks:
+        total = 0.0
+        now = time.time()
+        ttl = mark_ttl_s()
+        for lane, mint in open_positions:
+            m = (marks.get(lane) or {}).get(mint)
+            if m is None:
+                problems.append("%s/%s: no mark" % (lane, mint))
+                continue
+            v, problem = _mark_value(m, now, ttl)
+            if problem is not None:
+                problems.append("%s/%s: %s" % (lane, mint, problem))
+            else:
+                total += v  # type: ignore[operator]
+        if not problems:
+            marked = round(total, 6)
+    if marked is not None:
+        out["marks_status"] = "ok"
+        out["marked_exposure"] = marked
+        out["marked_equity"] = round(cash + marked, 6)
+        out["unrealized_pnl"] = round(marked - exposure, 6)
+    elif marks or open_positions:
+        out["marks_status"] = ("; ".join(problems) if problems
+                               else "unavailable")
+        out["marked_exposure"] = None
+        out["marked_equity"] = None
+        out["unrealized_pnl"] = None
+    else:
+        out["marks_status"] = "unavailable"
+        out["marked_exposure"] = None
+        out["marked_equity"] = None
+        out["unrealized_pnl"] = None
+    return out
+
+
+def _update_baselines_locked(led: Dict[str, Any],
+                             view: Dict[str, Any]) -> bool:
+    """Capture day-start / peak equity from a trustworthy view.
+    NEVER resets a baseline to a later favorable value on the same
+    day; at a rollover with no trustworthy mark the previous
+    baseline carries (the gate fields report stale and fail
+    closed). Caller holds the lock. Returns True when changed."""
+    if view["marks_status"] != "ok":
+        return False
+    me = view["marked_equity"]
+    now = time.time()
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    changed = False
+    baseline = led.get("day_baseline")
+    if not isinstance(baseline, dict) or baseline.get("day") != today:
+        led["day_baseline"] = {"day": today, "value": me, "ts": now}
+        changed = True
+    peak = led.get("peak_equity")
+    if not isinstance(peak, dict)             or not _valid_amount(peak.get("value"))             or me > float(peak["value"]):
+        led["peak_equity"] = {"value": me, "ts": now}
+        changed = True
+    return changed
+
+
+def _gate_fields(led: Dict[str, Any], view: Dict[str, Any]
+                 ) -> Dict[str, Any]:
+    """daily_loss / drawdown_pct gate inputs: None unless BOTH the
+    baseline/peak and the current equity are trustworthy (a stale
+    baseline or missing marks = fail-closed inputs, never a silent
+    fallback to book value)."""
+    out = {"day_start_equity": None, "peak_equity": None,
+           "daily_loss": None, "drawdown_pct": None}
+    baseline = led.get("day_baseline")
+    if isinstance(baseline, dict):
+        out["day_start_equity"] = dict(baseline)
+    peak = led.get("peak_equity")
+    if isinstance(peak, dict):
+        out["peak_equity"] = dict(peak)
+    if view["marks_status"] != "ok":
+        return out
+    me = view["marked_equity"]
+    today = view["day"]
+    if (isinstance(baseline, dict)
+            and _valid_amount(baseline.get("value"))
+            and baseline.get("day") == today):
+        out["daily_loss"] = round(
+            max(0.0, float(baseline["value"]) - me), 6)
+    if (isinstance(peak, dict) and _valid_amount(peak.get("value"))
+            and float(peak["value"]) > 0):
+        out["drawdown_pct"] = round(
+            max(0.0, (float(peak["value"]) - me)
+                / float(peak["value"]) * 100.0), 6)
+    return out
+
+
 def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
              ) -> Optional[Dict[str, Any]]:
     """Read-only account view. None when the ledger is unreadable.
@@ -874,7 +1094,8 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
     (the lanes own honest-fill marks; this module never fabricates
     them). Every mark is validated: finite, nonnegative, provenance
     present, and no older than PAPER_ACCOUNT_MARK_TTL_S. Only when
-    EVERY open position has a valid fresh mark does the view add
+    EVERY open position has a valid fresh mark (or no position is
+    open at all — equity is then exactly cash) does the view add
     marked_exposure / marked_equity / unrealized_pnl with
     marks_status "ok". Otherwise the marked fields are None and
     marks_status names the failure ("stale", "invalid", "no
@@ -887,8 +1108,8 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
     and folded into the all-time peak. A baseline is NEVER reset
     to a later favorable value on the same day; when no
     trustworthy mark exists after a rollover the previous baseline
-    carries and day_start_equity is reported with its own day so
-    the gate can see it is stale and fail closed. Both are None
+    carries with its original day visible, and daily_loss /
+    drawdown_pct report None so a gate fails closed. Both are None
     until the first trustworthy mark.
     """
     try:
@@ -896,112 +1117,10 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
             led, healthy, degraded = _load_locked()
             if not healthy or led is None:
                 return None
-            out_lanes = {}
-            exposure = 0.0
-            open_positions = []
-            for name, st in led.get("lanes", {}).items():
-                basis = 0.0
-                for mint, p in st.get("open", {}).items():
-                    basis += _pos_basis(p)
-                    open_positions.append((name, mint))
-                exposure += basis
-                out_lanes[name] = {
-                    "open_count": len(st.get("open", {})),
-                    "open_basis": round(basis, 6),
-                    "realized_pnl": st.get("realized_pnl", 0.0),
-                    "n_entries": st.get("n_entries", 0),
-                    "n_closes": st.get("n_closes", 0),
-                }
-            cash = float(led["cash"])
-            out = {
-                "start_balance": led["start_balance"],
-                "cash": round(cash, 6),
-                "cost_exposure": round(exposure, 6),
-                "book_value": round(cash + exposure, 6),
-                "realized_pnl": led.get("realized_pnl", 0.0),
-                "day": led.get("day"),
-                "day_realized_pnl": led.get("day_realized_pnl", 0.0),
-                "degraded": degraded,
-                "lanes": out_lanes,
-            }
-            marked = None
-            problems = []
-            if marks:
-                total = 0.0
-                now = time.time()
-                ttl = mark_ttl_s()
-                for lane, mint in open_positions:
-                    m = (marks.get(lane) or {}).get(mint)
-                    if m is None:
-                        problems.append("%s/%s: no mark"
-                                        % (lane, mint))
-                        continue
-                    v, problem = _mark_value(m, now, ttl)
-                    if problem is not None:
-                        problems.append("%s/%s: %s"
-                                        % (lane, mint, problem))
-                    else:
-                        total += v  # type: ignore[operator]
-                if not problems:
-                    marked = round(total, 6)
-            if marked is not None:
-                out["marks_status"] = "ok"
-                out["marked_exposure"] = marked
-                out["marked_equity"] = round(cash + marked, 6)
-                out["unrealized_pnl"] = round(marked - exposure, 6)
-            elif marks:
-                out["marks_status"] = "; ".join(problems)
-                out["marked_exposure"] = None
-                out["marked_equity"] = None
-                out["unrealized_pnl"] = None
-            else:
-                out["marks_status"] = "unavailable"
-                out["marked_exposure"] = None
-                out["marked_equity"] = None
-                out["unrealized_pnl"] = None
-            # Equity baselines: capture only from trustworthy marks,
-            # never reset to a later favorable value.
-            today = time.strftime("%Y-%m-%d", time.gmtime())
-            baseline = led.get("day_baseline")
-            peak = led.get("peak_equity")
-            changed = False
-            if marked is not None:
-                me = out["marked_equity"]
-                now = time.time()
-                if not isinstance(baseline, dict) \
-                        or baseline.get("day") != today:
-                    baseline = {"day": today, "value": me, "ts": now}
-                    led["day_baseline"] = baseline
-                    changed = True
-                if not isinstance(peak, dict) \
-                        or not _valid_amount(peak.get("value")) \
-                        or me > float(peak["value"]):
-                    peak = {"value": me, "ts": now}
-                    led["peak_equity"] = peak
-                    changed = True
-                if changed:
-                    _save_locked(led)
-            out["day_start_equity"] = (
-                dict(baseline) if isinstance(baseline, dict) else None)
-            out["peak_equity"] = (
-                dict(peak) if isinstance(peak, dict) else None)
-            # Gate inputs, None unless both ends are trustworthy.
-            if (marked is not None and isinstance(baseline, dict)
-                    and baseline.get("day") == today):
-                out["daily_loss"] = round(
-                    max(0.0, float(baseline["value"])
-                        - out["marked_equity"]), 6)
-            else:
-                out["daily_loss"] = None
-            if (marked is not None and isinstance(peak, dict)
-                    and _valid_amount(peak.get("value"))
-                    and float(peak["value"]) > 0):
-                out["drawdown_pct"] = round(
-                    max(0.0, (float(peak["value"])
-                              - out["marked_equity"])
-                        / float(peak["value"]) * 100.0), 6)
-            else:
-                out["drawdown_pct"] = None
+            out = _view_locked(led, marks, degraded)
+            if _update_baselines_locked(led, out):
+                _save_locked(led)
+            out.update(_gate_fields(led, out))
             return out
     except Exception:
         logger.exception("paper_account: snapshot failed")

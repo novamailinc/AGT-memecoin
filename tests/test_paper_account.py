@@ -79,8 +79,8 @@ check("first run creates the account at $10.00 default",
       and snap["start_balance"] == 10.00
       and snap["cost_exposure"] == 0.0 and snap["book_value"] == 10.00
       and snap["degraded"] is None
-      and snap["day_start_equity"] is None
-      and snap["peak_equity"] is None)
+      and abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9
+      and abs(snap["peak_equity"]["value"] - 10.0) < 1e-9)
 
 # ---- debit / credit conservation -----------------------------------
 ok, why, pid_a = pa.try_debit("grad", "MINT_A", 1.00, 1.00, "d-a1")
@@ -647,31 +647,27 @@ check("valid fresh mark accepted again after the rejects",
       snap["marks_status"] == "ok" and snap["marked_equity"] == 6.0)
 
 # ---- equity baselines: capture, carry, never-favorable-reset --------
-# The position is down 80%; the first trustworthy mark captures the
-# day baseline AT THE LOSS (6.00) and the peak.
+# This account's first TRUSTWORTHY view of the day came with the
+# position already down 80% (the debit preceded any snapshot), so
+# the day baseline captures AT THE LOSS: 6.00. (The account-start
+# capture case is covered by the first-run check above.)
 snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(1.0)}})
-check("day-start baseline captured from first trustworthy mark",
-      snap["day_start_equity"] is not None
-      and abs(snap["day_start_equity"]["value"] - 6.0) < 1e-9
+check("day-start baseline captured from first trustworthy view",
+      abs(snap["day_start_equity"]["value"] - 6.0) < 1e-9
       and snap["daily_loss"] == 0.0)
-check("peak equity captured",
-      snap["peak_equity"] is not None
-      and abs(snap["peak_equity"]["value"] - 6.0) < 1e-9)
+check("peak equity captured at 6.00",
+      abs(snap["peak_equity"]["value"] - 6.0) < 1e-9)
 # Later same day the mark RECOVERS: baseline must NOT reset to the
-# favorable value; the peak moves up, daily loss stays vs baseline.
+# favorable value; the peak moves up.
 snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(4.0)}})
 check("baseline never resets to a later favorable value",
       abs(snap["day_start_equity"]["value"] - 6.0) < 1e-9)
-check("peak rises with the recovery; daily loss shows the dip "
-      "recovered (0 vs 9.00 equity vs 6.00 baseline? no: gain)",
+check("peak rises with the recovery (9.00), no daily loss",
       abs(snap["peak_equity"]["value"] - 9.0) < 1e-9
       and snap["daily_loss"] == 0.0)
-# A dip below baseline counts as daily loss.
-snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(2.0)}})
-check("marked equity 7.00 vs baseline 6.00? no dip -> 0; dip shows "
-      "when below", snap["daily_loss"] == 0.0)
+# A dip below the baseline counts as daily loss; drawdown vs 9.00.
 snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(0.5)}})
-check("daily loss vs day-start baseline (6.00 - 5.50 = 0.50)",
+check("daily loss (6.00 - 5.50 = 0.50), drawdown (9-5.5)/9",
       abs(snap["daily_loss"] - 0.50) < 1e-9
       and abs(snap["drawdown_pct"] - (9.0 - 5.5) / 9.0 * 100) < 1e-6)
 # Rollover with NO trustworthy mark: baseline carries, marked

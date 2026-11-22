@@ -1,0 +1,23 @@
+{
+  "frozen_at": "2026-09-30T17:13:16.414309+00:00",
+  "symbols": {
+    "BTCUSDT": {
+      "windows": [],
+      "frac": 0.0,
+      "vol_filter": false,
+      "cost": 0.002
+    },
+    "ETHUSDT": {
+      "windows": [],
+      "frac": 0.0,
+      "vol_filter": false,
+      "cost": 0.002
+    },
+    "SOLUSDT": {
+      "windows": [],
+      "frac": 0.0,
+      "vol_filter": false,
+      "cost": 0.002
+    }
+  }
+}

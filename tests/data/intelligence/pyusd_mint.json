@@ -1,0 +1,141 @@
+{
+ "capture": {
+  "method": "getAccountInfo",
+  "params_parsed": [
+   "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",
+   {
+    "encoding": "jsonParsed",
+    "commitment": "confirmed"
+   }
+  ],
+  "params_base64": [
+   "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",
+   {
+    "encoding": "base64",
+    "commitment": "confirmed"
+   }
+  ],
+  "mint": "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",
+  "captured_at_utc": "2026-11-22T08:42:30Z",
+  "provider": "daemon/launch_scanner/reserves.py rpc() \u2014 Helius primary, public-RPC fallback; per-call provider recorded where the capture log showed it",
+  "note": "PayPal USD mint on Solana (address verified against multiple published sources), Token-2022, decimals 6, extensions include permanentDelegate, transferHook (null program), metadataPointer and tokenMetadata. The safety assessment must FAIL on the permanent delegate. Raw base64 bytes cross-check the TLV decoder against the RPC's own jsonParsed parse."
+ },
+ "rpc_result_parsed": {
+  "context": {
+   "slot": 472477803,
+   "apiVersion": "4.3.0-alpha.2"
+  },
+  "value": {
+   "lamports": 2078412094,
+   "data": {
+    "program": "spl-token-2022",
+    "parsed": {
+     "info": {
+      "decimals": 6,
+      "extensions": [
+       {
+        "extension": "mintCloseAuthority",
+        "state": {
+         "closeAuthority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk"
+        }
+       },
+       {
+        "extension": "permanentDelegate",
+        "state": {
+         "delegate": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk"
+        }
+       },
+       {
+        "extension": "transferFeeConfig",
+        "state": {
+         "newerTransferFee": {
+          "epoch": 605,
+          "maximumFee": 0,
+          "transferFeeBasisPoints": 0
+         },
+         "olderTransferFee": {
+          "epoch": 605,
+          "maximumFee": 0,
+          "transferFeeBasisPoints": 0
+         },
+         "transferFeeConfigAuthority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "withdrawWithheldAuthority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "withheldAmount": 0
+        }
+       },
+       {
+        "extension": "confidentialTransferMint",
+        "state": {
+         "auditorElgamalPubkey": null,
+         "authority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "autoApproveNewAccounts": false
+        }
+       },
+       {
+        "extension": "confidentialTransferFeeConfig",
+        "state": {
+         "authority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "harvestToMintEnabled": true,
+         "withdrawWithheldAuthorityElgamalPubkey": "HDfmQztzBN2Cc3rkDZuL88SfWw5sSajVMyiz5QaQHFc=",
+         "withheldAmount": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        }
+       },
+       {
+        "extension": "transferHook",
+        "state": {
+         "authority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "programId": null
+        }
+       },
+       {
+        "extension": "metadataPointer",
+        "state": {
+         "authority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "metadataAddress": "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo"
+        }
+       },
+       {
+        "extension": "tokenMetadata",
+        "state": {
+         "additionalMetadata": [],
+         "mint": "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",
+         "name": "PayPal USD",
+         "symbol": "PYUSD",
+         "updateAuthority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+         "uri": "https://token-metadata.paxos.com/pyusd_metadata/prod/solana/pyusd_metadata.json"
+        }
+       }
+      ],
+      "freezeAuthority": "2apBGMsS6ti9RyF5TwQTDswXBWskiJP2LD4cUEDqYJjk",
+      "isInitialized": true,
+      "mintAuthority": "DRXA1H9SjZPyPCEeuAWpfwk8GqVW6dZsKFAtdfpFwApX",
+      "supply": "720480615162772"
+     },
+     "type": "mint"
+    },
+    "space": 866
+   },
+   "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "executable": false,
+   "rentEpoch": 18446744073709551615,
+   "space": 866
+  }
+ },
+ "rpc_result_base64": {
+  "context": {
+   "apiVersion": "4.4.0",
+   "slot": 472477907
+  },
+  "value": {
+   "data": [
+    "AQAAALiUR3j6qjM6rsRVVI5a6c6J+J3BH9vQQ7CNu0TnqQE4lGMi90WPAgAGAQEAAAAXhTJh72q4Uypn8FOGWq0xKT/PB88SCrW5oVcGVI3AKwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQMAIAAXhTJh72q4Uypn8FOGWq0xKT/PB88SCrW5oVcGVI3AKwwAIAAXhTJh72q4Uypn8FOGWq0xKT/PB88SCrW5oVcGVI3AKwEAbAAXhTJh72q4Uypn8FOGWq0xKT/PB88SCrW5oVcGVI3AKxeFMmHvarhTKmfwU4ZarTEpP88HzxIKtbmhVwZUjcArAAAAAAAAAABdAgAAAAAAAAAAAAAAAAAAAABdAgAAAAAAAAAAAAAAAAAAAAAEAEEAF4UyYe9quFMqZ/BThlqtMSk/zwfPEgq1uaFXBlSNwCsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAIEAF4UyYe9quFMqZ/BThlqtMSk/zwfPEgq1uaFXBlSNwCscN+ZDO3ME3YJzeuQNm4vzxJ9bDmxJqNUzKLPlBpAcVwEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgBAABeFMmHvarhTKmfwU4ZarTEpP88HzxIKtbmhVwZUjcArAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASAEAAF4UyYe9quFMqZ/BThlqtMSk/zwfPEgq1uaFXBlSNwCsXkkg7bIoqh7dHHYFPlZH5OVyECpzj2fTVun06S4p0nhMArgAXhTJh72q4Uypn8FOGWq0xKT/PB88SCrW5oVcGVI3AKxeSSDtsiiqHt0cdgU+Vkfk5XIQKnOPZ9NW6fTpLinSeCgAAAFBheVBhbCBVU0QFAAAAUFlVU0RPAAAAaHR0cHM6Ly90b2tlbi1tZXRhZGF0YS5wYXhvcy5jb20vcHl1c2RfbWV0YWRhdGEvcHJvZC9zb2xhbmEvcHl1c2RfbWV0YWRhdGEuanNvbgAAAAA=",
+    "base64"
+   ],
+   "executable": false,
+   "lamports": 2078412094,
+   "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "rentEpoch": 18446744073709551615,
+   "space": 866
+  }
+ }
+}

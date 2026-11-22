@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""Locked-liquidity hunter -> degen lane CA cards (user-requested 2026-10-18).
+
+"If you detect a coin that its liquidity is locked, send the CA to the lane
+so I can buy."
+
+Hunts coins with VERIFIED locked liquidity that are ALREADY RUNNING, on
+Solana / Base / Ethereum, and fires their CAs into the degen lane as cards.
+Every buy stays manual; the bot never trades.
+
+Stages per pool:
+  1. Prefilter  — age 10-120 min, liquidity + mcap floors, known DEX only.
+  2. LP-LOCK    — the core filter, verified on-chain, fail-CLOSED:
+       Solana (Raydium + PumpSwap): the CANDIDATE POOL'S OWN RugCheck
+       market (matched by pool address) must show lp.lpLockedPct >= 90%.
+       A locked different market never rescues an unlocked/unreported
+       candidate market.
+       Base/ETH (V2-style): lp_lock.check_lp_lock() == "locked"
+       (LP tokens burned >=90%). V3/V4 concentrated pools can never pass
+       (no LP token to verify) — honest skip, not a guess.
+  3. Safety     — safety.check_token(), fail-CLOSED on unknown.
+  4. Momentum   — already running: m15 buys, buy/sell pressure, rising.
+  5. Score/tier — modest bar (the lock IS the filter); 1 card/day/chain.
+
+Solana scope note: pump.fun bonding-curve tokens are excluded on purpose —
+their liquidity is program-owned by construction, so a "locked liq" scan
+would match every launch and select nothing. Graduated tokens whose
+liquidity migrated to PumpSwap (and Raydium pairs) are where the lock is
+a real, checkable differentiator. The venue is NEVER trusted on its own:
+a directly-created PumpSwap pool whose LP is not verifiably locked
+rejects like anything else.
+
+Hyperliquid is excluded: spot order books have no LP to lock.
+
+Free-only: stdlib HTTP + free public APIs (GeckoTerminal, RugCheck,
+GoPlus, Honeypot.is, public EVM RPCs). Watchdog-supervised. Never raises
+out of main().
+"""
+
+import json
+import logging
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("locked-liq-scan")
+
+_sys = sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+try:
+    from robust_http import get_json as _robust_get
+    _HAS_ROBUST = True
+except ImportError:
+    _HAS_ROBUST = False
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+try:
+    import safety as _safety
+    _HAS_SAFETY = True
+except ImportError:
+    _HAS_SAFETY = False
+try:
+    import lp_lock
+    _HAS_LPLOCK = True
+except ImportError:
+    _HAS_LPLOCK = False
+try:
+    import saturation
+    _HAS_SATURATION = True
+except ImportError:
+    _HAS_SATURATION = False
+try:
+    from signal_bus import make_signal, publish, feed_enabled, track_callback
+    _HAS_BUS = True
+except ImportError:
+    _HAS_BUS = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "locked_liq_seen.json")
+DAILY_FILE = os.path.join(HOME, "locked_liq_daily.json")
+
+POLL_SECS = 120
+MAX_CARDS_PER_DAY_PER_CHAIN = 1  # tight: user complained about lane spam
+
+# ---- per-chain hunt config ----
+CHAINS = {
+    "solana": {
+        "network": "solana", "prefix": "solana_",
+        "min_liq": 25_000.0, "min_mcap": 30_000.0, "max_mcap": 10_000_000.0,
+        "dexes": ("raydium", "pumpswap"),
+    },
+    "base": {
+        "network": "base", "prefix": "base_",
+        "min_liq": 25_000.0, "min_mcap": 50_000.0, "max_mcap": 10_000_000.0,
+        "dexes": ("uniswap-v2-base", "sushiswap", "base-swap"),
+    },
+    "ethereum": {
+        "network": "eth", "prefix": "eth_",
+        "min_liq": 25_000.0, "min_mcap": 100_000.0, "max_mcap": 10_000_000.0,
+        "dexes": ("uniswap_v2", "uniswap-v2-ethereum", "sushiswap",
+                  "sushiswap-ethereum"),
+    },
+}
+
+MIN_AGE_MIN = 10
+MAX_AGE_MIN = 120
+LP_LOCKED_PCT = 90.0  # RugCheck lpLockedPct bar for Solana
+MIN_M15_BUYS = 5      # already running, not dead
+MIN_BUY_SELL_M15 = 1.2
+MIN_SCORE = 50.0
+
+_RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/%s/report"
+
+
+def _http(url, timeout=12):
+    if _HAS_ROBUST:
+        try:
+            return _robust_get(url, timeout=timeout, tries=3)
+        except Exception:
+            return None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def _f(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _i(v):
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_page(network, page):
+    return _http("https://api.geckoterminal.com/api/v2/networks/%s/"
+                 "new_pools?page=%d" % (network, page))
+
+
+def _parse_pools(data, now, chain, cfg):
+    """Down to candidate dicts. Never raises."""
+    out = []
+    if not data or "data" not in data:
+        return out
+    for p in data["data"]:
+        try:
+            a = p.get("attributes", {}) or {}
+            rel = p.get("relationships", {}) or {}
+            dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
+            if dex_id and dex_id not in cfg["dexes"]:
+                continue
+            base_id = ((rel.get("base_token") or {}).get("data") or {}
+                       ).get("id", "")
+            if not base_id.startswith(cfg["prefix"]):
+                continue
+            mint = base_id[len(cfg["prefix"]):]
+            if chain == "solana":
+                if not mint or mint.startswith("So111"):
+                    continue
+            elif len(mint) != 42 or not mint.startswith("0x"):
+                continue
+            quote_id = ((rel.get("quote_token") or {}).get("data") or {}
+                        ).get("id", "")
+            if mint.lower() == quote_id[len(cfg["prefix"]):].lower():
+                continue
+            try:
+                created = datetime.fromisoformat(
+                    (a.get("pool_created_at", "") or "").replace("Z", "+00:00"))
+                age_min = (now - created).total_seconds() / 60
+            except Exception:
+                continue
+            if age_min < 0:
+                continue
+            tx = a.get("transactions") or {}
+            vol = a.get("volume_usd") or {}
+            chg = a.get("price_change_percentage") or {}
+            mcap = _f(a.get("market_cap_usd")) or _f(a.get("fdv_usd"))
+            out.append({
+                "chain": chain,
+                "mint": mint,
+                "name": (a.get("name", "?") or "?").split(" / ")[0],
+                "age_min": age_min,
+                "dex": dex_id or "?",
+                "pair": a.get("address", "") or "",
+                "mcap": mcap,
+                "fdv": _f(a.get("fdv_usd")),
+                "liq": _f(a.get("reserve_in_usd")),
+                "price_usd": _f(a.get("base_token_price_usd")),
+                "tx": {w: {"buys": _i((tx.get(w) or {}).get("buys")),
+                           "sells": _i((tx.get(w) or {}).get("sells")),
+                           "buyers": _i((tx.get(w) or {}).get("buyers")),
+                           }
+                       for w in ("m5", "m15", "m30", "h1")},
+                "vol": {w: _f(vol.get(w)) for w in ("m5", "m15", "m30", "h1")},
+                "chg": {w: _f(chg.get(w)) for w in ("m5", "m15", "h1")},
+            })
+        except Exception:
+            continue
+    return out
+
+
+def get_pools(chain, cfg, pages):
+    now = datetime.now(timezone.utc)
+    merged, seen = [], set()
+    for page in pages:
+        data = _fetch_page(cfg["network"], page)
+        if not data:
+            continue
+        for pool in _parse_pools(data, now, chain, cfg):
+            if pool["mint"] in seen:
+                continue
+            seen.add(pool["mint"])
+            merged.append(pool)
+    return merged
+
+
+def passes_prefilter(pool, cfg):
+    """Stage 1: age / liquidity / mcap / DEX. Returns (ok, why).
+    Fail-closed: unknown/missing liq or mcap (None) counts as 0 → reject."""
+    if not (MIN_AGE_MIN <= pool["age_min"] <= MAX_AGE_MIN):
+        return False, "age %.0fm outside 10-120m" % pool["age_min"]
+    liq = pool["liq"] or 0.0
+    if liq < cfg["min_liq"]:
+        return False, "liq $%.0f < $%.0f" % (liq, cfg["min_liq"])
+    mcap = pool["mcap"] or 0.0
+    if mcap < cfg["min_mcap"]:
+        return False, "mcap dust"
+    if pool["mcap"] > cfg["max_mcap"]:
+        return False, "mcap above runner zone"
+    return True, "prefilter ok"
+
+
+def _rugcheck_report(mint):
+    try:
+        return _http(_RUGCHECK_URL % mint, timeout=15)
+    except Exception:
+        return None
+
+
+# RugCheck marketType prefixes per Solana candidate venue. Used ONLY as a
+# fallback for candidates that carry no pool address; address-carrying
+# candidates match strictly by address (see _sol_market_for_pool).
+_SOL_VENUE_TYPES = {
+    "raydium": ("raydium",),
+    "pumpswap": ("pump_fun_amm",),
+}
+
+
+def _market_matches_venue(market_type, dex):
+    mt = (market_type or "").lower()
+    for t in _SOL_VENUE_TYPES.get(dex or "", ()):
+        if mt == t or mt.startswith(t + "_") or mt.startswith(t + "-"):
+            return True
+    return False
+
+
+def _sol_market_for_pool(rep, pool):
+    """The RugCheck market entry for THIS candidate pool, or (None, "").
+
+    Primary key: pool address — RugCheck markets[].pubkey is the AMM pool
+    address, identical to the GeckoTerminal pool address (verified live,
+    e.g. a graduated PumpSwap pool). If the candidate carries an address
+    and no market matches it, the candidate's own market is unreported:
+    a locked DIFFERENT market of the same token must never rescue it, so
+    there is NO fallback in that case. Only address-less candidates fall
+    back to venue (marketType) matching.
+    """
+    markets = [m for m in (rep.get("markets") or []) if isinstance(m, dict)]
+    pair = (pool.get("pair") or "").strip()
+    if pair:
+        for m in markets:
+            if (m.get("pubkey") or "") == pair:
+                return m, (m.get("marketType") or pool.get("dex") or "?")
+        return None, ""
+    dex = pool.get("dex") or ""
+    cands = [m for m in markets
+             if _market_matches_venue(m.get("marketType"), dex)]
+    if not cands:
+        return None, ""
+    best = max(cands,
+               key=lambda m: _f((m.get("lp") or {}).get("lpLockedPct")))
+    return best, (best.get("marketType") or dex)
+
+
+def check_lp_locked(pool):
+    """Stage 2 (the core filter): VERIFIED locked liquidity, fail-CLOSED.
+
+    Returns (locked: bool, badge: str, why: str).
+    """
+    chain = pool["chain"]
+    if chain == "solana":
+        rep = _rugcheck_report(pool["mint"])
+        if not rep:
+            return False, "", "LP unknown (RugCheck unreachable)"
+        market, venue = _sol_market_for_pool(rep, pool)
+        if market is None:
+            return False, "", ("LP unknown (candidate pool market not in "
+                               "RugCheck report)")
+        pct = _f((market.get("lp") or {}).get("lpLockedPct"))
+        if pct >= LP_LOCKED_PCT:
+            return True, \
+                "🔒 LP locked %.0f%% (RugCheck, %s)" % (pct, venue), \
+                "lpLockedPct %.0f on %s" % (pct, venue)
+        return False, "", "LP not locked (%.0f%% on %s)" % (pct, venue)
+    # EVM: on-chain burn check via lp_lock (V2-style pools only).
+    if not _HAS_LPLOCK:
+        return False, "", "LP unknown (lp_lock unavailable)"
+    rep = lp_lock.check_lp_lock(chain, pool.get("dex", ""),
+                                pool.get("pair", ""))
+    if rep.get("status") == "locked":
+        return True, "🔒 " + rep.get("detail", "LP locked"), "evm lp burned"
+    return False, "", "LP not verified locked (%s)" % rep.get("detail", "?")
+
+
+def check_safety(pool):
+    """Stage 3: safety pipeline, fail-CLOSED on unknown."""
+    if not _HAS_SAFETY:
+        return False, "SAFETY BLOCK: safety module missing", {}
+    rep = _safety.check_token(pool["chain"], pool["mint"], timeout=12,
+                              limits={"evm_sell_sim_enabled": True,
+                                      "evm_sell_sim_timeout_s": 3.0})
+    if rep.get("unknown"):
+        return False, "SAFETY BLOCK: safety unknown", {}
+    if not rep.get("passed"):
+        return False, "SAFETY BLOCK: %s" % "; ".join(rep["fails"][:2]), {}
+    return True, "safety pass", rep
+
+
+def is_running(pool):
+    """Stage 4: already running — buys flowing, pressure positive."""
+    m15 = pool["tx"]["m15"]
+    if m15["buys"] < MIN_M15_BUYS:
+        return False, "only %d m15 buys" % m15["buys"]
+    tot = m15["buys"] + m15["sells"]
+    if tot and m15["buys"] / tot < 0.5:
+        return False, "sellers dominate m15"
+    if pool["chg"]["h1"] < 0 and pool["chg"]["m15"] < 0:
+        return False, "falling m15+h1"
+    return True, "running"
+
+
+def score_pool(pool):
+    """Stage 5: the lock IS the filter; score ranks momentum. Bar 50."""
+    score, reasons = 50.0, ["verified locked liquidity"]
+    m15 = pool["tx"]["m15"]
+    if m15["buyers"] >= 15:
+        score += 12
+        reasons.append("%d m15 buyers" % m15["buyers"])
+    elif m15["buyers"] >= 8:
+        score += 7
+        reasons.append("%d m15 buyers" % m15["buyers"])
+    if pool["chg"]["h1"] >= 50:
+        score += 10
+        reasons.append("h1 +%d%%" % pool["chg"]["h1"])
+    if pool["vol"]["h1"] >= 20_000:
+        score += 8
+        reasons.append("h1 vol $%.0fk" % (pool["vol"]["h1"] / 1000))
+    if pool["liq"] >= 50_000:
+        score += 5
+        reasons.append("deep liq $%.0fk" % (pool["liq"] / 1000))
+    return min(score, 100.0), reasons
+
+
+def tap_callback(chain, mint):
+    try:
+        return track_callback(chain, "locked-liq", mint)
+    except Exception:
+        return "track:%s:ll:%s" % (chain, mint)
+
+
+def feed_live(chain):
+    """Per-chain kill switch. Solana is never paused by this check."""
+    if not _HAS_BUS:
+        return True
+    return bool(feed_enabled(chain))
+
+
+def send_card(text, chain, mint):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[
+                {"text": "📋 Copy CA",
+                 "copy_text": {"text": mint}},
+                {"text": "📍 I bought this",
+                 "callback_data": tap_callback(chain, mint)},
+            ]],
+        })
+        payload = {"chat_id": "6883056760", "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send_card failed: %s", e)
+        return False
+
+
+def fmt(v):
+    if v >= 1e6:
+        return "$%.2fM" % (v / 1e6)
+    if v >= 1e3:
+        return "$%.1fk" % (v / 1e3)
+    return "$%.0f" % v
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, obj):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("save %s failed: %s", path, e)
+
+
+def daily_left(chain):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = load_json(DAILY_FILE, {})
+    used = (daily.get(today) or {}).get(chain, 0)
+    return MAX_CARDS_PER_DAY_PER_CHAIN - used, daily, today
+
+
+def bump_daily(daily, today, chain):
+    day = daily.get(today) or {}
+    day[chain] = day.get(chain, 0) + 1
+    daily[today] = day
+    # prune to last 7 days
+    for k in sorted(daily)[:-7]:
+        daily.pop(k, None)
+    save_json(DAILY_FILE, daily)
+
+
+_CHAIN_LABEL = {"solana": "Solana", "base": "Base", "ethereum": "Ethereum"}
+
+
+def build_text(pool, score, reasons, safety_reason, lp_badge):
+    m5 = pool["tx"]["m5"]
+    chain = pool["chain"]
+    label = _CHAIN_LABEL.get(chain, chain.title())
+    supply = ""
+    if _HAS_LPLOCK:
+        try:
+            supply = lp_lock.token_supply(chain, pool["mint"])
+        except Exception as exc:
+            logger.warning("supply lookup failed: %s", exc)
+    if _HAS_CARDS:
+        return build_card(
+            symbol=pool["name"], score=score, mint=pool["mint"],
+            entry_price=pool.get("price_usd", 0),
+            current_price=pool.get("price_usd", 0),
+            mcap=pool["mcap"] or pool["fdv"], liquidity=pool["liq"],
+            buyers=m5.get("buyers", 0), age_min=pool["age_min"],
+            buys_5m=m5.get("buys", 0), sells_5m=m5.get("sells", 0),
+            safety=safety_reason, is_runner=True, lp_lock=lp_badge,
+            risk_note=("🔒 LOCKED-LIQ hunt — %s pool with verified locked "
+                       "liquidity, already running. The bot does not trade; "
+                       "this card is a signal only. "
+                       "💸 If this rugs, you lose your full stake." % label),
+            chain=chain, source="locked-liq", supply=supply,
+            saturation=(saturation.saturation_line(pool["name"])
+                        if _HAS_SATURATION and chain == "solana"
+                        else ""),
+        )
+    lines = [
+        "🔒 LOCKED-LIQ %s — $%s (score %.0f/100)"
+        % (label.upper(), pool["name"], score),
+        "⚡ ALREADY RUNNING + LIQ LOCKED — %d min old" % pool["age_min"],
+        "⚠️ HIGH RISK — real-money gamble, not a pick.",
+        "CA: %s" % pool["mint"],
+        "mcap %s · liq %s" % (fmt(pool["mcap"] or pool["fdv"]),
+                              fmt(pool["liq"])),
+        "5m: %d buys / %d sells (%d buyers)" % (
+            m5.get("buys", 0), m5.get("sells", 0), m5.get("buyers", 0)),
+    ]
+    for r in reasons[:5]:
+        lines.append("  • %s" % r)
+    lines.append("🛡️ safety: %s" % safety_reason)
+    if lp_badge:
+        lines.append(lp_badge)
+    return "\n".join(lines)
+
+
+def scan_chain(chain, cfg, seen, pages):
+    """One full pass for a chain. Returns cards fired."""
+    fired = 0
+    left, daily, today = daily_left(chain)
+    if left <= 0:
+        return 0
+    if not feed_live(chain):
+        logger.warning("%s locked-liq feed PAUSED by kill switch", chain)
+        return 0
+    pools = get_pools(chain, cfg, pages)
+    for pool in pools:
+        if left <= 0:
+            break
+        if pool["mint"] in seen:
+            continue
+        seen.add(pool["mint"])
+        ok, why = passes_prefilter(pool, cfg)
+        if not ok:
+            continue
+        locked, badge, why = check_lp_locked(pool)
+        if not locked:
+            logger.warning("LOCK SKIP %s [%s]: %s",
+                           pool["name"], chain, why)
+            continue
+        safe, safety_reason, _intel = check_safety(pool)
+        if not safe:
+            logger.warning("SAFETY BLOCK %s [%s]: %s",
+                           pool["name"], chain, safety_reason)
+            continue
+        ok, why = is_running(pool)
+        if not ok:
+            logger.warning("DEAD SKIP %s [%s]: %s", pool["name"], chain, why)
+            continue
+        score, reasons = score_pool(pool)
+        if score < MIN_SCORE:
+            continue
+        card = build_text(pool, score, reasons, safety_reason, badge)
+        if send_card(card, chain, pool["mint"]):
+            bump_daily(daily, today, chain)
+            left -= 1
+            fired += 1
+            if _HAS_BUS:
+                m5 = pool["tx"]["m5"]
+                publish(make_signal(
+                    chain, "locked-liq", pool["mint"],
+                    symbol=pool["name"], score=score, tier="runner-pick",
+                    age_min=pool["age_min"], mcap=pool["mcap"] or pool["fdv"],
+                    liquidity=pool["liq"], buys=m5["buys"], sells=m5["sells"],
+                    evidence={"safety": safety_reason,
+                              "reasons": reasons[:4], "dex": pool["dex"],
+                              "lp_badge": badge,
+                              "m15_buyers": pool["tx"]["m15"]["buyers"]}))
+            logger.warning("LOCKED-LIQ CARD %s [%s] score=%.0f age=%.0fm",
+                           pool["name"], chain, score, pool["age_min"])
+            # Paper mirror: $1 paper position with honest per-chain costs +
+            # the user's exit ladder. Never affects the card.
+            try:
+                from mirror import mirror_card
+                opened, why = mirror_card(
+                    chain, "locked-liq", pool["mint"],
+                    symbol=pool["name"], score=score, tier="runner-pick",
+                    mcap=pool["mcap"] or pool["fdv"],
+                    liquidity=pool["liq"],
+                    evidence={"safety": safety_reason,
+                              "reasons": reasons[:4],
+                              "age_min": pool.get("age_min", 0)})
+                if not opened:
+                    logger.warning("mirror skip %s: %s",
+                                   pool["mint"][:12], why)
+            except Exception:
+                pass
+    return fired
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("locked-liq-scan", token="scripts/locked-liq-scan")
+    logger.warning("locked-liq-scan started (user-requested 2026-10-18)")
+    seen = set(load_json(SEEN_FILE, []))
+    poll_n = 0
+    while True:
+        try:
+            poll_n += 1
+            pages = (1, 2) if poll_n % 2 == 0 else (1,)
+            for chain, cfg in CHAINS.items():
+                try:
+                    scan_chain(chain, cfg, seen, pages)
+                except Exception:
+                    logger.exception("locked-liq scan failed for %s", chain)
+            save_json(SEEN_FILE, sorted(seen)[-3000:])
+        except Exception:
+            logger.exception("locked-liq loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

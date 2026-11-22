@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""X-feed paper test harness (Phase 3, 2026-11-17).
+
+Loads the fixture tests/data/x_feed_posts.json, runs the posts through
+the x_feed parser (daemon/launch_scanner/x_feed.py), and prints a
+candidate table + summary.
+
+TEST DATA ONLY: no network, no credentials, no X API. Parse only — it
+writes NOTHING to the live signal bus (no publish call anywhere here).
+Stdlib-only, never raises.
+"""
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
+
+import x_feed  # noqa: E402
+
+FIXTURE = os.path.join(REPO, "tests", "data", "x_feed_posts.json")
+
+
+def main():
+    try:
+        with open(FIXTURE) as f:
+            posts = json.load(f)
+    except Exception as e:
+        print("FAIL: cannot read fixture %s: %s" % (FIXTURE, e))
+        return 1
+    candidates, stats = x_feed.parse_posts(posts)
+    print("X-FEED PAPER TEST — fixture only (no network, no live bus)")
+    print("fixture: %s" % FIXTURE)
+    print("")
+    print("%-4s %-44s %-10s %-8s %s" % ("#", "MINT", "SYMBOL", "TS",
+                                        "AUTHOR / EXTRA"))
+    for i, c in enumerate(candidates, 1):
+        mint = c.get("mint") or "(cashtag-only)"
+        ts = c.get("created_ts") or 0
+        ts_s = ("0 (unknown)" if not ts else
+                "%d" % ts)
+        ex = c.get("extra") or {}
+        print("%-4d %-44s %-10s %-8s %s likes=%d reposts=%d "
+              "dups=%d tags=%s" % (
+                  i, mint[:44], (c.get("symbol") or "")[:10], ts_s,
+                  ex.get("author") or "?",
+                  ex.get("likes") or 0, ex.get("reposts") or 0,
+                  ex.get("duplicates") or 0,
+                  ",".join(ex.get("cashtags") or [])))
+    print("")
+    print("summary: posts in %d | candidates out %d | with mint %d | "
+          "cashtag-only %d | duplicates dropped %d | malformed "
+          "skipped %d" % (stats["posts_in"], stats["candidates"],
+                          stats["with_mint"], stats["cashtag_only"],
+                          stats["duplicates_dropped"],
+                          stats["malformed_skipped"]))
+    print("live bus untouched: parse only, nothing published.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

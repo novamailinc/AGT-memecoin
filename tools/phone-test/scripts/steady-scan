@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Steady scanner: finds mean-reversion setups on $50K-$10M tokens.
+
+Scans trending/established pools for 60-85% drawdown from 7d high.
+Paper-only signals via Telegram. Kill switch + consistency gated.
+"""
+import json, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+from steady import score_steady, SteadyLedger, CFG
+
+
+def _load_ledger():
+    try:
+        with open(STEADY_LEDGER_PATH) as f:
+            return SteadyLedger.from_dict(json.load(f))
+    except Exception:
+        return SteadyLedger()
+
+
+def _save_ledger(ledger):
+    try:
+        tmp = STEADY_LEDGER_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(ledger.to_dict(), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STEADY_LEDGER_PATH)
+        try:
+            dfd = os.open(os.path.dirname(STEADY_LEDGER_PATH) or ".",
+                          os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+
+def _check_steady_exits(ledger, now):
+    """Feed prices to open steady positions so exits fire.
+
+    Same pattern as the Stacker fix: the ledger's exit logic is useless
+    unless something calls on_price(). Also handles dead price feeds.
+    """
+    events = []
+    # Iterate a copy: ledger._close_frac removes fully-closed positions
+    # from ledger.positions (2026-10-16 hygiene fix).
+    for pos in list(ledger.positions):
+        if pos.exit_ts is not None:
+            continue
+        price = 0
+        try:
+            d = get_json(
+                "https://api.dexscreener.com/tokens/v1/solana/%s"
+                % pos.mint, tries=2, timeout=15)
+            if d:
+                p = d[0] if isinstance(d, list) else d
+                price = float(p.get("priceUsd") or 0)
+        except Exception:
+            pass
+        if price <= 0:
+            # Dead feed + past time stop = total loss (don't haunt ledger)
+            if now - pos.entry_ts >= CFG["max_hold_h"] * 3600:
+                ledger._close_frac(pos, now, 0.0, "time_stop_noprice", 1.0)
+                events.append(f"{pos.symbol} TIME STOP (no price, -100%)")
+            continue
+        for ev in ledger.on_price(pos.mint, now, price):
+            events.append(ev)
+        time.sleep(0.5)
+    return events
+import killswitch
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+STEADY_LEDGER_PATH = os.path.join(HOME, "steady_ledger.json")
+
+STEADY_SIGNALS_PATH = os.path.join(HOME, "steady_signals.jsonl")
+
+# Per-mint signal cooldown: don't re-fire the same token every hour.
+# 12h default — a setup that hasn't meaningfully changed isn't a new signal.
+STEADY_COOLDOWN_PATH = os.path.join(HOME, "steady_cooldown.json")
+SIGNAL_COOLDOWN_SEC = 12 * 3600
+
+
+def _load_cooldown():
+    try:
+        with open(STEADY_COOLDOWN_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cooldown(cd):
+    try:
+        # prune entries older than 48h to bound file size
+        now = time.time()
+        cd = {m: ts for m, ts in cd.items() if now - ts < 48 * 3600}
+        with open(STEADY_COOLDOWN_PATH, "w") as f:
+            json.dump(cd, f)
+    except Exception:
+        pass
+
+
+def _on_cooldown(cd, mint, now):
+    """True if this mint was signaled within the cooldown window."""
+    ts = cd.get(mint, 0)
+    return (now - ts) < SIGNAL_COOLDOWN_SEC
+
+
+def btc_regime_ok():
+    """Market-regime gate (2026-10-15 research): skip ALL steady signals
+    when BTC 24h return < -5%. Buying memecoin dips in BTC selloffs is
+    the #1 killer (90.5% of alts fail to recover). Fail-open on API
+    failure (log it) — a broken gate shouldn't silence the lane.
+    Returns (ok: bool, btc_24h_pct: float)."""
+    try:
+        d = get_json(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin&vs_currencies=usd&include_24hr_change=true",
+            tries=2, timeout=15)
+        chg = (d.get("bitcoin") or {}).get("usd_24h_change")
+        if chg is None:
+            return True, 0.0
+        pct = float(chg)
+        floor = CFG.get("btc_regime_min_24h_pct", -5.0)
+        return pct >= floor, pct
+    except Exception:
+        return True, 0.0
+
+
+def record_signal(rec):
+    """Append one signal record to the steady signal ledger (append-only,
+    fail-soft — a write failure must never break the scan or the card)."""
+    try:
+        with open(STEADY_SIGNALS_PATH, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+def get_trending():
+    try:
+        d = get_json("https://api.geckoterminal.com/api/v2/networks/solana/trending_pools",
+                     tries=4, timeout=20)
+        return d.get("data", [])
+    except Exception:
+        return []
+
+def get_pool_7d_range(pool_addr):
+    """Get (7-day high, recent low, hours since high) from daily candles.
+
+    Returns (0, 0, 0) on any fetch failure. The low is the minimum daily
+    low across the fetched candles — used for the bounce-off-lows check.
+    Hours-since-high powers the panic-flush filter: a 60%+ drawdown that
+    developed in <=48h is panic (mean-reverting); over days it's a slow
+    bleed (trending to zero).
+    """
+    try:
+        url = (f"https://api.geckoterminal.com/api/v2/networks/solana/"
+               f"pools/{pool_addr}/ohlcv/day?limit=8")
+        d = get_json(url, tries=4, timeout=20)
+        ohlcv = d.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+        if not ohlcv:
+            return 0, 0, 0
+        high = 0
+        high_idx = 0
+        low = float("inf")
+        for i, c in enumerate(ohlcv):
+            h = float(c[2])
+            if h > high:
+                high = h
+                high_idx = i
+            low = min(low, float(c[3]))
+        # ohlcv_list is oldest-first; hours since the high candle
+        hours_since_high = (len(ohlcv) - 1 - high_idx) * 24
+        return high, low, hours_since_high
+    except Exception:
+        return 0, 0, 0
+
+def get_pool_7d_high(pool_addr):
+    """Legacy wrapper: 7-day high only."""
+    h, _, _ = get_pool_7d_range(pool_addr)
+    return h
+
+def smart_cluster_count(mint):
+    """Smart-money accumulation check via Eagle Eye smartflow.
+
+    The steady lane wants evidence that informed buyers are accumulating
+    during the dip. Eagle Eye's smartflow engine scores exactly this
+    (buyer dominance + healthy turnover on established tokens).
+
+    Returns 3 (meets the cluster bar) on strong accumulation,
+    1 on mild buyer interest, else 0. Never raises.
+    """
+    try:
+        from eagle_eye_api import get_momentum
+        m = get_momentum(mint)
+        if not m:
+            return 0
+        if time.time() - (m.get("ts") or 0) > 600:
+            return 0  # stale
+        buyers = m.get("buyers_m5", 0) or 0
+        sellers = m.get("sellers_m5", 0) or 0
+        score = m.get("momentum_score", 0) or 0
+        if buyers >= 10 and buyers >= 1.5 * max(sellers, 1) and score >= 50:
+            return 3
+        if buyers >= 5 and buyers > sellers:
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+def send_telegram(text, mint=None):
+    try:
+        t = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+        import urllib.request, urllib.parse
+        payload = {"chat_id": "6883056760", "text": text}
+        # Real inline buttons (STANDING requirement)
+        if mint:
+            payload["reply_markup"] = json.dumps({
+                "inline_keyboard": [[
+                    {"text": "📋 Copy CA",
+                     "copy_text": {"text": mint}},
+                    {"text": "📍 I bought this",
+                     "callback_data": "track:" + mint},
+                ]],
+            })
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{t}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=15)
+        print("steady telegram card sent ok")
+    except Exception as e:
+        # Never swallow card failures silently: a dropped Steady card
+        # must be visible in the cron log, not invisible.
+        print(f"steady telegram card FAILED: {type(e).__name__}: {e}")
+
+def main():
+    now = time.time()
+    cooldown = _load_cooldown()
+    ledger = _load_ledger()
+    # Exit monitoring ALWAYS runs first — a halted or gate-blocked lane
+    # still manages its open positions (entries stop, exits keep
+    # running; same halt semantics as grad_raw/ceo). 2026-10-24 fix:
+    # the old order returned on the killswitch BEFORE exits were
+    # processed, so a halted lane's open positions would never be
+    # exit-monitored — and the documented consistency gate below was
+    # never evaluated at all.
+    exited = _check_steady_exits(ledger, now)
+    for ev in exited:
+        print(f"  EXIT: {ev}")
+    # --- Entry gates, in order. Exits above are never gated. ---
+    if not killswitch.gate("steady"):
+        print("steady halted by killswitch — entries skipped, exits ran")
+        _save_cooldown(cooldown)
+        _save_ledger(ledger)
+        return
+    # Regime gate: skip entries if BTC is selling off
+    regime_ok, btc_pct = btc_regime_ok()
+    if not regime_ok:
+        print(f"steady regime-blocked: BTC 24h {btc_pct:+.1f}% < "
+              f"{CFG.get('btc_regime_min_24h_pct', -5.0)}%"
+              " — entries skipped, exits ran")
+        _save_cooldown(cooldown)
+        _save_ledger(ledger)
+        return
+    # Consistency gate (design 2026-10-14): pause entries when the
+    # last-20 record fails the WR >=40% / ex-top-3 profit test.
+    gate = ledger.consistency_check()
+    if not gate.get("pass"):
+        print(f"steady consistency-gated: {gate.get('reason')} "
+              f"(n={gate.get('n')}) — entries skipped, exits ran")
+        _save_cooldown(cooldown)
+        _save_ledger(ledger)
+        return
+    pools = get_trending()
+    print(f"scanning {len(pools)} pools for steady setups")
+    signals = 0
+    skipped_cooldown = 0
+    for pool in pools[:30]:  # top 30 trending
+        try:
+            attrs = pool.get("attributes", {})
+            pid = pool.get("id", "")
+            pool_addr = pid.split("_")[-1] if "_" in pid else pid
+            name = attrs.get("name", "?").split("/")[0].strip()
+            fdv = float(attrs.get("fdv_usd", 0) or 0)
+            liq = float(attrs.get("reserve_in_usd", 0) or 0)
+            price = float(attrs.get("base_token_price_usd", 0) or 0)
+
+            # Universe filter
+            if not (CFG["mcap_min"] <= fdv <= CFG["mcap_max"]):
+                continue
+            if liq < CFG["liq_min"] or price <= 0:
+                continue
+
+            # 7d high/low, drawdown, and panic-flush filter
+            high_7d, low_recent, hrs_since_high = get_pool_7d_range(pool_addr)
+            if high_7d <= 0:
+                continue
+            dd = 100.0 * (1.0 - price / high_7d)
+            if not (CFG["dd_min_pct"] <= dd <= CFG["dd_max_pct"]):
+                continue
+            # Panic-flush filter (2026-10-15 research): the drawdown must
+            # have developed FAST (panic <=48h), not as a slow bleed over
+            # days. Slow bleeds are trends, not mean-reversion setups.
+            # Fail-open when candle timing is unknown (hrs_since_high=0).
+            max_develop = CFG.get("dd_max_develop_h", 48.0)
+            if hrs_since_high > max_develop:
+                continue
+            # Drawdown sub-zones (2026-10-15 research): 75-85% needs
+            # fresh smart-wallet confirmation; 60-75% uses standard.
+            # Enforced after scoring via smart_buyers_30m check below.
+            zone_strong = dd > CFG.get("dd_zone_standard_max", 75.0)
+            # Bounce off lows: real recovery % from the recent candle low.
+            # 0 when unknown (neutral — no points, no penalty).
+            bounce = (100.0 * (price - low_recent) / low_recent
+                      if low_recent > 0 else 0.0)
+
+            # Build token data and score
+            mint = pool.get("relationships", {}).get(
+                "base_token", {}).get("data", {}).get("id", "")
+            mint = mint.split("_")[-1] if "_" in mint else mint
+            token = {
+                "drawdown_7d_pct": dd,
+                "smart_buyers_30m": smart_cluster_count(mint),
+                "vol24h": float(attrs.get("volume_usd", {}).get("h24", 0) or 0),
+                "liquidity": liq,
+                "bounce_pct": bounce,
+                "has_catalyst": False,
+            }
+            r = score_steady(token)
+            if r["pass"]:
+                # Sub-zone gate (2026-10-15 research): 75-85% drawdown
+                # REQUIRES fresh smart-wallet buys. Deeper = deader
+                # without smart-money confirmation.
+                if zone_strong and token.get("smart_buyers_30m", 0) < 1:
+                    continue
+                # Cooldown: skip mints signaled recently (not a new setup)
+                if _on_cooldown(cooldown, mint, now):
+                    skipped_cooldown += 1
+                    continue
+                signals += 1
+                cooldown[mint] = now
+                # Paper entry into the steady ledger (kill-switch tracked)
+                dd_zone = "60-75" if dd <= 75 else "75-85"
+                pos = ledger.enter(mint, name, now, price,
+                                   dd_zone=dd_zone)
+                if pos:
+                    print(f"  📝 paper entry {name} @ ${price:.6f} "
+                          f"[{dd_zone}]")
+                record_signal({
+                    "ts": time.time(),
+                    "symbol": name,
+                    "mint": mint,
+                    "score": r["score"],
+                    "signal_price": price,
+                    "fdv_usd": fdv,
+                    "liquidity_usd": liq,
+                    "drawdown_7d_pct": dd,
+                    "bounce_pct": bounce,
+                    "smart_buyers_30m": token.get("smart_buyers_30m", 0),
+                    "vol24h_usd": token.get("vol24h", 0),
+                    # Validation fields (2026-10-15 research):
+                    # hrs_since_high validates the panic-flush filter (#3),
+                    # btc_24h_pct validates the regime gate (#1),
+                    # dd_zone validates sub-zone calibration (#4).
+                    "hrs_since_high": hrs_since_high,
+                    "btc_24h_pct": round(btc_pct, 2),
+                    "dd_zone": "60-75" if dd <= 75 else "75-85",
+                })
+                if _HAS_CARDS:
+                    msg = build_card(
+                        symbol=name,
+                        score=r["score"],
+                        mint=mint,
+                        entry_price=price,
+                        current_price=price,
+                        mcap=fdv,
+                        liquidity=liq,
+                        safety="paper",
+                        is_steady=True,
+                        risk_note=f"📉 {dd:.0f}% off 7d high (paper)",
+                    )
+                else:
+                    msg = (f"📊 STEADY [{r['score']:.0f}/100] (paper)\n"
+                           f"${name}\n"
+                           f"{dd:.0f}% off 7d high\n"
+                           f"FDV ${fdv:,.0f} | Liq ${liq:,.0f}\n"
+                           f"Price ${price:.6f}\n"
+                           f"`{mint}`")
+                send_telegram(msg, mint=mint)
+                print(f"  🎯 {name}: dd={dd:.0f}% score={r['score']}")
+                if signals >= 3:
+                    break
+            time.sleep(1)
+        except Exception as e:
+            continue
+    _save_cooldown(cooldown)
+    _save_ledger(ledger)
+    n_open = sum(1 for p in ledger.positions if p.exit_ts is None)
+    n_closed = len(ledger.closed)
+    buckets = ledger.bucket_stats()
+    print(f"done: {signals} steady signals "
+          f"({skipped_cooldown} on cooldown) | "
+          f"ledger: {n_open} open, {n_closed} closed | "
+          f"buckets: {buckets}")
+
+if __name__ == "__main__":
+    main()

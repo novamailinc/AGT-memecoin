@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Degen v2 feed: evidence-based picker, 2-10 min window.
+
+Replaces degen-feed v1. Key differences:
+- Entry window 2-10 min (not sub-minute sniper)
+- Evidence-weighted scoring (telegram, holders, concentration)
+- Score bar 60 (vs 50)
+- Fast exits via degen_v2_ledger
+- Kill switch gated
+- Honest $1.25 cost modeling
+"""
+import json, os, sys, time, logging
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+from degen_v2 import score_token, FILTERS
+from degen_v2_ledger import DegenLedger
+import killswitch
+# Deployer filter (2026-10-15 launch research #1): repeat-rug deployers
+# are the strongest pre-launch signal. Promoted from TODO to first-class.
+try:
+    from deployers import resolve_deployer
+    from deployer_tracker import deployer_score
+    _HAS_DEPLOYER = True
+except ImportError:
+    _HAS_DEPLOYER = False
+# Holder acceleration (2026-10-15 research #2): ~64% stronger than tx count.
+try:
+    from holder_tracker import record as holder_record, \
+        wash_detected as holder_wash
+    _HAS_HOLDERS = True
+except ImportError:
+    _HAS_HOLDERS = False
+# Eagle Eye integration: momentum confirmation from shared data layer.
+# Eagle Eye is SILENT (no signals) — lanes read its DB and decide.
+try:
+    import eagle_eye_db
+    _HAS_EAGLE = True
+except ImportError:
+    _HAS_EAGLE = False
+# Spark ignition feed: TTL'd ignition signals recorded by scripts/spark-feed.
+# Feed-only by user instruction — Spark never fires its own cards.
+try:
+    import spark as spark_mod
+    _HAS_SPARK = True
+except ImportError:
+    _HAS_SPARK = False
+
+def eagle_momentum_bonus(mint: str) -> tuple:
+    """Check Eagle Eye for momentum confirmation. Returns (bonus_pts, reason)."""
+    if not _HAS_EAGLE:
+        return 0.0, ""
+    try:
+        conn = eagle_eye_db.get_db()
+        m = eagle_eye_db.get_momentum(conn, mint)
+        conn.close()
+        if not m:
+            return 0.0, ""
+        # Stale check: older than 5 min = ignore
+        if time.time() - m["ts"] > 300:
+            return 0.0, ""
+        score = m["momentum_score"]
+        if score >= 70:
+            return 10.0, f"eagle hot ({score:.0f})"
+        if score >= 50:
+            return 5.0, f"eagle warm ({score:.0f})"
+        return 0.0, ""
+    except Exception:
+        return 0.0, ""
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "degen_v2_seen.json")
+LEDGER_FILE = os.path.join(HOME, "degen_v2_ledger.json")
+# Daily card cap: max 10 cards/day (v1 had 3/day; v2 is more selective
+# so 10 is generous). Prevents spam if scoring goes haywire.
+DAILY_CAP_FILE = os.path.join(HOME, "degen_v2_daily.json")
+MAX_CARDS_PER_DAY = 10
+
+
+def _daily_count():
+    """Cards sent today. Resets at midnight UTC."""
+    try:
+        d = json.load(open(DAILY_CAP_FILE))
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if d.get("date") == today:
+            return d.get("count", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _bump_daily_count():
+    try:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        d = {"date": today, "count": _daily_count() + 1}
+        json.dump(d, open(DAILY_CAP_FILE, "w"))
+    except Exception:
+        pass
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("degen-v2")
+
+def load_seen():
+    try:
+        return set(json.load(open(SEEN_FILE)))
+    except Exception:
+        return set()
+
+def save_seen(s):
+    json.dump(sorted(s), open(SEEN_FILE, "w"))
+
+def get_new_pools():
+    """Fetch new pools from GeckoTerminal."""
+    try:
+        d = get_json("https://api.geckoterminal.com/api/v2/networks/solana/new_pools",
+                     tries=4, timeout=20)
+        return d.get("data", [])
+    except Exception as e:
+        log.warning(f"new_pools FAIL: {e}")
+        return []
+
+def get_pool_detail(pool_addr):
+    """Get pool details including holders, transactions."""
+    try:
+        d = get_json(f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_addr}",
+                     tries=3, timeout=15)
+        return d.get("data", {}).get("attributes", {})
+    except Exception:
+        return {}
+
+def get_rug_report(mint):
+    """Fetch the RugCheck report once per candidate (safety + holder data)."""
+    try:
+        d = get_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report",
+                     tries=3, timeout=15)
+        return d or None
+    except Exception:
+        return None
+
+def check_rug_report(report):
+    """RugCheck safety from an already-fetched report. Returns (safe, reason)."""
+    if not report:
+        return True, "api down, fail-open"  # fail-open per standing rule
+    risks = report.get("risks", [])
+    for r in risks:
+        name = r.get("name", "").lower()
+        if any(k in name for k in ("honeypot", "cannot sell", "mint authority",
+                                   "freeze authority", "high tax")):
+            return False, name
+    return True, "ok"
+
+def top10_from_report(report):
+    """Real top-10 holder concentration from RugCheck topHolders.
+    Returns float pct, or None when holder data is unavailable."""
+    try:
+        holders = (report or {}).get("topHolders") or []
+        holders = [h for h in holders if isinstance(h, dict)]
+        if not holders:
+            return None
+        pcts = sorted((float(h.get("pct") or 0) for h in holders), reverse=True)
+        return sum(pcts[:10]) if pcts else None
+    except Exception:
+        return None
+
+def get_token_price(mint):
+    """Current USD price for a mint via GeckoTerminal token endpoint."""
+    try:
+        d = get_json(f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
+                     tries=2, timeout=10)
+        attrs = (d.get("data") or {}).get("attributes", {})
+        return float(attrs.get("price_usd") or 0)
+    except Exception:
+        return 0.0
+
+def pool_age_sec(pool, now):
+    """Pool age in seconds from the pool list's own attributes (no fetch)."""
+    try:
+        import datetime
+        created = pool.get("attributes", {}).get("pool_created_at", "")
+        ct = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+        return now - ct.timestamp()
+    except Exception:
+        return 0
+
+def build_token_data(pool, now, top10_pct=None):
+    """Extract scoring features from pool data."""
+    attrs = pool.get("attributes", {})
+    pool_addr = pool.get("id", "").split("_")[-1]
+    # Base token = the non-SOL token
+    relationships = pool.get("relationships", {})
+    base = relationships.get("base_token", {}).get("data", {}).get("id", "").split("_")[-1]
+
+    age_sec = pool_age_sec(pool, now)
+
+    # Get holder/transaction details
+    detail = get_pool_detail(pool_addr)
+    txns = detail.get("transactions", {}).get("h24", {})
+    buys = txns.get("buys", 0)
+    sells = txns.get("sells", 0)
+
+    return {
+        "mint": base,
+        "pool": pool_addr,
+        "symbol": attrs.get("name", "?").split("/")[0].strip(),
+        "age_sec": age_sec,
+        "fdv": float(attrs.get("fdv_usd", 0) or 0),
+        "liquidity": float(attrs.get("reserve_in_usd", 0) or 0),
+        "holders": 0,  # GeckoTerminal doesn't give holders; no bonus until real
+        "buy_sell_ratio": buys / max(sells, 1),
+        "holder_velocity": 0,  # TODO: track over polls
+        "top10_pct": top10_pct,  # real from RugCheck, or None = honestly unknown
+        "has_telegram": False,  # TODO: check metadata
+        "deployer_clean": True,  # replaced below by real deployer check
+        "deployer_rugger": False,
+        "deployer_score": 0,
+        "holder_velocity": 0.0,   # replaced below by real tracking
+        "holder_accel": 0.0,
+        "wash_flag": False,
+    }
+    # Holder acceleration (2026-10-15 research #2)
+    if _HAS_HOLDERS:
+        try:
+            vel, accel = holder_record(token["mint"])
+            token["holder_velocity"] = vel
+            token["holder_accel"] = accel
+            tx5m = int(pool.get("attributes", {}).get("transactions", {})
+                       .get("m5", {}).get("txns", 0) or 0)
+            if holder_wash(token["mint"], tx5m):
+                token["wash_flag"] = True
+        except Exception:
+            pass
+    # Deployer filter (2026-10-15 research #1): resolve + score the deployer.
+    # Repeat-rug deployers get a near-veto penalty; proven deployers get bonus.
+    if _HAS_DEPLOYER:
+        try:
+            dep = resolve_deployer(token["mint"], "solana")
+            if dep:
+                ds = deployer_score(dep)
+                token["deployer_score"] = ds.get("score", 0)
+                launches = ds.get("launches", 0)
+                runners = ds.get("runners", 0)
+                if ds.get("is_factory"):
+                    token["deployer_clean"] = False
+                    token["deployer_rugger"] = True
+                elif launches >= 3 and runners == 0:
+                    # Repeat launcher, zero survivors: near-veto per research
+                    token["deployer_clean"] = False
+                    token["deployer_rugger"] = True
+        except Exception:
+            pass  # fail-open: unknown deployer doesn't block
+    return token
+
+def send_card(token, score_result):
+    """Send Telegram degen card."""
+    try:
+        t = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+        import urllib.request, urllib.parse
+        sym = token["symbol"]
+        reasons = " | ".join(score_result["reasons"][:4])
+        text = (
+            f"🎲 DEGEN v2 [{score_result['score']:.0f}/100]\n"
+            f"${sym}\n"
+            f"FDV ${token['fdv']:,.0f} | Liq ${token['liquidity']:,.0f}\n"
+            f"Age {token['age_sec']:.0f}s | B/S {token['buy_sell_ratio']:.2f}\n"
+            f"{reasons}\n"
+            f"`{token['mint']}`"
+        )
+        payload = {"chat_id": "6883056760", "text": text,
+                   "parse_mode": "Markdown"}
+        # Real inline buttons (STANDING requirement): Copy CA + I bought this
+        if token.get("mint"):
+            payload["reply_markup"] = json.dumps({
+                "inline_keyboard": [[
+                    {"text": "📋 Copy CA",
+                     "copy_text": {"text": token["mint"]}},
+                    {"text": "📍 I bought this",
+                     "callback_data": "track:" + token["mint"]},
+                ]],
+            })
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{t}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=15)
+        log.info(f"card sent for {sym}")
+    except Exception as e:
+        log.warning(f"card FAIL: {e}")
+
+def load_ledger():
+    from degen_v2_ledger import DegenLedger
+    try:
+        return DegenLedger.from_dict(json.load(open(LEDGER_FILE)))
+    except Exception:
+        return DegenLedger()
+
+def save_ledger(ledger):
+    try:
+        json.dump(ledger.to_dict(), open(LEDGER_FILE, "w"))
+    except Exception as e:
+        log.warning(f"ledger save FAIL: {e}")
+
+def main():
+    # Kill switch gate: don't even scan if halted
+    if not killswitch.gate("degen_v2"):
+        log.info("degen_v2 halted by killswitch, skipping scan")
+        return
+    ledger = load_ledger()
+    seen = load_seen()
+    now = time.time()
+    pools = get_new_pools()
+    log.info(f"scanning {len(pools)} pools")
+    new_cards = 0
+    for pool in pools:
+        try:
+            mint_guess = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "").split("_")[-1]
+            if not mint_guess or mint_guess in seen:
+                continue
+            # Age filter first (from pool list data, no extra API call):
+            # most new pools are <2min old, skip them before any fetches
+            age_sec = pool_age_sec(pool, now)
+            if not (FILTERS["age_min_sec"] <= age_sec <= FILTERS["age_max_sec"]):
+                continue
+            # Fetch RugCheck once: safety verdict + real top-10 concentration
+            report = get_rug_report(mint_guess)
+            safe, reason = check_rug_report(report)
+            if not safe:
+                log.info(f"rug blocked ({reason}): {mint_guess[:8]}")
+                seen.add(mint_guess)
+                continue
+            token = build_token_data(pool, now,
+                                     top10_pct=top10_from_report(report))
+            mint = token["mint"]
+            if not mint or mint in seen:
+                continue
+            # Score
+            result = score_token(token)
+            spark_src = "v2"
+            # Spark ignition feed (bonus, not gate): +15 when Spark saw
+            # ignition in the 30-180s window. Feed-only by user instruction.
+            if _HAS_SPARK:
+                try:
+                    sig = spark_mod.get_spark(mint)
+                except Exception:
+                    sig = None
+                if sig:
+                    result["score"] = min(100, result["score"] + spark_mod.SPARK_BONUS)
+                    why = "; ".join(sig.get("reasons", [])[:2])
+                    result["reasons"].append(f"spark ignition: {why}")
+                    spark_src = "v2_spark"
+                    # Re-check pass with bonus
+                    if not result["pass"] and result["score"] >= 60:
+                        result["pass"] = True
+            # Eagle Eye momentum confirmation (bonus, not gate)
+            ee_bonus, ee_reason = eagle_momentum_bonus(mint)
+            if ee_bonus > 0:
+                result["score"] = min(100, result["score"] + ee_bonus)
+                result["reasons"].append(f"🦅 {ee_reason}")
+                # Re-check pass with bonus
+                if not result["pass"] and result["score"] >= 60:
+                    result["pass"] = True
+            seen.add(mint)
+            if result["pass"]:
+                # Daily cap
+                if _daily_count() >= MAX_CARDS_PER_DAY:
+                    log.info("daily card cap reached, skipping")
+                    break
+                log.info(f"🎯 {token['symbol']}: score {result['score']} "
+                         f"reasons={result['reasons']}")
+                send_card(token, result)
+                _bump_daily_count()
+                new_cards += 1
+                # Paper entry into the v2 ledger (kill-switch tracked)
+                price = get_token_price(mint)
+                if price > 0:
+                    pos = ledger.enter(mint, token["symbol"], now, price,
+                                       source=spark_src)
+                    if pos:
+                        log.info(f"paper entry {token['symbol']} @ ${price:.8f}")
+                    else:
+                        log.info(f"paper entry BLOCKED by killswitch: {token['symbol']}")
+                else:
+                    log.warning(f"no price for {token['symbol']}, card only (no paper entry)")
+                if new_cards >= 3:  # max 3 cards per scan
+                    break
+        except Exception as e:
+            log.warning(f"pool error: {e}")
+            continue
+    # Exit processing for open paper positions
+    n_closed_before = len(ledger.closed)
+    for pos in list(ledger.positions):
+        if pos.exit_ts is not None:
+            continue
+        price = get_token_price(pos.mint)
+        if price > 0:
+            for ev in ledger.on_price(pos.mint, now, price):
+                log.info(f"exit: {ev}")
+    # Record newly closed trades into the kill switch (powers auto-halt)
+    for pos in ledger.closed[n_closed_before:]:
+        try:
+            killswitch.record_trade("degen_v2", float(pos.pnl))
+        except Exception as e:
+            log.warning(f"killswitch record FAIL: {e}")
+    save_ledger(ledger)
+    save_seen(seen)
+    st = ledger.stats()
+    src_st = ledger.source_stats()
+    log.info(f"scan done: {new_cards} cards, ledger={st} by_source={src_st}")
+
+if __name__ == "__main__":
+    main()

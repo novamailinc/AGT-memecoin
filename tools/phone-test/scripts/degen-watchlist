@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Degen watchlist tier: the wide net for the user's 50-shot game.
+
+Second tier under the degen lane. Same pool source (GeckoTerminal new
+pools, 3 pages) and the same RugCheck safety hard-blocks as degen-feed,
+but NO score bar and NO buy-pressure / sustained-buying gates: it lists
+safety-vetted coins ranked by score so the user can pick from volume.
+
+Fail-CLOSED on safety: RugCheck down or "unvetted" => the coin is skipped,
+never listed. (degen-feed itself is fail-open; the watchlist is stricter
+because it runs no buy-pressure gates of its own.)
+
+Caps: 30 cards/day, 5/hour own budget. It also yields to the pick tier:
+if degen-feed already sent 5 pick cards this hour, the watchlist waits —
+pick-tier cards always get priority.
+
+Dedup: a coin the feed carded (degen_outcomes.json) never appears here,
+and a coin listed here is never listed twice (own seen file).
+
+Alerts only. No trading, no keys, no wallets.
+"""
+import importlib.util
+import json
+import logging
+import os
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("degen-watchlist")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+WATCH_SEEN_FILE = os.path.join(HOME, "degen_watchlist_seen.json")
+FEED_OUTCOMES = os.path.join(HOME, "degen_outcomes.json")  # feed's carded set
+FEED_HOURLY = os.path.join(HOME, "degen_hourly.json")      # feed's hourly budget
+DAY_STATE = os.path.join(HOME, "degen_watchlist_day.json")
+
+POLL_SECS = 60
+MAX_PER_DAY = 30
+MAX_PER_HOUR = 5
+FEED_MAX_PER_HOUR = 5
+SEEN_CAP = 2000
+
+# --- reuse degen-feed's pipeline (import, never duplicate) ---
+# (extensionless script => explicit SourceFileLoader; spec_from_file_location
+# returns None for it)
+import importlib.machinery
+_FEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "degen-feed")
+_loader = importlib.machinery.SourceFileLoader("degen_feed", _FEED_PATH)
+_spec = importlib.util.spec_from_loader("degen_feed", _loader)
+df = importlib.util.module_from_spec(_spec)
+_loader.exec_module(df)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+
+def feed_cards_this_hour():
+    """Pick tier's hourly usage. None => unknown/stale => don't block."""
+    d = load_json(FEED_HOURLY, None)
+    if not d:
+        return None
+    if time.time() - d.get("ts", 0) > 4200:
+        return None  # feed probably down; never block forever on it
+    if time.time() - d.get("hour_start", 0) > 3600:
+        return 0
+    return int(d.get("cards_this_hour", 0))
+
+
+def passes_watchlist_filters(pool, knobs):
+    """Light gates only: FDV range, liquidity, age. No buy-pressure gates.
+
+    RUNNER-ONLY standing rule (2026-10-18, user order): the watchlist is a
+    second-chance list, not a dust backdoor — the runner gate applies here
+    too. Fail-closed on unknown liq/mcap/momentum.
+    """
+    # Runner gate first: $25k liq, $50k mcap, rising. Knob-independent.
+    ok, _why = df.passes_runner_gate(pool)
+    if not ok:
+        return False
+    fdv = pool["fdv"]
+    if fdv < knobs["min_fdv"] or fdv > knobs["max_fdv"]:
+        return False
+    if pool["reserve"] < knobs["min_reserve"]:
+        return False
+    age = pool["age_min"]
+    if age > knobs["max_age_minutes"] or age < 0:
+        return False
+    return True
+
+
+def send_watchlist_card(text, mint):
+    """Copy-CA button only. No track button on watchlist cards."""
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[{
+                "text": "📋 Copy CA",
+                "copy_text": {"text": mint},
+            }]],
+        })
+        payload = {"chat_id": "6883056760", "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def main():
+    df.refresh_intel()
+    seen = set(load_json(WATCH_SEEN_FILE, []))
+    day_state = load_json(DAY_STATE, {})
+    logger.warning("degen watchlist started (wide tier)")
+    while True:
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if day_state.get("day") != today:
+                day_state = {"day": today, "candidates": {}, "listed": [],
+                             "count": 0, "hour_start": time.time(),
+                             "hour_count": 0}
+            now = time.time()
+            if now - day_state.get("hour_start", 0) > 3600:
+                day_state["hour_start"] = now
+                day_state["hour_count"] = 0
+
+            df.refresh_intel()
+            knobs = df.get_weights()
+            pools = df.get_new_pools(pages=(1, 2, 3))
+
+            feed_carded = set(load_json(FEED_OUTCOMES, {}).keys())
+            cands = day_state.setdefault("candidates", {})
+
+            # --- discover: light filters only, one safety check per mint/day
+            fresh = []
+            for pool in pools:
+                mint = pool["mint"]
+                if mint in seen or mint in feed_carded or mint in cands:
+                    continue
+                if not passes_watchlist_filters(pool, knobs):
+                    continue
+                fresh.append(pool)
+            if fresh:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    results = list(ex.map(df.check_safety,
+                                          [p["mint"] for p in fresh]))
+                for pool, (safe, reason, intel) in zip(fresh, results):
+                    # FAIL-CLOSED: unvetted (RugCheck down) => skip, never list
+                    if not safe or reason == "unvetted":
+                        continue
+                    if intel.get("holder_conc", 0) > 80:
+                        continue
+                    score, reasons, _sm, _w, _comp = df.score_pool(
+                        pool, intel, skip_gates=True)
+                    cands[pool["mint"]] = {
+                        "mint": pool["mint"],
+                        "name": pool["name"],
+                        "score": score,
+                        "reasons": reasons[:3],
+                        "fdv": pool["fdv"],
+                        "reserve": pool["reserve"],
+                    }
+
+            # --- send: top-ranked unlisted, within caps, yielding to feed
+            listed = set(day_state.get("listed", []))
+            ranked = sorted(
+                (c for m, c in cands.items() if m not in listed),
+                key=lambda c: c["score"], reverse=True)
+            feed_n = feed_cards_this_hour()
+            for c in ranked:
+                if day_state["count"] >= MAX_PER_DAY:
+                    break
+                if day_state.get("hour_count", 0) >= MAX_PER_HOUR:
+                    break
+                if feed_n is not None and feed_n >= FEED_MAX_PER_HOUR:
+                    logger.warning(
+                        "watchlist yielding: feed sent %d pick cards/hr",
+                        feed_n)
+                    break
+                mint = c["mint"]
+                lines = [
+                    "👀 WATCHLIST — $%s (score %.0f)" % (c["name"], c["score"]),
+                    "mcap %s · liq %s" % (df.fmt(c["fdv"]),
+                                          df.fmt(c["reserve"])),
+                    "CA: %s" % mint,
+                ]
+                for r in c["reasons"]:
+                    lines.append("  • %s" % r)
+                if c["score"] < 60:
+                    lines.append(
+                        "Not a pick — score below 60. Vet before buying.")
+                else:
+                    lines.append("Watchlist — vet before buying.")
+                if send_watchlist_card("\n".join(lines), mint=mint):
+                    seen.add(mint)
+                    day_state["listed"].append(mint)
+                    day_state["count"] += 1
+                    day_state["hour_count"] = (
+                        day_state.get("hour_count", 0) + 1)
+                    logger.warning("WATCHLIST CARD %s score=%.0f",
+                                   c["name"], c["score"])
+
+            try:
+                with open(WATCH_SEEN_FILE, "w") as f:
+                    json.dump(sorted(seen)[-SEEN_CAP:], f)
+            except Exception:
+                pass
+            save_json(DAY_STATE, day_state)
+        except Exception:
+            logger.exception("watchlist loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

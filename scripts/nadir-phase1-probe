@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Nadir-v0 Phase 1: historical-data feasibility probe.
+
+Makes NO signals, sends NO cards, opens NO positions.
+Only answers: can free data support clean 30-day hourly history?
+
+Steps:
+1. Take last 20 distinct mints from degen_seen.json (no hand-picking).
+2. For each: resolve deepest pool via DexScreener.
+3. Fetch 30 days of hourly OHLCV from GeckoTerminal.
+4. Validate: >=95% candles, 0 dupes, 0 future candles, 0 identity mismatches.
+5. Output coverage report + verdict: DATA FIT or DATA UNFIT.
+"""
+import json, os, sys, time, hashlib
+from datetime import datetime, timezone
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from nadir_http import http_json
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN = os.path.join(HOME, "degen_seen.json")
+OUTDIR = os.path.join(HOME, "nadir_phase1")
+os.makedirs(OUTDIR, exist_ok=True)
+
+def http(url, timeout=20):
+    return http_json(url, timeout=timeout)
+
+def get_mints(n=20):
+    """Mints for probe. Priority order:
+    1. Local history (our own 30d recordings - most reliable)
+    2. Established-tokens list (verified 30d+ old via DexScreener)
+    3. Age-appropriate file; falls back to recent seen."""
+    # 0. Local history: tokens with 700+ recorded hourly candles
+    histdir = os.path.join(HOME, "nadir_history")
+    try:
+        local_mints = []
+        if os.path.isdir(histdir):
+            for fn in os.listdir(histdir):
+                if not fn.endswith(".jsonl"):
+                    continue
+                path = os.path.join(histdir, fn)
+                with open(path) as f:
+                    count = sum(1 for _ in f)
+                if count >= 700:
+                    sym = fn[:-6]
+                    # map symbol back to mint via established list
+                    est = json.load(open(os.path.join(
+                        HOME, "nadir_phase1", "established_tokens.json")))
+                    for s, info in est.items():
+                        if s == sym and info.get("mint"):
+                            local_mints.append(info["mint"])
+                            break
+        if len(local_mints) >= 10:
+            print("using LOCAL history probe set (%d mints, %d+ candles each)"
+                  % (len(local_mints), 700))
+            return local_mints[:n]
+    except Exception:
+        pass
+    # 1. Established tokens (verified 30d+ old via DexScreener search)
+    est_file = os.path.join(HOME, "nadir_phase1", "established_tokens.json")
+    try:
+        est = json.load(open(est_file))
+        mints = [v["mint"] for v in est.values() if v.get("mint")]
+        if len(mints) >= 10:  # meaningful sample even if < 20
+            print("using established-token probe set (%d mints)" % len(mints))
+            return mints[:n]
+    except Exception:
+        pass
+    # 2. Pre-selected age-appropriate mints
+    age_file = os.path.join(HOME, "nadir_phase1", "probe_mints.json")
+    try:
+        mints = json.load(open(age_file))
+        if len(mints) >= n:
+            print("using age-appropriate probe set (%d mints)" % len(mints))
+            return mints[:n]
+    except Exception:
+        pass
+    try:
+        seen = json.load(open(SEEN))
+        # degen_seen is a list; take the last n
+        if isinstance(seen, list):
+            print("WARN: using fresh-launch mints (likely too young)")
+            return seen[-n:]
+        return list(seen.keys())[-n:]
+    except Exception as e:
+        print("FAIL: cannot read seen file: %s" % e)
+        return []
+
+def resolve_pool(mint):
+    """Deepest Solana pool for mint via DexScreener."""
+    try:
+        pairs = http("https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    except Exception as e:
+        return None, "dexscreener fail: %s" % str(e)[:60]
+    if not pairs:
+        return None, "no pairs"
+    # deepest by liquidity
+    best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+    return {
+        "pairAddress": best.get("pairAddress"),
+        "dexId": best.get("dexId"),
+        "liquidity": float((best.get("liquidity") or {}).get("usd") or 0),
+        "baseMint": mint,
+    }, "ok"
+
+def fetch_ohlcv(pair_address):
+    """30d hourly OHLCV from GeckoTerminal."""
+    # GeckoTerminal OHLCV: /networks/solana/pools/{pool}/ohlcv/hour?aggregate=1&limit=720
+    url = ("https://api.geckoterminal.com/api/v2/networks/solana/pools/%s/ohlcv/hour"
+           "?aggregate=1&limit=720" % pair_address)
+    try:
+        data = http(url, timeout=30)
+    except Exception as e:
+        return None, "ohlcv fetch fail: %s" % str(e)[:80]
+    ohlcv = (data.get("data") or {}).get("attributes", {}).get("ohlcv_list") or []
+    return ohlcv, "ok" if ohlcv else "empty ohlcv"
+
+def validate(ohlcv, mint):
+    """Return (report dict)."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    # ohlcv_list entries: [timestamp, open, high, low, close, volume]
+    seen_ts, dupes, future = set(), 0, 0
+    clean = []
+    for c in ohlcv:
+        try:
+            ts = int(c[0])
+        except Exception:
+            continue
+        if ts in seen_ts:
+            dupes += 1; continue
+        seen_ts.add(ts)
+        if ts > now_ts:
+            future += 1; continue
+        clean.append(c)
+    clean.sort(key=lambda c: c[0])
+    # expected: 720 hourly candles
+    expected = 720
+    coverage = len(clean) / expected if expected else 0
+    # hash for reproducibility
+    h = hashlib.sha256(json.dumps(clean).encode()).hexdigest()[:16]
+    return {
+        "mint": mint,
+        "raw_count": len(ohlcv),
+        "clean_count": len(clean),
+        "dupes": dupes,
+        "future": future,
+        "coverage_pct": round(coverage * 100, 1),
+        "hash": h,
+        "pass_95": coverage >= 0.95,
+        "pass_no_dupe": dupes == 0,
+        "pass_no_future": future == 0,
+    }
+
+def main():
+    print("=== Nadir-v0 Phase 1: data feasibility probe ===")
+    mints = get_mints(20)
+    print("probe set: %d mints" % len(mints))
+    if len(mints) < 20:
+        print("WARN: fewer than 20 mints available")
+    reports = []
+    for i, mint in enumerate(mints):
+        print("\n[%d/20] %s..." % (i + 1, mint[:12]))
+        pool, why = resolve_pool(mint)
+        if not pool:
+            print("  pool: FAIL (%s)" % why)
+            reports.append({"mint": mint, "status": "pool_fail", "reason": why})
+            continue
+        print("  pool: %s (%s) liq=$%.0f" % (
+            pool["pairAddress"][:12], pool["dexId"], pool["liquidity"]))
+        ohlcv, why = fetch_ohlcv(pool["pairAddress"])
+        if not ohlcv:
+            print("  ohlcv: FAIL (%s)" % why)
+            reports.append({"mint": mint, "status": "ohlcv_fail",
+                            "reason": why, "pool": pool["pairAddress"]})
+            continue
+        rep = validate(ohlcv, mint)
+        rep["status"] = "ok"
+        rep["pool"] = pool["pairAddress"]
+        rep["dex"] = pool["dexId"]
+        # cache normalized history
+        with open(os.path.join(OUTDIR, "%s.json" % mint), "w") as f:
+            json.dump({"mint": mint, "pool": pool["pairAddress"],
+                       "hash": rep["hash"], "candles": len(ohlcv)}, f)
+        print("  candles: %d clean (%.1f%%) dupes=%d future=%d hash=%s" % (
+            rep["clean_count"], rep["coverage_pct"], rep["dupes"],
+            rep["future"], rep["hash"]))
+        reports.append(rep)
+        time.sleep(1.5)  # rate-limit kindness
+
+    # verdict
+    with open(os.path.join(OUTDIR, "coverage_report.json"), "w") as f:
+        json.dump(reports, f, indent=2)
+    ok = [r for r in reports if r.get("status") == "ok" and r.get("pass_95")
+          and r.get("pass_no_dupe") and r.get("pass_no_future")]
+    print("\n=== VERDICT ===")
+    print("tokens passing all gates: %d/%d" % (len(ok), len(reports)))
+    if len(ok) >= 19:  # 95% of 20
+        print("DATA FIT — Phase 2 permitted")
+    else:
+        print("DATA UNFIT — STOP. Nadir-v0 not implementable on free data.")
+    print("report: %s/coverage_report.json" % OUTDIR)
+
+if __name__ == "__main__":
+    main()

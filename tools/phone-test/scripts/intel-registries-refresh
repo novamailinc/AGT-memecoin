@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Intel registries refresh (2026-10-23): funding clusters + serial
+ruggers, in ONE run.
+
+Why one script for both: the rugger refresh is free (local evidence
+files only) and the funding population pass already walks the same
+wallet census (dossiers, smart-wallet registry, deployer census), so
+splitting them would duplicate the census walk for no benefit. This
+script refreshes BOTH registries; the modules stay independent and
+either can be refreshed alone from Python.
+
+What it does:
+  1. Seeds funding_clusters from the legacy deployer_funders cache
+     (known funders only — its nulls are unparsed, not unknown).
+  2. Collects candidate wallets: dossier deployers (+ any
+     buyer/wallet/trader/creator fields and safety-report top
+     holders), the smart-wallet registry keys, and the deployer
+     census keys (deployer_history / deployer_tracker).
+  3. Resolves first funders for unresolved wallets, FRESH-DOSSIER-
+     first (see order_resolve_queue), capped at --max-resolve
+     per run (default 40). A wallet attempted within the last 7
+     days is not re-attempted (idempotent re-runs burn no quota).
+     Resolution prefers the Helius DISCOVERY key (funding_clusters
+     key-loading pattern), sleeps politely between calls, and is
+     fail-soft per wallet.
+
+Queue order (changed 2026-10-23): the original OLDEST-first order
+spent the whole first live batch (25 attempted, 0 resolved) on
+deep-history smart/census wallets whose first funding tx sits
+beyond the resolver's 1,000-signature walk bound — they record
+"unknown" and burn quota. Wallets seen in live dossiers are, by
+construction, recently active around a launch and are the
+freshest/shallowest population we hold, so they go first, newest
+dossier sighting first; non-dossier candidates follow, also
+newest first-seen first, and candidates with no known ts go last
+(the old sort treated ts=0 as OLDEST, i.e. first — exactly
+backwards for this resolver). The 1,000-signature bound itself is
+NOT raised: the Helius key is near its monthly cap.
+  4. Rebuilds funding clusters and writes
+     ~/.forex-agent/funding_clusters.json.
+  5. Rebuilds the serial-rugger registry from local evidence and
+     writes ~/.forex-agent/rugger_registry.json.
+
+MEASUREMENT / DISPLAY ONLY: nothing written here gates, vetoes,
+sizes, or blocks any trade. Safe to re-run (idempotent).
+
+Usage: scripts/intel-registries-refresh [--max-resolve N] [--no-resolve]
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.join(_HERE, "..")
+sys.path.insert(0, os.path.join(_REPO, "daemon", "launch_scanner"))
+sys.path.insert(0, _REPO)
+
+from daemon.launch_scanner import funding_clusters as FC  # noqa: E402
+from daemon.launch_scanner import rugger_registry as RR   # noqa: E402
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+RETRY_AFTER_S = 7 * 86400
+RESOLVE_SLEEP_S = 0.4
+
+_WALLET_KEYS = ("deployer", "trader", "creator", "wallet", "buyer",
+                "funder", "owner", "address")
+
+
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, type(default)) else default
+    except Exception:
+        return default
+
+
+def _note_first_seen(info, ts):
+    """Keep the earliest known first-seen ts (0.0 = unknown)."""
+    if ts:
+        prev = info.get("first_seen") or 0.0
+        info["first_seen"] = min(prev, ts) if prev else ts
+
+
+def _collect_dossier_wallets(cands):
+    """cands: wallet -> {"first_seen": ts, "dossier_ts": ts|None}.
+    Walks live dossiers for deployers + any wallet-shaped fields
+    actually present. dossier_ts is the wallet's LATEST dossier
+    sighting — the freshness signal the resolve queue sorts on."""
+    ddir = os.path.join(HOME, "dossiers")
+    try:
+        fns = [f for f in os.listdir(ddir) if f.endswith(".json")]
+    except Exception:
+        return
+    for fn in fns:
+        d = _load_json(os.path.join(ddir, fn), {})
+        if not isinstance(d, dict):
+            continue
+        ts = float(d.get("born_ts") or d.get("opened_ts") or 0)
+
+        def note(w):
+            if FC.is_plausible_wallet(w):
+                info = cands.setdefault(
+                    w, {"first_seen": 0.0, "dossier_ts": None})
+                _note_first_seen(info, ts)
+                if ts:
+                    prev = info.get("dossier_ts") or 0.0
+                    info["dossier_ts"] = max(prev, ts)
+
+        def walk(obj, key=""):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k == "mint":
+                        continue
+                    if isinstance(v, str) and any(
+                            s in str(k).lower() for s in _WALLET_KEYS):
+                        note(v)
+                    else:
+                        walk(v, k)
+            elif isinstance(obj, list):
+                for v in obj:
+                    walk(v, key)
+
+        if d.get("deployer"):
+            note(str(d["deployer"]))
+        walk(d)
+
+
+def _collect_smart_wallets(cands):
+    d = _load_json(os.path.join(
+        HOME, "launch_scanner", "smart_wallets.json"), {})
+    for w, e in d.items():
+        if FC.is_plausible_wallet(w):
+            ts = float((e or {}).get("added_ts") or 0) \
+                if isinstance(e, dict) else 0.0
+            info = cands.setdefault(
+                w, {"first_seen": 0.0, "dossier_ts": None})
+            _note_first_seen(info, ts)
+
+
+def _collect_deployer_census(cands):
+    hist = _load_json(os.path.join(
+        HOME, "launch_scanner", "deployer_history.json"), {})
+    for w, e in hist.items():
+        if FC.is_plausible_wallet(w):
+            ts = float((e or {}).get("first_seen") or 0) \
+                if isinstance(e, dict) else 0.0
+            info = cands.setdefault(
+                w, {"first_seen": 0.0, "dossier_ts": None})
+            _note_first_seen(info, ts)
+    tracker = _load_json(os.path.join(
+        HOME, "launch_scanner", "deployer_tracker.json"), {})
+    if isinstance(tracker, dict):
+        for w in (tracker.get("deployers") or {}):
+            if FC.is_plausible_wallet(w):
+                cands.setdefault(
+                    w, {"first_seen": 0.0, "dossier_ts": None})
+
+
+def collect_candidates():
+    """wallet -> {"first_seen": float, "dossier_ts": float|None}.
+    dossier_ts is set ONLY for wallets actually seen in a live
+    dossier; it is what puts a wallet in the fresh tier."""
+    cands = {}
+    _collect_dossier_wallets(cands)
+    _collect_smart_wallets(cands)
+    _collect_deployer_census(cands)
+    return cands
+
+
+def collect_wallets():
+    """Back-compat view: wallet -> earliest known first-seen ts."""
+    return {w: (info.get("first_seen") or 0.0)
+            for w, info in collect_candidates().items()}
+
+
+def order_resolve_queue(todo):
+    """Sort (wallet, info) pairs for first-funder resolution.
+
+    Fresh-dossier-first: (1) wallets seen in a live dossier before
+    all others, newest dossier sighting first — their histories are
+    the shallowest we hold, so the bounded 1,000-signature walk can
+    actually reach their first tx; (2) non-dossier wallets, newest
+    first-seen first; (3) unknown-ts wallets last (ts=0/missing is
+    NOT "oldest", it is "no evidence of freshness"). Wallet string
+    is the deterministic tie-break. Pure; never raises."""
+    def key(item):
+        w, info = item
+        info = info if isinstance(info, dict) else {}
+        dts = float(info.get("dossier_ts") or 0)
+        fts = float(info.get("first_seen") or 0)
+        if dts:
+            return (0, -dts, w)
+        if fts:
+            return (1, -fts, w)
+        return (2, 0.0, w)
+    return sorted(todo, key=key)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-resolve", type=int, default=40,
+                    help="cap on Helius resolutions this run")
+    ap.add_argument("--no-resolve", action="store_true",
+                    help="skip network resolution (local rebuild only)")
+    args = ap.parse_args()
+
+    seeded = FC.seed_from_deployer_funders()
+    cands = collect_candidates()
+    print("candidates: %d wallets (seeded known funders: %d)"
+          % (len(cands), seeded))
+
+    resolved = attempted = 0
+    if not args.no_resolve and args.max_resolve > 0:
+        now = time.time()
+        todo = []
+        for w, info in cands.items():
+            entry = FC.known_funder(w)
+            if entry is None:
+                todo.append((w, info))                  # never attempted
+            elif not entry.get("funder") and \
+                    now - float(entry.get("ts") or 0) > RETRY_AFTER_S:
+                todo.append((w, info))                  # stale unknown
+        todo = order_resolve_queue(todo)                # fresh-first
+        fresh_n = sum(1 for _w, i in todo
+                      if isinstance(i, dict) and i.get("dossier_ts"))
+        print("resolve queue: %d eligible (%d fresh-dossier), "
+              "resolving up to %d, fresh-dossier first"
+              % (len(todo), fresh_n, max(0, args.max_resolve)))
+        for w, _info in todo[:max(0, args.max_resolve)]:
+            funder = FC.resolve_first_funder(w)
+            FC.record_funder(w, funder, source="helius")
+            attempted += 1
+            if funder:
+                resolved += 1
+            time.sleep(RESOLVE_SLEEP_S)
+    fc_stats = FC.refresh_clusters()
+    print("funding: attempted %d, resolved %d this run; registry: %s"
+          % (attempted, resolved, fc_stats))
+
+    rr_stats = RR.refresh()
+    print("ruggers: %s (threshold: >= %d dead)" % (rr_stats,
+                                                   RR.FLAG_THRESHOLD))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

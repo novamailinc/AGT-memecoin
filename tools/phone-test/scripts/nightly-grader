@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Nightly wallet grader: feeds Helius trade history into wallet_grader.
+
+For each tracked wallet:
+1. Fetch recent signatures (getSignaturesForAddress, limit 100)
+2. Parse swap transactions (getTransaction jsonParsed)
+3. Build trade dicts: {side, amount, mint, ts}
+4. Compute realized returns (FIFO match sells to buys per mint)
+5. Call wallet_grader.grade_all()
+
+Saves grades to wallet_grades_v2.json. Auto-demotes failing wallets.
+Logs to nightly-grader.log.
+
+Usage: scripts/nightly-grader [--wallets w1,w2] [--limit N]
+"""
+import json, os, sys, time
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+HOME = Path(os.environ.get("FOREX_AGENT_HOME", str(Path.home() / ".forex-agent")))
+
+def load_helius_keys():
+    """Return (main_key, discovery_key). Main is primary; discovery is the
+    fallback when the main key is exhausted (monthly quota)."""
+    def _read(p, env):
+        f = HOME / "helius" / p
+        if f.exists():
+            v = f.read_text().strip()
+            if v:
+                return v
+        return os.environ.get(env, "")
+
+    return (_read("api_key", "HELIUS_API_KEY"),
+            _read("api_key_discovery", "HELIUS_API_KEY_DISCOVERY"))
+
+
+class QuotaExhausted(Exception):
+    """Raised immediately (no pointless retries) when Helius reports the
+    key is at its usage quota."""
+
+
+RPC = "https://mainnet.helius-rpc.com/?api-key="
+
+def _is_quota_error(e):
+    msg = str(e).lower()
+    return ("429" in msg or "max usage" in msg or "usage limit" in msg
+            or "quota" in msg or "exceeded" in msg)
+
+
+def rpc_call(key, method, params, tries=3):
+    import urllib.request
+    url = RPC + key
+    for i in range(tries):
+        try:
+            payload = json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "method": method, "params": params,
+            }).encode()
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.load(r)
+            if "error" in d:
+                raise Exception(d["error"])
+            return d["result"]
+        except Exception as e:
+            if _is_quota_error(e):
+                raise QuotaExhausted(str(e))
+            if i == tries - 1:
+                raise
+            time.sleep(2 ** i)
+    return None
+
+def get_wallet_swaps(key, wallet, limit=100):
+    """Get recent swap transactions for a wallet."""
+    sigs = rpc_call(key, "getSignaturesForAddress",
+                    [wallet, {"limit": limit}])
+    trades = []
+    for s in sigs:
+        try:
+            tx = rpc_call(key, "getTransaction",
+                          [s["signature"],
+                           {"encoding": "jsonParsed",
+                            "maxSupportedTransactionVersion": 0}])
+            if not tx or not tx.get("meta"):
+                continue
+            # Parse token balance changes to detect swaps
+            pre = tx["meta"].get("preTokenBalances", [])
+            post = tx["meta"].get("postTokenBalances", [])
+            # Simplified: look for SOL in/out + token in/out
+            # A swap = SOL out + token in (buy) or token out + SOL in (sell)
+            ts = s.get("blockTime", 0)
+            # Find the main token mint (non-SOL token with biggest change)
+            changes = {}
+            pre_map = {(b.get("mint"), b.get("owner")): float(b.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                       for b in pre}
+            for b in post:
+                k = (b.get("mint"), b.get("owner"))
+                post_amt = float(b.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                pre_amt = pre_map.get(k, 0)
+                delta = post_amt - pre_amt
+                if abs(delta) > 1e-9 and b.get("owner") == wallet:
+                    mint = b.get("mint", "")
+                    if mint not in changes:
+                        changes[mint] = 0
+                    changes[mint] += delta
+            # SOL change (native)
+            sol_pre = tx["meta"].get("preBalances", [0])[0] / 1e9 if tx["meta"].get("preBalances") else 0
+            # Find account index for wallet
+            try:
+                keys = tx["transaction"]["message"]["accountKeys"]
+                # accountKeys may be parsed objects
+                widx = None
+                for i, k in enumerate(keys):
+                    kk = k.get("pubkey") if isinstance(k, dict) else k
+                    if kk == wallet:
+                        widx = i
+                        break
+                sol_post = tx["meta"].get("postBalances", [0])[widx] / 1e9 if widx is not None and widx < len(tx["meta"].get("postBalances", [])) else sol_pre
+            except Exception:
+                sol_post = sol_pre
+            sol_delta = sol_post - sol_pre
+
+            for mint, tok_delta in changes.items():
+                if "So11111111111111111111111111111111111111112" in mint:
+                    continue
+                # Buy: token in (+), SOL out (-). Sell: opposite.
+                if tok_delta > 0 and sol_delta < -0.001:
+                    trades.append({"side": "buy", "amount": abs(sol_delta),
+                                   "mint": mint, "ts": ts})
+                elif tok_delta < 0 and sol_delta > 0.001:
+                    trades.append({"side": "sell", "amount": sol_delta,
+                                   "mint": mint, "ts": ts})
+            time.sleep(0.15)  # rate limit: ~7 RPS
+        except Exception:
+            continue
+    # Sort chronological (oldest first)
+    trades.sort(key=lambda t: t.get("ts", 0))
+    return trades
+
+def compute_returns(trades):
+    """FIFO match sells to buys per mint → realized returns."""
+    # lots: mint -> list of (amount_usd, ts)
+    lots = defaultdict(list)
+    enriched = []
+    for t in trades:
+        mint = t["mint"]
+        if t["side"] == "buy":
+            lots[mint].append([t["amount"], t["ts"]])
+            enriched.append({**t, "return": None})
+        else:  # sell
+            sell_amt = t["amount"]
+            cost = 0
+            matched = 0
+            while sell_amt > 1e-9 and lots[mint]:
+                lot_amt, lot_ts = lots[mint][0]
+                take = min(lot_amt, sell_amt)
+                cost += take  # FIFO: assume same price basis simplifed
+                # Actually we need buy price. We stored amount as SOL.
+                # Return = (sell_value - buy_value) / buy_value per matched unit
+                matched += take
+                sell_amt -= take
+                lots[mint][0][0] -= take
+                if lots[mint][0][0] < 1e-9:
+                    lots[mint].pop(0)
+            if matched > 1e-9 and cost > 1e-9:
+                # Simplified: sell proceeds vs cost basis
+                # We stored both as SOL amounts, so return = (proceeds - cost)/cost
+                # But sell amount is total proceeds; need pro-rata
+                proceeds = t["amount"] * (matched / (matched + sell_amt + 1e-9))
+                ret = (proceeds - cost) / cost if cost > 0 else 0
+                enriched.append({**t, "return": ret})
+            else:
+                enriched.append({**t, "return": None})
+    return enriched
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wallets", default="")
+    ap.add_argument("--limit", type=int, default=100)
+    args = ap.parse_args()
+
+    key, discovery_key = load_helius_keys()
+    if not key and not discovery_key:
+        print("no helius key")
+        sys.exit(1)
+    if not key:
+        print("main key missing, using discovery key")
+        key = discovery_key
+        discovery_key = ""
+
+    reg = json.loads((HOME / "launch_scanner" / "smart_wallets.json").read_text())
+    wallets = args.wallets.split(",") if args.wallets else list(reg.keys())
+    print(f"grading {len(wallets)} wallets (limit {args.limit} tx each)")
+
+    from wallet_grader import grade_all
+
+    wallet_trades = {}
+    fetch_failed = set()
+
+    key_holder = [key]
+    for i, w in enumerate(wallets):
+        label = reg.get(w, {}).get("label", "?") if isinstance(reg.get(w), dict) else "?"
+        print(f"  [{i+1}/{len(wallets)}] {w[:8]}... ({label})")
+        try:
+            raw = get_wallet_swaps(key_holder[0], w, limit=args.limit)
+        except QuotaExhausted:
+            if key_holder[0] != discovery_key and discovery_key:
+                print("    main key quota hit, switching to discovery key")
+                key_holder[0] = discovery_key
+                try:
+                    raw = get_wallet_swaps(key_holder[0], w, limit=args.limit)
+                except Exception as e:
+                    print(f"    FAILED (discovery key): {e}")
+                    fetch_failed.add(w)
+                    continue
+            else:
+                print(f"    FAILED: quota exhausted, no fallback key")
+                fetch_failed.add(w)
+                continue
+        except Exception as e:
+            print(f"    FAILED: {e}")
+            fetch_failed.add(w)
+            continue
+        trades = compute_returns(raw)
+        wallet_trades[w] = trades
+        n_ret = sum(1 for t in trades if t.get("return") is not None)
+        print(f"    {len(trades)} swaps, {n_ret} realized returns")
+
+    if fetch_failed:
+        print(f"\nskipped {len(fetch_failed)} wallets with fetch failures "
+              f"(no grade written, no demotion)")
+
+    results = grade_all(wallet_trades)
+
+    # Summary
+    active = [w for w, m in results.items() if m.status == "active"]
+    watching = [w for w, m in results.items() if m.status == "watching"]
+    removed = [w for w, m in results.items() if m.status == "removed"]
+    print(f"\nRESULT: {len(active)} active, {len(watching)} watching, {len(removed)} removed")
+    for w in active:
+        m = results[w]
+        print(f"  ✅ {w[:12]}... WR={m.win_rate:.0%} n={m.trade_count} t={m.t_stat:.2f}")
+    for w in removed:
+        print(f"  ❌ {w[:12]}... removed")
+
+    log = HOME / "launch_scanner" / "nightly-grader.log"
+    with open(log, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M')} graded={len(results)} "
+                f"active={len(active)} watching={len(watching)} removed={len(removed)}\n")
+
+if __name__ == "__main__":
+    main()

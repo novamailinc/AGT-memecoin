@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="280" viewBox="0 0 1200 280">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#1a2332"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="280" rx="16" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="278" rx="15" fill="none" stroke="#30363d"/>
+  <text x="60" y="105" font-family="system-ui, -apple-system, sans-serif" font-size="62" font-weight="800" fill="#e6edf3">meme-project</text>
+  <text x="60" y="152" font-family="system-ui, -apple-system, sans-serif" font-size="25" fill="#8b949e">Solana memecoin trading bot</text>
+  <rect x="60" y="182" width="150" height="36" rx="18" fill="#3fb950" fill-opacity="0.15" stroke="#3fb950"/>
+  <text x="135" y="206" font-family="system-ui, -apple-system, sans-serif" font-size="16" font-weight="700" fill="#3fb950" text-anchor="middle">PAPER MODE</text>
+  <rect x="228" y="182" width="210" height="36" rx="18" fill="#58a6ff" fill-opacity="0.12" stroke="#58a6ff"/>
+  <text x="333" y="206" font-family="system-ui, -apple-system, sans-serif" font-size="16" font-weight="700" fill="#58a6ff" text-anchor="middle">LIVE DEMO MODE</text>
+  <polyline points="820,210 880,170 940,185 1000,120 1060,135 1120,70" fill="none" stroke="#3fb950" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="820" cy="210" r="6" fill="#3fb950"/>
+  <circle cx="940" cy="185" r="6" fill="#58a6ff"/>
+  <circle cx="1060" cy="135" r="6" fill="#bc8cff"/>
+  <circle cx="1120" cy="70" r="7" fill="#3fb950"/>
+</svg>

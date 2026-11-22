@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+# forex-watchdog — keep the paper-trading daemons alive + heartbeat.
+#
+# Intended to run every few minutes from the platform scheduler.
+#   - `forex-daemons start` is idempotent: already-running daemons are a
+#     no-op, stopped/stale ones are relaunched. So this script simply
+#     starts, diffs before/after state, and records a heartbeat.
+#   - Heartbeat: $FOREX_AGENT_HOME/run/heartbeat.json (checked_at, daemon
+#     states, actions taken). If this file goes stale, the scheduler
+#     itself isn't firing.
+#   - Log: $FOREX_AGENT_HOME/log/watchdog.log
+#
+# Exit 0 always on a completed check (a dead daemon that was restarted is
+# a success, not a failure). Exit 2 if the daemons script itself errors.
+set -u
+
+AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOME_DIR="${FOREX_AGENT_HOME:-$HOME/.forex-agent}"
+RUN_DIR="$HOME_DIR/run"
+LOG_DIR="$HOME_DIR/log"
+HEARTBEAT="$RUN_DIR/heartbeat.json"
+WLOG="$LOG_DIR/watchdog.log"
+DAEMONS_BIN="$AGENT_ROOT/scripts/forex-daemons"
+
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+before="$(FOREX_AGENT_HOME="$HOME_DIR" "$DAEMONS_BIN" status 2>&1)" || exit 2
+start_out="$(FOREX_AGENT_HOME="$HOME_DIR" "$DAEMONS_BIN" start 2>&1)" || exit 2
+after="$(FOREX_AGENT_HOME="$HOME_DIR" "$DAEMONS_BIN" status 2>&1)" || exit 2
+
+# Degen feed v1: RETIRED 2026-10-14 — 1 win in 101 cards, replaced by Degen v2.
+# (Removed from watchdog; do not restart.)
+
+# degen-feed stanza DISABLED 2026-10-30 (degen lane permanent kill, user order: lane not useful, remove forever; do not re-enable without his explicit word).
+# # Degen feed v3: Solana early-launch -> degen lane cards.
+# # NOTE 2026-10-17: found dead since 2026-10-14 (crashed 7 min after start,
+# # no supervisor covered it, degen-health has no cron). Added to watchdog
+# # supervision — this is one of the two Solana card feeds the user gambles
+# # on; it must not silently die. Standalone, not in forex-daemons.
+# if ! pgrep -f "scripts/degen-feed$" > /dev/null 2>&1; then
+#     cd "$AGENT_ROOT" || exit 2
+#     FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/degen-feed \
+#         > "$HOME_DIR/log/degen-feed.log" 2>&1 &
+#     echo "$(ts) watchdog: restarted dead degen-feed" >> "$WLOG"
+#     after="$after + degen-feed"
+# fi
+
+# Degen peak tracker: intraday peak multiples for the nightly learner.
+# REVIVED 2026-10-23 — it was wrongly retired 2026-10-14 "with Degen v1"
+# while the v3 learner still depends on its peaks; with no supervisor
+# roster entry and no cron it stayed dead for 9 days. Primary keeper is
+# now the resident supervisor roster; this stanza is the fallback (same
+# pattern as the other standalone daemons).
+if ! pgrep -f "scripts/degen-peak-tracker" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/degen-peak-tracker \
+        >> "$HOME_DIR/log/degen-peak-tracker.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead degen-peak-tracker" >> "$WLOG"
+    after="$after + degen-peak-tracker"
+fi
+
+# Smart watcher: PERMANENTLY SHUT DOWN 2026-10-29 — full smart-money
+# shutdown (user order): watcher + smart_select trial gone; smart money
+# adds no proven value (watcher v1/v2 KILLED, copy cards killed
+# 2026-10-29). Removed from the supervisor roster. Do NOT restart.
+# (Bus/journal history kept on disk as evidence.)
+# if ! pgrep -f "scripts/smart-watcher" > /dev/null 2>&1; then
+#     cd "$AGENT_ROOT" || exit 2
+#     FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/smart-watcher \
+#         > "$HOME_DIR/log/smart-watcher.log" 2>&1 &
+#     echo "$(ts) watchdog: restarted dead smart-watcher" >> "$WLOG"
+#     after="$after + smart-watcher"
+# fi
+
+# Stacker feed: RETIRED 2026-10-23 — lane KILLED on the 2026-10-22
+# verdict (7 closes, -$11.79, 0 wins); removed from the supervisor
+# roster and killswitch lane "stacker" halted. Do NOT restart.
+# (Ledger kept on disk as evidence; 7 stale position entries remain.)
+
+# Wallet monitor: DISABLED 2026-10-14 — PumpPortal now requires API key
+# funded with 0.02 SOL for subscribeAccountTrade (free-only block).
+# Real-time wallet coverage via smart-watcher (Helius polling) instead.
+# Re-enable when PumpPortal key is funded.
+
+# Base runner feed: Signal Refinery Phase 1 (2026-10-17). Base runner
+# signals -> degen lane cards, signals-only, kill-switch gated.
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/base-runner-feed" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/base-runner-feed \
+        > "$HOME_DIR/log/base-runner-feed.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead base-runner-feed" >> "$WLOG"
+    after="$after + base-runner-feed"
+fi
+
+# ETH runner feed: Signal Refinery Phase 2 (2026-10-17). ETH runner
+# signals -> degen lane cards, signals-only, kill-switch gated.
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/eth-runner-feed" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/eth-runner-feed \
+        > "$HOME_DIR/log/eth-runner-feed.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead eth-runner-feed" >> "$WLOG"
+    after="$after + eth-runner-feed"
+fi
+
+# Locked-liq scan: user-requested 2026-10-18. Verified-locked-liquidity
+# runners (Solana Raydium / Base+ETH V2) -> degen lane CA cards.
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/locked-liq-scan" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/locked-liq-scan \
+        > "$HOME_DIR/log/locked-liq-scan.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead locked-liq-scan" >> "$WLOG"
+    after="$after + locked-liq-scan"
+fi
+
+# HL listing watch: Signal Refinery Phase 2 (2026-10-17). New HIP-1 spot
+# listings -> degen lane cards, signals-only, kill-switch gated.
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/hl-listing-watch" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/hl-listing-watch \
+        > "$HOME_DIR/log/hl-listing-watch.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead hl-listing-watch" >> "$WLOG"
+    after="$after + hl-listing-watch"
+fi
+
+# Mirror exits: paper-mirror exit engine (2026-10-17). Runs the
+# pre-registered exit ladder on open mirror positions every ~2 min.
+# Paper only; a halted mirror lane stops new entries, this keeps
+# managing open positions to their planned exits.
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/mirror-exits" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/mirror-exits \
+        >> "$HOME_DIR/log/mirror-exits.log" 2>&1 &  # append: restart must not wipe crash evidence (2026-10-19)
+    echo "$(ts) watchdog: restarted dead mirror-exits" >> "$WLOG"
+    after="$after + mirror-exits"
+fi
+
+# CEO trader: $100 paper CEO account (2026-10-20). Tails the signal bus,
+# opens $1 positions with real-money discipline, runs the user's exit
+# ladder in the same loop. Paper only; killswitch lane "ceo".
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/ceo-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/ceo-trader \
+        >> "$HOME_DIR/log/ceo-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead ceo-trader" >> "$WLOG"
+    after="$after + ceo-trader"
+fi
+
+# Graduation test trader: measures the "buy at graduation" strategy
+# (2026-10-21, user-ordered). Watches GeckoTerminal newest pools for
+# pump.fun graduations, $1 paper shots, user's ladder, pre-registered
+# 100-close verdict (killswitch lane "grad"). NO cards in v1.
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/grad-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/grad-trader \
+        >> "$HOME_DIR/log/grad-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead grad-trader" >> "$WLOG"
+    after="$after + grad-trader"
+fi
+
+# Graduation RAW trader: the friend's exact no-gate game, head-to-head with
+# the gated grad-trader (2026-10-23, user-ordered "Build the every-graduation
+# lane now"). Buys EVERY pump.fun graduation — NO safety gate, NO veto —
+# so the friend's coins are a subset and can't be missed. Live PumpPortal
+# migration stream + GT backfill; $1 paper shots, user's ladder,
+# killswitch lane "grad_raw", pre-registered 100-close verdict. NO cards.
+# Standalone daemon, not in forex-daemons. Check and restart.
+# (Primary keeper is the resident supervisor roster; this stanza
+# is the fallback, same pattern as the other standalone daemons.)
+if ! pgrep -f "scripts/grad-raw-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/grad-raw-trader \
+        >> "$HOME_DIR/log/grad-raw-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead grad-raw-trader" >> "$WLOG"
+    after="$after + grad-raw-trader"
+fi
+
+# Graduation SELECT trader: grad_raw's spray + the only
+# externally-evidenced filters (serial deployers, fast-curve/
+# few-trades, canonical-only, copycat tickers); NO safety gate
+# by design (2026-10-24, user-ordered). Head-to-head vs grad_raw.
+# Live PumpPortal migration stream + GT backfill; $1 paper shots,
+# user's ladder, killswitch lane "grad_select", pre-registered
+# 100-close verdict (raw + ex-top-1 + head-to-head). NO cards.
+# Standalone daemon, not in forex-daemons. Check and restart.
+# (Primary keeper is the resident supervisor roster; this stanza
+# is the fallback, same pattern as the other standalone daemons.)
+if ! pgrep -f "scripts/grad-select-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/grad-select-trader \
+        >> "$HOME_DIR/log/grad-select-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead grad-select-trader" >> "$WLOG"
+    after="$after + grad-select-trader"
+fi
+
+# Tranche trader: grad_select entries + tranche exits (2026-10-30,
+# user-ordered). $25 paper shots, tranche ladder + one dip
+# buyback, killswitch lane "tranche", pre-registered 100-close
+# or 7-day verdict. Paper only; NO cards in v1.
+# Standalone daemon, not in forex-daemons. Check and restart.
+# (Primary keeper is the resident supervisor roster; this stanza
+# is the fallback, same pattern as the other standalone daemons.)
+if ! pgrep -f "scripts/tranche-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/tranche-trader \
+        >> "$HOME_DIR/log/tranche-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead tranche-trader" >> "$WLOG"
+    after="$after + tranche-trader"
+fi
+
+# Tranche-protect + raw-tight test lanes (2026-10-31, CEO diagnosis).
+# Same fallback pattern as tranche-trader; supervisor roster is primary.
+if ! pgrep -f "scripts/tranche-protect-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/tranche-protect-trader \
+        >> "$HOME_DIR/log/tranche-protect-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead tranche-protect-trader" >> "$WLOG"
+    after="$after + tranche-protect-trader"
+fi
+# Live10 demo mirror: the $10 demo account split across the live
+# lanes (2026-11-02, user-ordered correction — NOT $10 each, one
+# $10 split: $2.50 each to grad_select, tranche, tranche_protect,
+# grad_raw). Mirrors those lanes' paper closes at $1 stakes
+# (paper $25 trades scaled by 1/25); killswitch lane "live10",
+# 100-close verdict. PAPER ONLY. (paper-live-trader, the single
+# $10 lane, was superseded before its first trade.)
+# Standalone daemon, not in forex-daemons. Check and restart.
+# (Primary keeper is the resident supervisor roster; this stanza
+# is the fallback, same pattern as the other standalone daemons.)
+if ! pgrep -f "scripts/live10-demo-mirror" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/live10-demo-mirror \
+        >> "$HOME_DIR/log/live10-demo-mirror.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead live10-demo-mirror" >> "$WLOG"
+    after="$after + live10-demo-mirror"
+fi
+if ! pgrep -f "scripts/raw-tight-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/raw-tight-trader \
+        >> "$HOME_DIR/log/raw-tight-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead raw-tight-trader" >> "$WLOG"
+    after="$after + raw-tight-trader"
+fi
+
+# MIMIC STANZA COMMENTED OUT 2026-11-02 (permanent kill, user order — never restart)
+# # Mimic trader: the traced outside bot's launch game on paper
+# # (2026-11-01, user-ordered). Unfiltered launch spray from the
+# # PumpPortal new-token stream, live-quote entries, $25 paper shots,
+# # killswitch lane "mimic", pre-registered 100-close verdict.
+# # NO cards. Standalone daemon, not in forex-daemons. Check and restart.
+# # (Primary keeper is the resident supervisor roster; this stanza
+# # is the fallback, same pattern as the other standalone daemons.)
+# if ! pgrep -f "scripts/mimic-trader" > /dev/null 2>&1; then
+#     cd "$AGENT_ROOT" || exit 2
+#     FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/mimic-trader \
+#         >> "$HOME_DIR/log/mimic-trader.log" 2>&1 &  # append: keep crash evidence
+#     echo "$(ts) watchdog: restarted dead mimic-trader" >> "$WLOG"
+#     after="$after + mimic-trader"
+# fi
+
+
+# MIMIC STANZA COMMENTED OUT 2026-11-02 (permanent kill, user order — never restart)
+# # Mimic-edge trader: the redesigned mimic lane (2026-11-01,
+# # user-ordered) — TWAP sequenced-sell exit, -25% stop, 60min max
+# # hold, copycat/serial launch filter; killswitch lane
+# # "mimic_edge", pre-registered 100-close verdict. NO cards.
+# # Standalone daemon, not in forex-daemons. Check and restart.
+# # (Primary keeper is the resident supervisor roster; this stanza
+# # is the fallback, same pattern as the other standalone daemons.)
+# if ! pgrep -f "scripts/mimic-edge-trader" > /dev/null 2>&1; then
+#     cd "$AGENT_ROOT" || exit 2
+#     FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/mimic-edge-trader \
+#         >> "$HOME_DIR/log/mimic-edge-trader.log" 2>&1 &  # append: keep crash evidence
+#     echo "$(ts) watchdog: restarted dead mimic-edge-trader" >> "$WLOG"
+#     after="$after + mimic-edge-trader"
+# fi
+
+
+# MIMIC STANZA COMMENTED OUT 2026-11-02 (permanent kill, user order — never restart)
+# # Mimic-edge2 trader: the thorough fix of edge's three limits
+# # (2026-11-02, user-ordered) — TWAP 64 slices at 4/poll (~80s)
+# # + 8/poll below 0.90x; killswitch lane "mimic_edge2",
+# # pre-registered 100-close verdict. NO cards.
+# # Standalone daemon, not in forex-daemons. Check and restart.
+# # (Primary keeper is the resident supervisor roster; this stanza
+# # is the fallback, same pattern as the other standalone daemons.)
+# if ! pgrep -f "scripts/mimic-edge2-trader" > /dev/null 2>&1; then
+#     cd "$AGENT_ROOT" || exit 2
+#     FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/mimic-edge2-trader \
+#         >> "$HOME_DIR/log/mimic-edge2-trader.log" 2>&1 &  # append: keep crash evidence
+#     echo "$(ts) watchdog: restarted dead mimic-edge2-trader" >> "$WLOG"
+#     after="$after + mimic-edge2-trader"
+# fi
+
+
+# Devnet demo trader: mirrors grad_select paper entries to real
+# devnet self-transfers (2026-10-30, user-ordered). Execution proof
+# only; NO P&L by design; devnet-only keypair, mainnet refused.
+# Standalone daemon, not in forex-daemons. Check and restart.
+# (Primary keeper is the resident supervisor roster; this stanza
+# is the fallback, same pattern as the other standalone daemons.)
+if ! pgrep -f "scripts/devnet-demo-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    # venv python: signing needs 'solders', which system python3 lacks.
+    FOREX_AGENT_HOME="$HOME_DIR" nohup /home/hatch/workspace/Forex-agent/.venv/bin/python scripts/devnet-demo-trader \
+        >> "$HOME_DIR/log/devnet-demo-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead devnet-demo-trader" >> "$WLOG"
+    after="$after + devnet-demo-trader"
+fi
+
+# Watcher trader: the smart-watcher convergence TRADING ARM
+# (2026-10-23, user-ordered). Consumes convergence fires off the
+# signal bus event-driven (~1s watch), $1 paper shots, user's
+# ladder, killswitch lane "watcher", pre-registered 100-close
+# verdict. Paper only; NO cards (smart-watcher sends them).
+# Standalone daemon, not in forex-daemons. Check and restart.
+# (Primary keeper is the resident supervisor roster; this stanza
+# is the fallback, same pattern as the other standalone daemons.)
+if ! pgrep -f "scripts/watcher-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/watcher-trader \
+        >> "$HOME_DIR/log/watcher-trader.log" 2>&1 &  # append: keep crash evidence
+    echo "$(ts) watchdog: restarted dead watcher-trader" >> "$WLOG"
+    after="$after + watcher-trader"
+fi
+
+# Resident supervisor (2026-10-21): owns/adopts all 22 daemons and
+# restarts any death within ~1-2s (backoff ladder + storm guard), far
+# faster than this cron's 5-minute cycle. This watchdog's remaining
+# job for the roster is to revive the SUPERVISOR itself (e.g. after a
+# VM reboot); the per-daemon stanzas below stay as a fallback for the
+# case where the supervisor cannot run.
+if ! pgrep -f "scripts/supervisor" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/supervisor \
+        >> "$HOME_DIR/log/supervisor.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead supervisor" >> "$WLOG"
+    after="$after + supervisor"
+fi
+
+# Launch radar: PAUSED 2026-10-18 per user (birth-anticipation obsolete under
+# runner-only rule; alerts were warnings, never actionable picks).
+# Daemon intentionally not supervised; script kept on disk for possible revival.
+# (removed pgrep/restart block)
+
+# Position tracker: sell-signal alerts for user manual positions (degen lane).
+# Standalone daemon, not in forex-daemons. Check and restart.
+if ! pgrep -f "scripts/position-tracker" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/position-tracker \
+        > "$HOME_DIR/log/position-tracker.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead position-tracker" >> "$WLOG"
+    after="$after + position-tracker"
+fi
+
+# Eagle Eye 3-engine: RETIRED 2026-10-23 — audit verified their output
+# has no consumer in the card path or alerts; removed from the
+# supervisor roster. Do NOT restart.
+# (Was: silent market-wide momentum data layer, 3 engines on shared
+# SQLite WAL — discovery 'new', momentum 'trending', smartflow
+# 'established'.)
+# Legacy single-engine eagle-eye: RETIRED 2026-10-14, replaced by 3 engines.
+
+# Degen watchlist v1: RETIRED 2026-10-14 with Degen v1.
+# Degen peak tracker: NOT retired — REVIVED 2026-10-23 (see stanza above;
+# the nightly learner labels winners from its peaks).
+# Degen fastwatch v1: RETIRED 2026-10-14 with Degen v1.
+# Degen runner v1: RETIRED 2026-10-14 with Degen v1.
+# (All removed from watchdog; do not restart. Degen v2 + smart-watcher cover this.)
+
+# Challenge trader: paper trades for the 1 SOL -> $2M challenge (re-enabled 2026-10-12 18:21 WAT).
+if ! pgrep -f "scripts/challenge-trader" > /dev/null 2>&1; then
+    cd "$AGENT_ROOT" || exit 2
+    FOREX_AGENT_HOME="$HOME_DIR" nohup python3 scripts/challenge-trader \
+        > "$HOME_DIR/log/challenge-trader.log" 2>&1 &
+    echo "$(ts) watchdog: restarted dead challenge-trader" >> "$WLOG"
+    after="$after + challenge-trader"
+fi
+
+actions="none"
+if [ "$before" != "$after" ]; then
+    actions="restarted dead daemons"
+fi
+
+# Wedge detection: a stale SQLite journal means a daemon is holding an
+# uncommitted write transaction, which blocks every other writer until
+# the process dies. The hourly backup only ever reads, so a journal
+# older than 2 minutes is never legitimate — find the holder and
+# restart that daemon. (2026-09-29: four wedges, all previously needed
+# a manual kill -9 because the wedged process still looked "alive".)
+JOURNAL="$HOME_DIR/storage/local.db-journal"
+if [ -f "$JOURNAL" ]; then
+    now=$(date +%s); mtime=$(stat -c %Y "$JOURNAL" 2>/dev/null || echo "$now")
+    if [ $((now - mtime)) -gt 120 ]; then
+        holder=$(fuser "$JOURNAL" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)
+        if [ -n "$holder" ]; then
+            for name in market_monitor signal_monitor position_monitor health_monitor telegram launch_scanner; do
+                pid=$(cat "$RUN_DIR/$name.pid" 2>/dev/null || true)
+                if [ -n "$pid" ] && [ "$pid" = "$holder" ]; then
+                    echo "$(ts) wedge: $name (pid $holder) holding stale journal, restarting" >> "$WLOG"
+                    FOREX_AGENT_HOME="$HOME_DIR" "$DAEMONS_BIN" restart "$name" >> "$WLOG" 2>&1
+                    actions="wedge-restart:$name"
+                    after="$(FOREX_AGENT_HOME="$HOME_DIR" "$DAEMONS_BIN" status 2>&1)" || exit 2
+                    break
+                fi
+            done
+            if [ "$actions" = "none" ]; then
+                echo "$(ts) wedge: stale journal held by unknown pid $holder" >> "$WLOG"
+            fi
+        fi
+    fi
+fi
+
+python3 - "$HEARTBEAT" "$after" "$actions" <<'PYEOF'
+import fcntl, json, os, sys, datetime
+# Flock-guard the read-modify-write (2026-11-22): the 2s beaters
+# (daemon/launch_scanner/heartbeat.py) hold heartbeat.json.lock for
+# every write. This writer did not, so a beater could read the old
+# doc after this write's read and write it back, clobbering the new
+# checked_at/daemons (observed 2026-11-22 17:54: the 17:54:54 run's
+# update was lost, heartbeat stayed at 17:49:26 with stale PIDs).
+# Same lock path as heartbeat.py: HEARTBEAT_PATH + ".lock".
+# The read-modify-write merge preserves the realtime "beats"
+# section the trading arm writes every 2 seconds.
+lf = open(sys.argv[1] + ".lock", "w")
+try:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    hb = {}
+    try:
+        with open(sys.argv[1]) as f:
+            old = json.load(f)
+        if isinstance(old, dict):
+            hb = old
+    except Exception:
+        hb = {}
+    hb.update({
+        "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "daemons": sys.argv[2].splitlines(),
+        "actions": sys.argv[3],
+    })
+    tmp = sys.argv[1] + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(hb, f, indent=2)
+    os.replace(tmp, sys.argv[1])
+finally:
+    try:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+    finally:
+        lf.close()
+PYEOF
+
+echo "$(ts) watchdog | actions: $actions" >> "$WLOG"
+if [ "$actions" != "none" ]; then
+    echo "$(ts) --- before ---" >> "$WLOG"; echo "$before" >> "$WLOG"
+    echo "$(ts) --- after ---" >> "$WLOG"; echo "$after" >> "$WLOG"
+fi
+
+echo "watchdog ok | actions: $actions"
+echo "$after"

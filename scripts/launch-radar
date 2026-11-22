@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Deployer launch radar: early warning BEFORE the next launch.
+
+The $60M-portfolio playbook's one buildable weapon for us: proven
+deployers fund a fresh wallet minutes BEFORE their next launch. We own
+the moat -- deployer_history.json (2007 deployers, launches_seen /
+hits_2x) -- so we watch the wallets of proven deployers via Helius and
+fire an instant Telegram alert on:
+
+  (a) outgoing SOL funding (>= 0.05 SOL) from a tracked deployer to a
+      FRESH wallet (no prior history)  -> launch likely in minutes
+  (b) a new token mint created by a tracked deployer (initializeMint /
+      pump.fun create as fee payer with a new pump mint)
+
+ALERTS ONLY. This daemon never places trades, never touches devnet,
+never rotates credentials. It shares the free Helius budget with
+smart-watcher: 17 wallets swept every 90s at 0.6s spacing (~11 RPC
+calls/min base), plus a local 429 cooldown guard.
+
+Dedup: one alert per deployer per 30 minutes (persisted state).
+"""
+import json
+import logging
+import os
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("launch-radar")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+DEPLOYER_FILE = os.path.join(HOME, "launch_scanner", "deployer_history.json")
+STATE_FILE = os.path.join(HOME, "launch_radar_state.json")
+
+POLL_SECS = 120         # full sweep of all tracked deployers; funding moves
+# happen minutes before launch, so 120s sweeps are fit for purpose
+# while keeping the free-tier footprint small.
+WALLET_SPACING = 0.8    # seconds between Helius calls (avoid 429 bursts)
+SIG_LIMIT = 15          # signatures per wallet per sweep (deployers are quiet)
+MIN_LAUNCHES = 3
+MIN_HIT_RATE = 0.10
+FUNDING_MIN_LAMPORTS = 50_000_000  # 0.05 SOL: real funding, not dust
+ALERT_COOLDOWN_SECS = 1800          # one alert per deployer per 30 min
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRmmuEkDWonX"
+
+# Local 429 guard (mirrors daemon/launch_scanner/helius_ratelimit behavior;
+# this script is standalone so it carries its own guard).
+_cooldown_until = 0.0
+_backoff_s = 60.0
+
+
+def _cooldown_remaining():
+    return max(0.0, _cooldown_until - time.time())
+
+
+def _http(url, data=None, timeout=15):
+    global _cooldown_until, _backoff_s
+    if _cooldown_remaining() > 0:
+        return None
+    try:
+        headers = {"User-Agent": "forex-agent/1.0",
+                   "Content-Type": "application/json"}
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            _backoff_s = 60.0
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _cooldown_until = time.time() + _backoff_s
+            logger.warning("helius 429: cooling down %ds", int(_backoff_s))
+            _backoff_s = min(600.0, _backoff_s * 2.0)
+        else:
+            # Silent non-429 failures (401/403/...) hide dead keys for
+            # hours. Log the code; never the URL (it carries the key).
+            # 401/403 = the key itself is rejected -> stop using it and
+            # fall back to the main key (get_helius_key reads the flag).
+            logger.warning("helius http %d (not 429)", e.code)
+            if e.code in (401, 403):
+                global _discovery_dead
+                if not _discovery_dead:
+                    _discovery_dead = True
+                    logger.warning(
+                        "discovery key rejected (%d); falling back to "
+                        "main key", e.code)
+        return None
+    except Exception:
+        return None
+
+
+# Key seam: discovery key (own free-tier bucket) first; a 401/403 marks it
+# dead for the rest of this process and the main key takes over. Never
+# hammer a rejected key -- that burns the sweep for nothing.
+_discovery_dead = False
+_main_key_cache = None
+_discovery_key_cache = None
+_key_cache_checked = False
+
+
+def _read_key_file(name):
+    try:
+        with open(os.path.join(HOME, "helius", name)) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _load_keys():
+    global _main_key_cache, _discovery_key_cache, _key_cache_checked
+    if _key_cache_checked:
+        return
+    _key_cache_checked = True
+    _discovery_key_cache = (
+        os.environ.get("HELIUS_API_KEY_DISCOVERY", "").strip()
+        or _read_key_file("api_key_discovery"))
+    _main_key_cache = _read_key_file("api_key")
+
+
+def get_helius_key():
+    """Discovery key first (its own rate-limit bucket), main key as
+    fallback -- mirrors daemon/launch_scanner/smartmoney.py's
+    discovery_api_key() seam. If Helius ever rejects the discovery key
+    (401/403), it is marked dead and the main key is used instead."""
+    _load_keys()
+    if not _discovery_dead and _discovery_key_cache:
+        return _discovery_key_cache
+    return _main_key_cache
+
+
+def rpc(method, params):
+    # Key is resolved per call so the 401/403 fallback in _http takes
+    # effect mid-run instead of pinning a dead key for the whole process.
+    api_key = get_helius_key()
+    if not api_key:
+        return None
+    url = "https://mainnet.helius-rpc.com/?api-key=%s" % api_key
+    resp = _http(url, {"jsonrpc": "2.0", "id": 1,
+                       "method": method, "params": params})
+    return (resp or {}).get("result")
+
+
+def load_qualifying_deployers():
+    """Deployers with >=3 launches and >=10% 2x hit rate."""
+    try:
+        with open(DEPLOYER_FILE) as f:
+            hist = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for addr, h in hist.items():
+        seen = h.get("launches_seen", 0) or 0
+        hits = h.get("hits_2x", 0) or 0
+        if seen >= MIN_LAUNCHES and (hits / seen) >= MIN_HIT_RATE:
+            out[addr] = {"launches": seen, "hits": hits,
+                         "rate": hits / seen}
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+        os.chmod(STATE_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def send_card(text, mint=""):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = None
+        if mint:
+            keyboard = json.dumps({
+                "inline_keyboard": [[{
+                    "text": "\U0001f4cb Copy CA",
+                    "copy_text": {"text": mint},
+                }]],
+            })
+        payload = {"chat_id": "6883056760", "text": text}
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def _iter_instructions(tx):
+    """Yield (instruction, is_inner) over parsed instructions + inners."""
+    msg = (tx.get("transaction") or {}).get("message") or {}
+    for ix in msg.get("instructions") or []:
+        yield ix, False
+    meta = tx.get("meta") or {}
+    for inner in meta.get("innerInstructions") or []:
+        for ix in inner.get("instructions") or []:
+            yield ix, True
+
+
+def detect_events(deployer, sig, known_mints):
+    """Return list of events for one new tx: ('funding', dest) or
+    ('mint', mint_addr). Fail-soft: unparseable tx -> []."""
+    events = []
+    tx = rpc("getTransaction",
+             [sig, {"encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0}])
+    if not tx:
+        return []
+    acct_keys = []
+    try:
+        for k in ((tx.get("transaction") or {}).get("message") or {}).get(
+                "accountKeys") or []:
+            acct_keys.append(k.get("pubkey") if isinstance(k, dict)
+                            else k)
+    except Exception:
+        pass
+    fee_payer = acct_keys[0] if acct_keys else ""
+
+    for ix, _inner in _iter_instructions(tx):
+        try:
+            program = ix.get("program") or ""
+            parsed = ix.get("parsed") or {}
+            ptype = parsed.get("type") or ""
+            info = parsed.get("info") or {}
+
+            # (b) definitive mint creation
+            if ptype in ("initializeMint", "initializeMint2"):
+                mint = info.get("mint", "")
+                if mint and mint not in known_mints:
+                    events.append(("mint", mint))
+                continue
+
+            # (a) native SOL funding from the deployer
+            if program == "system" and ptype == "transfer":
+                if info.get("source") != deployer:
+                    continue
+                lamports = int(info.get("lamports") or 0)
+                if lamports < FUNDING_MIN_LAMPORTS:
+                    continue
+                dest = info.get("destination", "")
+                if not dest or dest == deployer:
+                    continue
+                # Fresh wallet? Only the funding tx itself may exist.
+                dest_sigs = rpc("getSignaturesForAddress",
+                                [dest, {"limit": 2}]) or []
+                if len(dest_sigs) <= 1:
+                    events.append(("funding", dest))
+        except Exception:
+            continue
+
+    # (b2) pump.fun create: pump program present, deployer is fee payer,
+    # and a NEW pump-suffixed mint appears in the account list.
+    try:
+        if fee_payer == deployer and PUMP_PROGRAM in acct_keys:
+            for k in acct_keys:
+                if (isinstance(k, str) and k.endswith("pump")
+                        and k != PUMP_PROGRAM and k not in known_mints):
+                    # Confirm it looks like a fresh mint, not a random
+                    # account: it must not have been seen for this
+                    # deployer before. (Definitive mint-authority check
+                    # would cost another RPC; the new-mint heuristic is
+                    # the cheap, useful signal.)
+                    events.append(("mint", k))
+                    break
+    except Exception:
+        pass
+    # Dedupe: same mint via initializeMint + pump heuristic -> one event.
+    seen_ev = set()
+    uniq = []
+    for e in events:
+        if e not in seen_ev:
+            seen_ev.add(e)
+            uniq.append(e)
+    return uniq
+
+
+def maybe_alert(deployer, stats, kind, target, state):
+    """One alert per deployer per ALERT_COOLDOWN_SECS. Returns True if sent."""
+    now = time.time()
+    last = (state.get("last_alert") or {}).get(deployer, 0)
+    if now - last < ALERT_COOLDOWN_SECS:
+        return False
+    addr6 = deployer[:6]
+    if kind == "funding":
+        rate_pct = min(100, round(stats["rate"] * 100))
+        text = (
+            "\U0001f6a8 LAUNCH RADAR — deployer %s "
+            "(%d launches, %d%% 2x rate) just funded a FRESH wallet "
+            "(%s). Launch likely in minutes. Nothing to buy yet — "
+            "CA to follow."
+            % (addr6, stats["launches"], rate_pct,
+               target[:6]))
+        mint_btn = ""
+    else:
+        # Clamp: data bug can push hits_2x above launches_seen (e.g. 19/6).
+        # A rate can never exceed 100%.
+        rate_pct = min(100, round(stats["rate"] * 100))
+        text = (
+            "\U0001f6a8 LAUNCH RADAR — deployer %s "
+            "(%d launches, %d%% 2x rate) just created a mint. "
+            "Launch likely in minutes. Vet before any buy.\n"
+            "CA: %s"
+            % (addr6, stats["launches"], rate_pct, target))
+        mint_btn = target
+    if send_card(text, mint=mint_btn):
+        logger.warning("RADAR ALERT %s %s %s", addr6, kind, target[:8])
+        state.setdefault("last_alert", {})[deployer] = now
+        return True
+    return False
+
+
+def main():
+    api_key = get_helius_key()
+    if not api_key:
+        logger.warning("no helius key, exiting")
+        return
+    deployers = load_qualifying_deployers()
+    if not deployers:
+        logger.warning("no qualifying deployers, exiting")
+        return
+    logger.warning("launch radar started: %d deployers", len(deployers))
+
+    state = load_state()
+    last_sig = state.get("last_sig") or {}
+    known_mints = state.get("known_mints") or {}
+
+    # Initialize cursors at current tip: only NEW activity alerts.
+    addrs = list(deployers.keys())
+    for w in addrs:
+        if w not in last_sig:
+            sigs = rpc("getSignaturesForAddress",
+                       [w, {"limit": 1}]) or []
+            if sigs and sigs[0].get("signature"):
+                last_sig[w] = sigs[0]["signature"]
+        time.sleep(WALLET_SPACING)
+    state["last_sig"] = last_sig
+    save_state(state)
+
+    while True:
+        try:
+            for w in addrs:
+                stats = deployers[w]
+                sigs = rpc("getSignaturesForAddress",
+                           [w, {"limit": SIG_LIMIT}]) or []
+                if sigs and sigs[0].get("signature"):
+                    prev = last_sig.get(w)
+                    if prev is None:
+                        # Cursor never initialized (e.g. 429 during startup):
+                        # anchor at tip WITHOUT processing the backlog, or
+                        # the first clear sweep would fetch hundreds of txs
+                        # and re-trigger the throttle.
+                        last_sig[w] = sigs[0]["signature"]
+                        time.sleep(WALLET_SPACING)
+                        continue
+                    new_sigs = []
+                    for s in sigs:
+                        sg = (s or {}).get("signature")
+                        if not sg:
+                            continue
+                        if sg == prev:
+                            break
+                        new_sigs.append(sg)
+                    last_sig[w] = sigs[0]["signature"]
+                    for sg in reversed(new_sigs):
+                        km = set(known_mints.get(w) or [])
+                        for kind, target in detect_events(
+                                w, sg, km):
+                            if kind == "mint":
+                                km.add(target)
+                                known_mints[w] = sorted(km)[-50:]
+                            maybe_alert(w, stats, kind, target, state)
+                        time.sleep(0.3)
+                time.sleep(WALLET_SPACING)
+            state["last_sig"] = last_sig
+            state["known_mints"] = known_mints
+            save_state(state)
+        except Exception:
+            logger.exception("radar loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

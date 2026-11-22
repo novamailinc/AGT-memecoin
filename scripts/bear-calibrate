@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Bear-score calibration (2026-11-17).
+
+Scores the STORED closes of each grad lane (ledgers keep the
+last 500 closes per lane) with daemon/launch_scanner/bear_score
+and reports, per bear-score band, closes / wins / net pnl /
+expectancy — the evidence a gate decision has to rest on.
+
+Two scores per close, reported side by side:
+  * eval-only — exactly the features available at
+    evaluate_candidate time (deployer, copycat, curve speed /
+    trades, grad age). THIS is the score a gate would be decided
+    on: the live scorer cannot see anything else.
+  * full — every feature the close record carries, i.e. eval-only
+    plus top-level entry liquidity (top-10 is never in stored
+    closes, so it stays unknown in both). Reported for context
+    only; a gate must not rest on features the live scorer lacks.
+
+Bands: 0-19 / 20-39 / 40-59 / 60-79 / 80-100, plus an "unknown
+heavy" line (closes whose eval-only score had < 3 known
+features — a low score there is a shrug, not an all-clear).
+
+IN-SAMPLE by construction: the bands are tuned on the same
+stored closes they are measured on. A clean separation here
+justifies a JOURNAL-ONLY -> gate proposal, never the gate
+itself; the gate is proven only by a forward test on new
+closes. The script writes nothing to the ledgers and never
+touches entry behaviour — it only reads and prints.
+
+POINT-IN-TIME (TradingAgents #7, 2026-11-17): tuning must never learn
+from forward-test outcomes. Before any band is computed, closes with
+close_ts >= the forward window start recorded in
+~/.forex-agent/ab_forward.json are EXCLUDED from the training set
+(the excluded count is reported per lane), and the remaining training
+end (max close_ts) is asserted strictly before the forward start —
+a violation exits non-zero before anything is reported. The training
+window (earliest/latest close_ts) is printed per lane so the numbers
+stay reproducible. When no forward window is recorded, no exclusion
+applies and that is stated in the output.
+
+Usage: scripts/bear-calibrate [--lane grad_select] [--home DIR]
+Paper only. No network.
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+import bear_score as B
+import lessons as L
+import point_in_time as PIT
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+BANDS = ((0, 19), (20, 39), (40, 59), (60, 79), (80, 100))
+
+
+def _band_label(score):
+    for lo, hi in BANDS:
+        if lo <= score <= hi:
+            return "%d-%d" % (lo, hi)
+    return "?"
+
+
+
+def _summarize(rows):
+    closes = len(rows)
+    wins = sum(1 for r in rows if (r.get("pnl_usd") or 0) > 0)
+    net = round(sum(r.get("pnl_usd") or 0 for r in rows), 2)
+    return closes, wins, net
+
+
+def calibrate_lane(lane, home=None, forward_start_ts=None):
+    """Per-band tables for one lane's stored closes.
+
+    Point-in-time: closes with close_ts >= the forward window start
+    (from <home>/ab_forward.json, unless ``forward_start_ts`` is given
+    explicitly) are EXCLUDED from the training set and reported as
+    ``excluded_forward`` — tuning never learns from forward outcomes.
+    ``closes`` is the TRAINING close count; ``stored_closes`` is the
+    raw ledger count. ``training_window`` is (earliest, latest, n)
+    close_ts over the training set.
+
+    Returns {"lane", "closes", "stored_closes", "overall",
+    "eval_bands", "full_bands", "unknown_heavy", "unknown_heavy_n",
+    "excluded_forward", "forward_start_ts", "training_window"}.
+    Never raises."""
+    try:
+        home = home or HOME
+        if forward_start_ts is None:
+            forward_start_ts = PIT.load_forward_start(home)
+        path = os.path.join(home, L.LEDGER_FILES.get(lane, ""))
+        if not os.path.exists(path):
+            return {"lane": lane, "closes": 0, "stored_closes": 0,
+                    "overall": (0, 0, 0.0),
+                    "eval_bands": {}, "full_bands": {},
+                    "unknown_heavy": (0, 0, 0.0),
+                    "excluded_forward": 0,
+                    "forward_start_ts": forward_start_ts,
+                    "training_window": (None, None, 0)}
+        with open(path) as f:
+            d = json.load(f)
+        stored = [c for c in (d.get("closes") or [])
+                  if isinstance(c, dict) and c.get("mint")]
+        closes, excluded = PIT.split_training_before_forward(
+            stored, forward_start_ts)
+        window = PIT.training_window(closes)
+        eval_bands = {("%d-%d" % b): [] for b in BANDS}
+        full_bands = {("%d-%d" % b): [] for b in BANDS}
+        unknown_heavy = []
+        for c in closes:
+            full, eval_only = B.score_close(c)
+            eval_bands[_band_label(eval_only["bear_score"])].append(c)
+            full_bands[_band_label(full["bear_score"])].append(c)
+            if eval_only["known"] < 3:
+                unknown_heavy.append(c)
+        return {
+            "lane": lane,
+            "closes": len(closes),
+            "stored_closes": len(stored),
+            "overall": _summarize(closes),
+            "eval_bands": {k: _summarize(v)
+                           for k, v in eval_bands.items()},
+            "full_bands": {k: _summarize(v)
+                           for k, v in full_bands.items()},
+            "unknown_heavy": _summarize(unknown_heavy),
+            "excluded_forward": len(excluded),
+            "forward_start_ts": forward_start_ts,
+            "training_window": window,
+        }
+    except Exception:
+        return {"lane": lane, "closes": 0, "stored_closes": 0,
+                "overall": (0, 0, 0.0),
+                "eval_bands": {}, "full_bands": {},
+                "unknown_heavy": (0, 0, 0.0),
+                "excluded_forward": 0,
+                "forward_start_ts": forward_start_ts,
+                "training_window": (None, None, 0)}
+
+
+def _fmt_row(label, closes, wins, net):
+    wr = (100.0 * wins / closes) if closes else 0.0
+    exp = (net / closes) if closes else 0.0
+    return ("  %-8s %5d closes  %4d wins  %6.1f%%  net %+10.2f  "
+            "exp $%+7.2f/close" % (label, closes, wins, wr, net, exp))
+
+
+def print_lane(res):
+    print("=== %s: %d stored closes (%d training, %d excluded as "
+          "forward-window) ==="
+          % (res["lane"], res.get("stored_closes", res["closes"]),
+             res["closes"], res.get("excluded_forward", 0)))
+    fwd = res.get("forward_start_ts")
+    if fwd is not None:
+        print("  forward window starts %s; training must end before it"
+              % PIT.fmt_ts(fwd))
+    else:
+        print("  forward window: none recorded (no ab_forward.json) — "
+              "no exclusion applied")
+    lo, hi, _n = res.get("training_window") or (None, None, 0)
+    if lo is not None and hi is not None:
+        print("  training window: earliest close %s / latest close %s"
+              % (PIT.fmt_ts(lo), PIT.fmt_ts(hi)))
+    else:
+        print("  training window: empty (no dated training closes)")
+    c, w, n = res["overall"]
+    print(_fmt_row("OVERALL", c, w, n))
+    print("  -- eval-only bear score (the gate score) --")
+    for lo, hi in BANDS:
+        label = "%d-%d" % (lo, hi)
+        cc, ww, nn = res["eval_bands"].get(label, (0, 0, 0.0))
+        print(_fmt_row(label, cc, ww, nn))
+    print("  -- full bear score (incl. entry liquidity; context) --")
+    for lo, hi in BANDS:
+        label = "%d-%d" % (lo, hi)
+        cc, ww, nn = res["full_bands"].get(label, (0, 0, 0.0))
+        print(_fmt_row(label, cc, ww, nn))
+    c, w, n = res["unknown_heavy"]
+    print("  unknown-heavy eval scores (<3 known features): "
+          "%d closes, %d wins, net $%+.2f" % (c, w, n))
+    print()
+
+
+def main(argv=None):
+    argv = list(argv or sys.argv[1:])
+    home = HOME
+    lanes = list(L.LANES)
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--home" and i + 1 < len(argv):
+            home = argv[i + 1]
+            i += 2
+        elif a == "--lane" and i + 1 < len(argv):
+            lanes = [argv[i + 1]]
+            i += 2
+        else:
+            i += 1
+    print("Bear-score calibration (IN-SAMPLE: stored closes only; "
+          "a gate needs a forward test)")
+    print("Home: %s" % home)
+    print()
+    # Point-in-time gate, BEFORE any reporting: the training set
+    # (all lanes combined) must end strictly before the forward
+    # window starts. calibrate_lane already excluded forward-window
+    # closes; this asserts the remainder. Violation exits non-zero
+    # with nothing reported.
+    forward_start = PIT.load_forward_start(home)
+    results = [calibrate_lane(lane, home, forward_start)
+               for lane in lanes]
+    training_end = None
+    for res in results:
+        _lo, hi, _n = res.get("training_window") or (None, None, 0)
+        if hi is not None and (training_end is None or hi > training_end):
+            training_end = hi
+    if forward_start is not None:
+        print("Forward window start: %s" % PIT.fmt_ts(forward_start))
+        print("Training end (max close_ts across lanes): %s"
+              % (PIT.fmt_ts(training_end) if training_end is not None
+                 else "none (empty training set)"))
+        print("Excluded as forward-window closes: %d"
+              % sum(r.get("excluded_forward", 0) for r in results))
+        print()
+        try:
+            PIT.assert_training_before_forward(
+                training_end, forward_start, label="training set")
+        except PIT.PointInTimeError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+    for res in results:
+        print_lane(res)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,273 @@
+{
+  "entry_price": 2.5e-05,
+  "ladder": "50%@2x / 25%@3x / 25% trail 30% / -50% stop / 24h",
+  "notional_usd": 25.0,
+  "scenarios": {
+    "exactly_2x": [
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": false,
+          "c": false
+        },
+        "mult": 2.0,
+        "step": 0
+      }
+    ],
+    "just_below_2x": [
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 1.99,
+        "step": 0
+      }
+    ],
+    "moon_then_fade": [
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 1.0,
+        "step": 0
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 1.5,
+        "step": 1
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": false,
+          "c": false
+        },
+        "mult": 2.0,
+        "step": 2
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": false,
+          "c": false
+        },
+        "mult": 2.5,
+        "step": 3
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": true,
+          "c": false
+        },
+        "mult": 3.0,
+        "step": 4
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": true,
+          "c": false
+        },
+        "mult": 2.2,
+        "step": 5
+      },
+      {
+        "close": {
+          "pnl_usd": 29.0379,
+          "realized_mult": 2.1615,
+          "reason": "ladder_complete"
+        },
+        "legs": null,
+        "mult": 1.8,
+        "step": 6
+      }
+    ],
+    "phantom_print": [
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 100.0,
+        "step": 0
+      }
+    ],
+    "slow_bleed": [
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 1.0,
+        "step": 0
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 0.9,
+        "step": 1
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 0.85,
+        "step": 2
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 0.8,
+        "step": 3
+      }
+    ],
+    "straight_dump": [
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 1.0,
+        "step": 0
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 0.8,
+        "step": 1
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": true
+        },
+        "mult": 0.6,
+        "step": 2
+      },
+      {
+        "close": {
+          "pnl_usd": -12.1059,
+          "realized_mult": 0.5158,
+          "reason": "hard_stop_-50pct"
+        },
+        "legs": null,
+        "mult": 0.5,
+        "step": 3
+      }
+    ],
+    "time_only_known_price": {
+      "close": {
+        "pnl_usd": 4.4759,
+        "realized_mult": 1.179,
+        "reason": "time_stop_24h"
+      },
+      "open": false
+    },
+    "time_only_unquotable": {
+      "close": {
+        "pnl_usd": -25.001,
+        "realized_mult": -0.0,
+        "reason": "time_stop_24h_unquotable"
+      },
+      "open": false
+    },
+    "time_stop": [
+      {
+        "close": {
+          "pnl_usd": 2.0195,
+          "realized_mult": 1.0808,
+          "reason": "time_stop_24h"
+        },
+        "legs": null,
+        "mult": 1.1,
+        "step": 0
+      }
+    ],
+    "trail_exact": [
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": false,
+          "c": false
+        },
+        "mult": 2.0,
+        "step": 0
+      },
+      {
+        "close": null,
+        "legs": {
+          "a": true,
+          "b": false,
+          "c": true
+        },
+        "mult": 1.4,
+        "step": 1
+      }
+    ],
+    "zero_price": [
+      {
+        "close": null,
+        "legs": {
+          "a": false,
+          "b": false,
+          "c": false
+        },
+        "mult": 0.0,
+        "step": 0
+      }
+    ],
+    "zero_price_aged": [
+      {
+        "close": {
+          "pnl_usd": -25.001,
+          "realized_mult": -0.0,
+          "reason": "time_stop_24h_unquotable"
+        },
+        "legs": null,
+        "mult": 0.0,
+        "step": 0
+      }
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "capture_method": "daemon/launch_scanner/reserves.py rpc() (live Helius/public path, pacer-governed); retry after first attempt returned None",
+  "captured_ts": 1795341614.9707654,
+  "captured_utc": "2026-11-22T10:00:14Z",
+  "elapsed_s": 2.025,
+  "fixture": "live_getSignaturesForAddress_pump",
+  "method": "getSignaturesForAddress",
+  "params": [
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    {
+      "limit": 2
+    }
+  ],
+  "result": [
+    {
+      "blockTime": 1795341615,
+      "confirmationStatus": "finalized",
+      "err": {
+        "InstructionError": [
+          6,
+          {
+            "Custom": 6013
+          }
+        ]
+      },
+      "memo": null,
+      "signature": "eY5SFmn2qGBCbwqWUQEKJJr6N7VevCWvKTKqkCaC6RBbuSqYTQtfK9djE8EWSTHYFbnyMLUoYiC3ZAWVDiCt7q8",
+      "slot": 472499532,
+      "transactionIndex": 329
+    },
+    {
+      "blockTime": 1795341615,
+      "confirmationStatus": "finalized",
+      "err": null,
+      "memo": null,
+      "signature": "49mgM9e5tV8mKMPoQiL3GY8vTJgSib6ZnSwMNHbj74ciJMdgoddS7okT8jzRzAeCDmxdMftbf5uYJXmJ2q8CKVMu",
+      "slot": 472499532,
+      "transactionIndex": 328
+    }
+  ],
+  "source": "public-rpc"
+}

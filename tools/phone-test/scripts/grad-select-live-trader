@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Graduation SELECT LIVE trader daemon (mainnet, 2026-11-06 build).
+
+Runs the graduation SELECT lane with REAL fills: the same four
+evidence filters as paper grad_select (serial deployers, fast
+curve through few trades, canonical pools only, copycat tickers),
+but entries buy $1 of the token on mainnet via Jupiter and exits
+sell real token legs back to SOL. The paper loop keeps running
+untouched; this is a separate process with a separate ledger
+(FOREX_AGENT_HOME/live/live_grad_select_ledger.json).
+
+Hard rules:
+- DRY-RUN BY DEFAULT: quotes + simulates, never sends. Live sends
+  need --arm AND a deployment marker carrying "armed": true.
+- Refuses to run without a deployment marker (FOREX_AGENT_HOME/
+  live/deployment.json) — so it cannot run on the build VM.
+- The live key file is created by the user on his own machine
+  (MEMECOIN_WALLET_KEY_FILE, default FOREX_AGENT_HOME/live/
+  keypair.json, 0600). No key material ever appears in logs.
+- Killswitch lane "grad_select_live" gates entries (fail-closed);
+  exits ALWAYS run while halted, so open positions drain.
+- NO Telegram cards in v1 — entries/exits are logged only.
+- Detection: live PumpPortal migration WebSocket + GeckoTerminal
+  newest-pools backfill every ~60s (same as the paper trader).
+  Exits are evaluated in this same loop (~5s cycle) and by the
+  armed watcher on push prices.
+
+Pre-registered verdict: at 100 closes, expectancy <= 0 halts the
+lane permanently (killswitch lane "grad_select_live", human-only
+re-enable). $1/shot, MAX_OPEN 6, $6 bankroll.
+"""
+import argparse
+import json
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("grad-select-live-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import grad_select as _sel
+    import live_select as _live
+    import pumpportal as _pp
+    import killswitch as _ks_check
+    import armed_watch as _aw
+    import dossiers as _dossiers
+    import rt_sync as _rt
+    import heartbeat as _hb
+    from broker.memecoin.execution.mainnet_executor import (
+        MainnetExecutor)
+    from broker.memecoin.execution.rpc import MainnetRPC
+    from broker.memecoin.wallet import FileKeyProvider
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+# P4 event recorder: fail-soft — a missing recorder never stops
+# the lane.
+try:
+    import recorder as _recorder
+except Exception:
+    try:
+        from daemon.launch_scanner import recorder as _recorder
+    except Exception:
+        _recorder = None
+
+POLL_SECS = 5
+GT_BACKFILL_EVERY_S = 60
+GT_BACKFILL_PAGES = 5
+# SOL kept back for fees + ATA rent: an entry needs the $1 stake
+# in SOL plus this reserve in the wallet, or preflight refuses.
+SOL_RESERVE = 0.01
+
+
+def _rpc_url():
+    """Mainnet RPC endpoint: MEMECOIN_LIVE_RPC_URL wins; otherwise
+    the public mainnet-beta endpoint (free, no key — rate-limited,
+    fine for $1 stakes at this cadence). The user may set the URL
+    to his Helius endpoint on the deployment machine instead."""
+    url = os.environ.get("MEMECOIN_LIVE_RPC_URL", "").strip()
+    if url:
+        return url
+    return "https://api.mainnet-beta.solana.com"
+
+
+def _preflight(executor, engine):
+    """Before entries each cycle: killswitch gate open, live ledger
+    parses, SOL balance covers the $1 stake + reserve, today's
+    realized P&L above the -$3 daily loss cap. Returns (ok, why).
+    Never raises. Exits are NOT gated by this — they always run."""
+    if not _ks_check.gate(_live.LANE):
+        return False, "killswitch gate closed for %s" % _live.LANE
+    # The ledger must PARSE: engine._load() returns a blank ledger
+    # on corruption (paper's loud-log-and-blank rule), which for
+    # live positions would silently forget open positions and never
+    # exit them. Parse the file directly here instead.
+    try:
+        with open(engine.LEDGER_PATH) as f:
+            json.load(f)
+    except FileNotFoundError:
+        pass  # first run: no ledger yet is fine
+    except Exception as e:
+        return False, "live ledger unparseable: %s" % e
+    pnl = _live.today_pnl_usd(engine)
+    if pnl <= -_live.DAILY_LOSS_CAP_USD:
+        return False, ("daily loss cap hit (today pnl $%.2f <= -$%.2f)"
+                       % (pnl, _live.DAILY_LOSS_CAP_USD))
+    try:
+        sol = executor.get_balance_sol()
+    except Exception as e:
+        return False, "SOL balance unreadable: %s" % e
+    sol_price = executor.sol_price_usd()
+    if not sol_price or sol_price <= 0:
+        return False, "SOL price unknown — cannot size the stake"
+    stake_sol = _live.NOTIONAL_USD / sol_price
+    if sol < stake_sol + SOL_RESERVE:
+        return False, ("SOL balance %.4f < stake %.4f + reserve %.3f"
+                       % (sol, stake_sol, SOL_RESERVE))
+    return True, ""
+
+
+def _maybe_fail_streak_halt(engine):
+    """Fail-streak halt (Step 5): 5 consecutive executor failures
+    halt entries until a human re-enables. Returns True if the lane
+    was (or already is) halted by this rule. Never raises. Exits
+    are unaffected — the caller runs them unconditionally."""
+    try:
+        if engine._live_fail_streak.count >= _live.FAIL_STREAK_HALT:
+            if not _ks_check.is_halted(_live.LANE):
+                _ks_check.halt_lane(
+                    _live.LANE,
+                    "fail-streak: %d consecutive executor failures"
+                    % engine._live_fail_streak.count)
+                logger.warning(
+                    "LIVE FAIL-STREAK HALT: %d consecutive executor "
+                    "failures — entries stopped, exits still drain, "
+                    "human-only re-enable",
+                    engine._live_fail_streak.count)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _heartbeat_loop():
+    """Emit the live-trader heartbeat on an independent 2-second
+    thread (filter evaluation can block the trading loop on RPC
+    round-trips; the cadence proof must not depend on it)."""
+    while True:
+        try:
+            _hb.beat("grad-select-live-trader")
+        except Exception:
+            pass
+        time.sleep(_hb.BEAT_INTERVAL_S)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", action="store_true",
+                    help="arm live sends (requires the deployment "
+                         "marker to carry \"armed\": true; without "
+                         "this flag the trader runs dry-run)")
+    args = ap.parse_args()
+    if not _HAS_DEPS:
+        logger.warning("grad-select-live deps missing: %s", _IMPORT_ERROR)
+        return 1
+    home = os.environ.get(
+        "FOREX_AGENT_HOME", os.path.expanduser("~/.forex-agent"))
+    key_file = os.environ.get(
+        "MEMECOIN_WALLET_KEY_FILE",
+        os.path.join(home, "live", "keypair.json"))
+    expected = os.environ.get("MEMECOIN_WALLET_PUBKEY", "").strip()
+    if not expected:
+        logger.warning("MEMECOIN_WALLET_PUBKEY is not set — refusing "
+                       "to run without the expected wallet identity")
+        return 1
+    provider = FileKeyProvider(key_file)
+    executor = MainnetExecutor(
+        key_provider=provider, rpc=MainnetRPC(_rpc_url()),
+        expected_pubkey=expected, live_home=home)
+    try:
+        wallet = executor.connect()
+    except Exception as e:
+        # No deployment marker (or bad RPC/key) — fail closed.
+        # This is the refusal that keeps the live trader off the
+        # build VM: that machine has no live/deployment.json.
+        logger.warning("live executor refused to connect: %s", e)
+        return 1
+    if args.arm:
+        try:
+            executor.arm_live()
+        except Exception as e:
+            logger.warning("live executor refused to arm: %s", e)
+            return 1
+        logger.warning("LIVE ARMED: real mainnet sends enabled for "
+                       "wallet %s", wallet)
+    else:
+        logger.warning("DRY-RUN: quotes + simulates only, no sends "
+                       "(pass --arm to enable live sends)")
+    engine = _live.make_live_engine(home, executor)
+    state = engine.ensure_ledger()
+    # Materialize the killswitch lane entry (not halted) so the
+    # lane is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_live.LANE)
+    except Exception:
+        pass
+    threading.Thread(target=_heartbeat_loop,
+                     name="grad-select-live-heartbeat",
+                     daemon=True).start()
+    feed = _pp.PumpPortalFeed()
+    feed.start()
+
+    # Armed positions (peak >= 1.5x) are priced by PUSH, exactly
+    # as in the paper trader; the loop's poll is the backstop.
+    def _armed_price_fn(chain, mint, spot_index=None):
+        wp = watcher.price(mint)
+        if wp > 0:
+            return wp
+        return engine.quote_price(chain, mint, spot_index)
+
+    def _on_armed_price(mint, px, ts):
+        try:
+            engine.poll_exits(_armed_price_fn)
+        except Exception:
+            pass
+
+    def _on_watch_state(state, info):
+        logger.warning("grad-select-live armed watch: %s %s", state, info)
+        if state == "RECONCILED":
+            for mv in (info or {}).get("moved") or []:
+                rec = dict(mv)
+                rec["ts"] = time.time()
+                rec["source"] = "grad-select-live-armed-watch"
+                _rt.journal_reconciliation(rec)
+
+    watcher = _aw.ArmedWatcher(on_price=_on_armed_price,
+                               on_state=_on_watch_state)
+    watcher.start()
+
+    def _observe(items):
+        # P8: births open dossiers; migrations stamp them.
+        _dossiers.observe_births(items)
+        _dossiers.observe_migrations(items)
+        # Select filters: fold births/migrations into the local
+        # index at once (the recorder files catch up behind it).
+        _sel.note_items(items)
+        # P4: record births + migrations for offline replay,
+        # tagged with the LIVE lane (this trader is the observer).
+        if _recorder is not None:
+            for item in items or []:
+                try:
+                    src = (item or {}).get("source")
+                    if src == "pumpportal-new":
+                        kind = "birth"
+                    elif src == "pumpportal-migration":
+                        kind = "migration"
+                    else:
+                        continue
+                    body = dict(item)
+                    body.setdefault("lane", _live.LANE)
+                    _recorder.record(kind, body)
+                except Exception:
+                    continue
+
+    # Entry thread: wake on stream arrival and run a fresh-only
+    # scan (filters evaluated inline for this cycle's candidates,
+    # then live entries). Watchlist retries and the GT backfill
+    # stay in the main loop.
+    def _entry_loop():
+        while True:
+            try:
+                q = getattr(feed, "_q", None)
+                if q is not None and not q.empty():
+                    ok, why = _preflight(executor, engine)
+                    if ok:
+                        _sel.scan_once(engine, feed=feed, gt_rows=None,
+                                       on_items=_observe, fresh_only=True)
+                    else:
+                        logger.warning("live entries skipped "
+                                       "(preflight): %s", why)
+                else:
+                    time.sleep(0.1)
+            except Exception:
+                logger.exception("grad-select-live entry loop failed")
+                time.sleep(1.0)
+
+    threading.Thread(target=_entry_loop, name="grad-select-live-entry",
+                     daemon=True).start()
+
+    logger.warning("grad-select-live-trader started (%s, bankroll "
+                   "$%.2f, state %s, verdict sample %d closes)",
+                   "LIVE" if not executor.dry_run else "dry-run",
+                   float(state.get("bankroll") or 0), state.get("state"),
+                   _live.VERDICT_SAMPLE_CLOSES)
+    last_gt = 0.0
+    while True:
+        try:
+            gt_rows = None
+            now = time.time()
+            if now - last_gt >= GT_BACKFILL_EVERY_S:
+                last_gt = now
+                gt_rows = engine.fetch_candidates(GT_BACKFILL_PAGES)
+            ok, why = _preflight(executor, engine)
+            if ok:
+                res = _sel.scan_once(engine, feed=feed, gt_rows=gt_rows,
+                                     on_items=_observe)
+            else:
+                logger.warning("live entries skipped (preflight): %s",
+                               why)
+                res = {"stream": 0, "opened": 0, "select_rejected": 0,
+                       "select_reasons": {}}
+            # Exits ALWAYS run — even halted, even when preflight
+            # fails — so open positions drain, never strand.
+            closes = engine.poll_exits(_armed_price_fn)
+            # Fail-streak halt (Step 5): the gate check in
+            # _preflight enforces it from the next cycle (both
+            # loops); exits above are unaffected.
+            _maybe_fail_streak_halt(engine)
+            watcher.set_positions(
+                _aw.armed_positions(engine.open_positions()))
+            if res.get("opened") or closes or \
+                    res.get("select_rejected"):
+                st = engine.account_state()
+                logger.warning(
+                    "grad-select-live-trader: %d opened, %d "
+                    "filter-rejected %s; %d closes; cash $%.2f, "
+                    "%d open, state %s, fail-streak %d, dry-run %s",
+                    res.get("opened", 0),
+                    res.get("select_rejected", 0),
+                    res.get("select_reasons") or {},
+                    len(closes), st.get("bankroll", 0.0),
+                    st.get("n_open", 0), st.get("state"),
+                    engine._live_fail_streak.count,
+                    executor.dry_run)
+        except Exception:
+            logger.exception("grad-select-live-trader loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

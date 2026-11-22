@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""14-day smart-wallet registry rotation (2026-10-17 rebuild).
+
+Re-scores every wallet on trailing-30d FOLLOWER P&L (what following the
+wallet would have done to YOUR money — not the wallet's own P&L):
+
+  MUTE (auto, reversible, loud): n_follows >= 10 and avg_net <= -0.20.
+      A proven loser as a follow target stops feeding the watcher.
+  STALE (report only): zero buys in 30d. Dormant, not necessarily dead —
+      the user decides via /smartremove; never auto-muted.
+  KEEP: everything else.
+
+Never deletes wallets — mute only, and unmuting is one flag flip.
+Idempotent: records last_rotation_ts; no-ops unless 14+ days elapsed
+(first run always acts). Safe to run daily from cron.
+
+Research cadence: re-score every 14 days, rotate 3-5 wallets/month.
+Discovery: reports whether the proposals file has fresh candidates.
+"""
+import json
+import logging
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "daemon", "launch_scanner"))
+from follower_grader import grade_followers  # noqa: E402
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("smart-registry-rotate")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+REGISTRY = os.path.join(HOME, "launch_scanner", "smart_wallets.json")
+GRADES = os.path.join(HOME, "launch_scanner", "smart_wallet_grades.json")
+PROPOSALS = os.path.join(HOME, "launch_scanner", "discovery_proposals.json")
+STATE = os.path.join(HOME, "launch_scanner", "rotation_state.json")
+
+ROTATION_DAYS = 14.0
+MUTE_MIN_FOLLOWS = 10
+MUTE_MAX_AVG_NET = -0.20
+WINDOW_DAYS = 30.0
+
+
+def rotation_action(n_follows, avg_net, n_buys_30d, already_muted):
+    """Pure rule: -> 'mute' | 'stale' | 'keep'. Never raises."""
+    try:
+        if already_muted:
+            return "keep"  # leave muted wallets alone; user unmutes
+        n_follows = int(n_follows or 0)
+        avg_net = float(avg_net or 0.0)
+        n_buys_30d = int(n_buys_30d or 0)
+        if n_follows >= MUTE_MIN_FOLLOWS and avg_net <= MUTE_MAX_AVG_NET:
+            return "mute"
+        if n_buys_30d == 0:
+            return "stale"
+        return "keep"
+    except Exception:
+        return "keep"
+
+
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else default
+    except Exception:
+        return default
+
+
+def _due():
+    st = _load_json(STATE, {})
+    last = float(st.get("last_rotation_ts") or 0)
+    if last <= 0:
+        return True  # first run always acts
+    return (time.time() - last) >= ROTATION_DAYS * 86400.0
+
+
+def main():
+    force = "--force" in sys.argv
+    dry = "--dry-run" in sys.argv
+    if not force and not _due():
+        print("rotation not due (14d cadence); use --force to override")
+        return 0
+
+    registry = _load_json(REGISTRY, {})
+    grades = _load_json(GRADES, {})
+    per_wallet = grade_followers(grades, window_days=WINDOW_DAYS)
+    now = time.time()
+    cutoff = now - WINDOW_DAYS * 86400.0
+
+    actions = {}
+    muted_now = []
+    for wallet in sorted(registry):
+        s = per_wallet.get(wallet) or {}
+        rec = grades.get(wallet) or {}
+        n_buys = sum(1 for b in (rec.get("buys") or [])
+                     if float(b.get("buy_ts") or 0) >= cutoff)
+        already = bool((registry.get(wallet) or {}).get("muted"))
+        act = rotation_action(s.get("n_follows", 0), s.get("avg_net", 0.0),
+                              n_buys, already)
+        actions[wallet] = {
+            "action": act,
+            "n_follows": s.get("n_follows", 0),
+            "avg_net": s.get("avg_net", 0.0),
+            "win_rate": s.get("win_rate", 0.0),
+            "n_buys_30d": n_buys,
+            "label": (registry.get(wallet) or {}).get("label") or "",
+        }
+        if act == "mute" and not dry:
+            registry[wallet]["muted"] = True
+            registry[wallet]["muted_ts"] = now
+            registry[wallet]["muted_reason"] = (
+                "rotation 14d: follower avg %+.1f%% over %d follows"
+                % (s.get("avg_net", 0.0) * 100, s.get("n_follows", 0)))
+            muted_now.append(wallet)
+            logger.warning("ROTATION MUTE %s (%s): %s",
+                           wallet[:10],
+                           (registry.get(wallet) or {}).get("label"),
+                           registry[wallet]["muted_reason"])
+
+    if muted_now and not dry:
+        bak = REGISTRY + ".bak-%d" % int(now)
+        try:
+            with open(REGISTRY) as f:
+                old = f.read()
+            with open(bak, "w") as f:
+                f.write(old)
+            os.chmod(bak, 0o600)
+        except Exception as exc:
+            logger.warning("registry backup failed: %s", exc)
+        try:
+            tmp = REGISTRY + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(registry, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, REGISTRY)
+        except Exception as exc:
+            logger.error("registry save failed: %s", exc)
+            return 1
+
+    if not dry:
+        try:
+            with open(STATE, "w") as f:
+                json.dump({"last_rotation_ts": now}, f)
+            os.chmod(STATE, 0o600)
+        except Exception:
+            pass
+
+    # Discovery status
+    props = _load_json(PROPOSALS, {})
+    n_props = len(props.get("proposals") or []) if isinstance(props, dict) else 0
+
+    # Report
+    lines = ["🔄 Smart-wallet rotation (%s):" % ("DRY RUN" if dry else "14d") ]
+    for wallet, a in actions.items():
+        name = a["label"] or wallet[:10]
+        if a["action"] == "mute":
+            lines.append("• %s — MUTED: %d follows, avg %+.1f%%/follow" % (
+                name, a["n_follows"], a["avg_net"] * 100))
+        elif a["action"] == "stale":
+            lines.append("• %s — STALE: 0 buys in 30d (kept, needs /smartremove decision)" % name)
+        else:
+            lines.append("• %s — keep: %d follows, avg %+.1f%%" % (
+                name, a["n_follows"], a["avg_net"] * 100))
+    lines.append("")
+    lines.append("Discovery proposals: %d candidate(s)%s" % (
+        n_props, " — registry needs fresh blood" if n_props == 0 else ""))
+    if muted_now and not dry:
+        lines.append("Muted %d wallet(s); unmute by clearing the 'muted' flag "
+                     "in smart_wallets.json." % len(muted_now))
+    print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

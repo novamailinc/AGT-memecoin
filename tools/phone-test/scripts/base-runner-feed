@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+"""Signal Refinery Phase 1 — Base runner adapter (2026-10-17).
+
+Catches runners on BASE and feeds the ONE destination: the existing degen
+lane, as cards. The user gambles their OWN real money on these cards, so
+Base carries a HIGHER bar than Solana (fraud base rate, 1-holder mass,
+cheap wash — the per-chain roles from nova-design.md).
+
+What this is NOT:
+- No paper entries, no paper lanes, no positions on Base. The bot trades
+  nothing from this feed; every buy stays manual.
+- Not a launch sniper: it hunts MIDDLES, not births — coins already
+  running with a current volume surge, with a continuation check
+  confirming the run has room left (inverted whale-exit markers).
+  Pool age is not a filter on the trending source (it ranks by surge,
+  not recency); the $20M mcap cap + buyer/volume filters keep blue
+  chips and dust out. Base discovery latency of ~120s is fine for
+  that target (locked scope, 00-READ-FIRST-SCOPE.md).
+
+Six stages (per-chain retune of the nova-design.md funnel):
+  1. DISCOVERY: GeckoTerminal base/trending_pools (pages 1-2) PLUS the
+     Aerodrome Slipstream dex pool list (pages 1-2) — new_pools proved
+     dust-dominated (73 pools, 0 passes, 2026-10-18) and missed
+     Aerodrome entirely (~half of Base DEX volume). Rate-safe:
+     4 req / 120 s poll.
+  2. SURVIVAL PRE-FILTER: cheap fields only (age, liq, mcap, txns).
+  3. SAFETY VETOES: GoPlus token_security + Honeypot.is sell simulation,
+     via daemon/launch_scanner/safety.py. Fail-CLOSED on unknown
+     (user: "I don't want rug coin").
+  4. MANIPULATION FILTERS: escape from 1-holder mass (distinct-buyer
+     proxy), sell_presence (zero-sell = manufactured; >40% sell share =
+     distribution), wash-guard (buys/buyers ratio).
+  5. POSITIVE-EVIDENCE GATE: >=1 of volume acceleration / rising buy
+     share / organic buyer depth.
+  6. CONTINUATION CHECK + SCORE/TIER: inverted exit markers; only tier
+     "runner-pick" (score >= 60) reaches the lane.
+
+Guardrails:
+- Respects the per-chain feed kill switch (signal_bus.feed_enabled):
+  a paused Base feed sends no cards and publishes nothing.
+- Own daily card budget: MAX_CARDS_PER_DAY = 1. Solana's feed is
+  untouched (its own counter, its own budget).
+- Every fired signal is published to the normalized signal bus with
+  chain="base", source="base-runner" — cards carry chain + source
+  provenance and the tap journal attributes the user's manual buys.
+
+Free-only: stdlib HTTP, free public APIs (GeckoTerminal, GoPlus,
+Honeypot.is, DexScreener). No keys, no paid tiers.
+"""
+import json
+import logging
+import os
+import sys as _sys
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("base-runner-feed")
+
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+try:
+    from robust_http import get_json as _robust_get
+    _HAS_ROBUST = True
+except ImportError:
+    _HAS_ROBUST = False
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+try:
+    import safety as _safety
+    _HAS_SAFETY = True
+except ImportError:
+    _HAS_SAFETY = False
+try:
+    import lp_lock
+    _HAS_LPLOCK = True
+except ImportError:
+    _HAS_LPLOCK = False
+try:
+    from signal_bus import make_signal, publish, feed_enabled
+    _HAS_BUS = True
+except ImportError:
+    _HAS_BUS = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "base_runner_seen.json")
+OUTCOME_FILE = os.path.join(HOME, "base_runner_outcomes.json")
+DAILY_FILE = os.path.join(HOME, "base_runner_daily.json")
+
+POLL_SECS = 120  # trending runners move in minutes, not seconds
+MAX_CARDS_PER_DAY = 1  # Phase 1: higher bar, tiny budget; Solana untouched
+
+# ---- survival pre-filter knobs (HIGHER bar than Solana's degen-feed) ----
+MIN_AGE_MIN = 10        # runners, not births
+# No max age: trending_pools ranks by *current* volume surge, not
+# recency — pool age is not a quality signal on this source. Live
+# 2026-10-18: a 12h cap killed 100% of trending pools (youngest was
+# 23h old; median ~514d). The $20M mcap cap + buyer/volume filters
+# exclude blue chips; the surge itself is the "already running" proof.
+MAX_AGE_MIN = None
+MIN_LIQ_USD = 25_000.0  # RUNNER-ONLY rule 2026-10-18: serious liquidity everywhere.
+MIN_MCAP_USD = 50_000.0  # runner zone; Solana launches at $8k-$600k
+MAX_MCAP_USD = 20_000_000.0  # trending runners run bigger than launches
+MIN_M15_BUYERS = 15     # escape from the 1-holder mass (distinct buyers)
+MIN_M5_BUYERS = 3
+MIN_H1_VOL_USD = 5_000.0
+# ---- manipulation filter knobs ----
+MAX_BUYS_PER_BUYER_M15 = 6.0  # one wallet spamming buys = wash
+MAX_SELL_SHARE = 0.40         # >40% sells = distribution
+MIN_BUY_SELL_M5 = 1.2
+MIN_BUY_SELL_M15 = 1.2
+# ---- continuation + tier knobs ----
+MIN_BUY_SHARE_M5 = 0.60   # >=1.5:1 buy/sell, the inverted exit marker
+MIN_BUY_SHARE_M15 = 0.55
+MIN_VOL_HOLD = 0.35       # m15 volume vs h1 run-rate: not -40% off peak
+MIN_SCORE = 60.0          # Solana: 45. Higher bar, per the user's contract.
+
+DEXES = ("uniswap-v2-base", "uniswap-v3-base", "uniswap-v4-base",
+         "aerodrome", "aerodrome-base", "aerodrome-slipstream",
+         "aerodrome-slipstream-3", "base-swap", "sushiswap")
+
+
+def _http(url, timeout=12):
+    if _HAS_ROBUST:
+        try:
+            return _robust_get(url, timeout=timeout, tries=3)
+        except Exception:
+            return None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def _f(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _i(v):
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_trending(page):
+    return _http("https://api.geckoterminal.com/api/v2/networks/base/"
+                 "trending_pools?page=%d" % page)
+
+
+def _fetch_aerodrome(page):
+    # Aerodrome Slipstream (concentrated liquidity) — verified live
+    # 2026-10-18: slug "aerodrome-slipstream" returns 20 pools/page;
+    # bare "aerodrome" returns 0.
+    return _http("https://api.geckoterminal.com/api/v2/networks/base/dexes/"
+                 "aerodrome-slipstream/pools?page=%d" % page)
+
+
+def _parse_pools(data, now):
+    """Down to candidate dicts. Never raises."""
+    out = []
+    if not data or "data" not in data:
+        return out
+    for p in data["data"]:
+        try:
+            a = p.get("attributes", {}) or {}
+            rel = p.get("relationships", {}) or {}
+            dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
+            if dex_id and dex_id not in DEXES:
+                continue
+            base_id = ((rel.get("base_token") or {}).get("data") or {}
+                       ).get("id", "")
+            if not base_id.startswith("base_0x"):
+                continue
+            mint = base_id.replace("base_", "")
+            if len(mint) != 42:
+                continue
+            quote_id = ((rel.get("quote_token") or {}).get("data") or {}
+                        ).get("id", "")
+            if mint.lower() == quote_id.replace("base_", "").lower():
+                continue
+            created_str = a.get("pool_created_at", "")
+            try:
+                created = datetime.fromisoformat(
+                    created_str.replace("Z", "+00:00"))
+                age_min = (now - created).total_seconds() / 60
+            except Exception:
+                continue
+            if age_min < 0:
+                continue
+            tx = a.get("transactions") or {}
+            vol = a.get("volume_usd") or {}
+            chg = a.get("price_change_percentage") or {}
+            mcap = _f(a.get("market_cap_usd")) or _f(a.get("fdv_usd"))
+            out.append({
+                "mint": mint,
+                "name": (a.get("name", "?") or "?").split(" / ")[0],
+                "age_min": age_min,
+                "dex": dex_id or "?",
+                # Pool address = merge/dedupe key. Fall back to the
+                # top-level pool id (base_0x...) if attributes.address
+                # is ever empty, so dedupe never collapses distinct
+                # pools onto "".
+                "pair": (a.get("address", "") or ""
+                         or (p.get("id", "") or "").replace("base_", "")),
+                "mcap": mcap,
+                "fdv": _f(a.get("fdv_usd")),
+                "liq": _f(a.get("reserve_in_usd")),
+                "price_usd": _f(a.get("base_token_price_usd")),
+                "tx": {w: {"buys": _i((tx.get(w) or {}).get("buys")),
+                           "sells": _i((tx.get(w) or {}).get("sells")),
+                           "buyers": _i((tx.get(w) or {}).get("buyers")),
+                       }
+                       for w in ("m5", "m15", "m30", "h1")},
+                "vol": {w: _f(vol.get(w)) for w in ("m5", "m15", "m30", "h1")},
+                "chg": {w: _f(chg.get(w)) for w in ("m5", "m15", "h1")},
+            })
+        except Exception:
+            continue
+    return out
+
+
+def get_pools(pages=(1, 2)):
+    """Merge trending_pools + Aerodrome dex pools, deduped by pool address.
+
+    4 requests per 120s poll (~2 req/min, far under GeckoTerminal's
+    30/min free cap). Same token on two DEXes yields two pool entries;
+    the seen-set (by mint) in main() keeps it to one evaluation.
+    """
+    now = datetime.now(timezone.utc)
+    merged, seen_addr = [], set()
+    jobs = ([("trending", p) for p in pages]
+            + [("aerodrome", p) for p in pages])
+    for kind, page in jobs:
+        data = (_fetch_trending(page) if kind == "trending"
+                else _fetch_aerodrome(page))
+        if not data:
+            continue
+        for pool in _parse_pools(data, now):
+            addr = pool["pair"]
+            if addr in seen_addr:
+                continue
+            seen_addr.add(addr)
+            merged.append(pool)
+    return merged
+
+
+def passes_prefilter(pool):
+    """Survival pre-filter on cheap fields. (ok, reason)."""
+    if pool["age_min"] < MIN_AGE_MIN:
+        return False, "too young (<10m)"
+    if MAX_AGE_MIN is not None and pool["age_min"] > MAX_AGE_MIN:
+        return False, "age above cap"
+    if pool["liq"] < MIN_LIQ_USD:
+        return False, "liq < $25k"
+    if not (MIN_MCAP_USD <= pool["mcap"] <= MAX_MCAP_USD):
+        return False, "mcap out of runner zone"
+    m5, m15 = pool["tx"]["m5"], pool["tx"]["m15"]
+    if m15["buyers"] < MIN_M15_BUYERS:
+        return False, "1-holder mass"
+    if m5["buyers"] < MIN_M5_BUYERS:
+        return False, "thin m5"
+    if pool["vol"]["h1"] < MIN_H1_VOL_USD:
+        return False, "low h1 volume"
+    bs5 = m5["buys"] / m5["sells"] if m5["sells"] else (99.0 if m5["buys"] else 0)
+    bs15 = (m15["buys"] / m15["sells"]
+            if m15["sells"] else (99.0 if m15["buys"] else 0))
+    if bs5 < MIN_BUY_SELL_M5:
+        return False, "m5 selling"
+    if bs15 < MIN_BUY_SELL_M15:
+        return False, "m15 selling"
+    if pool["chg"]["m15"] < -30:
+        return False, "dumping"
+    return True, ""
+
+
+def check_safety(mint):
+    """EVM safety: GoPlus + Honeypot.is sell sim. Fail-CLOSED on unknown."""
+    if not _HAS_SAFETY:
+        return False, "safety module missing", {}
+    try:
+        rep = _safety.check_token("base", mint, timeout=12,
+                                  limits={"evm_sell_sim_enabled": True,
+                                          "evm_sell_sim_timeout_s": 3.0})
+    except Exception as e:
+        return False, "safety error: %s" % e, {}
+    if rep.get("unknown"):
+        # User contract (2026-10-11): "I don't want rug coin". Unknown
+        # safety never sends a card — same fail-closed rule as the
+        # Solana degen-feed.
+        return False, "SAFETY BLOCK: safety unknown (GoPlus unreachable)", {}
+    if not rep.get("passed"):
+        return False, "SAFETY BLOCK: %s" % "; ".join(rep["fails"][:2]), {}
+    intel = {"score": rep.get("score", 0), "flags": rep.get("flags") or []}
+    return True, "ok", intel
+
+
+def passes_manipulation(pool):
+    """Stage 4: manipulation filters. (ok, reason)."""
+    m15, m5 = pool["tx"]["m15"], pool["tx"]["m5"]
+    # Escape from 1-holder mass + wash-guard: too many buys per distinct
+    # buyer means one wallet spamming (cheap on Base).
+    if m15["buyers"] > 0 and m15["buys"] / m15["buyers"] > MAX_BUYS_PER_BUYER_M15:
+        return False, "wash: buys/buyer %.1f" % (
+            m15["buys"] / m15["buyers"])
+    # Sell presence: zero sells = manufactured; >40% sells = distribution.
+    n = m15["buys"] + m15["sells"]
+    sell_share = m15["sells"] / n if n else 0
+    if m15["sells"] == 0 and m15["buys"] > 0:
+        return False, "no sells (manufactured)"
+    if sell_share > MAX_SELL_SHARE:
+        return False, "distribution (sell share %.0f%%)" % (sell_share * 100)
+    # Same sanity on m5.
+    n5 = m5["buys"] + m5["sells"]
+    if n5 and m5["sells"] / n5 > MAX_SELL_SHARE:
+        return False, "m5 distribution"
+    return True, ""
+
+
+def _buy_share(tx):
+    n = tx["buys"] + tx["sells"]
+    return tx["buys"] / n if n else 0.0
+
+
+def positive_evidence(pool):
+    """Stage 5: the 'already running' gate. At least one must hold."""
+    m5, m15 = pool["tx"]["m5"], pool["tx"]["m15"]
+    hits = []
+    bs5, bs15 = _buy_share(m5), _buy_share(m15)
+    # Volume acceleration: the current 5m outruns the 15m run-rate.
+    if pool["vol"]["m15"] > 0 and pool["vol"]["m5"] >= 1.5 * (
+            pool["vol"]["m15"] / 3):
+        hits.append("volume accelerating")
+    # Buy share rising: fresh demand, not fading.
+    if bs5 > bs15 + 0.05:
+        hits.append("buy share rising %.0f%%→%.0f%%" % (bs15 * 100, bs5 * 100))
+    # Organic buyer depth: many distinct buyers, modest per-wallet size.
+    if m15["buyers"] >= 25 and m15["buys"] / max(m15["buyers"], 1) < 3:
+        hits.append("%d distinct m15 buyers" % m15["buyers"])
+    return hits
+
+
+def continuation_ok(pool):
+    """Stage 6: inverted whale-exit markers — the run has room left."""
+    m5, m15 = pool["tx"]["m5"], pool["tx"]["m15"]
+    bs5, bs15 = _buy_share(m5), _buy_share(m15)
+    if bs5 < MIN_BUY_SHARE_M5:
+        return False, "m5 buy share %.0f%% (<%.0f%%)" % (
+            bs5 * 100, MIN_BUY_SHARE_M5 * 100)
+    if bs15 < MIN_BUY_SHARE_M15:
+        return False, "m15 buy share fading"
+    h1_rate = pool["vol"]["h1"] / 4  # per-15-min run rate over the hour
+    if h1_rate > 0 and pool["vol"]["m15"] < MIN_VOL_HOLD * h1_rate:
+        return False, "volume %d%% off pace" % (
+            int(100 * (1 - pool["vol"]["m15"] / h1_rate)))
+    if pool["chg"]["m15"] < -20:
+        return False, "distribution wick"
+    return True, ""
+
+
+def score_pool(pool, ev_hits):
+    """0-100 runner score. Higher bar: card tier needs >= 60."""
+    m5, m15 = pool["tx"]["m5"], pool["tx"]["m15"]
+    bs5 = _buy_share(m5)
+    reasons, score = [], 0.0
+
+    # Buy pressure (0-30): the inverted exit marker, weighted heaviest.
+    if bs5 >= 0.85:
+        score += 30; reasons.append("m5 buy share %d%% 🚀" % (bs5 * 100))
+    elif bs5 >= 0.75:
+        score += 24; reasons.append("m5 buy share %d%%" % (bs5 * 100))
+    elif bs5 >= 0.60:
+        score += 16; reasons.append("m5 buy share %d%%" % (bs5 * 100))
+    else:
+        score += 8
+
+    # Buyer depth (0-25): distinct buyers = escape velocity.
+    b = m15["buyers"]
+    if b >= 60:
+        score += 25; reasons.append("%d distinct buyers 🔥" % b)
+    elif b >= 35:
+        score += 18; reasons.append("%d distinct buyers" % b)
+    elif b >= 15:
+        score += 10; reasons.append("%d distinct buyers" % b)
+
+    # Sustained pressure (0-20): m15 must agree with m5.
+    bs15 = _buy_share(m15)
+    if bs15 >= 0.75:
+        score += 20; reasons.append("sustained m15 pressure")
+    elif bs15 >= 0.65:
+        score += 14
+    elif bs15 >= 0.55:
+        score += 8
+
+    # Volume acceleration (0-15).
+    if pool["vol"]["m15"] > 0 and pool["vol"]["m5"] >= 1.5 * (
+            pool["vol"]["m15"] / 3):
+        score += 15; reasons.append("volume accelerating")
+    elif pool["vol"]["m5"] >= pool["vol"]["m15"] / 3:
+        score += 8
+
+    # FDV zone (0-10): middles — big enough to be real, small enough
+    # to run. Trending runners run bigger than fresh launches, so the
+    # zone stretches to $20M (partial credit past $5M).
+    mcap = pool["mcap"]
+    if 150_000 <= mcap <= 2_000_000:
+        score += 10; reasons.append("mcap $%dk (runner zone)" % (mcap / 1000))
+    elif 50_000 <= mcap <= 5_000_000:
+        score += 6
+    elif 5_000_000 < mcap <= 20_000_000:
+        score += 3; reasons.append("mcap $%.1fM (large runner)" % (mcap / 1e6))
+
+    # Evidence gate reasons ride along for the card + bus.
+    reasons.extend(ev_hits[:2])
+    return round(score, 1), reasons
+
+
+def tap_callback(mint):
+    """The '📍 I bought this' callback: track:base:br:<mint>.
+
+    Short source code keeps callback_data under Telegram's 64-byte cap
+    (full "track:base:base-runner:<mint>" 400s at send time). The tap
+    parser resolves "br" back to "base-runner" so the journal keeps full
+    (chain, source) attribution."""
+    try:
+        from signal_bus import track_callback
+        return track_callback("base", "base-runner", mint)
+    except Exception:
+        return "track:base:br:%s" % mint
+
+
+def feed_live():
+    """True when the per-chain kill switch leaves the Base feed on."""
+    if not _HAS_BUS:
+        return True  # bus unavailable: fail-open, log below
+    return bool(feed_enabled("base"))
+
+
+def send_card(text, mint):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[
+                {"text": "📋 Copy CA",
+                 "copy_text": {"text": mint}},
+                {"text": "📍 I bought this",
+                 "callback_data": tap_callback(mint)},
+            ]],
+        })
+        payload = {"chat_id": "6883056760", "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def fmt(v):
+    if not v:
+        return "?"
+    if v >= 1e6:
+        return "$%.1fM" % (v / 1e6)
+    if v >= 1e3:
+        return "$%.0fk" % (v / 1e3)
+    return "$%.0f" % v
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+
+def daily_budget_left():
+    """Own daily card budget (Solana's counter is untouched)."""
+    today = time.strftime("%Y-%m-%d")
+    d = load_json(DAILY_FILE, {})
+    if d.get("date") != today:
+        d = {"date": today, "count": 0}
+    return MAX_CARDS_PER_DAY - d.get("count", 0), d
+
+
+def bump_daily(d):
+    d["count"] = d.get("count", 0) + 1
+    save_json(DAILY_FILE, d)
+
+
+def record_outcome(pool, score):
+    """Card anchor price for later measurement. Cheap: GT already gave
+    base_token_price_usd; DexScreener enriches on demand at card time."""
+    try:
+        outs = load_json(OUTCOME_FILE, {})
+        outs[pool["mint"]] = {
+            "symbol": pool["name"], "alert_ts": time.time(),
+            "alert_price": pool.get("price_usd", 0),
+            "alert_mcap": pool["mcap"], "score": score,
+            "age_min": round(pool["age_min"], 1),
+        }
+        save_json(OUTCOME_FILE, outs)
+    except Exception:
+        pass
+
+
+def build_text(pool, score, reasons, safety_reason, lp_badge=""):
+    m5 = pool["tx"]["m5"]
+    supply = ""
+    if _HAS_LPLOCK:
+        try:
+            supply = lp_lock.token_supply("base", pool["mint"])
+        except Exception as exc:
+            logger.warning("supply lookup failed: %s", exc)
+    if _HAS_CARDS:
+        return build_card(
+            symbol=pool["name"], score=score, mint=pool["mint"],
+            entry_price=pool.get("price_usd", 0),
+            current_price=pool.get("price_usd", 0),
+            mcap=pool["mcap"] or pool["fdv"], liquidity=pool["liq"],
+            buyers=m5.get("buyers", 0), age_min=pool["age_min"],
+            buys_5m=m5.get("buys", 0), sells_5m=m5.get("sells", 0),
+            safety=safety_reason, is_runner=True, lp_lock=lp_badge,
+            supply=supply,
+            risk_note=("⛓ BASE runner — the bot does not trade Base; "
+                       "this card is a signal only. 💸 If this rugs, "
+                       "you lose your full stake."),
+            chain="base", source="base-runner",
+        )
+    lines = [
+        "🏃 BASE RUNNER — $%s (score %.0f/100)" % (pool["name"], score),
+        "⚡ ALREADY RUNNING — %d min old" % pool["age_min"],
+        "⚠️ HIGH RISK — real-money gamble, not a pick.",
+        "CA: %s" % pool["mint"],
+        "mcap %s · liq %s" % (fmt(pool["mcap"] or pool["fdv"]),
+                              fmt(pool["liq"])),
+        "5m: %d buys / %d sells (%d buyers)" % (
+            m5.get("buys", 0), m5.get("sells", 0), m5.get("buyers", 0)),
+    ]
+    for r in reasons[:5]:
+        lines.append("  • %s" % r)
+    lines.append("🛡️ safety: %s" % safety_reason)
+    if lp_badge:
+        lines.append(lp_badge)
+    return "\n".join(lines)
+
+
+def main():
+    logger.warning("base-runner feed started (trending-source, signals-only)")
+    seen = set(load_json(SEEN_FILE, []))
+    poll_n = 0
+    feed_paused_logged = False
+    while True:
+        try:
+            # Per-chain kill switch: a paused Base feed sends no cards and
+            # publishes nothing. Solana is never touched by this check.
+            if not feed_live():
+                if not feed_paused_logged:
+                    logger.warning("base feed PAUSED by kill switch — "
+                                   "sleeping, no cards, no bus publish")
+                    feed_paused_logged = True
+                time.sleep(120)
+                continue
+            feed_paused_logged = False
+
+            left, daily = daily_budget_left()
+            if left <= 0:
+                time.sleep(300)
+                continue
+
+            poll_n += 1
+            # Trending runners move in minutes: trending_pools pages 1-2
+            # + Aerodrome Slipstream pages 1-2 every 120s poll.
+            # 4 requests/poll = ~2 req/min, far under GeckoTerminal's
+            # 30/min free cap.
+            pools = get_pools((1, 2))
+
+            candidates = []
+            for pool in pools:
+                if pool["mint"] in seen:
+                    continue
+                seen.add(pool["mint"])
+                ok, why = passes_prefilter(pool)
+                if not ok:
+                    continue
+                ok, why = passes_manipulation(pool)
+                if not ok:
+                    continue
+                candidates.append(pool)
+
+            # Safety in parallel (I/O bound); fail-CLOSED on unknown.
+            results = []
+            if candidates:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    results = list(ex.map(
+                        check_safety, [p["mint"] for p in candidates]))
+
+            for pool, (safe, safety_reason, intel) in zip(candidates,
+                                                          results):
+                if not safe:
+                    logger.warning("SAFETY BLOCK %s: %s", pool["name"],
+                                   safety_reason)
+                    continue
+                ev_hits = positive_evidence(pool)
+                if not ev_hits:
+                    logger.warning("SKIP %s: no positive evidence",
+                                   pool["name"])
+                    continue
+                ok, why = continuation_ok(pool)
+                if not ok:
+                    logger.warning("SKIP %s: continuation %s",
+                                   pool["name"], why)
+                    continue
+                score, reasons = score_pool(pool, ev_hits)
+                if score < MIN_SCORE:
+                    logger.warning("SKIP %s: score %.0f < %.0f",
+                                   pool["name"], score, MIN_SCORE)
+                    continue
+                left, daily = daily_budget_left()
+                if left <= 0:
+                    break
+                # LP-lock badge: display-only, runs only for the winning
+                # candidate (<=1/day). Never blocks the card (fail-soft).
+                lp_badge = ""
+                if _HAS_LPLOCK:
+                    try:
+                        lp_badge = lp_lock.badge(lp_lock.check_lp_lock(
+                            "base", pool.get("dex", ""),
+                            pool.get("pair", "")))
+                    except Exception as exc:
+                        logger.warning("lp_lock badge failed: %s", exc)
+                card = build_text(pool, score, reasons, safety_reason,
+                                  lp_badge)
+                if send_card(card, pool["mint"]):
+                    bump_daily(daily)
+                    record_outcome(pool, score)
+                    if _HAS_BUS:
+                        m5 = pool["tx"]["m5"]
+                        publish(make_signal(
+                            "base", "base-runner", pool["mint"],
+                            symbol=pool["name"], score=score,
+                            tier="runner-pick", age_min=pool["age_min"],
+                            mcap=pool["mcap"] or pool["fdv"],
+                            liquidity=pool["liq"],
+                            buys=m5["buys"], sells=m5["sells"],
+                            evidence={"safety": safety_reason,
+                                      "reasons": reasons[:4],
+                                      "dex": pool["dex"],
+                                      "m15_buyers": pool["tx"]["m15"]["buyers"]}))
+                    logger.warning("BASE RUNNER CARD %s score=%.0f age=%.0fm",
+                                   pool["name"], score, pool["age_min"])
+                    # Paper mirror (2026-10-17): $1 paper position with
+                    # honest per-chain costs + the user's exit ladder.
+                    # Never affects the card.
+                    try:
+                        from mirror import mirror_card
+                        opened, why = mirror_card(
+                            "base", "base-runner", pool["mint"],
+                            symbol=pool["name"], score=score,
+                            tier="runner-pick",
+                            mcap=pool["mcap"] or pool["fdv"],
+                            liquidity=pool["liq"],
+                            evidence={"safety": safety_reason,
+                                      "reasons": reasons[:4],
+                                      "age_min": pool.get("age_min", 0)})
+                        if not opened:
+                            logger.warning("mirror skip %s: %s",
+                                           pool["mint"][:12], why)
+                    except Exception:
+                        pass
+                    break  # daily budget is 1; done for today
+            save_json(SEEN_FILE, sorted(seen)[-2000:])
+        except Exception:
+            logger.exception("base-runner loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

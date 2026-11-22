@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Helius quiet-period control (2026-11-20).
+
+Sets, clears, or reports the fleet-wide Helius quiet period
+(~/.forex-agent/helius_quiet.json). While quiet is active the
+pacer refuses every Helius token fleet-wide, so entries run on
+the public-RPC fallback only and the armed-watch WSS handshake
+pauses; after `until`, exactly one caller claims the single
+probe — a success clears quiet, a 429 re-enters quiet for 12h.
+
+This script only writes the state file. It never makes network
+calls, never reads a key, and never touches a daemon. Restart
+the daemons once after deploying this code so they load the
+quiet gate; after that, set/clear take effect immediately with
+no restart (every Helius caller re-reads the state file on each
+admission).
+
+Usage:
+  scripts/helius-quiet set --hours 12 --reason "penalty box cooldown"
+  scripts/helius-quiet clear --reason "operator clear"
+  scripts/helius-quiet status
+Exit 0 on success, 1 on a failed write, 2 on bad usage.
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from helius_ratelimit import (  # noqa: E402
+    quiet_clear, quiet_set, quiet_status)
+
+
+def _fmt_ts(ts):
+    try:
+        if not ts:
+            return "-"
+        return datetime.datetime.fromtimestamp(
+            float(ts), datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return "-"
+
+
+def _print_status(st):
+    now = time.time()
+    active = bool(st.get("active"))
+    until = float(st.get("until", 0.0) or 0.0)
+    if active and until > now:
+        left = until - now
+        print("quiet ACTIVE until %s (%.1fh left)"
+              % (_fmt_ts(until), left / 3600.0))
+    elif active:
+        print("quiet EXPIRED (probe pending — next caller probes)")
+    else:
+        print("quiet INACTIVE")
+    print("reason: %s" % (st.get("reason") or "-"))
+    print("set: %s" % _fmt_ts(st.get("set_ts")))
+    pr = st.get("probe_result")
+    if isinstance(pr, dict):
+        print("last probe: %s ok=%s"
+              % (_fmt_ts(pr.get("ts")), bool(pr.get("ok"))))
+    else:
+        print("last probe: none")
+    claimed = float(st.get("probe_claimed_until", 0.0) or 0.0)
+    if claimed > now:
+        print("probe claimed by pid %s until %s"
+              % (st.get("probe_claimed_by"), _fmt_ts(claimed)))
+    print(json.dumps(st, sort_keys=True))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Helius quiet-period control.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_set = sub.add_parser("set", help="start a quiet period")
+    p_set.add_argument("--hours", type=float, default=12.0)
+    p_set.add_argument("--reason", default="operator set")
+    p_clear = sub.add_parser("clear", help="end the quiet period")
+    p_clear.add_argument("--reason", default="operator clear")
+    sub.add_parser("status", help="show the quiet state")
+    args = ap.parse_args(argv)
+    home = os.environ.get("FOREX_AGENT_HOME",
+                          "/home/hatch/.forex-agent")
+    if args.cmd == "set":
+        if args.hours <= 0:
+            print("error: --hours must be > 0", file=sys.stderr)
+            return 2
+        st = quiet_set(args.hours, args.reason, home=home)
+        if st is None:
+            print("error: could not write the quiet state file",
+                  file=sys.stderr)
+            return 1
+        print("quiet SET for %.1fh until %s (reason: %s)"
+              % (args.hours, _fmt_ts(st.get("until")),
+                 st.get("reason") or "-"))
+        print("Helius attempts are now refused fleet-wide; entries "
+              "run on the public fallback. Probe at %s."
+              % _fmt_ts(st.get("until")))
+        return 0
+    if args.cmd == "clear":
+        st = quiet_clear(args.reason, home=home)
+        if st is None:
+            print("error: could not write the quiet state file",
+                  file=sys.stderr)
+            return 1
+        print("quiet CLEARED (reason: %s)" % (st.get("reason") or "-"))
+        return 0
+    _print_status(quiet_status(home=home))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

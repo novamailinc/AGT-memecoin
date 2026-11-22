@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Smart-SELECT trader daemon (2026-10-27, measurement-only test).
+
+Runs the smart_select lane (daemon/launch_scanner/smart_select.py):
+smart-watcher bus fires are the TRIGGER, and a coin enters ONLY if
+it passes ALL FOUR grad_select evidence filters (serial deployer
+>= 3/24h rejected; fast curve TTG <= 3600s AND <= 250 curve
+signatures; canonical pools only; copycat tickers >= 3/24h
+rejected) — all fail-closed on unknown. NO safety gate, NO veto
+beyond those filters. $1 paper per coin, $100 bankroll, no daily
+cap, standard ladder exits (50%@2x / 25%@3x / 25% trail 30% /
+-50% stop / 24h time stop), 25% cost gate. NO cards in v1 —
+measurement only.
+
+Detection: the normalized signal bus (~/.forex-agent/
+launch_scanner/signal_bus.jsonl), polled every ~2s; exits
+evaluated every ~5s by live quote (poll-only — no PumpPortal
+feed, no GeckoTerminal backfill, no armed watcher; this lane
+consumes fires, it does not hunt graduations).
+
+Pre-registered verdict: at 100 closes, expectancy <= 0 halts the
+lane permanently (killswitch lane "smart_select", human-only
+re-enable); reported raw + ex-top-1 + same-period head-to-head
+vs grad_select on per-$1 expectancy and win rate.
+
+Paper only. Nothing here touches real money, keys, or wallets.
+Free-only: local bus file + recorder files + DexScreener/Helius
+via the engine's existing paths.
+"""
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("smart-select-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import smart_select as _sel
+    import killswitch as _ks_check
+    import heartbeat as _hb
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+SCAN_SECS = 2
+EXIT_SECS = 5
+
+
+def _heartbeat_loop():
+    """Emit the smart-select-trader heartbeat on an independent
+    thread so a slow scan never blocks liveness reporting."""
+    while True:
+        try:
+            _hb.beat("smart-select-trader")
+        except Exception:
+            pass
+        time.sleep(_hb.BEAT_INTERVAL_S)
+
+
+def main():
+    if not _HAS_DEPS:
+        logger.warning("smart-select deps missing: %s", _IMPORT_ERROR)
+        return 1
+    engine = _sel.make_engine()
+    engine.ensure_ledger()
+    # Materialize the killswitch lane entry (not halted) so the
+    # lane is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_sel.LANE)
+    except Exception:
+        pass
+    _sel.register_trial()
+    _sel.seed_checkpoint(engine)
+
+    threading.Thread(target=_heartbeat_loop,
+                     name="smart-select-heartbeat",
+                     daemon=True).start()
+
+    logger.warning("smart-select-trader up (bus poll %ss, exits %ss)",
+                   SCAN_SECS, EXIT_SECS)
+    last_exit = 0.0
+    while True:
+        try:
+            res = _sel.scan_once(engine)
+            if res.get("opened"):
+                logger.warning("smart_select opened %d (fires %d, "
+                               "select_rejected %d)",
+                               res["opened"], res["fires"],
+                               res["select_rejected"])
+            if res.get("select_rejected"):
+                logger.warning("smart_select select_rejected %d %s",
+                               res["select_rejected"],
+                               res["select_reasons"])
+            if res.get("parked"):
+                logger.warning("smart_select parked %d (awaiting "
+                               "graduation)", res["parked"])
+            if res.get("expired"):
+                logger.warning("smart_select parked expired %d "
+                               "(no migration record in window)",
+                               res["expired"])
+            now = time.time()
+            if now - last_exit >= EXIT_SECS:
+                last_exit = now
+                closes = engine.poll_exits()
+                if closes:
+                    logger.warning("smart_select closed %d",
+                                   len(closes))
+                rep = _sel.maybe_verdict_report(engine)
+                if rep:
+                    logger.warning("smart_select VERDICT REPORT: %s",
+                                   rep)
+        except Exception as e:
+            logger.warning("smart-select loop error: %s", e)
+        time.sleep(SCAN_SECS)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

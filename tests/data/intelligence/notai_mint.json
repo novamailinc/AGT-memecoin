@@ -1,0 +1,87 @@
+{
+ "capture": {
+  "method": "getAccountInfo",
+  "params_parsed": [
+   "8bGA7uQRGURruJLacPopiTSJtzS49VvLL7C5yDBpump",
+   {
+    "encoding": "jsonParsed",
+    "commitment": "confirmed"
+   }
+  ],
+  "params_base64": [
+   "8bGA7uQRGURruJLacPopiTSJtzS49VvLL7C5yDBpump",
+   {
+    "encoding": "base64",
+    "commitment": "confirmed"
+   }
+  ],
+  "mint": "8bGA7uQRGURruJLacPopiTSJtzS49VvLL7C5yDBpump",
+  "captured_at_utc": "2026-11-22T08:42:08Z",
+  "provider": "daemon/launch_scanner/reserves.py rpc() \u2014 Helius primary, public-RPC fallback; per-call provider recorded where the capture log showed it",
+  "note": "NOTAI mint, Token-2022, 404 bytes, 2,702,560 lamports, decimals 6, supply 989994050051393, mint/freeze authorities revoked, extensions metadataPointer + tokenMetadata (name 'This Is Not AI', symbol NOTAI). Raw base64 bytes cross-check the TLV decoder against the RPC's own jsonParsed parse."
+ },
+ "rpc_result_parsed": {
+  "context": {
+   "apiVersion": "4.4.0",
+   "slot": 472477698
+  },
+  "value": {
+   "data": {
+    "parsed": {
+     "info": {
+      "decimals": 6,
+      "extensions": [
+       {
+        "extension": "metadataPointer",
+        "state": {
+         "authority": null,
+         "metadataAddress": "8bGA7uQRGURruJLacPopiTSJtzS49VvLL7C5yDBpump"
+        }
+       },
+       {
+        "extension": "tokenMetadata",
+        "state": {
+         "additionalMetadata": [],
+         "mint": "8bGA7uQRGURruJLacPopiTSJtzS49VvLL7C5yDBpump",
+         "name": "This Is Not AI",
+         "symbol": "NOTAI",
+         "updateAuthority": null,
+         "uri": "https://ipfs.io/ipfs/QmSh1oFHAYXzv6Ugp7sFeUfJ1SdKPALxiKr6jAFci472K2"
+        }
+       }
+      ],
+      "freezeAuthority": null,
+      "isInitialized": true,
+      "mintAuthority": null,
+      "supply": "989994050051393"
+     },
+     "type": "mint"
+    },
+    "program": "spl-token-2022",
+    "space": 404
+   },
+   "executable": false,
+   "lamports": 2702560,
+   "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "rentEpoch": 18446744073709551615,
+   "space": 404
+  }
+ },
+ "rpc_result_base64": {
+  "context": {
+   "apiVersion": "4.4.0",
+   "slot": 472480919
+  },
+  "value": {
+   "data": [
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQd2u82SEAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHxzhlc7SrxcKiYUNrZTslQMu20wmmNVmsetcLjKCvvEwCmAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfHOGVztKvFwqJhQ2tlOyVAy7bTCaY1Wax61wuMoK+8OAAAAVGhpcyBJcyBOb3QgQUkFAAAATk9UQUlDAAAAaHR0cHM6Ly9pcGZzLmlvL2lwZnMvUW1TaDFvRkhBWVh6djZVZ3A3c0ZlVWZKMVNkS1BBTHhpS3I2akFGY2k0NzJLMgAAAAA=",
+    "base64"
+   ],
+   "executable": false,
+   "lamports": 2702560,
+   "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+   "rentEpoch": 18446744073709551615,
+   "space": 404
+  }
+ }
+}

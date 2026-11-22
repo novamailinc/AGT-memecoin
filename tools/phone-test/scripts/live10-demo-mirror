@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Live10 demo mirror (2026-11-02, user-ordered correction).
+
+The $10 demo account, split across the live lanes — NOT $10 each.
+One $10 total: $2.50 each to grad_select, tranche, tranche_protect
+and grad_raw (the four live entry lanes; momentum is tiny and
+negative all-time, hl_mirror is a mirror book, not an entry lane,
+so neither gets a share). Each lane's paper closes are mirrored
+at $2 stakes (raised from $1 on the user's 2026-11-05 order):
+every paper close contributes paper_pnl * (2/25),
+because all four lanes stake $25 paper per trade.
+
+Funding rule (what makes it behave like a real $10 account): a
+lane mirrors a close only while its balance holds at least $2.00
+(the next $2 stake). Below $2.00 the lane is unfunded: its closes
+are still recorded, but they contribute $0 — a broke lane cannot
+open new trades. Balances therefore cannot silently trade on
+money the account does not have.
+
+Pre-registered verdict (FUNDED-sample terms, fixed 2026-11-02
+after the first verdict fired on only 3 funded trades): a sample
+is 100 FUNDED closes mirrored after the sample start. Unfunded
+closes are recorded but never advance the sample — a broke lane's
+noise must not fire the verdict. At 100 funded closes, if mean
+scaled pnl per funded close in the sample <= 0 the mirror halts
+permanently (killswitch lane "live10", human-only re-enable);
+above zero it survives and keeps mirroring. Honest limit: if all
+four lanes go unfunded before 100 funded closes, no verdict
+fires — but the account is empty then, so there is nothing left
+to test. The verdict judges the account's money: funded closes'
+mean, over funded closes only.
+
+PAPER ONLY. This mirrors paper closes into a paper account. No
+real money, no real SOL, no real profit, no on-chain transfers.
+The ledger is USD-native; the SOL start amount ($10 at the live
+SOL price at first run) is stamped in the ledger header for
+display only. Free-only: reads local lane ledgers, nothing else.
+"""
+import json
+import logging
+import os
+import sys
+import time
+import urllib.request
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("live10-demo-mirror")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+try:
+    import killswitch as _ks
+except Exception:
+    _ks = None
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+LEDGER_PATH = os.path.join(HOME, "live10_demo_ledger.json")
+LANE = "live10"
+
+LANES = {
+    "grad_select": "grad_select_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+}
+SHARE_START = 2.50
+TOTAL_START = 10.00
+STAKE = 2.00
+PAPER_STAKE = 25.00
+SCALE = STAKE / PAPER_STAKE  # 0.08: $25 paper trade -> $2 live10 trade
+MIN_BALANCE = 2.00
+VERDICT_SAMPLE_CLOSES = 100
+POLL_SECS = 30
+SOL_FALLBACK_USD = 94.08
+
+
+def scaled_pnl(paper_pnl):
+    """Scale one paper close to live10 dollars."""
+    return round(float(paper_pnl or 0) * SCALE, 4)
+
+
+def new_ledger():
+    """Fresh live10 ledger, with the SOL start stamped (one free
+    price call at creation, fallback to the last known price).
+    Never raises."""
+    sol_usd = SOL_FALLBACK_USD
+    source = "fallback"
+    try:
+        req = urllib.request.Request(
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=solana&vs_currencies=usd",
+            headers={"User-Agent": "live10-demo-mirror/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            sol_usd = float(json.load(r)["solana"]["usd"])
+        source = "CoinGecko simple price"
+    except Exception:
+        pass
+    now = time.time()
+    return {
+        "created_ts": now,
+        "paper_only": True,
+        "total_start": TOTAL_START,
+        "sol_start": {"usd": TOTAL_START, "sol_usd": sol_usd,
+                      "sol": round(TOTAL_START / sol_usd, 5),
+                      "source": source, "ts": now,
+                      "note": "PAPER ONLY: launch-rate conversion for "
+                              "display; ledger is USD-native."},
+        "lanes": {lane: {"start": SHARE_START, "balance": SHARE_START,
+                         "closes": 0, "wins": 0, "net": 0.0,
+                         "funded_closes": 0}
+                  for lane in LANES},
+        "mirrored": [],
+        "seen": [],
+        "combined": {"closes": 0, "observed": 0, "wins": 0, "net": 0.0},
+        "verdict": None,
+        "verdict_sample": {"started_ts": now, "funded_start": 0,
+                           "net_start": 0.0},
+        "preregistered_verdict": {
+            "lane": LANE,
+            "sample_closes": VERDICT_SAMPLE_CLOSES,
+            "rule": ("A sample is %d FUNDED closes mirrored after "
+                     "the sample start; unfunded closes never "
+                     "advance it. At 100 funded closes, if mean "
+                     "scaled pnl per funded close in the sample "
+                     "<= 0 the mirror halts permanently "
+                     "(killswitch lane 'live10'); if > 0 it survives "
+                     "and keeps mirroring. Re-enable is human-only."
+                     % VERDICT_SAMPLE_CLOSES),
+            "terms": {"total_start": TOTAL_START,
+                      "share_per_lane": SHARE_START,
+                      "lanes": sorted(LANES),
+                      "stake_per_trade": STAKE,
+                      "paper_stake": PAPER_STAKE,
+                      "scale": SCALE,
+                      "min_balance": MIN_BALANCE,
+                      "paper_note": "PAPER ONLY — mirrors paper closes, "
+                                    "no real money, no real SOL."},
+            "registered_ts": now,
+        },
+    }
+
+
+def _atomic_write(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_ledger():
+    """Read the live10 ledger, creating it on first run ONLY.
+
+    Fail-closed: if a ledger file exists but cannot be read or
+    lacks the lane table, raise instead of overwriting it. The old
+    fail-open form silently re-seeded a fresh $10 ledger over the
+    account's real history on a restart (2026-11-04 11:14 WAT:
+    36 funded closes, 5 wins, net +$22.46 wiped to a fresh split).
+    A corrupt ledger must surface loudly in the log, never silently
+    reset. The poll loop catches the raise, logs it, and retries
+    without touching the file.
+    """
+    if not os.path.exists(LEDGER_PATH):
+        d = new_ledger()
+        try:
+            _atomic_write(LEDGER_PATH, d)
+        except Exception:
+            pass
+        return d
+    try:
+        with open(LEDGER_PATH) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and "lanes" in d:
+            return d
+    except Exception:
+        pass
+    # Live file present but unreadable (2026-11-04 15:08 WAT: a
+    # runtime restart left it 0 bytes). Fall back to the shadow
+    # copy the mirror rewrites after every successful poll; the
+    # caller rewrites the live file from it on the next poll. Never
+    # silently re-seed: with no usable shadow copy, raise loudly.
+    bak = LEDGER_PATH + ".bak"
+    try:
+        with open(bak) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and "lanes" in d:
+            logger.warning("live10 ledger unreadable, recovered "
+                           "from shadow copy %s", bak)
+            return d
+    except Exception:
+        pass
+    raise ValueError("live10 ledger unreadable and no usable shadow "
+                     "copy: %s" % LEDGER_PATH)
+
+
+def apply_close(led, lane, close):
+    """Mirror one paper close into the live10 ledger. Returns the
+    mirrored entry, or None when already seen. Never raises."""
+    try:
+        mint = str(close.get("mint") or "")
+        ts = float(close.get("close_ts") or 0)
+        key = "%s|%s|%s" % (lane, mint, ts)
+        seen = led.setdefault("seen", [])
+        if key in seen:
+            return None
+        paper = float(close.get("pnl_usd") or 0)
+        scaled = scaled_pnl(paper)
+        lane_state = led["lanes"][lane]
+        funded = float(lane_state.get("balance") or 0) >= MIN_BALANCE
+        contrib = scaled if funded else 0.0
+        comb = led["combined"]
+        comb["observed"] = int(comb.get("observed") or 0) + 1
+        if funded:
+            lane_state["balance"] = round(
+                float(lane_state.get("balance") or 0) + contrib, 4)
+            lane_state["closes"] = int(lane_state.get("closes") or 0) + 1
+            lane_state["funded_closes"] = int(
+                lane_state.get("funded_closes") or 0) + 1
+            if contrib > 0:
+                lane_state["wins"] = int(lane_state.get("wins") or 0) + 1
+            lane_state["net"] = round(
+                float(lane_state.get("net") or 0) + contrib, 4)
+            comb["closes"] = int(comb.get("closes") or 0) + 1
+            if contrib > 0:
+                comb["wins"] = int(comb.get("wins") or 0) + 1
+            comb["net"] = round(float(comb.get("net") or 0) + contrib, 4)
+        entry = {"lane": lane, "mint": mint,
+                 "symbol": str(close.get("symbol") or "")[:32],
+                 "close_ts": ts,
+                 "paper_pnl": round(paper, 4),
+                 "scaled_pnl": scaled,
+                 "contributed": contrib,
+                 "funded": funded,
+                 "balance_after": round(
+                     float(lane_state.get("balance") or 0), 4),
+                 "reason": str(close.get("closed_reason") or "")}
+        mirrored = led.setdefault("mirrored", [])
+        mirrored.append(entry)
+        led["mirrored"] = mirrored[-500:]
+        seen.append(key)
+        led["seen"] = seen[-5000:]
+        return entry
+    except Exception as e:
+        logger.warning("live10 apply_close failed: %s", e)
+        return None
+
+
+def maybe_verdict(led, ks=None):
+    """Attach the pre-registered verdict once per sample. A sample
+    is VERDICT_SAMPLE_CLOSES FUNDED closes mirrored after the
+    sample start (led["verdict_sample"]); unfunded closes never
+    advance it. Expectancy is mean scaled pnl per funded close
+    in the sample. Returns the verdict dict or None. Never
+    raises."""
+    try:
+        if led.get("verdict"):
+            return None
+        sample = led.get("verdict_sample") or {}
+        funded_start = int(sample.get("funded_start") or 0)
+        net_start = float(sample.get("net_start") or 0.0)
+        comb = led.get("combined") or {}
+        observed = int(comb.get("observed") or 0)
+        funded = int(comb.get("closes") or 0) - funded_start
+        net = float(comb.get("net") or 0) - net_start
+        if funded < VERDICT_SAMPLE_CLOSES:
+            return None
+        exp = net / funded if funded else 0.0
+        halt = exp <= 0
+        verdict = {"ts": time.time(), "n_closes": observed,
+                   "funded_closes": funded,
+                   "expectancy": round(exp, 6),
+                   "net_usd": round(net, 4),
+                   "action": ("HALT — sample expectancy <= 0"
+                              if halt else
+                              "SURVIVED — sample expectancy > 0"),
+                   "sample_closes": VERDICT_SAMPLE_CLOSES,
+                   "sample_start_ts": sample.get("started_ts")}
+        led["verdict"] = verdict
+        if halt and ks is not None:
+            try:
+                ks.halt_lane(
+                    LANE,
+                    "pre-registered verdict: sample expectancy "
+                    "%.4f <= 0 over %d funded closes (%d observed)"
+                    % (exp, funded, observed))
+            except Exception:
+                pass
+        logger.warning("live10 VERDICT at %d observed closes "
+                       "(%d funded in sample): expectancy %.4f -> %s",
+                       observed, funded, exp, verdict["action"])
+        return verdict
+    except Exception as e:
+        logger.warning("live10 maybe_verdict failed: %s", e)
+        return None
+
+
+def poll_once():
+    """One mirror cycle: fold every unseen paper close from the
+    four live lanes into the live10 ledger. Returns the number of
+    new mirrored entries. Never raises. A halted lane mirrors
+    nothing (the verdict stands)."""
+    try:
+        if _ks is not None and _ks.is_halted(LANE):
+            return 0
+    except Exception:
+        pass
+    led = load_ledger()
+    created = float(led.get("created_ts") or 0)
+    new = 0
+    for lane, fn in LANES.items():
+        try:
+            with open(os.path.join(HOME, fn)) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        closes = d.get("closes") or d.get("closed") or []
+        if isinstance(closes, dict):
+            closes = list(closes.values())
+        for c in closes:
+            if not isinstance(c, dict):
+                continue
+            # A new account mirrors only closes from its own
+            # lifetime: never backfill lane history predating it.
+            if float(c.get("close_ts") or 0) < created:
+                continue
+            if apply_close(led, lane, c) is not None:
+                new += 1
+    if new:
+        maybe_verdict(led, ks=_ks)
+    try:
+        _atomic_write(LEDGER_PATH, led)
+    except Exception as e:
+        logger.warning("live10 ledger write failed: %s", e)
+        return new
+    # Shadow copy for restart-truncation recovery: rewritten after
+    # every successful live write, best-effort. load_ledger falls
+    # back to it when the live file is unreadable.
+    try:
+        _atomic_write(LEDGER_PATH + ".bak", led)
+    except Exception as e:
+        logger.warning("live10 shadow write failed: %s", e)
+    return new
+
+
+def main():
+    logger.warning("live10-demo-mirror started (paper only, $10 split "
+                   "$2.50 x 4 live lanes, $2 stakes, verdict sample "
+                   "%d funded closes)", VERDICT_SAMPLE_CLOSES)
+    while True:
+        try:
+            n = poll_once()
+            if n:
+                led = load_ledger()
+                comb = led.get("combined") or {}
+                logger.warning(
+                    "live10: +%d mirrored, combined %d closes, %d "
+                    "wins, net $%+.2f",
+                    n, comb.get("closes", 0), comb.get("wins", 0),
+                    comb.get("net", 0.0))
+        except Exception:
+            logger.exception("live10 poll failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

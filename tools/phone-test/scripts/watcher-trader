@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Watcher trader daemon (2026-10-23, trading-arm build).
+
+Runs the watcher paper lane (daemon/launch_scanner/watcher_lane.py):
+the dedicated trading arm for smart-watcher CONVERGENCE fires.
+
+Realtime by construction:
+  * Intake: the loop watches the signal bus every ~1s and runs the
+    entry decision in the same cycle a convergence fire lands
+    (smart-watcher publishes the fire the moment its card sends;
+    it is itself woken by the logsSubscribe stream). No scan
+    timers, no candidate polling.
+  * Exits: the user's ladder evaluated every ~5s in the same loop
+    (F2 wired through the shared f2.check choke point).
+  * Heartbeat: this daemon beats into
+    ~/.forex-agent/run/heartbeat.json every 2 seconds (the user's
+    ordered cadence; shared daemon/launch_scanner/heartbeat.py —
+    merged with the watchdog's sections, never clobbering them).
+
+Pre-registered verdict: at 100 closes, expectancy <= 0 halts the
+lane permanently (killswitch lane "watcher", human-only
+re-enable).
+
+Paper only. NO Telegram cards — smart-watcher already sends them;
+this arm only trades. Nothing here touches real money or keys.
+"""
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("watcher-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import watcher_lane as _wl
+    import killswitch as _ks_check
+    import heartbeat as _hb
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+TICK_S = 1.0          # bus watch cadence — a fire is decided in-cycle
+EXIT_EVERY_S = 5.0    # ladder evaluation cadence (rt_sync's sweep par)
+
+
+def _heartbeat_loop():
+    """Emit the watcher-trader heartbeat on an independent 2-second
+    thread. Entry and safety checks can block the trading loop on
+    network calls; the cadence proof must not depend on that loop."""
+    while True:
+        try:
+            _hb.beat("watcher-trader")
+        except Exception:
+            pass
+        time.sleep(_hb.BEAT_INTERVAL_S)
+
+
+def main():
+    if not _HAS_DEPS:
+        logger.warning("watcher-trader deps missing: %s", _IMPORT_ERROR)
+        return 1
+    state = _wl.ensure_ledger()
+    # Register the lane's trial (idempotent).
+    _wl.register_trial()
+    # Materialize the killswitch lane entry (not halted) so the lane
+    # is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_wl.LANE)
+    except Exception:
+        pass
+    logger.warning("watcher-trader started (paper only, NO cards, "
+                   "bankroll $%.2f, state %s, verdict sample %d "
+                   "closes, intake: signal-bus convergence fires "
+                   "~1s watch, exits %.0fs, heartbeat %.0fs)",
+                   float(state.get("bankroll") or 0), state.get("state"),
+                   _wl.VERDICT_SAMPLE_CLOSES, EXIT_EVERY_S,
+                   _hb.BEAT_INTERVAL_S)
+    last_exit = 0.0
+    _hb.beat("watcher-trader")
+    threading.Thread(target=_heartbeat_loop, daemon=True,
+                     name="heartbeat-2s").start()
+    while True:
+        try:
+            now = time.time()
+            res = _wl.process_new_fires(now=now)
+            closes = []
+            if now - last_exit >= EXIT_EVERY_S:
+                last_exit = now
+                closes = _wl.poll_exits()
+            if res.get("fires") or res.get("dropped") or closes:
+                st = _wl.account_state()
+                logger.warning(
+                    "watcher-trader: %d fires (%d opened, %d blocked, "
+                    "%d pending, %d dropped); %d closes; cash $%.2f, "
+                    "%d open, state %s",
+                    res.get("fires", 0), res.get("opened", 0),
+                    res.get("blocked", 0), res.get("pending", 0),
+                    res.get("dropped", 0), len(closes),
+                    st.get("bankroll", 0.0), st.get("n_open", 0),
+                    st.get("state"))
+        except Exception:
+            logger.exception("watcher-trader loop failed")
+        time.sleep(TICK_S)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

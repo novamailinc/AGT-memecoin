@@ -1,0 +1,23 @@
+{
+  "symbol": "BTCUSDT",
+  "btc_beta": 0.0,
+  "n_candles": 18000,
+  "n_candidates": 62,
+  "bonferroni_alpha": 0.0008064516129032258,
+  "vol_filter": false,
+  "round_trip_cost": 0.002,
+  "discovered_on_train": [],
+  "validated_on_test": [],
+  "permutation": {
+    "n": 500,
+    "best_gross_t": 2.748624657278851,
+    "null_percentile": 0.746,
+    "null_p95": 3.228670248752644
+  },
+  "cost_drag": {
+    "mean_net_per_trade": -0.0019749346421676695,
+    "t_stat": -44.92373131407781,
+    "n": 12600
+  },
+  "kelly": null
+}

@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""degen-runner — hunts coins ALREADY RUNNING (path 3).
+
+The launch hunter (degen-feed) buys breakouts at minute 8-15 and goes 0/30.
+This watches for coins 30min-6h old with SUSTAINED multi-hour momentum —
+the KACY pattern (25x over 2h). You don't need to be first if you catch
+hour 1 of a 5-hour run.
+
+Polls GeckoTerminal new_pools pages 4-8 (older pools) every 2 min.
+Runner criteria: age 30min-6h, h1 +50%+ or h6 +100%+, liq >$15k, mcap <$5M.
+Safety: same fail-closed RugCheck as degen-feed.
+Cards: 🏃 RUNNER via Telegram. Challenge trader does DIP entries on these.
+"""
+import json, os, sys, time, urllib.request
+from datetime import datetime, timezone
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+OUTCOMES = os.path.join(HOME, "degen_outcomes.json")
+SEEN = os.path.join(HOME, "degen_runner_seen.json")
+LOG = os.path.join(HOME, "log", "degen-runner.log")
+
+TG_TOKEN = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+TG_CHAT = "6883056760"
+
+def log(msg):
+    line = "%s %s" % (datetime.now(timezone.utc).strftime("%H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        with open(LOG, "a") as f: f.write(line + "\n")
+    except Exception: pass
+
+def tg_send(text):
+    try:
+        data = json.dumps({"chat_id": TG_CHAT, "text": text,
+                           "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN,
+            data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=15).read()
+        return True
+    except Exception as e:
+        log("TG FAIL %s" % str(e)[:80]); return False
+
+def _fetch_pool_page(page):
+    url = ("https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+           "?page=%d" % page)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "forex-agent/1.0",
+                                                   "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        log("page %d fetch fail: %s" % (page, str(e)[:60])); return None
+
+def _parse_pools(data, now):
+    pools = []
+    if not data or "data" not in data: return pools
+    for p in data["data"]:
+        a = p.get("attributes", {}); rel = p.get("relationships", {})
+        dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
+        if dex_id not in ("pump-fun", "raydium", "pumpswap"): continue
+        try:
+            created = datetime.fromisoformat(
+                a.get("pool_created_at", "").replace("Z", "+00:00"))
+            age_min = (now - created).total_seconds() / 60
+        except Exception: continue
+        # RUNNER window: 30 min to 6 h
+        if age_min < 30 or age_min > 360: continue
+        base_id = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
+        if not base_id.startswith("solana_"): continue
+        mint = base_id.replace("solana_", "")
+        if not mint.endswith("pump"): continue
+        chg = a.get("price_change_percentage") or {}
+        pools.append({
+            "mint": mint,
+            "name": a.get("name", "?").split(" / ")[0],
+            "age_min": age_min,
+            "fdv": float(a.get("fdv_usd") or 0),
+            "reserve": float(a.get("reserve_in_usd") or 0),
+            "chg_h1": float(chg.get("h1") or 0),
+            "chg_h6": float(chg.get("h6") or 0),
+            "chg_m15": float(chg.get("m15") or 0),
+            "txns_h1": (a.get("transactions") or {}).get("h1") or {},
+        })
+    return pools
+
+def check_safety(mint):
+    """Fail-closed RugCheck — same bar as degen-feed."""
+    try:
+        req = urllib.request.Request(
+            "https://api.rugcheck.xyz/v1/tokens/%s/report" % mint,
+            headers={"User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            rep = json.loads(r.read().decode())
+    except Exception:
+        return False, "safety unknown (RugCheck unreachable)"
+    risks = [r.get("name", "") for r in (rep.get("risks") or [])]
+    hard = [r for r in risks if any(k in r.lower() for k in
+            ("mint", "freeze", "honeypot", "cannot", "transfer", "proxy"))]
+    if hard: return False, "SAFETY BLOCK: " + ", ".join(hard[:3])
+    score = rep.get("score_normalised") or rep.get("score") or 0
+    try: score = float(score)
+    except Exception: score = 0
+    if score and score < 1: return False, "SAFETY BLOCK: score %s" % score
+    return True, "ok"
+
+def is_runner(p):
+    # Sustained momentum, not a 5-min spike
+    if p["chg_h1"] < 50 and p["chg_h6"] < 100: return False
+    # Still has fuel: decent liquidity, not mega-cap
+    if p["reserve"] < 15000: return False
+    if p["fdv"] > 5000000 or p["fdv"] < 20000: return False
+    # Not already vertical in last 15m (don't chase the top)
+    if p["chg_m15"] > 80: return False
+    # Real trading activity
+    tx = p["txns_h1"]
+    buys = int(tx.get("buys") or 0); sells = int(tx.get("sells") or 0)
+    if buys + sells < 20: return False
+    if sells and buys / max(sells, 1) < 0.8: return False
+    return True
+
+def main():
+    log("degen-runner started (runner-hunter mode)")
+    seen = {}
+    try: seen = json.load(open(SEEN))
+    except Exception: pass
+    outcomes = {}
+    try: outcomes = json.load(open(OUTCOMES))
+    except Exception: pass
+    cards_today = 0
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            # deeper pages, slower cadence — runners don't vanish in seconds
+            merged, mints = [], set()
+            for page in (4, 5, 6):
+                data = _fetch_pool_page(page)
+                if not data: continue
+                for pool in _parse_pools(data, now):
+                    if pool["mint"] in mints: continue
+                    mints.add(pool["mint"]); merged.append(pool)
+                time.sleep(2)
+            for p in merged:
+                mint = p["mint"]
+                if mint in seen or mint in outcomes: continue
+                if not is_runner(p): continue
+                ok, why = check_safety(mint)
+                if not ok:
+                    log("SAFETY BLOCK %s: %s" % (p["name"], why))
+                    seen[mint] = now.isoformat(); continue
+                # RUNNER CARD
+                msg = (
+                    "🏃 <b>RUNNER</b> $%s\n"
+                    "Age: %.0f min | already running\n"
+                    "MCap: $%.0f | Liq: $%.0f\n"
+                    "h1: %+.0f%% | h6: %+.0f%%\n"
+                    "Dip-entry armed — trader waits for pullback\n"
+                    "CA: <code>%s</code>"
+                    % (p["name"], p["age_min"], p["fdv"], p["reserve"],
+                       p["chg_h1"], p["chg_h6"], mint))
+                if tg_send(msg):
+                    log("RUNNER card $%s h1=%+.0f%%" % (p["name"], p["chg_h1"]))
+                    # alert_price: DexScreener first, else fdv/1e9 fallback
+                    price = 0.0
+                    try:
+                        req = urllib.request.Request(
+                            "https://api.dexscreener.com/tokens/v1/solana/%s" % mint,
+                            headers={"User-Agent": "forex-agent/1.0"})
+                        with urllib.request.urlopen(req, timeout=10) as r:
+                            pairs = json.loads(r.read().decode())
+                        if pairs: price = float(pairs[0].get("priceUsd") or 0)
+                    except Exception: pass
+                    if not price and p["fdv"]: price = p["fdv"] / 1_000_000_000
+                    outcomes[mint] = {
+                        "symbol": p["name"], "alert_ts": now.timestamp(),
+                        "alert_price": price, "alert_mcap": p["fdv"],
+                        "type": "runner", "score": 80, "dip_armed": True,
+                    }
+                    seen[mint] = now.isoformat(); cards_today += 1
+            json.dump(seen, open(SEEN, "w"))
+            json.dump(outcomes, open(OUTCOMES, "w"), indent=2)
+        except Exception as e:
+            log("LOOP ERR %s" % str(e)[:100])
+        time.sleep(120)
+
+if __name__ == "__main__":
+    main()

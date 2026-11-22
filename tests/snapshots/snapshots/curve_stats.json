@@ -1,0 +1,47 @@
+{
+  "creator": "2BdnAxsgVehTFu14FmBJSXeCUnujkG8hVaZ4yxPufodz",
+  "creator_rpc_calls": [
+    [
+      "getTransaction",
+      [
+        "CREATEsig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+        {
+          "encoding": "jsonParsed",
+          "maxSupportedTransactionVersion": 1
+        }
+      ]
+    ]
+  ],
+  "curve_stats": {
+    "capped": false,
+    "created_ts": 1794787202.0,
+    "creation_slot": 300000100,
+    "exhausted": true,
+    "oldest_sig": "CREATEsig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "reason": null,
+    "rpc_error": null,
+    "trades": 3
+  },
+  "curve_stats_rpc_calls": [
+    [
+      "getSignaturesForAddress",
+      [
+        "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsg",
+        {
+          "limit": 251
+        }
+      ]
+    ]
+  ],
+  "tx_price": {
+    "info": {
+      "liquidity_usd": 1400.0,
+      "mcap_usd": 875000.0,
+      "pool": "PoolVaultOwner111111111111111111111111111",
+      "price_usd": 0.000875,
+      "quote_sol": 10.0,
+      "sol_usd": 70.0
+    },
+    "why": ""
+  }
+}

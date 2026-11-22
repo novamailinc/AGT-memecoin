@@ -1,0 +1,66 @@
+{
+  "agt_notes": [
+    "AGT has no cron/scheduled jobs: every recurring job runs as a loop inside this deployment (deploy/agt/scheduler.py).",
+    "AGT deploys accept GitHub URLs only; this manifest targets the public repo on branch main.",
+    "The deployment must operate independently: the development agent's computer does not need to remain online.",
+    "Secrets mapping: deploy/agt/secrets_mapping.md. Storage budget: deploy/agt/storage_budget.md. Backup + restore drill: deploy/agt/backup_recovery.md. Upgrade + rollback: deploy/agt/upgrade_rollback.md.",
+    "Phase 13 finalize (2026-11-22): void list live in deploy/agt/voided_closes.json (dashboard shows raw vs void-excluded totals); restore drill run against a scratch home with all steps passing (see ~/workspace/reports/phase13-finalize-2026-11-22.md); hourly backup now runs backup_verify --verify-latest after every backup. Still on-phone: the 2h full soak (supervisor + scheduler + traders), the phone-reboot running check, live Alchemy/Chainstack verification, and live benchmarks (Phase 10, UNMEASURED here) - procedures are in deploy/agt/README.md and deploy/agt/live_benchmarks.md."
+  ],
+  "branch": "main",
+  "components_started_by_start_sh": [
+    "credential preflight (deploy/agt/credentials.py --preflight; fails closed on a missing required credential)",
+    "runtime credential file bridge for file-only readers (0600, deployment-private, from env only)",
+    "Python environment validation (deploy/agt/validate_env.py)",
+    "database init + migrations (deploy/agt/db_init.py)",
+    "resident supervisor (scripts/supervisor \u2014 owns/adopts all bot daemons, 1s tick, backoff + storm guard)",
+    "in-deployment scheduler (deploy/agt/scheduler.py --run \u2014 the 19 cron-job equivalents)",
+    "read-only status dashboard (deploy/agt/status_server.py on the deployment port)"
+  ],
+  "deploy_kind": "github_url",
+  "description": "Solana memecoin paper-trading bot (paper only, mainnet disabled) as an AGT deployment. Phase 13 finalize (2026-11-22) - see deploy/agt/README.md. Restore drill passed against a scratch home; 2h full soak and phone-reboot running check remain on-phone steps.",
+  "env_source": "AGT vault (injected into the deployment process environment only, never the command line). No credential value appears in this manifest, in any file under deploy/, or in any log.",
+  "environment": {
+    "AGT_STATUS_PORT": "8765 (dashboard port; override per deployment)",
+    "FOREX_AGENT_HOME": "deployment work dir + /.forex-agent (state root; also the deployment HOME on AGT)"
+  },
+  "mainnet_enabled": false,
+  "mode": "paper",
+  "name": "meme-project-paper-bot",
+  "optional_env": [
+    {
+      "name": "HELIUS_API_KEY_DISCOVERY",
+      "purpose": "Second Helius key for research/discovery traffic, kept off the live signals' quota."
+    },
+    {
+      "name": "ALCHEMY_API_KEY",
+      "purpose": "Alchemy API key (key only, never the endpoint URL). Required only when the router enables Alchemy (Phases 5-12 cutover; not the live leg today)."
+    },
+    {
+      "name": "CHAINSTACK_ENDPOINT",
+      "purpose": "Full Chainstack Solana mainnet endpoint URL (the key is its final path segment). Required only when the router enables Chainstack (Phases 5-12 cutover; not the live leg today)."
+    },
+    {
+      "name": "HELIUS_ALERT_CHAT_ID",
+      "purpose": "Telegram chat id for Helius 429-spike alerts."
+    },
+    {
+      "name": "GITHUB_TOKEN",
+      "purpose": "GitHub personal access token for the repo sync loop. Deferred to the finalize pass (the VM sync script uses the authd vault credential, which does not exist on AGT)."
+    }
+  ],
+  "port": 8765,
+  "port_purpose": "Read-only status dashboard (deploy/agt/status_server.py). AGT health-checks the port with a TCP connect; the tunnel publishes it. Binds 127.0.0.1 only.",
+  "python": "3.12",
+  "repo_url": "https://github.com/olamoreA/meme-project",
+  "required_env": [
+    {
+      "name": "HELIUS_API_KEY",
+      "purpose": "Helius main RPC key (live discovery + curve reads). Startup fails closed without it."
+    },
+    {
+      "name": "TELEGRAM_BOT_TOKEN",
+      "purpose": "Telegram bot token (alerts + control bot). Startup fails closed without it."
+    }
+  ],
+  "start_command": "bash deploy/agt/start.sh"
+}

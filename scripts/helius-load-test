@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Helius pacing load test (2026-11-17, pacing fix).
+
+Simulates the bot's real Helius call pattern against REAL Helius
+through the fleet-wide pacer and proves sustained success with
+0 429s over a meaningful window.
+
+Pattern (matches the live evaluation path):
+- 4 worker threads, each looping an evaluation-style pair through
+  daemon.launch_scanner.reserves.rpc:
+    1. getSignaturesForAddress [mint, {"limit": 251}]
+    2. getTransaction [first signature] (only if the first call
+       returned signatures)
+  The pacer throttles these to the refill rate (1 token / 20s /
+  key); when no token is available the call is skipped (counted
+  as a paced skip, not an error).
+- 1 priority thread: every 60s an exit-pricing call through
+  reserves.rpc(..., exempt=True) (priority token, never bypasses
+  the pacer).
+
+Run AFTER the pacer is deployed (all daemons restarted), so the
+live bot's own traffic is paced too and shares the same token
+bucket — the load test then proves the pacer coordinates across
+processes instead of racing the unpaced live traffic.
+
+Usage:
+    scripts/helius-load-test [--minutes N] [--mint MINT]
+Exit 0 when 429s == 0, else 1. Prints a one-line summary plus a
+JSON report. Uses the real keys (live FOREX_AGENT_HOME) and the
+real pacer state file — it is a live-network test by design.
+"""
+import argparse
+import json
+import os
+import random
+import sys
+import threading
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.join(_HERE, "..")
+sys.path.insert(0, _ROOT)
+
+from daemon.launch_scanner import helius_ratelimit as rl
+from daemon.launch_scanner import reserves
+
+# A real graduated pump.fun token (last grad_select close before
+# the 2026-11-16 drought) so the calls return real data, not empty.
+DEFAULT_MINT = "DXcc7L5PvdhLk2HQRe7vnjEDGokYVxf8zwbQXGm1pump"
+
+STATS = {
+    "sigs_attempted": 0,
+    "sigs_ok": 0,
+    "sigs_skip": 0,      # pacer had no token (not an error)
+    "tx_attempted": 0,
+    "tx_ok": 0,
+    "tx_skip": 0,
+    "priority_attempted": 0,
+    "priority_ok": 0,
+    "priority_skip": 0,
+    "r429_reported": 0,  # pacer_report(ok=False) calls in this process
+    "other_errors": 0,
+}
+_LOCK = threading.Lock()
+_STOP = threading.Event()
+
+# Count 429s by wrapping reserves._rpc_attempt (the ground truth
+# for this process): it returns (result, kind, elapsed) and kind
+# is "429" on a rate limit (HTTP 429 or JSON-RPC -32005/-32029).
+# (An earlier version wrapped the pacer_report module function,
+# which reserves never calls — it calls the pacer object's
+# .report() method — so it counted 0 and printed a false PASS
+# while the log showed 19 real 429s. Never wrap the module
+# function for counting; count at _rpc_attempt.)
+_REAL_ATTEMPT = reserves._rpc_attempt
+
+
+def _counting_attempt(url, body, method, host, timeout):
+    result, kind, elapsed = _REAL_ATTEMPT(url, body, method, host,
+                                          timeout)
+    if kind == "429":
+        with _LOCK:
+            STATS["r429_reported"] += 1
+    return result, kind, elapsed
+
+
+reserves._rpc_attempt = _counting_attempt
+
+
+def _bump(key, n=1):
+    with _LOCK:
+        STATS[key] += n
+
+
+def _worker(mint, wid):
+    while not _STOP.is_set():
+        _bump("sigs_attempted")
+        try:
+            sigs = reserves.rpc(
+                "getSignaturesForAddress", [mint, {"limit": 251}])
+        except Exception:
+            _bump("other_errors")
+            sigs = None
+        if sigs is None:
+            _bump("sigs_skip")
+        else:
+            _bump("sigs_ok")
+            # reserves.rpc returns the parsed result directly: a
+            # list of signatures for getSignaturesForAddress.
+            result = sigs if isinstance(sigs, list) else []
+            if result:
+                sig = result[0].get("signature")
+                if sig:
+                    _bump("tx_attempted")
+                    try:
+                        tx = reserves.rpc(
+                            "getTransaction",
+                            [sig, {"encoding": "json",
+                                   "maxSupportedTransactionVersion": 0}])
+                    except Exception:
+                        _bump("other_errors")
+                        tx = None
+                    if tx is None:
+                        _bump("tx_skip")
+                    else:
+                        _bump("tx_ok")
+        # Evaluation think time, jittered so the 4 workers do not
+        # synchronize when a backoff clears.
+        _STOP.wait(random.uniform(2.0, 6.0))
+
+
+def _priority(mint):
+    while not _STOP.wait(60.0):
+        _bump("priority_attempted")
+        try:
+            r = reserves.rpc("getAccountInfo", [mint], exempt=True)
+        except Exception:
+            _bump("other_errors")
+            r = None
+        if r is None:
+            _bump("priority_skip")
+        else:
+            _bump("priority_ok")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--minutes", type=float, default=10.0)
+    ap.add_argument("--mint", default=DEFAULT_MINT)
+    args = ap.parse_args()
+    seconds = max(60.0, args.minutes * 60.0)
+
+    # Sanity: the pacer must be live (state file present or creatable)
+    # and at least one key configured.
+    try:
+        rl.pacer()
+    except Exception as exc:
+        print("load test: pacer unavailable: %s" % exc)
+        return 2
+
+    threads = []
+    for wid in range(4):
+        t = threading.Thread(target=_worker, args=(args.mint, wid),
+                             daemon=True)
+        t.start()
+        threads.append(t)
+    pt = threading.Thread(target=_priority, args=(args.mint,),
+                          daemon=True)
+    pt.start()
+    threads.append(pt)
+
+    print("load test: %d workers + priority, %.1f minutes, mint %s"
+          % (4, args.minutes, args.mint))
+    print("load test: refill %ss/key, capacity %s, base backoff %ss"
+          % (rl._PACER_REFILL_S, rl._PACER_CAPACITY,
+             rl._PACER_BACKOFF_BASE_S))
+    _STOP.wait(seconds)
+    _STOP.set()
+    for t in threads:
+        t.join(timeout=10)
+
+    total_ok = (STATS["sigs_ok"] + STATS["tx_ok"]
+                + STATS["priority_ok"])
+    total_skip = (STATS["sigs_skip"] + STATS["tx_skip"]
+                  + STATS["priority_skip"])
+    report = dict(STATS)
+    report["minutes"] = args.minutes
+    report["total_ok"] = total_ok
+    report["total_skip"] = total_skip
+    report["verdict"] = ("PASS 0x429" if STATS["r429_reported"] == 0
+                         else "FAIL %dx429" % STATS["r429_reported"])
+    print("load test: ok=%d skip=%d 429=%d other_errors=%d -> %s"
+          % (total_ok, total_skip, STATS["r429_reported"],
+             STATS["other_errors"], report["verdict"]))
+    print(json.dumps(report, sort_keys=True))
+    return 0 if STATS["r429_reported"] == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

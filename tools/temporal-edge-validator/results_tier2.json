@@ -1,0 +1,111 @@
+{
+  "more_symbols": {
+    "XRPUSDT": {
+      "n_candles": 18000,
+      "btc_beta": 1.2625922358966937,
+      "discovery": {
+        "n_candidates": 62,
+        "bonferroni_alpha": 0.0008064516129032258,
+        "discovered": [],
+        "n_discovered": 0,
+        "n_validated": 0,
+        "dsr": 0.10737776024117968,
+        "dsr_rejects_null": false,
+        "best_train_sr": 0.22669769912254223,
+        "dsr_null_sr": 0.3161745568531652
+      },
+      "base_permutation_pct": 0.938,
+      "base_cost_drag_t": -28.49091465479597
+    },
+    "DOGEUSDT": {
+      "n_candles": 18000,
+      "btc_beta": 1.4715208789442915,
+      "discovery": {
+        "n_candidates": 62,
+        "bonferroni_alpha": 0.0008064516129032258,
+        "discovered": [],
+        "n_discovered": 0,
+        "n_validated": 0,
+        "dsr": 0.12029041743030544,
+        "dsr_rejects_null": false,
+        "best_train_sr": 0.18995675541640605,
+        "dsr_null_sr": 0.300566147296797
+      },
+      "base_permutation_pct": 0.144,
+      "base_cost_drag_t": -31.068945790171963
+    },
+    "ADAUSDT": {
+      "n_candles": 18000,
+      "btc_beta": 1.4994775598469114,
+      "discovery": {
+        "n_candidates": 62,
+        "bonferroni_alpha": 0.0008064516129032258,
+        "discovered": [],
+        "n_discovered": 0,
+        "n_validated": 0,
+        "dsr": 0.09292687100368396,
+        "dsr_rejects_null": false,
+        "best_train_sr": 0.13709389117758364,
+        "dsr_null_sr": 0.2829103437915803
+      },
+      "base_permutation_pct": 0.17,
+      "base_cost_drag_t": -28.586669713197857
+    },
+    "BNBUSDT": {
+      "n_candles": 18000,
+      "btc_beta": 0.8137037834252842,
+      "discovery": {
+        "n_candidates": 62,
+        "bonferroni_alpha": 0.0008064516129032258,
+        "discovered": [],
+        "n_discovered": 0,
+        "n_validated": 0,
+        "dsr": 0.013529232961702553,
+        "dsr_rejects_null": false,
+        "best_train_sr": 0.17515296424807983,
+        "dsr_null_sr": 0.4177569758715658
+      },
+      "base_permutation_pct": 0.884,
+      "base_cost_drag_t": -51.189653387619884
+    }
+  },
+  "longer_history": {
+    "n_candles": 36006,
+    "walkforward_qualified": 0,
+    "walkforward_n_folds": 5,
+    "dsr": 5.192291760558465e-05,
+    "dsr_rejects_null": false,
+    "block_obs_t": 3.0727325472168414,
+    "block_null_p95": 3.5723646414218115,
+    "block_percentile": 0.77
+  },
+  "regime": {
+    "n_candles": 36006,
+    "n_candidates": 124,
+    "bonferroni_alpha": 0.0004032258064516129,
+    "discovered": [],
+    "n_discovered": 0,
+    "dsr": 0.23338784207203384,
+    "dsr_rejects_null": false
+  },
+  "intraday_15m": {
+    "n_candles": 71000,
+    "n_candidates": 192,
+    "bonferroni_alpha": 0.00026041666666666666,
+    "discovered": [],
+    "n_discovered": 0,
+    "dsr": 0.0,
+    "dsr_rejects_null": false,
+    "best_train_sr": -0.42506544599684526,
+    "dsr_null_sr": 0.5883951438721506
+  },
+  "cross_venue": {
+    "n_candles": 17527,
+    "n_paired": 17527,
+    "venue_correlation": 0.9995092376592499,
+    "best_gross_t": 2.430382423918732,
+    "null_p95": 3.1843363799837165,
+    "null_percentile": 0.45,
+    "discovered_with_costs": []
+  }
+}

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Conviction replay — advanced build, piece 1 calibration.
+
+Applies the conviction scorer to STORED paper closes (each
+close's entry_features: select measurements + mcap/liquidity)
+and tallies win rate + net + mean per tier. This is the
+CALIBRATION check before the gate is wired into live entries:
+it must show STRONG+STANDARD clearly beating WEAK/SKIP/BLOCK
+on the same closes, or the thresholds are recalibrated before
+any live gate ships.
+
+Honest scope: this is IN-SAMPLE for the age and mcap edges
+(the exit study derived those bands from these same closes),
+so a good replay is necessary but NOT sufficient — the forward
+paper test (live entries with conviction journaled, judged on
+the next 100 closes) is the proof. A bad replay blocks the
+gate outright.
+
+Read-only: never writes, never calls the network.
+Usage: scripts/conviction-replay [--days N] [--lane LANE]
+Plain script — run directly with the venv python, not pytest.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..",
+    "daemon", "launch_scanner"))
+
+from conviction import score_candidate  # noqa: E402
+
+HOME = os.environ.get(
+    "FOREX_AGENT_HOME",
+    os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+LANES = ("grad_select", "grad_raw", "tranche", "tranche_protect")
+
+LEDGER_FILES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+}
+
+TIERS = ("STRONG", "STANDARD", "WEAK", "SKIP", "BLOCK")
+
+
+def _load(lane):
+    try:
+        with open(os.path.join(HOME, LEDGER_FILES[lane])) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def replay_lane(lane, since_ts):
+    d = _load(lane)
+    closes = [c for c in (d.get("closes") or [])
+              if isinstance(c, dict)]
+    if since_ts:
+        closes = [c for c in closes
+                  if float(c.get("close_ts") or 0) >= since_ts]
+    cells = {t: {"n": 0, "wins": 0, "net": 0.0} for t in TIERS}
+    unscored = 0
+    for c in closes:
+        ef = c.get("entry_features") or {}
+        sel = ef.get("select") or {}
+        # Tranche lanes stamp measurements under "tranche" /
+        # "tranche_protect" instead of "select".
+        if not sel:
+            for key in ("tranche", "tranche_protect"):
+                if isinstance(ef.get(key), dict):
+                    sel = ef[key]
+                    break
+        values = dict(sel)
+        values.setdefault("mcap", ef.get("mcap"))
+        values.setdefault("liquidity", ef.get("liquidity"))
+        # grad_age_s lives at entry_features top level.
+        if values.get("grad_age_s") is None:
+            values["grad_age_s"] = ef.get("grad_age_s")
+        try:
+            conv = score_candidate(values)
+        except Exception:
+            unscored += 1
+            continue
+        tier = conv.get("tier")
+        if tier not in cells:
+            unscored += 1
+            continue
+        pnl = float(c.get("pnl_usd") or 0)
+        cell = cells[tier]
+        cell["n"] += 1
+        cell["net"] += pnl
+        if pnl > 0:
+            cell["wins"] += 1
+    return cells, len(closes), unscored
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=float, default=0.0)
+    ap.add_argument("--lane", default="")
+    args = ap.parse_args(argv)
+    since_ts = time.time() - args.days * 86400.0 if args.days else 0.0
+    lanes = [args.lane] if args.lane else list(LANES)
+    print("conviction replay — stored paper closes%s"
+          % (" (last %.1fd)" % args.days if args.days else ""))
+    print("home: %s" % HOME)
+    print("IN-SAMPLE for the age/mcap edges (exit study derived "
+          "them from these closes) — calibration only; the "
+          "forward paper test is the proof.")
+    grand = {t: {"n": 0, "wins": 0, "net": 0.0} for t in TIERS}
+    grand_n = 0
+    for lane in lanes:
+        cells, n, unscored = replay_lane(lane, since_ts)
+        print("")
+        print("== %s: n=%d closes scored, %d unscored =="
+              % (lane, n, unscored))
+        for tier in TIERS:
+            cell = cells[tier]
+            if not cell["n"]:
+                print("  %-9s n=0" % tier)
+                continue
+            wr = cell["wins"] / cell["n"] * 100
+            mean = cell["net"] / cell["n"]
+            print("  %-9s n=%-4d win %5.1f%% net $%9.2f mean "
+                  "$%6.2f" % (tier, cell["n"], wr, cell["net"],
+                              mean))
+            for k in ("n", "wins", "net"):
+                grand[tier][k] += cell[k]
+        entered = cells["STRONG"]["n"] + cells["STANDARD"]["n"]
+        entered_net = cells["STRONG"]["net"] + cells["STANDARD"]["net"]
+        entered_wins = cells["STRONG"]["wins"] + cells["STANDARD"]["wins"]
+        refused = (cells["WEAK"]["n"] + cells["SKIP"]["n"]
+                   + cells["BLOCK"]["n"])
+        refused_net = (cells["WEAK"]["net"] + cells["SKIP"]["net"]
+                       + cells["BLOCK"]["net"])
+        print("  gate would ENTER %d (win %.1f%%, net $%.2f) and "
+              "REFUSE %d (net $%.2f)" % (
+                  entered,
+                  entered_wins / entered * 100 if entered else 0,
+                  entered_net, refused, refused_net))
+        grand_n += n
+    if len(lanes) > 1:
+        print("")
+        print("== POOLED %d closes ==" % grand_n)
+        for tier in TIERS:
+            cell = grand[tier]
+            if not cell["n"]:
+                continue
+            print("  %-9s n=%-4d win %5.1f%% net $%9.2f mean "
+                  "$%6.2f" % (tier, cell["n"],
+                              cell["wins"] / cell["n"] * 100,
+                              cell["net"], cell["net"] / cell["n"]))
+        entered = grand["STRONG"]["n"] + grand["STANDARD"]["n"]
+        entered_net = grand["STRONG"]["net"] + grand["STANDARD"]["net"]
+        entered_wins = grand["STRONG"]["wins"] + grand["STANDARD"]["wins"]
+        refused = (grand["WEAK"]["n"] + grand["SKIP"]["n"]
+                   + grand["BLOCK"]["n"])
+        refused_net = (grand["WEAK"]["net"] + grand["SKIP"]["net"]
+                       + grand["BLOCK"]["net"])
+        print("  gate would ENTER %d (win %.1f%%, net $%.2f) and "
+              "REFUSE %d (net $%.2f)" % (
+                  entered,
+                  entered_wins / entered * 100 if entered else 0,
+                  entered_net, refused, refused_net))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

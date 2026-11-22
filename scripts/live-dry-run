@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Mainnet dry-run (Step 6, run by the USER on the deployment
+machine — never by the builder, never on the build VM).
+
+Builds real Jupiter quotes and simulates real swap transactions
+on mainnet with NO send: the executor stays in dry-run mode and
+this script refuses any arming outright. For each mint given it
+runs buy simulations (SOL -> token, $1 stake, the live entry
+path) and sell quote + tx-build checks (token -> SOL).
+
+Honest limit (plan Step 6 wording vs reality): a sell
+SIMULATION cannot succeed until the wallet actually holds the
+token — simulation checks the token balance, so a pre-shakedown
+sell simulation fails for insufficient balance even when the
+route is fine. This script therefore treats the sell side as a
+quote + route check (Jupiter returns a swap transaction =
+route exists) and reports the simulation result separately. The
+sell EXECUTION is validated for real by the Step 7 shakedown
+(buy ~$0.50, sell it through one ladder leg). Exit 0 requires
+every BUY simulation to succeed and every SELL quote to return
+a route.
+
+Usage (on the deployment machine, after the key file exists):
+    MEMECOIN_WALLET_PUBKEY=<wallet pubkey> \\
+    python3 scripts/live-dry-run <mint1> [mint2 ...] [--count N]
+
+The key file defaults to FOREX_AGENT_HOME/live/keypair.json
+(MEMECOIN_WALLET_KEY_FILE overrides). RPC defaults to the public
+mainnet-beta endpoint (MEMECOIN_LIVE_RPC_URL overrides).
+"""
+import argparse
+import logging
+import os
+import sys as _sys
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("live-dry-run")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    from broker.memecoin.execution.mainnet_executor import (
+        MainnetExecutor, SOL_MINT)
+    from broker.memecoin.execution.rpc import MainnetRPC
+    from broker.memecoin.wallet import FileKeyProvider
+    from broker import BrokerError
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+
+def _rpc_url():
+    url = os.environ.get("MEMECOIN_LIVE_RPC_URL", "").strip()
+    if url:
+        return url
+    return "https://api.mainnet-beta.solana.com"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mints", nargs="+",
+                    help="token mints to dry-run (liquid, graduated)")
+    ap.add_argument("--count", type=int, default=5,
+                    help="simulations per mint per side (default 5)")
+    ap.add_argument("--stake-usd", type=float, default=1.00,
+                    help="buy stake in USD (default $1.00)")
+    args = ap.parse_args()
+    if not _HAS_DEPS:
+        logger.warning("live-dry-run deps missing: %s", _IMPORT_ERROR)
+        return 1
+    home = os.environ.get(
+        "FOREX_AGENT_HOME", os.path.expanduser("~/.forex-agent"))
+    key_file = os.environ.get(
+        "MEMECOIN_WALLET_KEY_FILE",
+        os.path.join(home, "live", "keypair.json"))
+    expected = os.environ.get("MEMECOIN_WALLET_PUBKEY", "").strip()
+    if not expected:
+        logger.warning("MEMECOIN_WALLET_PUBKEY is not set — refusing")
+        return 1
+    executor = MainnetExecutor(
+        key_provider=FileKeyProvider(key_file),
+        rpc=MainnetRPC(_rpc_url()),
+        expected_pubkey=expected, live_home=home)
+    try:
+        wallet = executor.connect()
+    except Exception as e:
+        logger.warning("live executor refused to connect: %s", e)
+        return 1
+    # Defense in depth: this script NEVER arms. If dry-run is ever
+    # off, stop before any swap is attempted.
+    if not executor.dry_run:
+        logger.warning("refusing: executor is not in dry-run mode")
+        return 1
+    sol_price = executor.sol_price_usd()
+    if not sol_price or sol_price <= 0:
+        logger.warning("SOL price unknown — cannot size the stake")
+        return 1
+    stake_lamports = int(args.stake_usd / sol_price * 1_000_000_000)
+    logger.warning("live dry-run: wallet %s, SOL $%.2f, stake %d "
+                   "lamports ($%.2f), %d simulations per mint",
+                   wallet, sol_price, stake_lamports, args.stake_usd,
+                   args.count)
+    buy_ok = buy_fail = sell_route_ok = sell_route_fail = 0
+    sell_sim_ok = sell_sim_fail = 0
+    latencies = []
+    for mint in args.mints:
+        for i in range(args.count):
+            t0 = time.monotonic()
+            try:
+                res = executor.execute_swap(
+                    SOL_MINT, mint, stake_lamports)
+                latencies.append(time.monotonic() - t0)
+                if res.get("simulated"):
+                    buy_ok += 1
+                    logger.warning(
+                        "BUY SIM OK %s #%d: expected out %s tokens, "
+                        "impact %s%% (%.1fs)",
+                        mint[:12], i + 1, res.get("out_amount"),
+                        res.get("price_impact_pct"),
+                        latencies[-1])
+                else:
+                    buy_fail += 1
+                    logger.warning("BUY SIM %s #%d: NOT simulated — "
+                                   "this should never happen in "
+                                   "dry-run", mint[:12], i + 1)
+            except BrokerError as e:
+                latencies.append(time.monotonic() - t0)
+                buy_fail += 1
+                logger.warning("BUY SIM FAIL %s #%d: %s (%.1fs)",
+                               mint[:12], i + 1,
+                               (getattr(e, "detail", {}) or {}).get(
+                                   "reason") or e, latencies[-1])
+            # Sell side: one dry-run execute_swap. Its failure
+            # reason classifies the outcome: no_route /
+            # over-cap impact = no route (a real failure);
+            # simulate_failed = route OK but simulation failed —
+            # expected until the wallet holds the token.
+            try:
+                res = executor.execute_swap(mint, SOL_MINT, 1_000_000)
+                sell_route_ok += 1
+                sell_sim_ok += 1
+                logger.warning(
+                    "SELL SIM OK %s #%d (the wallet holds this "
+                    "token)", mint[:12], i + 1)
+            except BrokerError as e:
+                reason = (getattr(e, "detail", {}) or {}).get("reason")
+                if reason in ("no_route", "price_impact_over_cap",
+                              "fee_over_cap", "price_impact_unknown"):
+                    sell_route_fail += 1
+                    logger.warning("SELL ROUTE FAIL %s #%d: %s",
+                                   mint[:12], i + 1, reason)
+                else:
+                    sell_route_ok += 1
+                    sell_sim_fail += 1
+                    logger.warning(
+                        "SELL SIM %s #%d: route OK, simulation %s "
+                        "(expected until the wallet holds the token)",
+                        mint[:12], i + 1, reason or e)
+    avg_lat = (sum(latencies) / len(latencies)) if latencies else 0.0
+    logger.warning(
+        "live dry-run SUMMARY: buy simulations %d ok / %d fail; "
+        "sell routes %d ok / %d fail; sell simulations %d ok / %d "
+        "fail (expected fails pre-holding); avg quote+simulate "
+        "latency %.2fs",
+        buy_ok, buy_fail, sell_route_ok, sell_route_fail,
+        sell_sim_ok, sell_sim_fail, avg_lat)
+    if buy_fail or sell_route_fail:
+        logger.warning("live dry-run FAILED: %d buy failures, %d "
+                       "sell route failures — do not proceed to "
+                       "Step 7", buy_fail, sell_route_fail)
+        return 1
+    logger.warning("live dry-run PASSED: entry path simulates cleanly "
+                   "on mainnet; sell execution still needs the Step 7 "
+                   "shakedown")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

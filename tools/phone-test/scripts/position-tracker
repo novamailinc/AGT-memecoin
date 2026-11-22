@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Position tracker with sell-signal alerts for the degen lane.
+
+ALERTS ONLY — this script never trades, holds no keys, touches no wallets.
+The user trades real money manually ($1/shot). They register a buy in chat;
+the assistant runs `position-tracker add <mint> <entry_price_usd> [symbol]`.
+The daemon polls DexScreener every 45s and fires one-time Telegram sell
+rungs:
+
+  1. mult >= 2.0  -> SELL HALF (lock profit, ride free)
+  2. mult >= 3.0  -> SELL HALF OF REST
+  3. trailing stop: after the 3x rung, if mult drops 30% below peak
+  4. mult <= 0.5  -> SELL ALL (-50% hard stop, no hoping)
+  5. momentum dead: mult >= 1.5 and h1 sells > buys for 2 straight polls
+  6. rug/dead: price fetch fails twice in a row
+
+Positions close on: trailing stop, -50% stop, or confirmed rug. Closed
+history is kept in the state file, never deleted.
+
+Free-only. DexScreener free endpoint, no keys.
+"""
+import json
+import logging
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("position-tracker")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+POS_FILE = os.path.join(HOME, "degen_positions.json")
+POLL_SECS = 45
+DRY_RUN = os.environ.get("POSITION_TRACKER_DRY_RUN") == "1"
+
+
+def _http(url, timeout=12):
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def load_positions():
+    try:
+        with open(POS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_positions(positions):
+    tmp = POS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(positions, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, POS_FILE)
+    except Exception:
+        logger.exception("save positions failed")
+
+
+def send_alert(text, mint=""):
+    """Telegram alert. In DRY_RUN mode, log instead of sending."""
+    if DRY_RUN:
+        logger.warning("DRY-RUN alert: %s", text.replace("\n", " | "))
+        return True
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        payload = {"chat_id": "6883056760", "text": text}
+        if mint:
+            payload["reply_markup"] = json.dumps({
+                "inline_keyboard": [[{
+                    "text": "📋 Copy CA",
+                    "copy_text": {"text": mint},
+                }]],
+            })
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def get_market(mint):
+    """Return (price_usd, h1_buys, h1_sells) or (0, 0, 0) on failure."""
+    pairs = _http(
+        "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    if not pairs:
+        return 0.0, 0, 0
+    p = pairs[0]
+    try:
+        price = float(p.get("priceUsd") or 0)
+    except Exception:
+        price = 0.0
+    tx = (p.get("txns") or {}).get("h1") or {}
+    return price, int(tx.get("buys") or 0), int(tx.get("sells") or 0)
+
+
+def fire(pos, rung, text, mint, close=False):
+    """Fire a rung once; record it; optionally close the position."""
+    if rung in pos.get("alerts_fired", []):
+        return False
+    pos.setdefault("alerts_fired", []).append(rung)
+    if close:
+        pos["status"] = "closed"
+        pos["closed_ts"] = time.time()
+        pos["closed_by"] = rung
+    if send_alert(text, mint=mint):
+        logger.warning("ALERT %s %s", pos.get("symbol", "?"), rung)
+    return True
+
+
+def check_position(pos):
+    """One poll for one open position. Returns True if anything fired."""
+    mint = pos["mint"]
+    symbol = pos.get("symbol", mint[:6])
+    entry = pos.get("entry_price") or 0
+    if entry <= 0:
+        return False
+    price, h1_buys, h1_sells = get_market(mint)
+    fired_any = False
+
+    # --- rug / dead detection: two consecutive failed fetches ---
+    if price <= 0:
+        pos["dead_polls"] = pos.get("dead_polls", 0) + 1
+        if pos["dead_polls"] >= 2:
+            fired_any |= fire(
+                pos, "rugged",
+                "🔴 %s looks RUGGED/DEAD — price feed gone.\n"
+                "Assume total loss. Do NOT buy more.\n"
+                "CA: %s" % (symbol, mint),
+                mint, close=True)
+        return fired_any
+    pos["dead_polls"] = 0
+
+    mult = price / entry
+    pos["last_mult"] = round(mult, 3)
+    if mult > pos.get("peak_mult", 0):
+        pos["peak_mult"] = round(mult, 3)
+    peak = pos.get("peak_mult", mult)
+
+    # --- rung 4: -50% hard stop (checked before profit rungs) ---
+    if mult <= 0.5:
+        fired_any |= fire(
+            pos, "stop_50",
+            "🔴 SELL ALL — %s hit -50%% stop (%.2fx).\n"
+            "No hoping. Exit now.\nCA: %s" % (symbol, mult, mint),
+            mint, close=True)
+        return fired_any  # closed; nothing else matters
+
+    # --- rung 1: 2x -> sell half ---
+    if mult >= 2.0:
+        fired_any |= fire(
+            pos, "take_half_2x",
+            "🟢 SELL HALF — %s hit 2x (%.2fx, peak %.2fx).\n"
+            "Lock profit, ride the rest free.\nCA: %s"
+            % (symbol, mult, peak, mint),
+            mint)
+
+    # --- rung 2: 3x -> sell half of rest ---
+    if mult >= 3.0:
+        fired_any |= fire(
+            pos, "take_half_3x",
+            "🟢 SELL HALF OF REST — %s hit 3x (%.2fx, peak %.2fx).\n"
+            "Bank it. Let the remainder ride with a trailing stop.\nCA: %s"
+            % (symbol, mult, peak, mint),
+            mint)
+
+    # --- rung 3: trailing stop, only after 3x rung, 30% below peak ---
+    if ("take_half_3x" in pos.get("alerts_fired", [])
+            and peak >= 3.0 and mult <= 0.70 * peak):
+        fired_any |= fire(
+            pos, "trailing_stop",
+            "🔴 SELL ALL — %s trailing stop.\n"
+            "Peak was %.2fx, now %.2fx (-30%% from peak).\n"
+            "Don't give it all back.\nCA: %s" % (symbol, peak, mult, mint),
+            mint, close=True)
+        return fired_any
+
+    # --- rung 5: momentum dead (up, but sells beating buys 2 polls straight) ---
+    if mult >= 1.5 and h1_sells > h1_buys:
+        pos["weak_polls"] = pos.get("weak_polls", 0) + 1
+    else:
+        pos["weak_polls"] = 0
+    if pos.get("weak_polls", 0) >= 2:
+        fired_any |= fire(
+            pos, "momentum_dead",
+            "⚠️ CONSIDER SELL — %s momentum dying.\n"
+            "Sells beating buys 2 polls running (%.2fx, peak %.2fx).\n"
+            "Tighten up or exit.\nCA: %s" % (symbol, mult, peak, mint),
+            mint)
+
+    return fired_any
+
+
+def cmd_add(args):
+    if len(args) < 2:
+        print("usage: position-tracker add <mint> <entry_price_usd> [symbol] [size_usd]",
+              file=sys.stderr)
+        return 2
+    mint = args[0]
+    try:
+        entry_price = float(args[1])
+    except ValueError:
+        print("entry_price_usd must be a number", file=sys.stderr)
+        return 2
+    symbol = args[2] if len(args) > 2 else mint[:6]
+    try:
+        size_usd = float(args[3]) if len(args) > 3 else 1.0
+    except ValueError:
+        size_usd = 1.0
+    positions = load_positions()
+    if any(p["mint"] == mint and p.get("status") == "open" for p in positions):
+        print("position already open for %s" % mint, file=sys.stderr)
+        return 1
+    positions.append({
+        "mint": mint,
+        "symbol": symbol,
+        "entry_price": entry_price,
+        "entry_ts": time.time(),
+        "size_usd": size_usd,
+        "status": "open",
+        "alerts_fired": [],
+        "peak_mult": 1.0,
+        "last_mult": 1.0,
+        "weak_polls": 0,
+        "dead_polls": 0,
+    })
+    save_positions(positions)
+    print("added %s @ $%s" % (symbol, entry_price))
+    return 0
+
+
+def cmd_list():
+    positions = load_positions()
+    for p in positions:
+        print("%s %s %s mult=%s peak=%s fired=%s" % (
+            p.get("status"), p.get("symbol"), p["mint"][:10],
+            p.get("last_mult"), p.get("peak_mult"),
+            ",".join(p.get("alerts_fired", [])) or "-"))
+    return 0
+
+
+def cmd_close(args):
+    if not args:
+        print("usage: position-tracker close <mint>", file=sys.stderr)
+        return 2
+    mint = args[0]
+    positions = load_positions()
+    for p in positions:
+        if p["mint"] == mint and p.get("status") == "open":
+            p["status"] = "closed"
+            p["closed_ts"] = time.time()
+            p["closed_by"] = "manual"
+            save_positions(positions)
+            print("closed %s" % p.get("symbol"))
+            return 0
+    print("no open position for %s" % mint, file=sys.stderr)
+    return 1
+
+
+def main():
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == "add":
+            return cmd_add(sys.argv[2:])
+        if cmd == "list":
+            return cmd_list()
+        if cmd == "close":
+            return cmd_close(sys.argv[2:])
+        print("unknown command: %s (add|list|close)" % cmd, file=sys.stderr)
+        return 2
+    logger.warning("position tracker started (poll %ds)", POLL_SECS)
+    while True:
+        try:
+            positions = load_positions()
+            changed = False
+            for pos in positions:
+                if pos.get("status") != "open":
+                    continue
+                try:
+                    if check_position(pos):
+                        changed = True
+                    else:
+                        # peak_mult / counters may have changed
+                        changed = True
+                except Exception:
+                    logger.exception("check failed for %s",
+                                     pos.get("symbol", "?"))
+            if changed:
+                save_positions(positions)
+        except Exception:
+            logger.exception("tracker loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

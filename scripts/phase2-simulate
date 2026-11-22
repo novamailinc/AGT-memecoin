@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Phase 2 simulation harness (2026-11-17, Batch 3).
+
+Validates the Phase 2 pre-signed templates + CU limits BEFORE
+any devnet run — the "prove it on paper first" gate. Adapted
+from the pumpfun-bonkfun-bot reference (tools/simulate_v2_trades.py,
+tools/simulate_bot_buy_path.py):
+
+  * Interception: send -> simulateTransaction (sigVerify False,
+    replaceRecentBlockhash True, commitment processed) and
+    confirm -> UNCONFIRMED. NOTHING is ever sent.
+  * Report per tx: instruction_count, account_count, cu_limit,
+    cu_price (micro-lamports/CU), total fee, data size, version
+    (v0/v1), unitsConsumed, err + error logs, CU headroom % vs
+    the venue budget.
+  * Buy + sell simulated (sell = 90% of the buy amount, the
+    representative sell sizing); the sell-minus-buy CU delta is
+    reported, as in the reference.
+
+What it runs on: canned Jupiter-shaped swap txs built offline
+with a FIXED dummy keypair (never a real key), with
+ComputeBudget instructions the harness builds BY HAND from raw
+bytes (discriminator + little-endian ints) — deliberately NOT
+via solders' set_compute_unit_price helper, whose docstring
+says micro-lamports and is wrong for the v1 total-lamports
+model (see the Batch 3 v1 audit in fee_policy.py). The CU price
+is derived from a TOTAL fee: price = total x 1e6 / limit, so
+the total the tx pays is exactly the policy fee. The round-trip
+(read back via tx.compute_budget_summary) proves it.
+
+Honest limits, stated up front:
+  * The canned swap instruction data is a shape mock, not a real
+    Jupiter swap — the simulation WILL error (invalid instruction
+    data) and its unitsConsumed is untrustworthy (a failed sim's
+    units are never used as an estimate). The harness therefore
+    reports CU consumption as NOT PROVEN until it runs on a real
+    Jupiter swap tx (devnet, --rpc). What it DOES prove here:
+    the interception mechanics against a real node, the structural
+    report, the declared-limit-vs-venue-budget check, and the
+    fee round-trip.
+  * The declared CU limit (not consumed units) is checked against
+    the venue budgets: a limit below its venue's budget fails the
+    run — the tx could run out of CU on the real venue.
+  * Default RPC is the public mainnet-beta endpoint (free, no
+    key). --rpc points it at devnet/another node; --no-sim runs
+    the structural report only.
+
+Exit 0: structural checks pass AND the sim call completed
+(returned a result, even an error result). Exit 1: a structural
+check fails, or the sim endpoint is unreachable (loud — the
+harness must not silently pretend it simulated).
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.request
+
+REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+sys.path.insert(0, REPO)
+
+from broker.memecoin.execution import fee_policy as FP
+from broker.memecoin.execution import tx as tx_mod
+
+COMPUTE_BUDGET_PROGRAM_ID = \
+    "ComputeBudget111111111111111111111111111111"
+JUPITER_PROGRAM_ID = \
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+TOK_MINT = "H8DX2KJNV3c9Dg4L7sZ85qS5Mr9ZZ4y36tgsEFMopump"
+
+DEFAULT_RPC_URL = "https://api.mainnet-beta.solana.com"
+# The canned buy/sell are Jupiter-routed PumpSwap swaps (the
+# venue a graduated token trades on), so the PumpSwap budgets
+# are the check. The other venues are reported for reference.
+VENUE = "pumpswap"
+TOTAL_FEE_LAMPORTS = 10_000  # policy base fee, total lamports.
+
+FAILS = []
+
+
+def check(name, cond, detail=""):
+    print(("PASS " if cond else "FAIL ") + name
+          + ((" — " + detail) if detail and not cond else ""))
+    if not cond:
+        FAILS.append(name)
+    return cond
+
+
+def _b58encode(raw: bytes) -> str:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n > 0:
+        n, r = divmod(n, 58)
+        out = alphabet[r] + out
+    pad = len(raw) - len(raw.lstrip(b"\x00"))
+    return "1" * pad + (out or "")
+
+
+def _cu_limit_ix(limit: int):
+    """setComputeUnitLimit, built by hand: 0x02 + u32 LE."""
+    from solders.instruction import AccountMeta, Instruction
+    from solders.pubkey import Pubkey
+    return Instruction(
+        Pubkey.from_string(COMPUTE_BUDGET_PROGRAM_ID),
+        bytes([2]) + int(limit).to_bytes(4, "little"), [])
+
+
+def _cu_price_ix(total_fee_lamports: int, limit: int):
+    """setComputeUnitPrice, built by hand: 0x03 + u64 LE.
+
+    The price is derived FROM the total fee (price = total x 1e6
+    / limit), because the v0 ComputeBudget price is micro-lamports
+    PER CU while the policy fee is TOTAL lamports. Writing the
+    total straight into the price field would misprice the fee by
+    the CU limit — the exact trap the v1 audit documents."""
+    from solders.instruction import AccountMeta, Instruction
+    from solders.pubkey import Pubkey
+    price = (int(total_fee_lamports) * 1_000_000) // int(limit)
+    return Instruction(
+        Pubkey.from_string(COMPUTE_BUDGET_PROGRAM_ID),
+        bytes([3]) + int(price).to_bytes(8, "little"), [])
+
+
+def _canned_swap_tx(kp, input_mint, output_mint, cu_limit: int,
+                    total_fee_lamports: int):
+    """Jupiter-shaped versioned tx with ComputeBudget first.
+
+    One swap instruction (shape mock — data b"\\x00\\x01", not a
+    real Jupiter swap) plus CU limit + CU price. Deterministic
+    for a fixed keypair: same bytes every run."""
+    from solders.hash import Hash
+    from solders.instruction import AccountMeta, Instruction
+    from solders.message import MessageV0
+    from solders.pubkey import Pubkey
+    from solders.transaction import VersionedTransaction
+    accounts = [
+        AccountMeta(kp.pubkey(), True, True),
+        AccountMeta(Pubkey.from_string(input_mint), False, True),
+        AccountMeta(Pubkey.from_string(output_mint), False, True),
+    ]
+    swap_ix = Instruction(
+        Pubkey.from_string(JUPITER_PROGRAM_ID), b"\x00\x01", accounts)
+    msg = MessageV0.try_compile(
+        kp.pubkey(),
+        [_cu_limit_ix(cu_limit),
+         _cu_price_ix(total_fee_lamports, cu_limit), swap_ix],
+        [],
+        Hash.from_string(_b58encode(bytes(range(32)))))
+    vtx = VersionedTransaction(msg, [kp])
+    return base64.b64encode(bytes(vtx)).decode("ascii")
+
+
+def _rpc_call(url, method, params, timeout=30):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                       "method": method, "params": params}).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+class SimulationHarness:
+    """Send -> simulate, confirm -> UNCONFIRMED. Never sends.
+
+    rpc_simulate(b64) is the injectable simulation call (default:
+    POST simulateTransaction to the RPC url with sigVerify False,
+    replaceRecentBlockhash True, commitment processed — the
+    reference's parameters). confirm(sig) always returns
+    "UNCONFIRMED"."""
+
+    def __init__(self, rpc_url, timeout=30):
+        self.rpc_url = rpc_url
+        self.timeout = timeout
+        self.sim_calls = []
+
+    def simulate(self, b64_tx):
+        """Simulate one tx; returns the RPC result dict."""
+        self.sim_calls.append(b64_tx)
+        res = _rpc_call(
+            self.rpc_url, "simulateTransaction",
+            [b64_tx, {"sigVerify": False,
+                      "replaceRecentBlockhash": True,
+                      "commitment": "processed",
+                      # simulateTransaction defaults to base58
+                      # encoding (unlike sendTransaction) — the
+                      # tx here is base64, so state it.
+                      "encoding": "base64"}],
+            timeout=self.timeout)
+        return res.get("result") or res
+
+    def confirm(self, signature):
+        """A simulated send is never confirmed."""
+        return "UNCONFIRMED"
+
+
+def _structural_report(label, b64_tx, side):
+    """Parse + summarize one template tx (no network)."""
+    vtx = tx_mod.deserialize_versioned_tx(b64_tx)
+    summary = tx_mod.compute_budget_summary(vtx)
+    version = tx_mod.tx_version(vtx)
+    raw = base64.b64decode(b64_tx)
+    budget = FP.venue_cu_budget(VENUE, side)
+    limit = summary.get("cu_limit")
+    headroom = None
+    if limit is not None and budget:
+        headroom = round((limit - budget) * 100.0 / budget, 1)
+    return {
+        "label": label,
+        "side": side,
+        "venue": VENUE,
+        "version": version.get("version"),
+        "is_v1": bool(version.get("is_v1")),
+        "has_config": bool(version.get("has_config")),
+        "instruction_count": summary.get("instruction_count"),
+        "account_count": summary.get("account_count"),
+        "cu_limit": limit,
+        "cu_price_micro_lamports":
+            summary.get("cu_price_micro_lamports"),
+        "total_fee_lamports": summary.get("total_fee_lamports"),
+        "data_size_bytes": len(raw),
+        "venue_cu_budget": budget,
+        # Headroom of the DECLARED limit over the venue budget:
+        # >= 0 means the limit covers the venue's typical
+        # consumption; negative means the tx could run out of CU.
+        "cu_limit_headroom_pct": headroom,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rpc", default=DEFAULT_RPC_URL,
+                    help="RPC url for simulateTransaction")
+    ap.add_argument("--no-sim", action="store_true",
+                    help="structural report only, no simulation")
+    args = ap.parse_args()
+
+    from solders.keypair import Keypair
+    # FIXED dummy keypair (test only, never a real key).
+    kp = Keypair.from_seed(bytes(range(32)))
+
+    # Buy: PumpSwap buy budget as the declared limit. Sell: 90%
+    # of the buy amount, PumpSwap sell budget as its limit.
+    buy_b64 = _canned_swap_tx(kp, SOL_MINT, TOK_MINT,
+                              FP.venue_cu_budget(VENUE, "buy"),
+                              TOTAL_FEE_LAMPORTS)
+    sell_b64 = _canned_swap_tx(kp, TOK_MINT, SOL_MINT,
+                               FP.venue_cu_budget(VENUE, "sell"),
+                               TOTAL_FEE_LAMPORTS)
+    buy = _structural_report("buy-template", buy_b64, "buy")
+    sell = _structural_report("sell-template", sell_b64, "sell")
+
+    # -- structural checks ------------------------------------------
+    check("buy tx is versioned v0 (not v1, no config)",
+          buy["version"] == 0 and not buy["is_v1"]
+          and not buy["has_config"])
+    check("sell tx is versioned v0 (not v1, no config)",
+          sell["version"] == 0 and not sell["is_v1"]
+          and not sell["has_config"])
+    check("buy fee round-trips to the policy total",
+          buy["total_fee_lamports"] == TOTAL_FEE_LAMPORTS,
+          "got %r" % buy["total_fee_lamports"])
+    check("sell fee round-trips to the policy total",
+          sell["total_fee_lamports"] == TOTAL_FEE_LAMPORTS,
+          "got %r" % sell["total_fee_lamports"])
+    check("buy declared CU limit covers the PumpSwap buy budget",
+          buy["cu_limit"] is not None
+          and buy["cu_limit"] >= buy["venue_cu_budget"]
+          and buy["cu_limit_headroom_pct"] is not None
+          and buy["cu_limit_headroom_pct"] >= 0,
+          "limit %r vs budget %r"
+          % (buy["cu_limit"], buy["venue_cu_budget"]))
+    check("sell declared CU limit covers the PumpSwap sell budget",
+          sell["cu_limit"] is not None
+          and sell["cu_limit"] >= sell["venue_cu_budget"]
+          and sell["cu_limit_headroom_pct"] is not None
+          and sell["cu_limit_headroom_pct"] >= 0,
+          "limit %r vs budget %r"
+          % (sell["cu_limit"], sell["venue_cu_budget"]))
+    # Reference-venue table for the reader (all venues, both sides).
+    venue_table = {}
+    for venue in ("pumpfun_v2", "pumpswap", "launchlab_cpmm"):
+        for side in ("buy", "sell"):
+            venue_table["%s/%s" % (venue, side)] = \
+                FP.venue_cu_budget(venue, side)
+
+    # -- simulation (interception) -----------------------------------
+    sims = {}
+    harness = SimulationHarness(args.rpc)
+    if args.no_sim:
+        print("SIMULATION SKIPPED (--no-sim): CU consumption NOT "
+              "PROVEN — run without --no-sim on a real swap tx.")
+    else:
+        try:
+            health = _rpc_call(args.rpc, "getHealth", [])
+            print("RPC health: %s" % health.get("result"))
+        except Exception as e:
+            check("simulation endpoint reachable", False, str(e)[:120])
+            print(json.dumps(
+                {"buy": buy, "sell": sell,
+                 "venue_budgets": venue_table,
+                 "simulation": None}, indent=2, sort_keys=True))
+            print("\nSIMULATION HARNESS FAILED")
+            return 1
+        for label, b64 in (("buy", buy_b64), ("sell", sell_b64)):
+            try:
+                sim = harness.simulate(b64)
+            except Exception as e:
+                check("simulate %s completes" % label, False,
+                      str(e)[:120])
+                sim = {"error": str(e)[:200]}
+            sims[label] = sim
+            # confirm() is UNCONFIRMED by construction.
+            check("confirm %s is UNCONFIRMED (never sent)"
+                  % label,
+                  harness.confirm("anysig") == "UNCONFIRMED")
+        for label in ("buy", "sell"):
+            sim = sims[label]
+            units = FP.units_consumed_from_sim(sim)
+            err = None
+            if isinstance(sim, dict):
+                err = sim.get("err") or \
+                    (sim.get("value") or {}).get("err")
+            print("SIM %s: err=%r unitsConsumed=%r"
+                  % (label, err, units))
+            if err is not None:
+                if err == "InsufficientFundsForFee":
+                    print("  NOTE: the dummy fee payer holds no SOL, "
+                          "so the sim stops at fee validation "
+                          "(expected) — unitsConsumed stays "
+                          "untrustworthy and CU consumption stays NOT "
+                          "PROVEN until this harness runs on a real "
+                          "swap tx (devnet).")
+                else:
+                    print("  NOTE: sim errored (canned swap data is a "
+                          "shape mock, not a real Jupiter swap) — "
+                          "unitsConsumed is untrustworthy and CU "
+                          "consumption stays NOT PROVEN until this "
+                          "harness runs on a real swap tx (devnet).")
+        buy_units = FP.units_consumed_from_sim(sims.get("buy"))
+        sell_units = FP.units_consumed_from_sim(sims.get("sell"))
+        delta = None
+        if buy_units is not None and sell_units is not None:
+            delta = sell_units - buy_units
+        print("SELL-MINUS-BUY CU DELTA: %r" % delta)
+
+    report = {"buy": buy, "sell": sell,
+              "venue_budgets": venue_table,
+              "simulation": sims if sims else None,
+              "sell_minus_buy_cu": None}
+    if sims:
+        bu = FP.units_consumed_from_sim(sims.get("buy"))
+        su = FP.units_consumed_from_sim(sims.get("sell"))
+        if bu is not None and su is not None:
+            report["sell_minus_buy_cu"] = su - bu
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if FAILS:
+        print("\nSIMULATION HARNESS FAILED: %d check(s)" % len(FAILS))
+        return 1
+    print("\nSIMULATION HARNESS PASSED (structural + interception; "
+          "CU consumption NOT PROVEN — see SIM notes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

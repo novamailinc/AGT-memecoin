@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Nadir history recorder: snapshots hourly prices for watchlist tokens.
+Builds our own 720-candle history over 30 days. Free, local, reliable.
+
+Runs hourly via cron. Each run appends one candle per token.
+Storage: ~/.forex-agent/nadir_history/<SYMBOL>.jsonl (one JSON per line)
+"""
+import json, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HISTDIR = os.path.join(HOME, "nadir_history")
+os.makedirs(HISTDIR, exist_ok=True)
+
+# Watchlist: established tokens we want 30d history for
+# (mint -> symbol). Prices via DexScreener (lighter than GeckoTerminal OHLCV).
+WATCHLIST = {}
+_est = os.path.join(HOME, "nadir_phase1", "established_tokens.json")
+try:
+    _d = json.load(open(_est))
+    for sym, info in _d.items():
+        if info.get("mint"):
+            WATCHLIST[info["mint"]] = sym
+except Exception:
+    pass
+
+# Fallback: hardcode the 13 if file missing
+if not WATCHLIST:
+    WATCHLIST = {
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": "BONK",
+        "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr": "POPCAT",
+        "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5": "MEW",
+        "ukHH6c7mMyiWCf1b9pnW5Hw8276zXH4sRoTE1KcDpump": "BOME",
+        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": "JUP",
+        "FJkTpy5rTZYCAUn3FXDzz9hgJYHYwBsxGm5ee75rAZNC": "RAY",
+        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo": "ORCA",
+        "StepAscQoEioFxxWGnh2sLBDFp9d8rvKz2Yp39iDpyT": "STEP",
+        "kinXdEcpDQeHPEuQnqmUgtYykqKGVFq6CeVX5iAHJq6": "KIN",
+        "KMNo3nJsBXfcpJTVhZcXLW7RzRxewN72Gr2p9pump": "KMNO",
+        "HZ1JovNiVvGrGNiiYvEoQY1No2K": "PYTH",
+        "9F4UatNR9XnvQVffUu6MojWEywTqwAwD1CtNL7Lht3pT": "HNT",
+        "7i5KKsX2weiT": "GMT",
+    }
+
+
+def get_price(mint):
+    """Current price + 24h stats via DexScreener tokens endpoint."""
+    d = get_json(f"https://api.dexscreener.com/tokens/v1/solana/{mint}",
+                 tries=4, timeout=20)
+    if not d:
+        return None
+    # deepest liquidity pair
+    best = max(d, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+    return {
+        "price": float(best.get("priceUsd") or 0),
+        "liq": float((best.get("liquidity") or {}).get("usd") or 0),
+        "vol24h": float((best.get("volume") or {}).get("h24") or 0),
+        "fdv": float(best.get("fdv") or 0),
+        "pair": best.get("pairAddress"),
+    }
+
+
+def main():
+    ts = int(time.time())
+    hour_ts = ts - (ts % 3600)  # align to hour boundary
+    recorded = 0
+    for mint, sym in WATCHLIST.items():
+        path = os.path.join(HISTDIR, f"{sym}.jsonl")
+        # Skip if we already have this hour; remember last close for sanity check
+        last_price = None
+        try:
+            with open(path) as f:
+                for line in f:
+                    pass
+                last = json.loads(line)
+                last_price = last.get("c") or None
+                if last.get("ts", 0) >= hour_ts:
+                    continue
+        except (FileNotFoundError, ValueError, StopIteration):
+            pass
+        try:
+            info = get_price(mint)
+            if not info or not info["price"]:
+                print(f"{sym}: no price")
+                continue
+            # Sanity guard: DexScreener occasionally returns a bogus pair
+            # (2026-11-06: PYTH $322.17 vs $0.065 prior — ~4950x jump).
+            # Hourly moves >10x are not real for these established tokens;
+            # skip the hour rather than poison the 30d history.
+            if last_price and not (last_price / 10 <= info["price"] <= last_price * 10):
+                print(f"{sym}: implausible ${info['price']:.6f} vs last ${last_price:.6f} — skipped")
+                continue
+            candle = {"ts": hour_ts, "o": info["price"], "h": info["price"],
+                      "l": info["price"], "c": info["price"], "v": info["vol24h"],
+                      "liq": info["liq"], "fdv": info["fdv"]}
+            with open(path, "a") as f:
+                f.write(json.dumps(candle) + "\n")
+            recorded += 1
+            print(f"{sym}: ${info['price']:.6f}")
+        except Exception as e:
+            print(f"{sym}: FAIL {str(e)[:50]}")
+        time.sleep(1)  # rate limit courtesy
+    print(f"recorded {recorded}/{len(WATCHLIST)}")
+
+
+if __name__ == "__main__":
+    main()

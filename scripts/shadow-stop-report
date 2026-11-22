@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Shadow-stop report (2026-11-20, faster-exits item 1c).
+
+Compares the SHADOW tighter early stop (-30% within the first 15
+min after entry) against what the live lanes actually realized —
+per lane, from the paper ledgers. Read-only: no ledger writes, no
+network, no live decisions. The shadow never exited anything; this
+script only replays the counterfactual from what was journaled.
+
+For each close it reports:
+- covered: closes whose early window is observable (a live
+  shadow_stop field, or a quote journal starting within 2 min of
+  entry — closes keep only the last 10 journal entries, so older
+  closes usually have no early coverage and are counted, not
+  guessed at).
+- crossed: covered closes where the shadow stop would have fired.
+- saved: crossed closes where the shadow exit beats the live
+  realized dollars (leg-aware: legs banked at 2x/3x keep live
+  dollars; only unbanked legs are re-priced at the shadow price).
+- cut_winner: crossed closes where the shadow exit is worse than
+  live (the position later recovered past the shadow price).
+- net_usd: total saved minus total cut across crossed closes.
+
+Plus the stop-slippage baseline that motivated the work: hard-stop
+closes' realized multiple vs the -50% the stop promises.
+
+Usage:
+  scripts/shadow-stop-report [--lane grad_select] [--json]
+      [--stop-mult 0.70] [--window 900]
+  Ledgers: $FOREX_AGENT_HOME (default /home/hatch/.forex-agent).
+"""
+import argparse
+import json
+import os
+import statistics
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+
+try:
+    import shadow_stop as _ss
+except Exception:
+    _ss = None
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+LANES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+    "momentum": "momentum_ledger.json",
+}
+
+
+def _load_lane(lane):
+    path = os.path.join(HOME, LANES[lane])
+    with open(path) as f:
+        return json.load(f)
+
+
+def analyze(lane, stop_mult, window_s):
+    """Aggregate shadow-vs-live for one lane's closes."""
+    d = _load_lane(lane)
+    closes = d.get("closes", [])
+    agg = {"lane": lane, "closes": len(closes), "covered": 0,
+           "crossed": 0, "saved_n": 0, "saved_usd": 0.0,
+           "cut_n": 0, "cut_usd": 0.0, "net_usd": 0.0,
+           "stop_closes": 0, "stop_below_06x": 0,
+           "stop_median_mult": None, "stop_below_01x": 0,
+           "shadow_fields": 0}
+    stop_mults = []
+    for c in closes:
+        if isinstance(c.get("shadow_stop"), dict):
+            agg["shadow_fields"] += 1
+        reason = str(c.get("closed_reason") or "")
+        if reason.startswith("hard_stop"):
+            agg["stop_closes"] += 1
+            try:
+                rm = float(c.get("realized_mult") or 0)
+            except Exception:
+                rm = 0.0
+            stop_mults.append(rm)
+            if rm < 0.6:
+                agg["stop_below_06x"] += 1
+            if rm < 0.1:
+                agg["stop_below_01x"] += 1
+        out = _ss.shadow_outcome(c, stop_mult, window_s)
+        if not out["covered"]:
+            continue
+        agg["covered"] += 1
+        if not out["crossed"]:
+            continue
+        agg["crossed"] += 1
+        saved = out["saved_usd"]
+        if saved is None:
+            continue
+        if saved > 0.02:
+            agg["saved_n"] += 1
+            agg["saved_usd"] += saved
+        elif saved < -0.02:
+            agg["cut_n"] += 1
+            agg["cut_usd"] += -saved
+    if stop_mults:
+        agg["stop_median_mult"] = round(statistics.median(stop_mults), 3)
+    agg["saved_usd"] = round(agg["saved_usd"], 2)
+    agg["cut_usd"] = round(agg["cut_usd"], 2)
+    agg["net_usd"] = round(agg["saved_usd"] - agg["cut_usd"], 2)
+    return agg
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--lane", choices=sorted(LANES), default=None)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--stop-mult", type=float, default=0.70)
+    ap.add_argument("--window", type=float, default=900.0)
+    args = ap.parse_args()
+    if _ss is None:
+        print("shadow_stop module not importable", file=sys.stderr)
+        return 1
+    lanes = [args.lane] if args.lane else sorted(LANES)
+    rows = []
+    for lane in lanes:
+        try:
+            rows.append(analyze(lane, args.stop_mult, args.window))
+        except FileNotFoundError:
+            print("ledger missing for %s" % lane, file=sys.stderr)
+    if args.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    print("SHADOW STOP REPORT: -%d%% within first %.0f min "
+          "(shadow only — live exits unchanged)"
+          % (round((1 - args.stop_mult) * 100), args.window / 60))
+    print("Ledger home: %s" % HOME)
+    tot = {"closes": 0, "covered": 0, "crossed": 0, "saved_n": 0,
+           "saved_usd": 0.0, "cut_n": 0, "cut_usd": 0.0, "net_usd": 0.0}
+    for r in rows:
+        print("\n%s: closes=%d covered=%d crossed=%d "
+              "(shadow would have fired)"
+              % (r["lane"], r["closes"], r["covered"], r["crossed"]))
+        print("  saved: %d closes +$%.2f | cut winner: %d closes "
+              "-$%.2f | NET %s$%.2f"
+              % (r["saved_n"], r["saved_usd"], r["cut_n"], r["cut_usd"],
+                 "+" if r["net_usd"] >= 0 else "-", abs(r["net_usd"])))
+        print("  stop baseline: %d hard-stop closes, median realized "
+              "%.3fx (stop promises 0.50x), %d below 0.6x, %d below 0.1x"
+              % (r["stop_closes"], r["stop_median_mult"] or 0,
+                 r["stop_below_06x"], r["stop_below_01x"]))
+        print("  live shadow_stop fields present: %d"
+              % r["shadow_fields"])
+        for k in tot:
+            tot[k] += r[k]
+    if len(rows) > 1:
+        print("\nTOTAL: closes=%d covered=%d crossed=%d saved=%d "
+              "+$%.2f cut=%d -$%.2f NET %s$%.2f"
+              % (tot["closes"], tot["covered"], tot["crossed"],
+                 tot["saved_n"], tot["saved_usd"], tot["cut_n"],
+                 tot["cut_usd"], "+" if tot["net_usd"] >= 0 else "-",
+                 abs(tot["net_usd"])))
+        print("NOTE: 'covered' is small because closes keep only the "
+              "last 10 journal entries — most old closes cannot show "
+              "their early window. Coverage grows as the live "
+              "shadow_stop field accumulates on new closes.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

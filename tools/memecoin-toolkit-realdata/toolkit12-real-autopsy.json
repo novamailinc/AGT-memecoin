@@ -1,0 +1,29 @@
+{
+  "judge_class_distribution": {
+    "never-met-bar": 298846,
+    "gate-correctly-blocked-rug": 0,
+    "invented-ceiling-block": 0,
+    "burned-one-shot-convergence": 0,
+    "safety-unknown-lag": 6549,
+    "caught-or-other": 404
+  },
+  "paper_close_patterns": {
+    "round-tripper": 22,
+    "rug-flagged": 118,
+    "winner": 39,
+    "plain-loss": 169,
+    "breakeven-band": 35
+  },
+  "judge_records": 305799,
+  "paper_closes": 383,
+  "paper_classifiable": 0,
+  "paper_unclassifiable": 383,
+  "other_records": 18,
+  "judge_rug_outcomes": 0,
+  "judge_safety_failed": 0,
+  "unreachable_classes": [
+    "invented-ceiling-block",
+    "burned-one-shot-convergence"
+  ],
+  "unreachable_reason": "the journal records no gate-log reasons and no convergence events, so these two classes cannot be observed in the recorded data; a zero count is absence of evidence, not evidence of absence"
+}

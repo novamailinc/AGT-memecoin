@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""CEO trader daemon (2026-10-20).
+
+Runs the $100 paper CEO account (daemon/launch_scanner/ceo.py): tails
+the signal bus for fired cards and opens $1 positions with real-money
+discipline (no resets, no top-ups, honest fills + costs), then runs
+the user's exit ladder on open positions — bus tail + exits in one
+loop, every 120s.
+
+Paper only. A killswitch halt or an exhausted bankroll stops entries;
+open positions always keep exiting. Nothing here sends cards or
+touches the user's lane.
+
+Free-only: stdlib HTTP (DexScreener, Hyperliquid public APIs).
+"""
+import logging
+import os
+import sys as _sys
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("ceo-trader")
+
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+try:
+    import ceo as _ceo
+    import killswitch as _ks_check
+    _HAS_CEO = True
+except ImportError as e:
+    _HAS_CEO = False
+    _IMPORT_ERROR = e
+
+POLL_SECS = 120
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("ceo-trader", token="scripts/ceo-trader")
+    if not _HAS_CEO:
+        logger.warning("ceo module missing: %s", _IMPORT_ERROR)
+        return 1
+    state = _ceo.ensure_ledger()
+    # Materialize the killswitch lane entry (not halted) so the lane is
+    # visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_ceo.LANE)
+    except Exception:
+        pass
+    logger.warning("ceo-trader started (paper only, bankroll $%.2f, "
+                   "state %s)", float(state.get("bankroll") or 0),
+                   state.get("state"))
+    while True:
+        try:
+            res = _ceo.process_bus()
+            closes = _ceo.poll_exits()
+            if res.get("opened") or closes:
+                st = _ceo.account_state()
+                logger.warning(
+                    "ceo-trader: bus +%d lines, %d opened; %d closes; "
+                    "cash $%.2f, %d open, state %s",
+                    res.get("lines", 0), res.get("opened", 0), len(closes),
+                    st.get("bankroll", 0.0), st.get("n_open", 0),
+                    st.get("state"))
+        except Exception:
+            logger.exception("ceo-trader loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="400" viewBox="0 0 1000 400">
+  <rect width="1000" height="400" rx="16" fill="#0d1117"/>
+  <rect x="1" y="1" width="998" height="398" rx="15" fill="none" stroke="#30363d"/>
+  <text x="40" y="40" font-family="system-ui, -apple-system, sans-serif" font-size="24" font-weight="800" fill="#e6edf3">The exit ladder — one plan for every position</text>
+  <polyline points="80,320 80,250 300,250 300,180 520,180 520,120 760,120" fill="none" stroke="#3fb950" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="80" cy="320" r="7" fill="#e6edf3"/>
+  <circle cx="300" cy="250" r="6" fill="#3fb950"/>
+  <circle cx="520" cy="180" r="6" fill="#3fb950"/>
+  <circle cx="760" cy="120" r="6" fill="#3fb950"/>
+  <line x1="60" y1="320" x2="940" y2="320" stroke="#30363d" stroke-width="2"/>
+  <text x="80" y="348" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#e6edf3">ENTRY · 1.00x</text>
+  <text x="190" y="232" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#3fb950" text-anchor="middle">LEG A · sell 25% @ 1.5x</text>
+  <text x="410" y="162" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#3fb950" text-anchor="middle">LEG B · sell 25% @ 3x</text>
+  <text x="640" y="102" font-family="system-ui, -apple-system, sans-serif" font-size="15" font-weight="700" fill="#3fb950" text-anchor="middle">LEG C · sell 50% on 30% trailing stop</text>
+  <line x1="60" y1="368" x2="940" y2="368" stroke="#f85149" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="60" y="392" font-family="system-ui, -apple-system, sans-serif" font-size="14" fill="#f85149">−50% hard stop</text>
+  <text x="940" y="348" font-family="system-ui, -apple-system, sans-serif" font-size="14" fill="#8b949e" text-anchor="end">24h time stop closes whatever is left</text>
+  <text x="940" y="392" font-family="system-ui, -apple-system, sans-serif" font-size="12" fill="#8b949e" text-anchor="end">not to scale</text>
+</svg>

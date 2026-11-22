@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Regime-stake replay — advanced build, piece 2 calibration.
+
+Models what regime-aware stakes would have done on STORED paper
+closes: walk each lane's closes in time order; at each close,
+assess the regime from the closes BEFORE it (the information the
+lane actually had), scale that close's pnl by (stake / base)
+— exact arithmetic, since pnl = stake x (realized_mult - 1) —
+and tally the scaled net vs the actual net, plus the sit-out
+saves (closes that would have been skipped while sitting out).
+
+Honest scope: this is a MODEL, not measured paper trading. It
+assumes the same realized_mult at a different stake (fair: the
+fill is per-dollar) and the same entries (the sit-out count is
+the closes that would not have happened). The forward paper test
+(live entries at regime stakes, judged on the next 100 closes)
+is the proof.
+
+Read-only: never writes, never calls the network.
+Usage: scripts/regime-replay [--lane LANE]
+Plain script — run directly with the venv python, not pytest.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..",
+    "daemon", "launch_scanner"))
+
+from regime import assess, effective_stake, sit_out  # noqa: E402
+
+HOME = os.environ.get(
+    "FOREX_AGENT_HOME",
+    os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+LANES = ("grad_select", "grad_raw", "tranche", "tranche_protect")
+
+LEDGER_FILES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+}
+
+BASE_STAKE = 25.00
+
+
+def _load(lane):
+    try:
+        with open(os.path.join(HOME, LEDGER_FILES[lane])) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def replay_lane(lane):
+    d = _load(lane)
+    closes = [c for c in (d.get("closes") or [])
+              if isinstance(c, dict)]
+    closes.sort(key=lambda c: float(c.get("close_ts") or 0))
+    actual_net = 0.0
+    scaled_net = 0.0
+    sat_out_n = 0
+    sat_out_pnl = 0.0
+    regime_counts = {"COLD": 0, "NORMAL": 0, "HOT": 0}
+    stake_by_regime = {"COLD": 0.0, "NORMAL": 0.0, "HOT": 0.0}
+    for i, c in enumerate(closes):
+        pnl = float(c.get("pnl_usd") or 0)
+        actual_net += pnl
+        prior = closes[:i]
+        so = sit_out(prior)
+        if so["sit_out"]:
+            sat_out_n += 1
+            sat_out_pnl += pnl
+            continue
+        reg = assess(prior)
+        regime = reg["regime"]
+        regime_counts[regime] += 1
+        stake = effective_stake(BASE_STAKE, regime)
+        # Exact scaling: pnl = base x (mult - 1); at a different
+        # stake the same mult gives stake x (mult - 1).
+        scaled = pnl * (stake / BASE_STAKE)
+        scaled_net += scaled
+        stake_by_regime[regime] += scaled
+    return {"lane": lane, "n": len(closes),
+            "actual_net": actual_net, "scaled_net": scaled_net,
+            "sat_out_n": sat_out_n, "sat_out_pnl": sat_out_pnl,
+            "regime_counts": regime_counts,
+            "stake_by_regime": stake_by_regime}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lane", default="")
+    args = ap.parse_args(argv)
+    lanes = [args.lane] if args.lane else list(LANES)
+    print("regime-stake replay — stored paper closes (MODEL, not "
+          "measured)")
+    print("home: %s" % HOME)
+    print("base stake $25.00; COLD $12.50, NORMAL $25.00, HOT "
+          "$37.50; sit-out skips entries while cold+bleeding")
+    tot_actual = 0.0
+    tot_scaled = 0.0
+    tot_sat_n = 0
+    tot_sat_pnl = 0.0
+    for lane in lanes:
+        r = replay_lane(lane)
+        print("")
+        print("== %s: n=%d closes ==" % (lane, r["n"]))
+        print("  actual net $%.2f, regime-scaled net $%.2f "
+              "(delta $%.2f)" % (r["actual_net"], r["scaled_net"],
+                                r["scaled_net"] - r["actual_net"]))
+        print("  entries by regime: %s" % (r["regime_counts"],))
+        print("  scaled net by regime: %s" % (
+            {k: round(v, 2)
+             for k, v in r["stake_by_regime"].items()},))
+        print("  sit-out would have skipped %d closes worth "
+              "$%.2f" % (r["sat_out_n"], r["sat_out_pnl"]))
+        tot_actual += r["actual_net"]
+        tot_scaled += r["scaled_net"]
+        tot_sat_n += r["sat_out_n"]
+        tot_sat_pnl += r["sat_out_pnl"]
+    if len(lanes) > 1:
+        print("")
+        print("== POOLED ==")
+        print("  actual net $%.2f, regime-scaled net $%.2f "
+              "(delta $%.2f)" % (tot_actual, tot_scaled,
+                                tot_scaled - tot_actual))
+        print("  sit-out would have skipped %d closes worth "
+              "$%.2f" % (tot_sat_n, tot_sat_pnl))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

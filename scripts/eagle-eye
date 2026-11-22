@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Eagle Eye scanner: silent market-wide momentum detection for Solana.
+
+SILENT DATA LAYER — writes to SQLite, sends ZERO Telegram signals.
+Lanes (degen v2, steady, smart-watcher) read the DB via eagle_eye_db API.
+
+Architecture:
+- Discovery: GeckoTerminal new_pools (every 60s) → intake
+- Tiered polling via DexScreener batch (/tokens/v1/solana/{30 mints}):
+    hot (50 tokens) @15s, warm (200) @60s, cold (250) @5min
+- Budget: ~20 calls/min vs 300/min ceiling (15x headroom)
+- Momentum scoring → SQLite WAL → lanes read
+
+Usage: scripts/eagle-eye [--once]  (once = single cycle, for testing)
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from robust_http import get_json
+import eagle_eye_db as db
+from eagle_eye_score import score_token, compute_heat
+
+try:
+    import killswitch
+    _HAS_KS = True
+except ImportError:
+    _HAS_KS = False
+
+HOME = Path(os.environ.get("FOREX_AGENT_HOME", str(Path.home() / ".forex-agent")))
+
+# Tier config: (tier_name, poll_interval_s, max_tokens, batch_size)
+TIERS = [
+    ("hot", 15, 50, 30),
+    ("warm", 60, 200, 30),
+    ("cold", 300, 250, 30),
+]
+
+DS_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{}"
+GT_NEW_POOLS = ("https://api.geckoterminal.com/api/v2/networks/solana/"
+                "new_pools?page=1")
+
+# Hard filters at intake
+MIN_LIQ_USD = 5000
+MAX_FDV_USD = 50_000_000  # ignore mega-caps, we hunt runners
+
+# Runner trigger
+RUNNER_SCORE = 70
+
+def discover_new_pools(conn) -> int:
+    """GeckoTerminal new_pools → intake. Returns count added."""
+    try:
+        d = get_json(GT_NEW_POOLS, tries=3, timeout=20)
+    except Exception as e:
+        print(f"  discovery failed: {e}", flush=True)
+        return 0
+    added = 0
+    for pool in d.get("data", []):
+        try:
+            attrs = pool.get("attributes", {})
+            pid = pool.get("id", "")
+            pool_addr = pid.split("_")[-1] if "_" in pid else pid
+            name = attrs.get("name", "?").split("/")[0].strip()
+            fdv = float(attrs.get("fdv_usd", 0) or 0)
+            liq = float(attrs.get("reserve_in_usd", 0) or 0)
+            if liq < MIN_LIQ_USD or fdv > MAX_FDV_USD or fdv <= 0:
+                continue
+            mint = pool.get("relationships", {}).get(
+                "base_token", {}).get("data", {}).get("id", "")
+            mint = mint.split("_")[-1] if "_" in mint else mint
+            if not mint:
+                continue
+            db.upsert_token(conn, mint, symbol=name, pool_address=pool_addr,
+                            liq_usd=liq, fdv_usd=fdv, source="gt_new_pools")
+            # New tokens start as NEW state, cold tier
+            added += 1
+        except Exception:
+            continue
+    return added
+
+def fetch_batch(mints: list) -> dict:
+    """DexScreener batch: 30 mints per call. Returns {mint: token_data}."""
+    if not mints:
+        return {}
+    result = {}
+    for i in range(0, len(mints), 30):
+        batch = mints[i:i+30]
+        try:
+            url = DS_BATCH.format(",".join(batch))
+            data = get_json(url, tries=3, timeout=20)
+            # Response is a list of token objects
+            for t in (data if isinstance(data, list) else []):
+                addr = t.get("tokenAddress", "")
+                if addr:
+                    result[addr] = t
+        except Exception as e:
+            print(f"  batch fetch failed: {e}", flush=True)
+        time.sleep(0.5)  # rate limit hygiene
+    return result
+
+def extract_features(ds_token: dict, mint: str) -> dict:
+    """Extract momentum features from DexScreener token object."""
+    txns = ds_token.get("txns", {})
+    volume = ds_token.get("volume", {})
+    price_chg = ds_token.get("priceChange", {})
+    m5 = txns.get("m5", {})
+    m15 = txns.get("m15", {})
+    h1 = txns.get("h1", {})
+
+    return {
+        "price_usd": float(ds_token.get("priceUsd", 0) or 0),
+        "volume_m5": float(volume.get("m5", 0) or 0),
+        "volume_m15": float(volume.get("m15", 0) or 0),
+        "volume_h1": float(volume.get("h1", 0) or 0),
+        "volume_h24": float(volume.get("h24", 0) or 0),
+        "buys_m5": int(m5.get("buys", 0) or 0),
+        "sells_m5": int(m5.get("sells", 0) or 0),
+        "buyers_m5": int(m5.get("buyers", 0) or 0),
+        "sellers_m5": int(m5.get("sellers", 0) or 0),
+        "price_chg_m5": float(price_chg.get("m5", 0) or 0),
+        "price_chg_m15": float(price_chg.get("m15", 0) or 0),
+        "price_chg_h1": float(price_chg.get("h1", 0) or 0),
+        "liq_usd": float(ds_token.get("liquidity", {}).get("usd", 0) or 0),
+        "fdv_usd": float(ds_token.get("fdv", 0) or 0),
+    }
+
+def get_baseline(conn, mint: str, window_s: float = 1800) -> float:
+    """Trailing average m5 volume from snapshots (for RVOL)."""
+    cur = conn.execute(
+        "SELECT AVG(vol_m5) as avg_v FROM snapshots"
+        " WHERE mint=? AND ts > ?",
+        (mint, time.time() - window_s))
+    r = cur.fetchone()
+    return r["avg_v"] if r and r["avg_v"] else 0
+
+def poll_tier(conn, tier: str, max_tokens: int, batch_size: int) -> int:
+    """Poll one tier, score, update DB. Returns tokens updated."""
+    tokens = db.get_tokens_by_tier(conn, tier)[:max_tokens]
+    if not tokens:
+        return 0
+    mints = [t["mint"] for t in tokens]
+    ds_data = fetch_batch(mints)
+    updated = 0
+    now = time.time()
+
+    for t in tokens:
+        mint = t["mint"]
+        ds = ds_data.get(mint)
+        if not ds:
+            continue
+        feat = extract_features(ds, mint)
+
+        # Get token age
+        cur = conn.execute("SELECT first_seen FROM tokens WHERE mint=?",
+                           (mint,))
+        row = cur.fetchone()
+        age_s = now - (row["first_seen"] if row and row["first_seen"] else now)
+
+        # Baseline for RVOL
+        baseline = get_baseline(conn, mint)
+
+        # Score
+        score_data = {
+            **feat,
+            "baseline_m5": baseline if baseline > 0 else feat["volume_m5"],
+            "vol_1m": feat["volume_m5"] / 5,  # approx from m5
+            "age_s": age_s,
+        }
+        result = score_token(score_data)
+
+        # Update momentum
+        db.update_momentum(conn, mint, {
+            "price_usd": feat["price_usd"],
+            "volume_m5": feat["volume_m5"],
+            "volume_m15": feat["volume_m15"],
+            "volume_h1": feat["volume_h1"],
+            "volume_h24": feat["volume_h24"],
+            "buys_m5": feat["buys_m5"],
+            "sells_m5": feat["sells_m5"],
+            "buyers_m5": feat["buyers_m5"],
+            "sellers_m5": feat["sellers_m5"],
+            "price_chg_m5": feat["price_chg_m5"],
+            "price_chg_m15": feat["price_chg_m15"],
+            "price_chg_h1": feat["price_chg_h1"],
+            "heat_score": result["heat"],
+            "momentum_score": result["score"],
+            "buy_sell_ratio": result["buy_sell_ratio"],
+            "factors": result["factors"],
+        })
+
+        # Record snapshot for baselines
+        db.record_snapshot(conn, mint, feat["price_usd"],
+                           feat["volume_m5"], feat["buys_m5"],
+                           feat["sells_m5"])
+
+        # State transitions
+        cur_state = t["state"]
+        score = result["score"]
+        if score >= RUNNER_SCORE and cur_state in ("WATCHLIST", "NEW"):
+            db.set_state(conn, mint, db.CANDIDATE)
+            # Promote to hot tier
+            db.set_tier(conn, mint, "hot")
+            # Record runner event (silent — lanes decide)
+            sym = t.get("symbol", "?")
+            db.record_runner(conn, mint, sym, score)
+            print(f"  🏃 RUNNER {sym}: score={score}", flush=True)
+        elif score >= 50 and cur_state == "NEW":
+            db.set_state(conn, mint, db.WATCHLIST)
+            db.set_tier(conn, mint, "warm")
+        elif score < 10 and cur_state == "COOLDOWN":
+            # Cooldown expired, back to watchlist
+            # (simplified: no time-based cooldown yet)
+            pass
+
+        updated += 1
+
+    return updated
+
+def run_cycle(conn) -> dict:
+    """One full scan cycle: discovery + all tiers."""
+    start = time.time()
+    stats = {"discovered": 0, "updated": 0}
+
+    # Discovery
+    stats["discovered"] = discover_new_pools(conn)
+
+    # Poll tiers
+    for tier, interval, max_tok, batch in TIERS:
+        # Check if tier is due (simple: every cycle polls all for now,
+        # tier timing handled by outer loop)
+        n = poll_tier(conn, tier, max_tok, batch)
+        stats["updated"] += n
+
+    # Prune old snapshots
+    db.prune_snapshots(conn)
+
+    cycle_ms = int((time.time() - start) * 1000)
+    db.update_heartbeat(conn, cycle_ms, db.count_tokens(conn))
+    stats["cycle_ms"] = cycle_ms
+    return stats
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true",
+                    help="single cycle then exit")
+    args = ap.parse_args()
+
+    if _HAS_KS and not killswitch.gate("eagle_eye"):
+        print("eagle_eye halted by killswitch", flush=True)
+        return
+
+    conn = db.get_db()
+    print("🦅 Eagle Eye starting (silent data layer)", flush=True)
+
+    # Tier scheduling: track last poll per tier
+    last_poll = {t[0]: 0 for t in TIERS}
+    last_discovery = 0
+
+    while True:
+        cycle_start = time.time()
+        now = time.time()
+
+        # Discovery every 60s
+        if now - last_discovery >= 60:
+            n = discover_new_pools(conn)
+            if n:
+                print(f"  discovered {n} new pools", flush=True)
+            last_discovery = now
+
+        # Poll due tiers
+        total = 0
+        for tier, interval, max_tok, batch in TIERS:
+            if now - last_poll[tier] >= interval:
+                n = poll_tier(conn, tier, max_tok, batch)
+                total += n
+                last_poll[tier] = time.time()
+
+        db.prune_snapshots(conn)
+        cycle_ms = int((time.time() - cycle_start) * 1000)
+        db.update_heartbeat(conn, cycle_ms, db.count_tokens(conn))
+
+        if total:
+            print(f"  cycle: {total} tokens updated ({cycle_ms}ms)",
+                  flush=True)
+
+        if args.once:
+            print("  --once: exiting", flush=True)
+            break
+
+        time.sleep(5)  # main loop tick
+
+if __name__ == "__main__":
+    main()

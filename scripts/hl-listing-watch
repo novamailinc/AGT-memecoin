@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""Signal Refinery Phase 2 — Hyperliquid listing watcher (2026-10-17).
+
+Watches for NEW HIP-1 spot listings on Hyperliquid (spotMeta diff) and
+feeds them to the ONE destination: the existing degen lane, as cards.
+The user gambles their OWN real money on these cards.
+
+Per-chain role (nova-design.md): Hyperliquid is NOT a memecoin-runner
+source — it is a LISTING-EVENT source. ~1/day, slow, clean. The card is
+a different type: "new HL listing" with auction-price context, tradeable
+spot.
+
+What this is NOT:
+- No paper entries, no paper lanes, no positions. Signals only; every
+  buy stays manual.
+
+Mechanism:
+- Poll https://api.hyperliquid.xyz/info {"type":"spotMeta"} every 5 min
+  (free, no key). Diff `universe` against the persisted snapshot; a new
+  universe entry = a new listing.
+- Auction context: {"type":"spotMetaAndAssetCtxs"} gives the mark price
+  of the new pair at detection time — the listing reference price.
+- First run SEEDS the snapshot (no cards for listings that already
+  existed).
+
+Safety honesty: HL spot settles on the exchange's own matching engine —
+there is no EVM-contract honeypot vector, and GoPlus/Honeypot.is do not
+cover HL-native tokens. The card says exactly that instead of a fake
+score. Exchange listing != safety: listings can still dump.
+
+Guardrails:
+- Respects the per-chain feed kill switch (signal_bus.feed_enabled):
+  a paused HL feed sends no cards and publishes nothing.
+- Own daily card budget: MAX_CARDS_PER_DAY = 2, SHARED between listing
+  cards and breakout cards. Solana/Base/ETH feeds untouched.
+- Every listing event is published to the normalized signal bus with
+  chain="hyperliquid", source="hl-listing", tier="listing".
+
+Spot breakout watch (2026-10-18): new listings are so rare the watch
+almost never signals, so the same loop also watches the established
+spot universe for volume breakouts (spotMetaAndAssetCtxs: whole universe
++ live dayNtlVlm/markPx/prevDayPx in one free call). Fires when
+dayNtlVlm >= $50k AND markPx/prevDayPx >= 1.25 AND the pair has been
+known >= 24h (day one belongs to listing cards) AND no breakout card
+for the pair in the last 24h. Cards via build_card with
+source="hl-breakout", tier="breakout"; mirror hooked (HL via spot
+index). Track code "hb".
+
+Free-only: stdlib HTTP, free public HL API. No keys, no paid tiers.
+"""
+import json
+import logging
+import os
+import sys as _sys
+import time
+import urllib.parse
+import urllib.request
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("hl-listing-watch")
+
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+try:
+    from signal_bus import make_signal, publish, feed_enabled
+    _HAS_BUS = True
+except ImportError:
+    _HAS_BUS = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "hl_listings_seen.json")
+DAILY_FILE = os.path.join(HOME, "hl_listing_daily.json")
+
+HL_INFO = "https://api.hyperliquid.xyz/info"
+POLL_SECS = 300  # listings are ~1/day; 5-min polls are plenty
+MAX_CARDS_PER_DAY = 2  # SHARED budget: listing cards + breakout cards
+
+# --- Spot breakout watch (2026-10-18) ---
+# The listing watch only fires on new HIP-1 listings (Dutch auction every
+# ~31h, max ~5/week) so it almost never signals. Breakouts on the
+# existing spot universe are the only other documented HL play:
+# spotMetaAndAssetCtxs returns the whole ~425-token universe with live
+# dayNtlVlm / markPx / prevDayPx in ONE free call, no key.
+BREAKOUT_FILE = os.path.join(HOME, "hl_breakout_seen.json")
+BREAKOUT_MIN_VOL = 50000.0   # dayNtlVlm >= $50k
+BREAKOUT_MIN_MOVE = 1.25     # markPx / prevDayPx >= 1.25
+BREAKOUT_MIN_AGE_S = 86400   # pair known >= 24h (day one belongs to
+                             # listing cards)
+BREAKOUT_CARD_COOLDOWN_S = 86400  # one breakout card per pair per 24h
+
+
+def _curl_json(url, payload, timeout):
+    """curl-first (no shell): the VM egress MITM proxy intermittently
+    truncates urllib POST bodies (IncompleteRead) while curl succeeds."""
+    import shutil
+    import subprocess
+    if not shutil.which("curl"):
+        return None
+    cmd = [shutil.which("curl"), "-sS", "--max-time", str(int(timeout)),
+           "-X", "POST", "-H", "Content-Type: application/json",
+           "-H", "User-Agent: forex-agent/1.0",
+           "-d", json.dumps(payload), url]
+    try:
+        out = subprocess.run(cmd, capture_output=True,
+                             timeout=timeout + 5, check=False)
+    except Exception:
+        return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    try:
+        return json.loads(out.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+
+
+def _http_json(url, payload, timeout=15):
+    data = _curl_json(url, payload, timeout)
+    if data is not None:
+        return data
+    try:
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "forex-agent/1.0",
+                     "Connection": "close"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        logger.warning("HL api failed: %s", e)
+        return None
+
+
+def fetch_spot_meta():
+    """(tokens, universe) or (None, None). Never raises."""
+    d = _http_json(HL_INFO, {"type": "spotMeta"})
+    if not isinstance(d, dict):
+        return None, None
+    tokens = d.get("tokens")
+    universe = d.get("universe")
+    if not isinstance(tokens, list) or not isinstance(universe, list):
+        return None, None
+    return tokens, universe
+
+
+def fetch_mark_prices():
+    """{universe_index: markPx} from spotMetaAndAssetCtxs. Best effort."""
+    out = {}
+    try:
+        d = _http_json(HL_INFO, {"type": "spotMetaAndAssetCtxs"})
+        if not isinstance(d, list) or len(d) < 2:
+            return out
+        meta, ctxs = d[0], d[1]
+        universe = (meta or {}).get("universe") or []
+        for u, c in zip(universe, ctxs or []):
+            try:
+                out[int(u.get("index"))] = float((c or {}).get("markPx") or 0)
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def token_by_index(tokens, idx):
+    for t in tokens:
+        try:
+            if int(t.get("index")) == int(idx):
+                return t
+        except (TypeError, ValueError):
+            continue
+    return {}
+
+
+def parse_spot_ctxs(d):
+    """{universe_index: {pair, day_vol, mark_px, prev_px}} from a
+    spotMetaAndAssetCtxs response. Non-canonical "@N" pair names are
+    resolved via the token table (e.g. "@109" -> "HYPE/USDC").
+    Pure function (unit-tested)."""
+    out = {}
+    try:
+        if not isinstance(d, list) or len(d) < 2:
+            return out
+        meta, ctxs = d[0], d[1]
+        meta = meta or {}
+        universe = meta.get("universe") or []
+        tokens = {}
+        for t in meta.get("tokens") or []:
+            try:
+                tokens[int(t.get("index"))] = t.get("name", "?")
+            except (TypeError, ValueError):
+                continue
+        for u, c in zip(universe, ctxs or []):
+            try:
+                idx = int(u.get("index"))
+                name = u.get("name", "?")
+                if isinstance(name, str) and name.startswith("@"):
+                    tids = u.get("tokens") or []
+                    if len(tids) >= 2:
+                        try:
+                            name = "%s/%s" % (tokens.get(int(tids[0]), "?"),
+                                              tokens.get(int(tids[1]), "?"))
+                        except (TypeError, ValueError):
+                            pass
+                c = c or {}
+                out[idx] = {
+                    "pair": name,
+                    "day_vol": float(c.get("dayNtlVlm") or 0),
+                    "mark_px": float(c.get("markPx") or 0),
+                    "prev_px": float(c.get("prevDayPx") or 0),
+                }
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def fetch_spot_ctxs():
+    """Whole spot universe with live volume in one call. Never raises."""
+    d = _http_json(HL_INFO, {"type": "spotMetaAndAssetCtxs"}, timeout=20)
+    return parse_spot_ctxs(d)
+
+
+def detect_breakouts(ctxs, bstate, now):
+    """Breakout candidates: volume + 24h move, aged, not recently carded.
+    Pure-ish (takes now). Never raises. Returns [(idx, info)]."""
+    hits = []
+    try:
+        for idx, info in (ctxs or {}).items():
+            try:
+                vol = float(info.get("day_vol") or 0)
+                mark = float(info.get("mark_px") or 0)
+                prev = float(info.get("prev_px") or 0)
+                if vol < BREAKOUT_MIN_VOL or mark <= 0 or prev <= 0:
+                    continue
+                if mark / prev < BREAKOUT_MIN_MOVE:
+                    continue
+                st = (bstate or {}).get(str(idx)) or {}
+                first = st.get("first_seen", 0)
+                if not first:
+                    continue  # need history before judging
+                if now - first < BREAKOUT_MIN_AGE_S:
+                    continue  # day one belongs to listing cards
+                if now - st.get("last_card", 0) < BREAKOUT_CARD_COOLDOWN_S:
+                    continue
+                hits.append((idx, info))
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        pass
+    return hits
+
+
+def fmt_vol(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    if v >= 1e6:
+        return "%.1fM" % (v / 1e6)
+    if v >= 1e3:
+        return "%.0fk" % (v / 1e3)
+    return "%.0f" % v
+
+
+def listing_id(pair_name):
+    """Bus/card identifier for a listing. Alphanumeric-only (the tap
+    parser's mint validator rejects anything else) and colon-free so the
+    tap callback stays parseable: track:hyperliquid:hl:<id>."""
+    return "HL" + "".join(ch for ch in pair_name if ch.isalnum())
+
+
+def detect_new(universe, seen):
+    """New universe entries vs the persisted snapshot. Never raises."""
+    new = []
+    try:
+        for u in universe:
+            try:
+                idx = int(u.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if str(idx) not in seen:
+                new.append(u)
+    except Exception:
+        pass
+    return new
+
+
+def tap_callback(listing):
+    """track:hyperliquid:hl:<id> — short code keeps it under Telegram's
+    64-byte callback cap; the parser resolves "hl" -> "hl-listing"."""
+    try:
+        from signal_bus import track_callback
+        return track_callback("hyperliquid", "hl-listing",
+                              listing_id(listing["pair"]))
+    except Exception:
+        return "track:hyperliquid:hl:%s" % listing_id(listing["pair"])
+
+
+def breakout_tap_callback(pair):
+    """track:hyperliquid:hb:<id> — "hb" keeps it under the 64-byte cap;
+    the telegram parser resolves hb -> hl-breakout."""
+    try:
+        from signal_bus import track_callback
+        return track_callback("hyperliquid", "hl-breakout",
+                              listing_id(pair))
+    except Exception:
+        return "track:hyperliquid:hb:%s" % listing_id(pair)
+
+
+def build_breakout_text(idx, info):
+    """Breakout card: the move IS the signal (post-listing volume
+    breakout on an established HL spot pair)."""
+    pair = info.get("pair", "?")
+    base = pair.split("/")[0]
+    mark = info.get("mark_px", 0)
+    prev = info.get("prev_px", 0)
+    vol = info.get("day_vol", 0)
+    chg = (mark / prev - 1) * 100 if prev else 0
+    if _HAS_CARDS:
+        card = build_card(
+            symbol="%s (%s)" % (base, pair), score=65.0,
+            mint=listing_id(pair),
+            entry_price=mark, current_price=mark,
+            mcap=0, liquidity=0, buyers=0, age_min=0,
+            safety=("exchange-settled spot — no contract honeypot vector; "
+                    "GoPlus/Honeypot.is do not cover HL-native tokens"),
+            is_runner=True, is_fresh=False,
+            risk_note=("📈 HL spot breakout: +%.0f%% in 24h on $%s day "
+                       "volume. Breakouts fade fast — size it like a "
+                       "gamble." % (chg, fmt_vol(vol))),
+            chain="hyperliquid", source="hl-breakout",
+        )
+        return card
+    return "📈 HL BREAKOUT %s +%.0f%% 24h, $%s day vol" % (pair, chg,
+                                                          fmt_vol(vol))
+
+
+def feed_live():
+    if not _HAS_BUS:
+        return True
+    return bool(feed_enabled("hyperliquid"))
+
+
+def send_card(text, listing):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[
+                {"text": "📋 Copy CA",
+                 "copy_text": {"text": listing["pair"].split("/")[0]}},
+                {"text": "📍 I bought this",
+                 "callback_data": tap_callback(listing)},
+            ]],
+        })
+        payload = {"chat_id": "6883056760", "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def send_breakout_card(text, pair):
+    """Same card plumbing as listings, with the hb tap callback."""
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[
+                {"text": "📋 Copy CA",
+                 "copy_text": {"text": pair.split("/")[0]}},
+                {"text": "📍 I bought this",
+                 "callback_data": breakout_tap_callback(pair)},
+            ]],
+        })
+        payload = {"chat_id": "6883056760", "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+
+def daily_budget_left():
+    today = time.strftime("%Y-%m-%d")
+    d = load_json(DAILY_FILE, {})
+    if d.get("date") != today:
+        d = {"date": today, "count": 0}
+    return MAX_CARDS_PER_DAY - d.get("count", 0), d
+
+
+def bump_daily(d):
+    d["count"] = d.get("count", 0) + 1
+    save_json(DAILY_FILE, d)
+
+
+def build_text(listing):
+    """Listing-event card. Different type from runner cards: the event
+    IS the signal (exchange listing), with auction-price context."""
+    pair = listing["pair"]
+    base = pair.split("/")[0]
+    mark = listing.get("mark_px", 0)
+    lines = [
+        "📋 NEW HL LISTING — $%s" % base,
+        "spot pair %s · index %s" % (pair, listing.get("spot_index", "?")),
+    ]
+    if mark:
+        lines.append("listing reference price: $%s" % mark)
+    lines += [
+        "tokenId %s" % (listing.get("token_id", "?")[:18] + "…"),
+        "⚠️ Listing events move fast, then fade — exchange listing is "
+        "not safety. Trade the listing, not a meme runner.",
+        "🛡️ exchange-settled spot — no contract honeypot vector; "
+        "GoPlus/Honeypot.is do not cover HL-native tokens",
+    ]
+    if _HAS_CARDS:
+        card = build_card(
+            symbol="%s (%s)" % (base, pair), score=70.0,
+            mint=listing_id(pair),
+            entry_price=mark, current_price=mark,
+            mcap=0, liquidity=0, buyers=0, age_min=0,
+            safety=("exchange-settled spot — no contract honeypot vector; "
+                    "GoPlus/Honeypot.is do not cover HL-native tokens"),
+            is_runner=False, is_fresh=False,
+            risk_note=("📋 HL listing event — trade the listing, not a "
+                       "meme runner. 💸 Listings can dump; size it like "
+                       "a gamble."),
+            chain="hyperliquid", source="hl-listing",
+        )
+        return card
+    lines.append("CA: %s" % listing_id(pair))
+    return "\n".join(lines)
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("hl-listing-watch", token="scripts/hl-listing-watch")
+    logger.warning("hl-listing watch started (Phase 2, signals-only)")
+    seen = load_json(SEEN_FILE, {})
+    feed_paused_logged = False
+    while True:
+        try:
+            if not feed_live():
+                if not feed_paused_logged:
+                    logger.warning("hl feed PAUSED by kill switch — "
+                                   "sleeping, no cards, no bus publish")
+                    feed_paused_logged = True
+                time.sleep(300)
+                continue
+            feed_paused_logged = False
+
+            tokens, universe = fetch_spot_meta()
+            if tokens is None:
+                time.sleep(POLL_SECS)
+                continue
+
+            if not seen:
+                # First run: seed the snapshot, no cards for history.
+                seen = {str(u.get("index")): u.get("name", "?")
+                        for u in universe
+                        if u.get("index") is not None}
+                save_json(SEEN_FILE, seen)
+                logger.warning("hl watch seeded with %d listings", len(seen))
+                time.sleep(POLL_SECS)
+                continue
+
+            new = detect_new(universe, seen)
+            if new:
+                marks = fetch_mark_prices()
+                for u in new:
+                    idx = int(u.get("index"))
+                    pair = u.get("name", "?")
+                    tok_idx = (u.get("tokens") or [None])[0]
+                    tok = token_by_index(tokens, tok_idx) if tok_idx is not None else {}
+                    listing = {
+                        "pair": pair,
+                        "spot_index": idx,
+                        "token_id": tok.get("tokenId", "?"),
+                        "evm_contract": ((tok.get("evmContract") or {})
+                                         .get("address", "?")),
+                        "mark_px": marks.get(idx, 0),
+                    }
+                    left, daily = daily_budget_left()
+                    if left > 0:
+                        card = build_text(listing)
+                        if send_card(card, listing):
+                            bump_daily(daily)
+                            if _HAS_BUS:
+                                publish(make_signal(
+                                    "hyperliquid", "hl-listing",
+                                    listing_id(pair),
+                                    symbol=pair.split("/")[0],
+                                    score=70.0, tier="listing",
+                                    age_min=0, mcap=0, liquidity=0,
+                                    buys=0, sells=0,
+                                    evidence={
+                                        "pair": pair,
+                                        "spot_index": idx,
+                                        "mark_px": listing["mark_px"],
+                                        "token_id": listing.get("token_id"),
+                                    }))
+                            logger.warning("HL LISTING CARD %s", pair)
+                            # Paper mirror (2026-10-17): $1 paper position
+                            # with honest HL costs + the user's exit ladder.
+                            # Never affects the card.
+                            try:
+                                from mirror import mirror_card
+                                opened, why = mirror_card(
+                                    "hyperliquid", "hl-listing",
+                                    listing_id(pair),
+                                    symbol=pair.split("/")[0],
+                                    score=70.0, tier="listing",
+                                    evidence={"pair": pair,
+                                              "spot_index": idx},
+                                    extra={"pair": pair, "spot_index": idx,
+                                           "mark_px": listing["mark_px"]})
+                                if not opened:
+                                    logger.warning("mirror skip %s: %s",
+                                                   pair, why)
+                            except Exception:
+                                pass
+                    else:
+                        logger.warning("HL listing %s: daily budget spent",
+                                       pair)
+                    seen[str(idx)] = pair
+                save_json(SEEN_FILE, seen)
+
+            # --- Spot breakout watch (2026-10-18) ---
+            # Listings are rare; breakouts on the established spot
+            # universe are the only other documented HL play. Same
+            # 5-min loop, same shared 2/day budget as listing cards.
+            bstate = load_json(BREAKOUT_FILE, {})
+            ctxs = fetch_spot_ctxs()
+            now = time.time()
+            for idx in ctxs:
+                st = bstate.get(str(idx)) or {}
+                if not st.get("first_seen"):
+                    st["first_seen"] = now
+                bstate[str(idx)] = st
+            for idx, info in detect_breakouts(ctxs, bstate, now):
+                left, daily = daily_budget_left()
+                if left <= 0:
+                    logger.warning("HL breakout %s: daily budget spent",
+                                   info.get("pair"))
+                    break
+                card = build_breakout_text(idx, info)
+                if send_breakout_card(card, info.get("pair", "?")):
+                    bump_daily(daily)
+                    bstate[str(idx)]["last_card"] = now
+                    if _HAS_BUS:
+                        publish(make_signal(
+                            "hyperliquid", "hl-breakout",
+                            listing_id(info.get("pair", "?")),
+                            symbol=info.get("pair", "?").split("/")[0],
+                            score=65.0, tier="breakout",
+                            age_min=0, mcap=0, liquidity=0,
+                            buys=0, sells=0,
+                            evidence={
+                                "pair": info.get("pair"),
+                                "spot_index": idx,
+                                "mark_px": info.get("mark_px"),
+                                "prev_px": info.get("prev_px"),
+                                "day_vol": info.get("day_vol"),
+                            }))
+                    logger.warning("HL BREAKOUT CARD %s", info.get("pair"))
+                    # Paper mirror: $1 paper position with honest HL
+                    # costs + the user's exit ladder. Never affects
+                    # the card.
+                    try:
+                        from mirror import mirror_card
+                        opened, why = mirror_card(
+                            "hyperliquid", "hl-breakout",
+                            listing_id(info.get("pair", "?")),
+                            symbol=info.get("pair", "?").split("/")[0],
+                            score=65.0, tier="breakout",
+                            evidence={"pair": info.get("pair"),
+                                      "spot_index": idx},
+                            extra={"pair": info.get("pair"),
+                                   "spot_index": idx,
+                                   "mark_px": info.get("mark_px")})
+                        if not opened:
+                            logger.warning("mirror skip %s: %s",
+                                           info.get("pair"), why)
+                    except Exception:
+                        pass
+            save_json(BREAKOUT_FILE, bstate)
+        except Exception:
+            logger.exception("hl-listing loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

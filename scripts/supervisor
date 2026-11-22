@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""Resident realtime supervisor (2026-10-21, user directive: "a high
+end extreme realtime monitoring watchdog, not a timed or scheduled
+watchdog").
+
+Replaces the 5-minute cron watchdog as the daemons' keeper. This is a
+RESIDENT process: it owns or adopts every bot daemon, notices a death
+within ~1 second (owned children are reaped via poll each tick; adopted
+processes are checked against /proc), and restarts it immediately under
+a per-daemon backoff ladder with a storm guard (a crash-looping daemon
+is held, not respawned forever). The old forex-watchdog cron keeps
+exactly one job: reviving THIS supervisor after a VM reboot — the
+supervisor then restores everything else in seconds.
+
+Design rules:
+  * Children are spawned detached (start_new_session) and are NEVER
+    killed by the supervisor's own exit — if the supervisor dies, the
+    daemons keep running and the next supervisor adopts them.
+  * Adoption is verified against /proc/<pid>/cmdline tokens, never a
+    bare pattern match (a shell whose command line merely mentions a
+    daemon is not the daemon).
+  * Single instance, enforced by an flock; a second supervisor exits.
+  * State is written every tick to ~/.forex-agent/supervisor_state.json
+    (atomic) — that file's timestamp is the supervisor's heartbeat.
+  * The supervisor restarts processes. It never edits code, ledgers,
+    killswitch state, or any daemon's data — repairs stay with the
+    agent under the self-repair protocol.
+
+Paper only — same boundary as everything it guards.
+"""
+import fcntl
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("supervisor")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+LOG_DIR = os.path.join(HOME, "log")
+STATE_PATH = os.path.join(HOME, "supervisor_state.json")
+LOCK_PATH = os.path.join(HOME, "supervisor.lock")
+
+# /proc location, overridable for tests. The supervisor adopts live
+# daemons by scanning process command lines; pointing it at a
+# scratch proc dir is how the spawn path is proven without ever
+# adopting a live daemon (see tests/test_agt_packaging.py).
+PROC_DIR = os.environ.get("FOREX_SUPERVISOR_PROC_DIR", "/proc")
+
+
+def _venv_python():
+    """Python that carries the compiled deps (solders for signing).
+
+    Relocatable (Phase 13 finalize): the roster used to hardcode
+    the VM path /home/hatch/workspace/Forex-agent/.venv/bin/python,
+    which fails on AGT. Resolution order: explicit
+    FOREX_VENV_PYTHON env override, else {repo}/.venv/bin/python,
+    else {repo}/../.venv/bin/python (the VM layout, where the
+    venv is a sibling of the checkout), else the interpreter
+    running this supervisor (on AGT, the prefix python). The last
+    resort lacks solders unless the prefix provides it —
+    devnet-demo-trader then fails at import, loudly, rather
+    than silently running unsigned.
+    """
+    override = os.environ.get("FOREX_VENV_PYTHON")
+    if override and os.path.isfile(override) and os.access(override,
+                                                           os.X_OK):
+        return override
+    for cand in (os.path.join(ROOT, ".venv", "bin", "python"),
+                 os.path.join(os.path.dirname(ROOT), ".venv", "bin",
+                              "python")):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return sys.executable
+
+TICK_S = 1.0
+BACKOFF_LADDER = (1.0, 2.0, 5.0, 15.0, 60.0)   # seconds, capped at last
+STABLE_S = 600.0        # a run this long resets the ladder
+STORM_MAX_STARTS = 6    # starts within STORM_WINDOW_S ...
+STORM_WINDOW_S = 600.0
+STORM_HOLD_S = 300.0    # ... trigger a hold this long
+
+
+class Spec:
+    def __init__(self, name, argv, token):
+        self.name = name
+        self.argv = argv
+        self.token = token  # cmdline token that identifies the process
+
+    @property
+    def log_path(self):
+        return os.path.join(LOG_DIR, self.name + ".log")
+
+
+def _module(name):
+    return Spec(name, ["python3", "-m", "daemon." + name],
+                "daemon." + name)
+
+
+def _script(name):
+    return Spec(name, ["python3", "scripts/" + name], "scripts/" + name)
+
+
+# Roster changes 2026-10-23 (user "no dead code, nothing idle" order):
+# stacker-feed REMOVED — lane KILLED on the 2026-10-22 verdict (7 closes,
+# -$11.79, 0 wins; killswitch lane "stacker" halted). eagle-eye x3
+# REMOVED — audit verified their output has no consumer in the card
+# path or alerts. Both also retired in scripts/forex-watchdog so the
+# 5-min watchdog cannot resurrect them.
+ROSTER = [
+    _module("market_monitor"), _module("signal_monitor"),
+    _module("position_monitor"), _module("health_monitor"),
+    _module("telegram"), _module("launch_scanner"),
+    # degen-feed REMOVED 2026-10-30 (degen lane permanent kill, user
+    # order: lane not useful, remove forever; do not re-add without his
+    # explicit word).
+    # smart-watcher REMOVED 2026-10-29 (full smart-money shutdown, user
+    # order; do not re-add without his explicit word).
+    # degen-peak-tracker REVIVED 2026-10-23: it was retired from the
+    # watchdog on 2026-10-14 as "Degen v1" collateral while the nightly
+    # degen-learner still labels winners from its peaks — with no
+    # supervisor and no cron it died silently that day and stayed dead.
+    _script("degen-peak-tracker"),
+    _script("base-runner-feed"),
+    _script("eth-runner-feed"), _script("locked-liq-scan"),
+    _script("hl-listing-watch"), _script("mirror-exits"),
+    _script("ceo-trader"), _script("grad-trader"),
+    _script("grad-raw-trader"), _script("momentum-trader"),
+    _script("grad-select-trader"),
+    _script("tranche-trader"),
+    _script("tranche-protect-trader"),
+    # paper-live-trader SUPERSEDED 2026-11-02 (user correction:
+    # the $10 is split across the live lanes on the demo, not
+    # one $10 lane) — 0 trades, clean retirement. Replaced by:
+    _script("live10-demo-mirror"),
+    _script("raw-tight-trader"),
+    # MIMIC FAMILY PERMANENTLY KILLED 2026-11-02 (user order:
+    # remove the unprofitable mimic lane forever — family 214
+    # closes, 32 wins, -$578.67). mimic-trader, mimic-edge-trader
+    # and mimic-edge2-trader REMOVED from the roster; revival
+    # only on the user's explicit order (see permanent_kills.json).
+    # devnet-demo-trader ADDED 2026-10-30 (user order: devnet demo
+    # lane; mirrors grad_select paper entries to real devnet
+    # self-transfers, execution proof only, NO P&L by design).
+    # Runs under the venv python, NOT system python3: signing needs
+    # the 'solders' package, which only the venv has (verified
+    # 2026-10-30: system python3 crashed this daemon on start).
+    # The venv path is resolved relocatively (_venv_python above):
+    # {repo}/.venv/bin/python, overridable via FOREX_VENV_PYTHON —
+    # the old hardcoded /home/hatch/... path failed on AGT.
+    Spec("devnet-demo-trader",
+         [_venv_python(), "scripts/devnet-demo-trader"],
+         "scripts/devnet-demo-trader"),
+    _script("watcher-trader"),
+    _script("watcher-v2-trader"),
+    _script("moon-trader"),
+    # smart-select-trader REMOVED 2026-10-31 (permanent smart-money
+    # shutdown, user order 2026-10-29; trial never traded, 0 closes.
+    # Do not re-add without his explicit word; the watchdog has no
+    # stanza for it either, so nothing restarts it.)
+    _script("realtime-sync"),
+    _script("position-tracker"), _script("challenge-trader"),
+]
+
+
+# ---- restart policy (pure logic; unit-tested) ---------------------------
+
+class RestartPolicy:
+    """Backoff ladder + storm guard for one daemon."""
+
+    def __init__(self):
+        self.starts = []          # start timestamps (windowed)
+        self.ladder_idx = 0
+        self.hold_until = 0.0
+
+    def note_start(self, now):
+        self.starts = [t for t in self.starts
+                       if now - t < STORM_WINDOW_S]
+        self.starts.append(now)
+        if len(self.starts) >= STORM_MAX_STARTS:
+            self.hold_until = now + STORM_HOLD_S
+
+    def note_stable(self):
+        """A long healthy run resets the ladder and the storm window."""
+        self.ladder_idx = 0
+        self.starts = []
+
+    def delay(self):
+        d = BACKOFF_LADDER[min(self.ladder_idx, len(BACKOFF_LADDER) - 1)]
+        self.ladder_idx = min(self.ladder_idx + 1, len(BACKOFF_LADDER) - 1)
+        return d
+
+    def allowed(self, now):
+        return now >= self.hold_until
+
+    def in_hold(self, now):
+        return now < self.hold_until
+
+
+# ---- process table --------------------------------------------------------
+
+def _cmdline(pid, proc_dir=None):
+    try:
+        with open(os.path.join(proc_dir or PROC_DIR,
+                               "%d/cmdline" % pid),
+                  "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8",
+                                                        "replace")
+    except Exception:
+        return ""
+
+
+def _is_python_cmd(cmd):
+    """True for a real interpreter command line: system python3 or a
+    venv bin/python. False for shells that merely mention a daemon."""
+    return "python3" in cmd or "/bin/python" in cmd
+
+
+def find_running(token, proc_dir=None):
+    """Pids whose cmdline contains the token AND a python interpreter.
+
+    Token match alone would adopt shells that merely mention the
+    daemon. The interpreter check must accept the venv binary
+    (…/.venv/bin/python) as well as system python3: devnet-demo-trader
+    runs under the venv, and the old python3-only check meant the
+    supervisor could never adopt it — every supervisor restart
+    spawned a duplicate while the orphan kept running (orphans 1945,
+    1845, 1857, all 2026-10-30). proc_dir defaults to
+    FOREX_SUPERVISOR_PROC_DIR (or /proc); tests point it at a
+    scratch dir so a test supervisor never adopts a live daemon."""
+    out = []
+    for pid_s in os.listdir(proc_dir or PROC_DIR):
+        if not pid_s.isdigit():
+            continue
+        pid = int(pid_s)
+        if pid == os.getpid():
+            continue
+        cmd = _cmdline(pid, proc_dir)
+        if token in cmd and _is_python_cmd(cmd):
+            out.append(pid)
+    return sorted(out)
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# ---- daemon runtime ---------------------------------------------------------
+
+class Daemon:
+    def __init__(self, spec):
+        self.spec = spec
+        self.policy = RestartPolicy()
+        self.proc = None          # Popen when owned
+        self.pid = 0
+        self.owned = False
+        self.state = "init"       # running|backoff|storm-hold|adopted
+        self.started_at = None    # None = not started (0.0 is falsy!)
+        self.restart_at = 0.0
+        self.restarts = 0
+        self.last_exit = None
+        self.storm_alerted = False
+
+    def spawn(self, now):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        logf = open(self.spec.log_path, "ab")
+        env = dict(os.environ)
+        env["FOREX_AGENT_HOME"] = HOME
+        self.proc = subprocess.Popen(
+            self.spec.argv, cwd=ROOT, env=env,
+            stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        self.pid = self.proc.pid
+        self.owned = True
+        self.started_at = now
+        self.state = "running"
+        self.policy.note_start(now)
+        logger.warning("supervisor: started %s (pid %d)",
+                       self.spec.name, self.pid)
+
+    def adopt(self, pid, now):
+        self.pid = pid
+        self.owned = False
+        self.started_at = now
+        self.state = "adopted"
+        logger.warning("supervisor: adopted %s (pid %d)",
+                       self.spec.name, pid)
+
+    def on_death(self, now, rc):
+        uptime = (now - self.started_at
+                  if self.started_at is not None else 0.0)
+        self.last_exit = rc
+        self.proc = None
+        self.pid = 0
+        self.owned = False
+        self.restarts += 1
+        if uptime >= STABLE_S:
+            self.policy.note_stable()
+        if self.policy.in_hold(now):
+            self.state = "storm-hold"
+            if not self.storm_alerted:
+                self.storm_alerted = True
+                logger.warning(
+                    "supervisor: STORM HOLD %s — %d starts in window; "
+                    "holding %.0fs (exit %s)",
+                    self.spec.name, len(self.policy.starts),
+                    STORM_HOLD_S, rc)
+            self.restart_at = self.policy.hold_until
+            return
+        d = self.policy.delay()
+        self.state = "backoff"
+        self.restart_at = now + d
+        logger.warning(
+            "supervisor: %s died (exit %s, uptime %.0fs) — restart in "
+            "%.0fs", self.spec.name, rc, uptime, d)
+
+    def tick(self, now):
+        if self.state in ("running", "adopted"):
+            alive = False
+            if self.owned and self.proc is not None:
+                rc = self.proc.poll()
+                if rc is None:
+                    alive = True
+                else:
+                    self.on_death(now, rc)
+                    return
+            else:
+                alive = pid_alive(self.pid) and \
+                    self.spec.token in _cmdline(self.pid)
+                if not alive:
+                    self.on_death(now, "gone")
+                    return
+            if alive and self.started_at and \
+                    now - self.started_at >= STABLE_S:
+                self.policy.note_stable()
+            return
+        if self.state in ("backoff", "storm-hold", "init"):
+            if self.policy.allowed(now) and now >= self.restart_at:
+                self.storm_alerted = False
+                # Adopt-before-spawn (2026-10-31): a matching process
+                # may have appeared since death (watchdog/manual start,
+                # or a pre-existing duplicate). Adopt it instead of
+                # spawning a second instance that would fight over the
+                # same state; without this, a spawn against a live
+                # lock-holder would exit at once and loop into storm
+                # hold. Adoption is already this supervisor's core
+                # mechanism; this applies it at respawn time too.
+                pids = find_running(self.spec.token)
+                if pids:
+                    self.adopt(pids[0], now)
+                else:
+                    self.spawn(now)
+
+
+# ---- supervisor -------------------------------------------------------------
+
+class Supervisor:
+    def __init__(self, roster=ROSTER):
+        self.daemons = {s.name: Daemon(s) for s in roster}
+        self.stop = False
+
+    def adopt_existing(self, now):
+        for d in self.daemons.values():
+            pids = find_running(d.spec.token)
+            if pids:
+                d.adopt(pids[0], now)
+            else:
+                d.state = "init"
+                d.restart_at = now  # spawn on first tick
+
+    def tick(self, now):
+        for d in self.daemons.values():
+            try:
+                d.tick(now)
+            except Exception:
+                logger.exception("supervisor: tick failed for %s",
+                                 d.spec.name)
+
+    def state_dict(self, now):
+        return {
+            "ts": now,
+            "pid": os.getpid(),
+            "daemons": {
+                name: {
+                    "state": d.state,
+                    "pid": d.pid,
+                    "owned": d.owned,
+                    "restarts": d.restarts,
+                    "last_exit": d.last_exit,
+                    "uptime_s": (round(now - d.started_at, 1)
+                                 if d.pid and d.started_at else 0),
+                } for name, d in self.daemons.items()
+            },
+        }
+
+    def write_state(self, now):
+        try:
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.state_dict(now), f, separators=(",", ":"))
+            os.replace(tmp, STATE_PATH)
+        except Exception:
+            logger.exception("supervisor: state write failed")
+
+
+def _active_roster():
+    """The roster the supervisor actually runs. Normally all 28.
+    FOREX_SUPERVISOR_ONLY (comma-separated daemon names) restricts
+    it — test/validation ONLY (proving the spawn path with one
+    daemon in a scratch home without adopting the live fleet).
+    Never set it in production: a restricted supervisor would
+    leave the rest of the fleet unguarded."""
+    only = os.environ.get("FOREX_SUPERVISOR_ONLY")
+    if not only:
+        return list(ROSTER)
+    wanted = {n.strip() for n in only.split(",") if n.strip()}
+    return [s for s in ROSTER if s.name in wanted]
+
+
+def main():
+    os.makedirs(HOME, exist_ok=True)
+    lockf = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.warning("supervisor: another instance holds the lock; "
+                       "exiting")
+        return 1
+    sup = Supervisor(roster=_active_roster())
+
+    def _term(signum, frame):
+        sup.stop = True
+
+    signal.signal(signal.SIGTERM, _term)
+    signal.signal(signal.SIGINT, _term)
+    now = time.time()
+    sup.adopt_existing(now)
+    running = sum(1 for d in sup.daemons.values()
+                  if d.state in ("running", "adopted"))
+    logger.warning("supervisor started (pid %d): %d/%d daemons present, "
+                   "spawning the rest", os.getpid(), running,
+                   len(sup.daemons))
+    while not sup.stop:
+        t0 = time.time()
+        sup.tick(t0)
+        sup.write_state(t0)
+        time.sleep(max(0.1, TICK_S - (time.time() - t0)))
+    logger.warning("supervisor stopping (children keep running)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

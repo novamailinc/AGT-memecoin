@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Exit-leakage re-measurement report (2026-10-23).
+
+Re-measures peak give-back on closes SINCE the P1 exit-execution
+restart (direct-reserve pricing, armed push-watch, peak_ts + quote
+journals on closes), against the PRE-P1 audit baselines.
+
+Give-back definition (same as the 2026-10-23 audit, which reproduced
+the Oct 22 verdict figure): for a close with peak_mult >= 1,
+    give-back % = (peak_mult - realized_mult) / peak_mult * 100
+Median is taken over closes with usable peak data (peak_mult present
+and >= 1, realized_mult derivable). Missing peak fields are counted,
+never imputed. A round-tripper is peak_mult >= 2.0 and
+realized_mult < 1.5. Peak->close lag uses peak_ts where persisted
+(post-P1 closes); closes without peak_ts contribute no lag sample.
+
+Ledger schemas differ per lane (verified by inspection 2026-10-23):
+  grad / grad_raw / ceo : "closes" list, close_ts, closed_reason,
+                          peak_mult + realized_mult fields.
+  mirror (degen_mirror) : "closes" list, close_ts, closed_reason,
+                          peak_mult but NO realized_mult -> derived
+                          from the sum of legs' realized_usd.
+  steady                : "closed" list, exit_ts, exit_reason, NO
+                          peak_mult / realized_mult -> peak_mult =
+                          peak_price / entry_price, realized_mult =
+                          1 + pnl / size_usd.
+
+Read-only: ledgers are never written.
+"""
+import argparse
+import datetime
+import json
+import os
+import statistics
+import sys
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+DEFAULT_SINCE = "2026-10-23T08:28:00Z"  # P1 restart
+
+# PRE-P1 baselines: median peak give-back % from the exit-leakage
+# audit of 2026-10-23 (hidden_files/exit-leakage-audit-2026-10-23.md).
+# These are the audit's figures over each lane's full pre-P1 history,
+# NOT recomputed here.
+BASELINES = {
+    "grad":     {"giveback_pct": 65.4, "n_peak": 56},
+    "grad_raw": {"giveback_pct": 68.9, "n_peak": 5},
+    "ceo":      {"giveback_pct": 78.5, "n_peak": 35},
+    "mirror":   {"giveback_pct": 72.5, "n_peak": 20},
+    "steady":   {"giveback_pct": 14.0, "n_peak": 25},
+}
+
+MIN_USABLE = 5  # below this, a median is misleading: report counts only
+
+
+class Lane:
+    def __init__(self, filename, closes_key, ts_field, reason_field,
+                 derived=False):
+        self.filename = filename
+        self.closes_key = closes_key
+        self.ts_field = ts_field
+        self.reason_field = reason_field
+        self.derived = derived  # peak/realized mults derived from prices
+
+
+LANES = {
+    "grad":     Lane("grad_ledger.json", "closes", "close_ts",
+                     "closed_reason"),
+    "grad_raw": Lane("grad_raw_ledger.json", "closes", "close_ts",
+                     "closed_reason"),
+    "ceo":      Lane("ceo_ledger.json", "closes", "close_ts",
+                     "closed_reason"),
+    "mirror":   Lane("degen_mirror_ledger.json", "closes", "close_ts",
+                     "closed_reason"),
+    "steady":   Lane("steady_ledger.json", "closed", "exit_ts",
+                     "exit_reason", derived=True),
+}
+ALL_LANES = ("grad", "grad_raw", "ceo", "mirror", "steady")
+
+
+def parse_since(raw):
+    """Accept an epoch (int/float string) or an ISO-8601 timestamp."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def realized_mult(rec):
+    """Position-level realized multiple, or None if not derivable."""
+    rm = rec.get("realized_mult")
+    if isinstance(rm, (int, float)):
+        return float(rm)
+    legs = rec.get("legs")
+    if isinstance(legs, dict) and legs:
+        vals = [leg.get("realized_usd") for leg in legs.values()
+                if isinstance(leg, dict)]
+        if vals and all(isinstance(v, (int, float)) for v in vals):
+            return float(sum(vals))  # $1 positions: usd sum == multiple
+    pnl, size = rec.get("pnl"), rec.get("size_usd")
+    if isinstance(pnl, (int, float)) and isinstance(size, (int, float)) \
+            and size:
+        return 1.0 + float(pnl) / float(size)
+    pnl = rec.get("pnl_usd")
+    if isinstance(pnl, (int, float)):
+        return 1.0 + float(pnl)  # $1-notional lanes without a mult field
+    return None
+
+
+def peak_mult(rec, derived):
+    pm = rec.get("peak_mult")
+    if isinstance(pm, (int, float)):
+        return float(pm)
+    if derived:
+        pp, ep = rec.get("peak_price"), rec.get("entry_price")
+        if isinstance(pp, (int, float)) and isinstance(ep, (int, float)) \
+                and ep:
+            return float(pp) / float(ep)
+    return None
+
+
+def lane_stats(name, since):
+    spec = LANES[name]
+    path = os.path.join(HOME, spec.filename)
+    out = {"lane": name, "ledger": spec.filename, "error": None,
+           "n_window": 0, "n_usable": 0, "n_missing_peak": 0,
+           "n_peak_below_1": 0, "median_giveback_pct": None,
+           "round_trippers": 0, "round_tripper_pct": None,
+           "n_lag": 0, "median_lag_s": None, "reasons": {}}
+    try:
+        with open(path) as f:
+            led = json.load(f)
+    except Exception as e:
+        out["error"] = "cannot read ledger: %s" % e
+        return out
+    closes = led.get(spec.closes_key) or []
+    givebacks, lags = [], []
+    for rec in closes:
+        if not isinstance(rec, dict):
+            continue
+        ts = rec.get(spec.ts_field)
+        if not isinstance(ts, (int, float)) or ts < since:
+            continue  # pre-window (or unstamped): excluded, never mixed
+        out["n_window"] += 1
+        reason = rec.get(spec.reason_field) or "(none)"
+        out["reasons"][reason] = out["reasons"].get(reason, 0) + 1
+        pm = peak_mult(rec, spec.derived)
+        rm = realized_mult(rec)
+        if pm is None or rm is None:
+            out["n_missing_peak"] += 1
+            continue
+        if pm < 1.0:
+            out["n_peak_below_1"] += 1
+            continue
+        out["n_usable"] += 1
+        givebacks.append((pm - rm) / pm * 100.0)
+        if pm >= 2.0 and rm < 1.5:
+            out["round_trippers"] += 1
+        pts, cts = rec.get("peak_ts"), rec.get(spec.ts_field)
+        if isinstance(pts, (int, float)) and isinstance(cts, (int, float)) \
+                and cts >= pts:
+            lags.append(cts - pts)
+    if givebacks:
+        out["median_giveback_pct"] = round(statistics.median(givebacks), 1)
+        out["round_tripper_pct"] = round(
+            100.0 * out["round_trippers"] / len(givebacks), 1)
+    out["n_lag"] = len(lags)
+    if lags:
+        out["median_lag_s"] = round(statistics.median(lags), 1)
+    out["sufficient"] = out["n_usable"] >= MIN_USABLE
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Exit-leakage re-measurement (read-only).")
+    ap.add_argument("--since", default=DEFAULT_SINCE,
+                    help="epoch or ISO-8601; default P1 restart "
+                         + DEFAULT_SINCE)
+    ap.add_argument("--lane", action="append", choices=ALL_LANES,
+                    dest="lanes",
+                    help="lane to report (repeatable; default: all)")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable JSON output")
+    args = ap.parse_args()
+    since = parse_since(args.since)
+    since_iso = datetime.datetime.fromtimestamp(
+        since, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    names = args.lanes or list(ALL_LANES)
+    results = [lane_stats(n, since) for n in names]
+
+    if args.json:
+        payload = {"since_epoch": since, "since_iso": since_iso,
+                   "definition": "give-back % = (peak_mult - realized_mult)"
+                                 " / peak_mult * 100 over closes with "
+                                 "peak_mult >= 1; round-tripper = peak >= "
+                                 "2.0 and realized < 1.5",
+                   "baselines_pre_p1_audit_2026_10_23": BASELINES,
+                   "lanes": results}
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print("Exit-leakage re-measurement — closes since %s (epoch %.0f)"
+          % (since_iso, since))
+    print("Give-back % = (peak_mult - realized_mult) / peak_mult x 100, "
+          "median over closes with peak_mult >= 1.")
+    print("Baselines are the PRE-P1 figures from the 2026-10-23 "
+          "exit-leakage audit (full pre-P1 history), not recomputed.")
+    for r in results:
+        base = BASELINES[r["lane"]]
+        print("")
+        print("== %s (%s)" % (r["lane"], r["ledger"]))
+        print("   PRE-P1 BASELINE (audit): median give-back %.1f%% "
+              "(n=%d with peak data)"
+              % (base["giveback_pct"], base["n_peak"]))
+        if r["error"]:
+            print("   ERROR: %s" % r["error"])
+            continue
+        print("   P1-era closes in window: %d (usable peak data: %d, "
+              "missing peak: %d, peak < 1: %d)"
+              % (r["n_window"], r["n_usable"], r["n_missing_peak"],
+                 r["n_peak_below_1"]))
+        if not r["sufficient"]:
+            print("   INSUFFICIENT P1-ERA CLOSES (n=%d)" % r["n_usable"])
+            continue
+        print("   median peak give-back: %.1f%%  (baseline %.1f%%, "
+              "delta %+.1f pts)"
+              % (r["median_giveback_pct"], base["giveback_pct"],
+                 r["median_giveback_pct"] - base["giveback_pct"]))
+        print("   round-trippers (peak>=2x, realized<1.5x): %d of %d "
+              "(%.1f%%)"
+              % (r["round_trippers"], r["n_usable"],
+                 r["round_tripper_pct"]))
+        if r["n_lag"]:
+            print("   median peak->close lag: %.1fs (n=%d with peak_ts)"
+                  % (r["median_lag_s"], r["n_lag"]))
+        else:
+            print("   median peak->close lag: n/a (no peak_ts on closes)")
+        if r["reasons"]:
+            brk = ", ".join("%s=%d" % (k, r["reasons"][k])
+                            for k in sorted(r["reasons"],
+                                            key=lambda k: -r["reasons"][k]))
+            print("   close reasons: %s" % brk)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

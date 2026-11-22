@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Regime forward-test report — advanced build, piece 2.
+
+Judges regime-aware stakes on REAL paper closes: closes whose
+entry_features carry a regime (post-deploy entries only) are
+tallied per regime (stake used, win rate, net, mean), alongside
+the sit_out_log (how often each lane sat out and why).
+
+Verdict rule (same convention as the other forward tests): NO
+verdict below 100 stamped forward closes. The report refuses a
+verdict and prints the count so far.
+
+Read-only: never writes, never calls the network.
+Usage: scripts/regime-report [--lane LANE] [--min N]
+Plain script — run directly with the venv python, not pytest.
+"""
+import argparse
+import json
+import os
+import sys
+
+HOME = os.environ.get(
+    "FOREX_AGENT_HOME",
+    os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+LANES = ("grad_select", "grad_raw", "tranche", "tranche_protect")
+
+LEDGER_FILES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+}
+
+REGIMES = ("COLD", "NORMAL", "HOT")
+
+
+def _load(lane):
+    try:
+        with open(os.path.join(HOME, LEDGER_FILES[lane])) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def report_lane(lane):
+    d = _load(lane)
+    closes = [c for c in (d.get("closes") or [])
+              if isinstance(c, dict)]
+    cells = {r: {"n": 0, "wins": 0, "net": 0.0, "stake": 0.0}
+             for r in REGIMES}
+    stamped = 0
+    unstamped = 0
+    for c in closes:
+        ef = c.get("entry_features") or {}
+        reg = ef.get("regime") or {}
+        regime = reg.get("regime")
+        if regime not in cells:
+            unstamped += 1
+            continue
+        stamped += 1
+        pnl = float(c.get("pnl_usd") or 0)
+        cell = cells[regime]
+        cell["n"] += 1
+        cell["net"] += pnl
+        cell["stake"] += float(ef.get("stake_usd")
+                               or c.get("entry_notional_usd") or 0)
+        if pnl > 0:
+            cell["wins"] += 1
+    sit_log = d.get("sit_out_log") or []
+    reasons = {}
+    for entry in sit_log:
+        if isinstance(entry, dict):
+            r = str(entry.get("reason") or "unknown")
+            reasons[r] = reasons.get(r, 0) + 1
+    return {"lane": lane, "stamped": stamped,
+            "unstamped": unstamped, "cells": cells,
+            "sit_out_n": len(sit_log), "sit_out_reasons": reasons}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lane", default="")
+    ap.add_argument("--min", type=int, default=100)
+    args = ap.parse_args(argv)
+    lanes = [args.lane] if args.lane else list(LANES)
+    print("regime forward test — live paper closes with a regime "
+          "stamp")
+    print("home: %s" % HOME)
+    print("verdict needs %d stamped forward closes; below that "
+          "the report refuses a verdict" % args.min)
+    grand = {r: {"n": 0, "wins": 0, "net": 0.0} for r in REGIMES}
+    grand_stamped = 0
+    grand_sit = 0
+    for lane in lanes:
+        r = report_lane(lane)
+        print("")
+        print("== %s: %d stamped closes, %d unstamped (pre-regime) =="
+              % (lane, r["stamped"], r["unstamped"]))
+        for regime in REGIMES:
+            cell = r["cells"][regime]
+            if not cell["n"]:
+                continue
+            print("  %-7s n=%-4d win %5.1f%% net $%9.2f mean "
+                  "$%6.2f avg stake $%.2f" % (
+                      regime, cell["n"],
+                      cell["wins"] / cell["n"] * 100,
+                      cell["net"], cell["net"] / cell["n"],
+                      cell["stake"] / cell["n"]))
+            for k in ("n", "wins", "net"):
+                grand[regime][k] += cell[k]
+        print("  sit-out log: %d entries %s" % (
+            r["sit_out_n"], r["sit_out_reasons"]))
+        grand_stamped += r["stamped"]
+        grand_sit += r["sit_out_n"]
+    if len(lanes) > 1:
+        print("")
+        print("== POOLED %d stamped closes, %d sit-outs =="
+              % (grand_stamped, grand_sit))
+        for regime in REGIMES:
+            cell = grand[regime]
+            if not cell["n"]:
+                continue
+            print("  %-7s n=%-4d win %5.1f%% net $%9.2f mean "
+                  "$%6.2f" % (regime, cell["n"],
+                              cell["wins"] / cell["n"] * 100,
+                              cell["net"], cell["net"] / cell["n"]))
+    print("")
+    if grand_stamped < args.min:
+        print("NO VERDICT: %d/%d stamped forward closes — regime "
+              "scaling is still in its forward paper test." % (
+                  grand_stamped, args.min))
+    else:
+        print("VERDICT-READY: %d stamped closes" % grand_stamped)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

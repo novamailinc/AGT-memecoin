@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# weekly-paper-review — print the structured weekly paper-trading report.
+#
+# Paper only, no network. Real paper closes come from the live lane
+# ledgers (USD paper); the backtest dataset feeds the judge replays only.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+# The sections below run weekly_review.py as a script, which puts
+# daemon/launch_scanner (not the repo root) on sys.path. Put the repo
+# root on PYTHONPATH so `from storage.store ...` and
+# `from daemon.launch_scanner ...` resolve the same way they do when
+# imported as a package (fixes the 5 "read failed" sections).
+PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" exec /home/hatch/workspace/Forex-agent/.venv/bin/python \
+    daemon/launch_scanner/weekly_review.py "$@"

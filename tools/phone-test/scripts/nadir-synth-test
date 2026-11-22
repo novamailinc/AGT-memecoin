@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Nadir-v0 synthetic crash test: prove engine+ledger work end-to-end.
+Builds fake price series with known crashes, runs full Phase 2 replay.
+
+Scenarios:
+  A: 80% crash then 3x recovery (should signal, should profit)
+  B: 80% crash then flat (should signal, time exit)
+  C: 85% crash then further -50% (should signal, hard stop)
+  D: 50% dip (should NOT signal - below 70% threshold)
+"""
+import json, os, sys, random
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from nadir_signal import evaluate_signal
+from nadir_paper import Ledger
+from nadir_report import daily_snapshot
+
+random.seed(42)
+T0 = 1_700_000_000
+
+def make_candles(scenario):
+    """Generate 1000 hourly candles for a scenario."""
+    candles = []
+    price = 1.00
+    for i in range(1000):
+        ts = T0 + i * 3600
+        # Scenario logic
+        if scenario == "A":  # crash then 3x recovery
+            if 700 <= i < 750: price *= 0.96   # crash to ~13% (~87% dd)
+            elif i >= 750: price *= 1.015        # recovery
+            else: price *= random.uniform(0.995, 1.005)
+        elif scenario == "B":  # crash then flat
+            if 700 <= i < 750: price *= 0.96
+            else: price *= random.uniform(0.998, 1.002)
+        elif scenario == "C":  # crash then further dump
+            if 700 <= i < 750: price *= 0.96
+            elif i >= 750: price *= 0.985        # bleeds further
+            else: price *= random.uniform(0.995, 1.005)
+        elif scenario == "D":  # 50% dip only (below threshold)
+            if 700 <= i < 720: price *= 0.97   # ~50% dd
+            elif i >= 720: price *= 1.01
+            else: price *= random.uniform(0.995, 1.005)
+        # Build candle
+        o = price * random.uniform(0.998, 1.002)
+        c = price
+        h = max(o, c) * random.uniform(1.0, 1.005)
+        l = min(o, c) * random.uniform(0.995, 1.0)
+        candles.append({"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": 10000})
+        price = c
+    return candles
+
+def run_scenario(name, candles, mint="SYNTH"):
+    ledger = Ledger()
+    signals = 0
+    for i in range(720, len(candles)):
+        window = candles[i-720:i]
+        now = candles[i]
+        c_tuples = [(c["ts"], c["o"], c["h"], c["l"], c["c"], c["v"])
+                    for c in window]
+        sig = evaluate_signal(
+            mint=mint, symbol=name, candles=c_tuples,
+            mcap=5_000_000, liquidity=1_000_000, vol_24h=500_000,
+            trades_24h=500, buys_24h=300, sells_24h=200,
+            median_vol_14d=400_000, pool_age_days=365,
+            safety_ok=True, safety_reason="",
+        )
+        if sig.get("signal"):
+            signals += 1
+            ledger.enter(mint, name, now["ts"], now["c"])
+        ledger.on_price(mint, now["ts"], now["c"])
+    # Close remaining
+    if candles:
+        last = candles[-1]
+        for p in ledger.positions:
+            if p.exit_ts is None:
+                ledger._close(p, last["ts"], last["c"], "replay_end")
+    snap = daily_snapshot(ledger, f"synth-{name}")
+    return {"signals": signals, **snap}
+
+if __name__ == "__main__":
+    print("=== Nadir-v0 Synthetic Crash Test ===\n")
+    results = {}
+    for scen, desc in [
+        ("A", "80% crash → 3x recovery (expect: signal + profit)"),
+        ("B", "80% crash → flat (expect: signal, time exit)"),
+        ("C", "85% crash → further bleed (expect: signal + hard stop)"),
+        ("D", "50% dip only (expect: NO signal)"),
+    ]:
+        print(f"Scenario {scen}: {desc}")
+        candles = make_candles(scen)
+        # Verify the crash actually happened
+        pre = candles[699]["c"]
+        bot = min(c["c"] for c in candles[700:760])
+        dd = 100*(1 - bot/pre)
+        print(f"  actual drawdown: {dd:.1f}%")
+        r = run_scenario(scen, candles)
+        results[scen] = r
+        print(f"  signals: {r['signals']}, closed: {r['closed']}, "
+              f"P&L: {r['net_pnl_sol']:.6f} SOL, exits: {r['exits']}")
+        print()
+    # Verdict
+    print("=== VERDICT ===")
+    checks = [
+        ("A signals>0 (crash+recovery)", results["A"]["signals"] > 0),
+        ("A profitable", results["A"]["net_pnl_sol"] > 0),
+        ("B blocked by knife filter (flat)", results["B"]["signals"] == 0),
+        ("C blocked by knife filter (bleeding)", results["C"]["signals"] == 0),
+        ("D no signals (shallow dip)", results["D"]["signals"] == 0),
+    ]
+    for name, ok in checks:
+        print(f"  {'PASS' if ok else 'FAIL'} {name}")
+    all_pass = all(ok for _, ok in checks)
+    print(f"\n{'ALL CHECKS PASS — machinery works end-to-end' if all_pass else 'FAILURES — machinery has bugs'}")

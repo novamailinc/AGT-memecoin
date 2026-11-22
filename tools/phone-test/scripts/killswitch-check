@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Kill switch checker: evaluates all lanes, halts losers, alerts human.
+Runs via cron. Paper-only safety system.
+"""
+import json, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+import killswitch as ks
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+def load_lane_pnl(lane: str):
+    """Load recent closed-trade PnLs from each lane's ledger."""
+    if lane == "main":
+        path = os.path.join(HOME, "data", "memecoin", "fills.jsonl")
+        try:
+            pnls = []
+            with open(path) as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        if d.get("kind") == "CLOSE" and "realized_pnl_sol" in d:
+                            pnls.append(float(d["realized_pnl_sol"]))
+                    except Exception:
+                        continue
+            return pnls[-50:]
+        except FileNotFoundError:
+            return []
+    elif lane == "degen":
+        # Degen: use peaks file — peak multiple vs 1.0 determines win/loss
+        # win = peak >= 3.0 (the lane's target)
+        path = os.path.join(HOME, "degen_peaks.json")
+        try:
+            d = json.load(open(path))
+            pnls = []
+            items = d.values() if isinstance(d, dict) else d
+            for o in list(items)[-30:]:
+                peak = float(o.get("peak_mult", o.get("peak", 0)) or 0)
+                # +2 for 3x win, -1 for loss (unit stakes)
+                pnls.append(2.0 if peak >= 3.0 else -1.0)
+            return pnls
+        except Exception:
+            return []
+    elif lane == "challenge":
+        path = os.path.join(HOME, "degen_challenge_2m.json")
+        try:
+            d = json.load(open(path))
+            trades = d.get("closed_trades", d.get("trades", []))
+            return [float(t.get("pnl", 0)) for t in trades[-30:]]
+        except Exception:
+            return []
+    elif lane == "nadir":
+        # Nadir paper ledger (when Phase 4 starts)
+        return []
+    return []
+
+def send_telegram(text: str):
+    try:
+        token = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+        import urllib.request, urllib.parse
+        data = urllib.parse.urlencode(
+            {"chat_id": "6883056760", "text": text}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        print(f"telegram FAIL: {e}")
+
+def main():
+    print("=== Kill switch check ===")
+    halted_now = []
+    for lane in ["main", "degen", "degen_v2", "challenge", "nadir"]:
+        # Sync latest PnLs into killswitch state
+        pnls = load_lane_pnl(lane)
+        # Only add new ones (killswitch tracks what it has)
+        s = ks._load()
+        ls = ks._lane_state(s, lane)
+        existing = len(ls["trades"])
+        # Simple: replace with latest window (idempotent enough for daily check)
+        if pnls:
+            ls["trades"] = [{"ts": time.time(), "pnl": p} for p in pnls]
+            ks._save(s)
+        result = ks.check_lane(lane)
+        action = result["action"]
+        n = result.get("n", 0)
+        exp = result.get("expectancy", 0)
+        print(f"{lane}: {action} (n={n}, exp={exp:.6f})")
+        if action == "HALTED":
+            halted_now.append((lane, result.get("halt_reason", "")))
+    # Alert on new halts
+    for lane, reason in halted_now:
+        msg = (f"🛑 KILL SWITCH: {lane} HALTED\n"
+               f"{reason}\n\n"
+               f"Lane stopped automatically. Re-enable only after review.")
+        send_telegram(msg)
+        print(f"  alert sent for {lane}")
+    if not halted_now:
+        print("no new halts")
+
+if __name__ == "__main__":
+    main()

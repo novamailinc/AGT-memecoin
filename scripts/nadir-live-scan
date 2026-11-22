@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Nadir live scanner: daily check for tokens in the 70-90% drawdown zone.
+Uses 30 daily candles (lightweight) + falling-knife filter.
+Paper-only: signals, never trades. Alerts via Telegram.
+
+Wired to Phase 1: uses local history when available, API otherwise.
+"""
+import json, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+from nadir_signal import evaluate_signal
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HISTDIR = os.path.join(HOME, "nadir_history")
+EST_FILE = os.path.join(HOME, "nadir_phase1", "established_tokens.json")
+STATE_FILE = os.path.join(HOME, "nadir_phase1", "live_scan_state.json")
+
+# Pool addresses for OHLCV (from Phase 1)
+POOLS = {
+    "BONK": "4RX3HeVhvDT1N2Qnn9wMVtHfSGE3NqU3GYnuhaCoKDUD",
+    "POPCAT": "GaDLUkaMH1XG784V1kny54BJnSHkrWuxESDsJ9kSEZ1f",
+    "MEW": "879F697iuDJGMevRkRcnW21fcXiAeLJK1ffsw2ATebce",
+    "JUP": "Bf6K2GXLJZGJycD1L2nDsVfwngPQG4Qe6SPsbsJytF5S",
+    "RAY": "EXxDoqE28AHRrSa4ZrGqzeHJuLz96FaJUMLYKtZo1KZt",
+    "ORCA": "9tXiuRRw7kbejLhZXtxDxYs2REe43uH2e7k1kocgdM9B",
+    "STEP": "8B9xR1dz9JQ3iEdGTsMGiguBE93eggd7zLHnRyCcoNH3",
+    "KIN": "BNJ8Y6WkbN5KReF6CJ5krxz9CQCmHosSe3MU3zxtpxgR",
+    "HNT": "6twoGe7EQh15eQgpE3gjuNyfJQBdoye7DkCdvyUiQ1Ko",
+    # Added 2026-11-15: verified live 2026-11-15 via GeckoTerminal token pools
+    # (top pool by reserve/volume) + 35 daily OHLCV candles each.
+    "BOME": "DSUvc5qf5LJHHV5e2tD184ixotSnCnwj7i4jJa4Xsrmt",  # BOME/SOL Raydium, ~$9.9M reserve
+    "KMNO": "3ndjN1nJVUKGrJBc1hhVpER6kWTZKHdyDrPyCJyX3CXK",  # KMNO/USDC Orca, ~$1.6M reserve
+    "PYTH": "9n3dSLrERZQp95dHXywft7xV8D8xnGFLaUHtEhQVaXaC",  # PYTH/SOL 0.25%, ~$307k reserve
+    # GMT deliberately NOT added: best Solana pool is ~$4k reserve / ~$535 vol24 —
+    # too thin for a meaningful drawdown read; it stays skipped with a reason.
+}
+
+def get_watchlist():
+    try:
+        d = json.load(open(EST_FILE))
+        return {sym: info["mint"] for sym, info in d.items() if info.get("mint")}
+    except Exception:
+        return {}
+
+def get_daily_candles(pool_addr, days=35):
+    """Fetch daily OHLCV (lightweight: 35 points vs 720 hourly)."""
+    url = (f"https://api.geckoterminal.com/api/v2/networks/solana/"
+           f"pools/{pool_addr}/ohlcv/day?limit={days}")
+    d = get_json(url, tries=5, timeout=25)
+    ohlcv = d.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+    candles = [{"ts": c[0], "o": float(c[1]), "h": float(c[2]),
+                "l": float(c[3]), "c": float(c[4]), "v": float(c[5])}
+               for c in ohlcv]
+    candles.sort(key=lambda x: x["ts"])
+    return candles
+
+def get_current_price(mint):
+    """Current price via DexScreener (lightweight)."""
+    d = get_json(f"https://api.dexscreener.com/tokens/v1/solana/{mint}",
+                 tries=4, timeout=20)
+    if not d:
+        return None
+    best = max(d, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+    return {
+        "price": float(best.get("priceUsd") or 0),
+        "liq": float((best.get("liquidity") or {}).get("usd") or 0),
+        "fdv": float(best.get("fdv") or 0),
+    }
+
+def check_token(sym, mint, pool_addr):
+    """Check if token is in nadir zone. Returns signal dict or None."""
+    # Get 30d high from daily candles
+    try:
+        dailies = get_daily_candles(pool_addr)
+        if len(dailies) < 20:
+            return {"symbol": sym, "status": "insufficient_data",
+                    "candles": len(dailies)}
+        high_30d = max(c["h"] for c in dailies)
+    except Exception as e:
+        return {"symbol": sym, "status": "api_fail", "error": str(e)[:50]}
+
+    # Current price
+    try:
+        info = get_current_price(mint)
+        if not info or not info["price"]:
+            return {"symbol": sym, "status": "no_price"}
+        curr = info["price"]
+    except Exception as e:
+        return {"symbol": sym, "status": "api_fail", "error": str(e)[:50]}
+
+    dd = 100.0 * (1.0 - curr / high_30d) if high_30d > 0 else 0
+
+    result = {
+        "symbol": sym,
+        "price": curr,
+        "high_30d": high_30d,
+        "drawdown_pct": round(dd, 1),
+        "liq": info["liq"],
+        "in_zone": 70 <= dd <= 90,
+        "status": "ok",
+    }
+
+    # If in zone, run falling-knife filter (needs hourly candles)
+    # For now: simplified check using daily data
+    # Full filter runs when we have hourly history
+    if result["in_zone"]:
+        # Simplified knife check: no new low in last 3 days + 10%+ off low
+        recent = dailies[-3:]
+        prior = dailies[-10:-3]
+        low_recent = min(c["l"] for c in recent)
+        low_prior = min(c["l"] for c in prior)
+        low_7d = min(c["l"] for c in dailies[-7:])
+        rebound = 100.0 * (curr / low_7d - 1.0) if low_7d > 0 else 0
+        result["knife_pass"] = (low_recent >= low_prior) and (rebound >= 10)
+        result["rebound_pct"] = round(rebound, 1)
+        result["signal"] = result["knife_pass"]
+    return result
+
+def send_telegram(text):
+    """Send alert via Telegram bot."""
+    try:
+        token = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+        chat_id = "6883056760"
+        import urllib.request, urllib.parse
+        data = urllib.parse.urlencode(
+            {"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        print(f"telegram FAIL: {e}")
+
+def main():
+    watchlist = get_watchlist()
+    print(f"Scanning {len(watchlist)} tokens for nadir setups...\n")
+    signals = []
+    for sym, mint in watchlist.items():
+        pool = POOLS.get(sym)
+        if not pool:
+            print(f"{sym}: no pool address, skipping")
+            continue
+        try:
+            r = check_token(sym, mint, pool)
+            dd = r.get("drawdown_pct", 0)
+            status = r.get("status", "?")
+            if r.get("in_zone"):
+                sig = "🎯 SIGNAL" if r.get("signal") else "👀 WATCH"
+                print(f"{sym}: {dd:.1f}% down {sig} (rebound {r.get('rebound_pct', 0):.1f}%)")
+                if r.get("signal"):
+                    signals.append(r)
+            else:
+                print(f"{sym}: {dd:.1f}% down ({status})")
+        except Exception as e:
+            print(f"{sym}: ERROR {str(e)[:50]}")
+        time.sleep(2)
+    print(f"\n{len(signals)} nadir signals")
+    # Alert on signals
+    for s in signals:
+        msg = (f"🎯 NADIR SIGNAL (paper)\n"
+               f"{s['symbol']}: {s['drawdown_pct']:.1f}% below 30d high\n"
+               f"Price: ${s['price']:.6f} | High: ${s['high_30d']:.6f}\n"
+               f"Rebound: {s['rebound_pct']:.1f}% | Liq: ${s['liq']:,.0f}\n"
+               f"Paper only — no trade executed.")
+        send_telegram(msg)
+        print(f"  alert sent for {s['symbol']}")
+    # Save state
+    json.dump({"last_run": int(time.time()), "signals": len(signals),
+               "tokens_checked": len(watchlist)},
+              open(STATE_FILE, "w"))
+
+if __name__ == "__main__":
+    main()

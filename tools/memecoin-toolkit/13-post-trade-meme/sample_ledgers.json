@@ -1,0 +1,207 @@
+{
+ "paper_closes": [
+  {
+   "mint": "Nr8nxhyniXk4hgwKAyKmdVvh1VRfJWTDokQtGw7pump",
+   "symbol": "GRAILS",
+   "source": "",
+   "leg": null,
+   "realized_mult": 3.027,
+   "peak_mult": 3.027,
+   "rug": false,
+   "exit_reason": "take_profit",
+   "outcome_kind": "paper"
+  },
+  {
+   "mint": "62BYSfbsTiG1zd7vBcY1ubpiZGvPAbTuvSpwg4WYkdei",
+   "symbol": "SPONGIEZ",
+   "source": "",
+   "leg": null,
+   "realized_mult": 0.1493,
+   "peak_mult": 2.1229,
+   "rug": false,
+   "exit_reason": "stop_loss",
+   "outcome_kind": "paper"
+  },
+  {
+   "mint": "GpTtQsyKpukVSpAHL4NhKzF88rkLrRHKMnaiwjuLpump",
+   "symbol": "DIHVIDENDS",
+   "source": "",
+   "leg": null,
+   "realized_mult": 0.024,
+   "peak_mult": 1.2355,
+   "rug": true,
+   "exit_reason": "stop_loss",
+   "outcome_kind": "paper"
+  }
+ ],
+ "mirror": {
+  "closes": [
+   {
+    "mint": "4ecxk2MFt4zLvbWD3fep1StQW4ZvFU6cnYK4u9H2pump",
+    "symbol": "Gemini",
+    "lane": "degen_mirror",
+    "source": "smart-watcher",
+    "entry_price": 0.00039446249999999995,
+    "pnl_usd": 0.1662,
+    "closed_reason": "hard_stop_-50pct",
+    "legs": {
+     "a": {
+      "realized_usd": 1.041356,
+      "exit_reason": "leg_a_2x"
+     },
+     "b": {
+      "realized_usd": 0.062434,
+      "exit_reason": "hard_stop_-50pct"
+     },
+     "c": {
+      "realized_usd": 0.062434,
+      "exit_reason": "hard_stop_-50pct"
+     }
+    }
+   },
+   {
+    "mint": "5gEnwao4F2pu2irKieAYvKU2JfenU2Q8Y3pEHf5pump",
+    "symbol": "Apple Siri",
+    "lane": "degen_mirror",
+    "source": "smart-watcher",
+    "entry_price": 0.0003305445,
+    "pnl_usd": -0.8066,
+    "closed_reason": "hard_stop_-50pct",
+    "legs": {
+     "a": {
+      "realized_usd": 0.096722,
+      "exit_reason": "hard_stop_-50pct"
+     },
+     "b": {
+      "realized_usd": 0.048361,
+      "exit_reason": "hard_stop_-50pct"
+     },
+     "c": {
+      "realized_usd": 0.048361,
+      "exit_reason": "hard_stop_-50pct"
+     }
+    }
+   },
+   {
+    "mint": "xk5FevmpacHLXxB7CHFtikQBXaitcmBsZ8wtDT1pump",
+    "symbol": "Mercedes",
+    "lane": "degen_mirror",
+    "source": "smart-watcher",
+    "entry_price": 0.0003286349999999999,
+    "pnl_usd": -0.8085,
+    "closed_reason": "hard_stop_-50pct",
+    "legs": {
+     "a": {
+      "realized_usd": 0.095729,
+      "exit_reason": "hard_stop_-50pct"
+     },
+     "b": {
+      "realized_usd": 0.047865,
+      "exit_reason": "hard_stop_-50pct"
+     },
+     "c": {
+      "realized_usd": 0.047865,
+      "exit_reason": "hard_stop_-50pct"
+     }
+    }
+   }
+  ]
+ },
+ "ceo": {
+  "closes": [
+   {
+    "mint": "CajxgqSuQs3uxbbx9YmiYoZdDfoq3Ah1mqzh2mqhpump",
+    "symbol": "MoonStone",
+    "lane": "ceo",
+    "source": "smart-watcher",
+    "entry_price": 9.169619999999998e-05,
+    "pnl_usd": 0.4047,
+    "closed_reason": "hard_stop_-50pct",
+    "legs": {
+     "a": {
+      "realized_usd": 1.391423,
+      "exit_reason": "leg_a_2x"
+     },
+     "b": {
+      "realized_usd": 0.00663,
+      "exit_reason": "hard_stop_-50pct"
+     },
+     "c": {
+      "realized_usd": 0.00663,
+      "exit_reason": "hard_stop_-50pct"
+     }
+    },
+    "realized_mult": 1.4047,
+    "realized_usd": 1.404683
+   }
+  ]
+ },
+ "steady": {
+  "closed": [
+   {
+    "mint": "2bCCHQadi4QeHWPKG3w13siCyWWQPgkFtniouTqVpump",
+    "symbol": "1",
+    "entry_price": 0.001031997552947637,
+    "size_usd": 1.0,
+    "peak_price": 0.00182,
+    "exit_reason": "trail",
+    "pnl": 0.5611290605754646
+   },
+   {
+    "mint": "HgTGdc29D5bDMrDvsCLnorxz899VyDj7ZN7FPa6vpump",
+    "symbol": "VEIL",
+    "entry_price": 0.004897310645908161,
+    "size_usd": 1.0,
+    "peak_price": 0.004897310645908161,
+    "exit_reason": "time_exit",
+    "pnl": -0.16788869058806008
+   },
+   {
+    "mint": "2ay4jNY3JxfuXJzhZ8DrAKkGzpirgD7Dv2ccL9zmpump",
+    "symbol": "Nihilism",
+    "entry_price": 0.00022871616018296497,
+    "size_usd": 1.0,
+    "peak_price": 0.0002613,
+    "exit_reason": "time_exit",
+    "pnl": -0.2709244792353714
+   }
+  ]
+ },
+ "stacker": {
+  "positions": [
+   {
+    "mint": "GiBNug2ajRCh7uoeBRFUV6CFRQo3eSW2yxkB1yNB3A24",
+    "symbol": "MIM ",
+    "entry_price": 7.423240307741687e-06,
+    "size_usd": 3.0,
+    "peak_price": 7.423240307741687e-06,
+    "exit_reason": "time_stop_noprice",
+    "realized_pnl": -3.15,
+    "frac_remaining": 0.0,
+    "exit_ts": 1792064161.73089
+   },
+   {
+    "mint": "H75KFf7ThhjmZV4JCo3iW9qhgXmxLbuKpvUPrFuPpump",
+    "symbol": "PNUS ",
+    "entry_price": 1.28826636278452e-05,
+    "size_usd": 3.0,
+    "peak_price": 1.327e-05,
+    "exit_reason": "hard_stop",
+    "realized_pnl": -1.0271470877428843,
+    "frac_remaining": 0.0,
+    "exit_ts": 1792202524.1193955
+   },
+   {
+    "mint": "GiTZeYcqvDH8ygEMZYPgnJfD85AhqwaTa55ZREcQpump",
+    "symbol": "FAA ",
+    "entry_price": 1.0005858908790477e-05,
+    "size_usd": 3.0,
+    "peak_price": 1.0005858908790477e-05,
+    "exit_reason": "hard_stop",
+    "realized_pnl": -1.340560134313491,
+    "frac_remaining": 0.0,
+    "exit_ts": 1792215507.6425524
+   }
+  ]
+ }
+}

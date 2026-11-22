@@ -1,0 +1,23 @@
+{
+  "symbol": "SOLUSDT",
+  "btc_beta": 1.339089780361998,
+  "n_candles": 18000,
+  "n_candidates": 62,
+  "bonferroni_alpha": 0.0008064516129032258,
+  "vol_filter": false,
+  "round_trip_cost": 0.002,
+  "discovered_on_train": [],
+  "validated_on_test": [],
+  "permutation": {
+    "n": 500,
+    "best_gross_t": 2.212902608634617,
+    "null_percentile": 0.186,
+    "null_p95": 3.321374650554029
+  },
+  "cost_drag": {
+    "mean_net_per_trade": -0.0020311210587042345,
+    "t_stat": -38.96329857314783,
+    "n": 12600
+  },
+  "kelly": null
+}

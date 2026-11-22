@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Steady outcome tracker: measures what happens AFTER steady signals.
+
+Reads steady_signals.jsonl, and for each signal older than 1h/6h/24h
+without a recorded outcome, fetches the current price and records the
+multiple. This is how the steady lane earns its data — signals without
+outcomes are noise; signals with outcomes train the bandit.
+
+Outcome horizons: 1h, 6h, 24h multiples from signal price.
+Also tracks max favorable excursion (peak multiple) for exit research.
+
+Runs hourly via cron. Idempotent: never re-records a horizon.
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SIGNALS_PATH = os.path.join(HOME, "steady_signals.jsonl")
+OUTCOMES_PATH = os.path.join(HOME, "steady_outcomes.jsonl")
+
+HORIZONS = [("m1h", 3600), ("m6h", 6 * 3600), ("m24h", 24 * 3600)]
+
+
+def get_price(mint):
+    """Current USD price via DexScreener. 0 on failure."""
+    try:
+        d = get_json(
+            "https://api.dexscreener.com/tokens/v1/solana/%s" % mint,
+            tries=2, timeout=15)
+        if not d:
+            return 0
+        p = d[0] if isinstance(d, list) else d
+        return float(p.get("priceUsd") or 0)
+    except Exception:
+        return 0
+
+
+def load_outcomes():
+    """(mint, signal_ts) -> {horizon: multiple} for recorded outcomes."""
+    done = {}
+    try:
+        with open(OUTCOMES_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    done[(d["mint"], d["signal_ts"])] = d
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return done
+
+
+def main():
+    now = time.time()
+    done = load_outcomes()
+    recorded = 0
+    try:
+        with open(SIGNALS_PATH) as f:
+            signals = [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        print("no signals yet")
+        return
+
+    out = open(OUTCOMES_PATH, "a")
+    try:
+        for s in signals:
+            mint = s.get("mint", "")
+            sts = float(s.get("ts", 0) or 0)
+            sig_price = float(s.get("signal_price", 0) or 0)
+            if not mint or not sts or sig_price <= 0:
+                continue
+            key = (mint, sts)
+            rec = done.get(key, {"mint": mint, "signal_ts": sts,
+                                 "symbol": s.get("symbol", "?"),
+                                 "signal_price": sig_price,
+                                 "score": s.get("score", 0)})
+            age = now - sts
+            updated = False
+            for hname, hsec in HORIZONS:
+                if hname in rec or age < hsec:
+                    continue
+                price = get_price(mint)
+                if price > 0:
+                    rec[hname] = round(price / sig_price, 4)
+                    updated = True
+                time.sleep(0.5)
+            # peak tracking: update max multiple seen
+            if age >= 3600:
+                price = get_price(mint)
+                if price > 0:
+                    peak = round(price / sig_price, 4)
+                    if peak > rec.get("peak", 0):
+                        rec["peak"] = peak
+                        updated = True
+                time.sleep(0.5)
+            if updated:
+                done[key] = rec
+                out.write(json.dumps(rec) + "\n")
+                recorded += 1
+    finally:
+        out.close()
+    print(f"steady outcomes: {recorded} records updated, "
+          f"{len(done)} signals tracked")
+
+
+if __name__ == "__main__":
+    main()

@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
+      # pyyaml: config falls back to forex symbols without it;
+      # solders: devnet signing tests.
+      - run: pip install pytest pyyaml solders
       - name: Agent subsystem suite (pytest modules)
         run: python -m pytest tests -q
       - name: Agent subsystem suite (script tests)

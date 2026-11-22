@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Tests for Eagle Eye momentum detection engine."""
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import sys
 import tempfile
 import time
 
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 
 # Use temp DB for tests
 _tmp = tempfile.mkdtemp()
@@ -221,7 +223,7 @@ except ValueError:
     check("with_retry non-lock raises", True)
 
 # eagle_eye_api
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 os.environ["FOREX_AGENT_HOME"] = _tmp2  # api uses same HOME
 import eagle_eye_api as api
 check("api get_by_stage", len(api.get_by_stage("trending")) >= 1)

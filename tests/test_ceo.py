@@ -7,6 +7,8 @@ halt rule) and bot-self-audit's decision functions (supervised-list
 derivation from the watchdog, repair planning, lock classification,
 log rotation) with monkeypatched system state. No network.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import fcntl
 import json
 import os
@@ -15,7 +17,7 @@ import tempfile
 import time
 from unittest.mock import patch
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

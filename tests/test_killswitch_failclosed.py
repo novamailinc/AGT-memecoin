@@ -22,13 +22,15 @@ pattern as tests/test_killswitch.py) — that re-points STATE_FILE,
 SHADOW_FILE and LOCK_FILE at the temp dir together.
 Plain script — run directly with the venv python, not pytest.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import importlib
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 TMPD = tempfile.mkdtemp(prefix="ks-failclosed-")
 os.environ["FOREX_AGENT_HOME"] = TMPD
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))

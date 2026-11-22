@@ -9,6 +9,8 @@ same mint, different mints still build in parallel, and _sweep
 cleans stale lock files without touching a held one. No live
 network: _res and _safety are fakes.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import struct
@@ -20,7 +22,7 @@ import time
 _TMP_HOME = tempfile.mkdtemp(prefix="dossier-home-")
 os.environ["FOREX_AGENT_HOME"] = _TMP_HOME
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

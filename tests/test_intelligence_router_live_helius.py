@@ -25,13 +25,15 @@ env var it exits 0 having made zero provider calls (LIVE-SKIP).
 Run: RUN_LIVE_HELIUS_TEST=1 venv python \\
     tests/test_intelligence_router_live_helius.py
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import provider_router as PR

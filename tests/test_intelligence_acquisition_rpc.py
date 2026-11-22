@@ -11,13 +11,15 @@ equivalence, provider failover, HTTP 429 (throughput vs
 monthly-quota distinguished), timeout handling, unsupported
 methods, key hygiene (no key material in logs / host-only logging).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import io
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import rpc as R

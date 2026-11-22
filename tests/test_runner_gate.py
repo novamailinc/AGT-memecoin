@@ -2,9 +2,12 @@
 """RUNNER-ONLY rule tests (2026-10-18 standing rule): every lane hunts ONLY
 real running signals — liq >= $25k, mcap >= $50k, positive momentum.
 Fail-closed on unknown liq/mcap/momentum."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 
 
 def load_script(name):

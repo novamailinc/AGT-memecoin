@@ -11,13 +11,15 @@ exits on synthetic price paths, and the pre-registered 100-close
 verdict halting the lane. No network: every feed is stubbed. Plain
 script — run directly, not via pytest.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

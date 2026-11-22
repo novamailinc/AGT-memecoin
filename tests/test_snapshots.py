@@ -40,6 +40,8 @@ Bot modules are imported lazily inside the group functions,
 after sys.path is set — the _fakes module itself imports
 nothing from the bot at module level.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import importlib.util
@@ -54,7 +56,7 @@ import time
 _TMP_HOME = tempfile.mkdtemp(prefix="snapshot-test-")
 os.environ["FOREX_AGENT_HOME"] = _TMP_HOME
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, os.path.join(REPO, "tests", "snapshots"))
 sys.path.insert(0, REPO)

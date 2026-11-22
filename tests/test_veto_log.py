@@ -10,12 +10,14 @@ These tests pin the fixed behavior: a synthetic veto lands a line at
 the documented path, passing checks write nothing, lane attribution
 is recorded, and a failing log write never breaks the veto itself.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

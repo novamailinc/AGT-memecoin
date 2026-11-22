@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Steady lane tests: scoring, exits, risk limits, consistency gate."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 from steady import score_steady, SteadyLedger, CFG
 import killswitch
 _orig = killswitch.gate

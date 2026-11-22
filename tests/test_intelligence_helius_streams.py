@@ -26,6 +26,8 @@ paid — not built), and router P0–P3 enforcement for the Helius
 workloads (preprocessed P0 refused, parsed stream P1/P0, complex
 parse P2, P3 routed elsewhere).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import base64
 import io
 import json
@@ -35,7 +37,7 @@ import sys
 import tempfile
 import urllib.error as _urlerr
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import helius_streams as HS

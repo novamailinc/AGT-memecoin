@@ -7,13 +7,15 @@ update_stats, corrupt/missing-registry tolerance, and the ledger
 backfill against temp ledgers + temp killswitch state. No network;
 the registry and all ledgers live in temp dirs.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import hashlib
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

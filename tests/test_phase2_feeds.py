@@ -4,8 +4,11 @@
 Covers scripts/eth-runner-feed (ETH-retuned six-stage funnel) and
 scripts/hl-listing-watch (spotMeta diff, listing cards).
 """
-ETH = "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/eth-runner-feed"
-HL = "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/hl-listing-watch"
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ETH = _REPO_ROOT + "/scripts/eth-runner-feed"
+HL = _REPO_ROOT + "/scripts/hl-listing-watch"
 
 
 def load(path, modname):

@@ -7,12 +7,14 @@ wins, split by reads_chain, per-check budget, required vs
 best-effort on unreadable data, exception text never surfaces.
 No network, no disk. Pure in-process checks.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import os
 import sys
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

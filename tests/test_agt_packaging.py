@@ -1000,27 +1000,44 @@ with tempfile.TemporaryDirectory() as tmp:
     check("roster: no hardcoded /home/hatch path survives in the "
           "devnet argv",
           "/home/hatch" not in proc.stdout)
-    env2 = {k: v for k, v in os.environ.items()
-            if k != "FOREX_VENV_PYTHON"}
-    env2["FOREX_AGENT_HOME"] = os.path.join(tmp, ".forex-agent")
-    proc2 = subprocess.run([sys.executable, "-c", _ROSTER_PROBE],
-                           cwd=REPO, env=env2, capture_output=True,
-                           text=True)
-    check("roster: default resolves to the repo venv (this VM: the "
-          "sibling .venv next to the checkout)",
-          proc2.returncode == 0
-          and ("DEVNET_ARGV0=%s"
-               % os.path.join(os.path.dirname(REPO), ".venv", "bin",
-                              "python"))
-          in proc2.stdout)
-    env3 = {**env2, "FOREX_SUPERVISOR_ONLY": "health_monitor"}
-    proc3 = subprocess.run([sys.executable, "-c", _ROSTER_PROBE],
-                           cwd=REPO, env=env3, capture_output=True,
-                           text=True)
-    check("roster: FOREX_SUPERVISOR_ONLY restricts the active "
-          "roster (test-only)",
-          proc3.returncode == 0
-          and "ONLY=health_monitor" in proc3.stdout)
+    # Default resolution must find the repo venv without any override.
+    # Create a fake {repo}/.venv so this check is hermetic: the original
+    # form only passed on the dev VM, where a sibling .venv happened to
+    # exist next to the checkout.
+    repo_venv_bin = os.path.join(REPO, ".venv", "bin")
+    repo_venv_py = os.path.join(repo_venv_bin, "python")
+    made_venv = not os.path.exists(repo_venv_py)
+    if made_venv:
+        os.makedirs(repo_venv_bin, exist_ok=True)
+        with open(repo_venv_py, "w") as fh:
+            fh.write("#!/bin/sh\nexec python3 \"$@\"\n")
+        os.chmod(repo_venv_py, 0o755)
+    try:
+        env2 = {k: v for k, v in os.environ.items()
+                if k != "FOREX_VENV_PYTHON"}
+        env2["FOREX_AGENT_HOME"] = os.path.join(tmp, ".forex-agent")
+        proc2 = subprocess.run([sys.executable, "-c", _ROSTER_PROBE],
+                               cwd=REPO, env=env2, capture_output=True,
+                               text=True)
+        check("roster: default resolves to the repo venv (.venv inside "
+              "the checkout)",
+              proc2.returncode == 0
+              and ("DEVNET_ARGV0=%s" % repo_venv_py) in proc2.stdout)
+        env3 = {**env2, "FOREX_SUPERVISOR_ONLY": "health_monitor"}
+        proc3 = subprocess.run([sys.executable, "-c", _ROSTER_PROBE],
+                               cwd=REPO, env=env3, capture_output=True,
+                               text=True)
+        check("roster: FOREX_SUPERVISOR_ONLY restricts the active "
+              "roster (test-only)",
+              proc3.returncode == 0
+              and "ONLY=health_monitor" in proc3.stdout)
+    finally:
+        if made_venv:
+            os.remove(repo_venv_py)
+            try:
+                os.removedirs(repo_venv_bin)
+            except OSError:
+                pass
 
 # ---------------- backup job runs backup + verify ----------------
 _backup = next(j for j in SCHED.JOBS if j["id"] == "forex-backup-hourly")

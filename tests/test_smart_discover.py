@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Discovery parsing tests (pure functions, synthetic txs, no network)."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import importlib.util
 import sys
 
 spec = importlib.util.spec_from_file_location(
-    "disc", "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/smart-discover")
+    "disc", _REPO_ROOT + "/scripts/smart-discover")
 # stub out the __main__ guard by exec'ing module source minus the guard
-_src = open("/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/smart-discover").read()
+_src = open(_REPO_ROOT + "/scripts/smart-discover").read()
 _ns = {"__name__": "disc_test",
-       "__file__": "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/smart-discover"}
+       "__file__": _REPO_ROOT + "/scripts/smart-discover"}
 exec(compile(_src.split('if __name__ == "__main__":')[0], "disc", "exec"), _ns)
 _buyers_of_mint = _ns["_buyers_of_mint"]
 _wallet_swaps = _ns["_wallet_swaps"]

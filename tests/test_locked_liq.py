@@ -6,9 +6,11 @@ RugCheck + EVM lp_lock, fail-closed), momentum gate, scoring bar, tap
 callback 64-byte safety, per-chain daily cap, and card provenance.
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 SCRIPT = os.path.join(REPO, "scripts/locked-liq-scan")
 _src = open(SCRIPT).read()
 _ns = {"__name__": "locked_liq_test", "__file__": SCRIPT}

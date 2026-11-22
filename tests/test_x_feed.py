@@ -11,11 +11,13 @@ Also runs the real fixture (tests/data/x_feed_posts.json) through the
 parser and checks the expected candidate counts. No network, no live
 bus, no credentials. Plain script — run directly, not via pytest.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

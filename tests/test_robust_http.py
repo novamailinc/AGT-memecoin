@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Tests for robust_http: retry, circuit breaker, backoff, fail-fast."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys, time
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 import robust_http as rh
 
 fails = []

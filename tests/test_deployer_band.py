@@ -13,6 +13,8 @@ No network, no live ledgers (report math runs on in-memory fixtures;
 the evaluate test stubs every data source in-process, same pattern as
 tests/test_ab_forward.py). Plain script — run directly, not via pytest.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import contextlib
 import importlib.util
 import os
@@ -20,7 +22,7 @@ import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

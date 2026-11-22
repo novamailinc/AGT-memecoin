@@ -17,12 +17,14 @@ Covers the wiring (2026-11-21):
 No network: every feed is stubbed. Temp ledgers only.
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import queue
 import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

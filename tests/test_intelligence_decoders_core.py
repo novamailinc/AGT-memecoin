@@ -15,6 +15,8 @@ agree exactly. Synthetic bytes pin the layouts the fixtures
 verified (canonical Token-2022 TLV start at offset 166 with the
 AccountType byte at 165; SIMD-0437 rent at 5,080 lamports/byte).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import base64
 import copy
 import json
@@ -22,7 +24,7 @@ import os
 import struct
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 FIX = os.path.join(REPO, "tests", "data", "intelligence")
 

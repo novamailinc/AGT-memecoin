@@ -11,13 +11,15 @@ disable), the request journal (which account serviced each
 request, no key material), and per-feature consumption mapping
 (Helius parsed_streams / parsed_events vs standard_rpc).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import provider_capabilities as CAPS

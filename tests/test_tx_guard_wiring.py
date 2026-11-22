@@ -8,6 +8,8 @@ deployer resolver (deployers), and the logstream mint lookup.
 Uses the recorded migration-tx fixture from the snapshot
 harness, with err injected. No network, no disk (temp HOME).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import copy
 import json
@@ -18,7 +20,7 @@ import tempfile
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
     prefix="txguard-wiring-")
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, os.path.join(REPO, "tests", "snapshots"))
 sys.path.insert(0, REPO)

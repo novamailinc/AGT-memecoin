@@ -15,6 +15,8 @@ and the usage report reproducing exact counts from a seeded
 journal (requests, usage, errors per provider x workload) with
 its measurement window stated.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import io
 import json
 import os
@@ -24,7 +26,7 @@ import tempfile
 import time
 from contextlib import redirect_stdout
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import provider_capabilities as CAPS

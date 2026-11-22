@@ -7,12 +7,14 @@ Plain script, no network. Covers (§11): smart-money tracking
 cursor), gap detection, public-fallback-only alert, per-provider
 latency/error surfacing.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import event_backfill as EB

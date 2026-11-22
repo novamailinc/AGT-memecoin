@@ -7,9 +7,11 @@ spotMetaAndAssetCtxs parsing, breakout detection (volume + 24h move +
 breakout card text, and the shared 2/day listing+breakout budget.
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import tempfile
 
-HL = "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/hl-listing-watch"
+HL = _REPO_ROOT + "/scripts/hl-listing-watch"
 
 
 def load(path, modname):
@@ -137,7 +139,7 @@ check("breakout callback carries mint id", cb.endswith(MINT))
 
 # signal_bus short code (single source of truth)
 import sys as _sys
-_sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/"
+_sys.path.insert(0, _REPO_ROOT + "/"
                      "daemon/launch_scanner")
 from signal_bus import track_callback, TRACK_SOURCE_CODES
 check("signal_bus has hb code", TRACK_SOURCE_CODES.get("hl-breakout") == "hb")

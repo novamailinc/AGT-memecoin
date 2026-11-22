@@ -24,11 +24,13 @@ No network: all RPC is stubbed. Plain script — run directly,
 not via pytest.
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 # Trader-identical path order: launch_scanner dir inserted first,
 # then repo root inserted at 0 (so repo root ends up first, exactly
 # as scripts/grad-select-trader does it).

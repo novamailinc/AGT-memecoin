@@ -16,6 +16,8 @@ publish different values (non-constant). No network: send_card and
 mirror_card are stubbed at the module seams fire_card uses, and the
 bus/outcome files live in a temp FOREX_AGENT_HOME.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import importlib.machinery
 import importlib.util
 import json
@@ -24,7 +26,7 @@ import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 TMPD = tempfile.mkdtemp(prefix="smartwatcher-producer-")
 os.environ["FOREX_AGENT_HOME"] = TMPD
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))

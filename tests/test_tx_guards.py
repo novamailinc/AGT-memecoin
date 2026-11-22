@@ -6,11 +6,13 @@ CreateEvent can survive in a reverted tx's logs) and whole-line
 log matching (substring also matches CreateTokenAccount /
 CreatePool). No network, no disk. Pure in-process checks.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import os
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

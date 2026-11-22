@@ -14,12 +14,14 @@ safety report, no hard fails, score >= 1/100.
 Run: python3 tests/test_flash_pregate.py
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import sys
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.launch_scanner import LaunchScanner

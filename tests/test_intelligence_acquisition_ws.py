@@ -7,9 +7,12 @@ Covers (§11): WebSocket disconnections + reconnect backoff,
 handshake-429 counted SEPARATELY from RPC 429s, duplicate events,
 event ordering, missing-event detection.
 """
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import websocket_manager as WM

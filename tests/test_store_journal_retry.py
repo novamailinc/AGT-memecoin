@@ -8,11 +8,13 @@ retries a bounded number of times on locked errors only.
 No network. Uses temp DBs.
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import sqlite3
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from storage.store import Store

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Nadir-v0 Phase 2 tests: boundary values and pure-function determinism."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 from nadir_signal import drawdown_pct, in_drawdown_band, check_universe, check_falling_knife
 
 def mk_candles(n, base=100.0, trend=0.0):

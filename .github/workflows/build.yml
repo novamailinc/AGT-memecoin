@@ -15,8 +15,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pytest
-      - name: Agent subsystem suite
+      - name: Agent subsystem suite (pytest modules)
         run: python -m pytest tests -q
+      - name: Agent subsystem suite (script tests)
+        # About half of tests/ are plain scripts that pytest cannot
+        # collect; this runner executes each one and fails on any
+        # nonzero exit. Nothing is skipped.
+        run: python scripts/run_script_tests.py
       - name: Manifest freshness check
         run: python3 scripts/gen_manifest.py --check
 

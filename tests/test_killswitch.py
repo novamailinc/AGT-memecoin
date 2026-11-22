@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Kill switch tests: halt logic, re-enable, fail-closed behavior."""
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys, os, tempfile, json
 # Isolate state
 tmpd = tempfile.mkdtemp()
 os.environ["FOREX_AGENT_HOME"] = tmpd
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 # Re-import after env set (module reads env at import)
 import importlib
 import killswitch

@@ -10,12 +10,14 @@ agreement at the comparison level (creator / migrate-instruction
 fields from a jsonParsed fixture — the full decoders are Phase 3),
 benchmark latency summaries.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import shadow as SH

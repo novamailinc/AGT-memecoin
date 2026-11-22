@@ -9,6 +9,8 @@ verdict (kill at expectancy <= 0, survive at > 0). Plus the new
 sources.geckoterminal_new_pools normalizer and the killswitch 'grad'
 registration / halt_lane API. No network: every feed is stubbed.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
@@ -16,7 +18,7 @@ import tempfile
 import time
 from unittest.mock import patch
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

@@ -6,7 +6,10 @@ survival pre-filter (HIGHER bar than Solana), safety-callback wiring,
 manipulation filters, positive-evidence gate, continuation check,
 score/tier, tap-callback provenance, and the feed kill-switch hook.
 """
-SCRIPT = "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/base-runner-feed"
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = _REPO_ROOT + "/scripts/base-runner-feed"
 _src = open(SCRIPT).read()
 _ns = {"__name__": "base_runner_test", "__file__": SCRIPT}
 exec(compile(_src.split('if __name__ == "__main__":')[0], "base_runner", "exec"), _ns)

@@ -416,7 +416,7 @@ class LaunchScanner(Daemon):
                 self._drain_pumpportal(config, adapter, state)
             except Exception:
                 logger.exception("pumpportal drain failed")
-            if self._stop:
+            if getattr(self, "_stop", False):
                 # SIGTERM/SIGINT arrived during the drains: do not start
                 # the scan phase (the multi-minute part). This return is
                 # inside the cycle's try, so the finally block still
@@ -969,7 +969,7 @@ class LaunchScanner(Daemon):
         if ls is None:
             return
         for item in ls.drain():
-            if self._stop:
+            if getattr(self, "_stop", False):
                 logger.warning("logstream drain stopping on SIGTERM — "
                                "remaining queued detections wait for the "
                                "next start")
@@ -1028,7 +1028,7 @@ class LaunchScanner(Daemon):
         if pp is None:
             return
         for c in pp.drain():
-            if self._stop:
+            if getattr(self, "_stop", False):
                 logger.warning("pumpportal drain stopping on SIGTERM — "
                                "remaining queued detections wait for the "
                                "next start")
@@ -1145,7 +1145,7 @@ class LaunchScanner(Daemon):
                            "markets) — no alerts for the existing book",
                            len(known))
         for _ci, c in enumerate(cands):
-            if self._stop:
+            if getattr(self, "_stop", False):
                 logger.warning("scan cycle stopping on SIGTERM — "
                                "deferring %d remaining candidates to "
                                "next cycle", len(cands) - _ci)
@@ -1159,7 +1159,7 @@ class LaunchScanner(Daemon):
                 self._consider(config, adapter, state, c)
             except Exception:
                 logger.exception("consider failed for %s", c.get("mint"))
-        if self._stop:
+        if getattr(self, "_stop", False):
             # SIGTERM/SIGINT mid-cycle: skip the rest of the scan phase
             # (sniper flush, momentum scan, judge, digest, recap,
             # feedback) — the cycle's finally block still saves state,
@@ -3600,7 +3600,7 @@ class LaunchScanner(Daemon):
             getattr(degen, "sentiment_per_cycle", 2))
         batch = self._batch_refresh(candidates, now)
         for key in list(candidates):
-            if self._stop:
+            if getattr(self, "_stop", False):
                 logger.warning("scan cycle stopping on SIGTERM in judge "
                                "— deferring remaining candidates")
                 break

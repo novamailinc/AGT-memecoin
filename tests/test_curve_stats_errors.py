@@ -8,6 +8,8 @@ fail-closed decision is untouched by these tests; only the diagnostic
 path is exercised: failures must now carry their class, and a bare
 None must never again masquerade as an error string. No network.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import logging
 import os
@@ -17,7 +19,7 @@ import time
 import urllib.error
 from unittest.mock import patch
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

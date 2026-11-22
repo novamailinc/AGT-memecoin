@@ -35,7 +35,14 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
-from dynamic_credentials import add_surrogate_to_request  # noqa: E402
+
+
+def _add_surrogate_to_request(req):
+    # Imported lazily: dynamic_credentials only exists on the agent
+    # runtime, but the secret guard below is unit-tested standalone
+    # (tests/test_security_fixes.py) where that runtime is absent.
+    from dynamic_credentials import add_surrogate_to_request
+    return add_surrogate_to_request(req, CRED, allowed_hosts=ALLOWED)
 
 API = "https://api.github.com"
 ALLOWED = ("api.github.com", "uploads.github.com")
@@ -105,7 +112,7 @@ def api(method: str, path: str, payload: dict | None = None) -> dict:
             "Content-Type": "application/json",
         },
     )
-    add_surrogate_to_request(req, CRED, allowed_hosts=ALLOWED)
+    _add_surrogate_to_request(req)
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read()

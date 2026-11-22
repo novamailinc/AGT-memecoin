@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Degen v2 tests: scoring, filters, exits, breakeven math."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 from degen_v2 import score_token, breakeven_win_rate, expected_value, FILTERS
 from degen_v2_ledger import DegenLedger
 

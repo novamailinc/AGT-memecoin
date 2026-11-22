@@ -14,11 +14,13 @@ Covered here:
   4. A corrupt primary still fails closed even when a good shadow
      exists (the shadow is restore material only, never auto-used).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys, os, tempfile, json, multiprocessing
 
 tmpd = tempfile.mkdtemp()
 os.environ["FOREX_AGENT_HOME"] = tmpd
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 import killswitch as ks
 
 fails = []

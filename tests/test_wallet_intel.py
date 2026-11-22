@@ -7,13 +7,15 @@
 4. fresh_sniffer.py — insider/sniper/organic classification
 5. scripts/wallet-monitor — message handling, dedup, killswitch
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
 import os
 import time
 import json
 import tempfile
 
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 
 # Isolate state files to temp dir
 _tmp = tempfile.mkdtemp()
@@ -293,13 +295,13 @@ check("marked wallet not fresh", not is_fresh("brand_new_wallet_xyz"))
 # 5. WALLET MONITOR
 # ============================================================
 print("\n=== wallet-monitor ===")
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts")
+sys.path.insert(0, _REPO_ROOT + "/scripts")
 # Import as module (script has no .py extension — use SourceFileLoader)
 import importlib.util
 from importlib.machinery import SourceFileLoader
 loader = SourceFileLoader(
     "wallet_monitor",
-    "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/wallet-monitor")
+    _REPO_ROOT + "/scripts/wallet-monitor")
 spec = importlib.util.spec_from_loader("wallet_monitor", loader)
 wm = importlib.util.module_from_spec(spec)
 loader.exec_module(wm)

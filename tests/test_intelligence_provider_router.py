@@ -18,6 +18,8 @@ journal recording which account serviced each request, no account
 rotation, and provider_manager delegating to the router (the router
 is the ONLY place routing decisions live).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import io
 import json
 import os
@@ -25,7 +27,7 @@ import sys
 import tempfile
 import urllib.error
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import provider_manager as PM

@@ -22,6 +22,9 @@ The original checks are preserved below the early exit for history;
 they no longer execute. Original header: "Tests for the Stacker lane:
 scoring, tiered exits, stops, risk limits."
 """
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
 print("RETIRED 2026-10-23: Stacker lane killed by the 2026-10-22 "
       "verdict and removed from the roster 2026-10-23 — suite retired, "
@@ -30,7 +33,7 @@ sys.exit(0)
 
 # --- Original suite below (retired 2026-10-23, not executed) --------------
 import time
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 
 # Bypass killswitch for ledger tests (test the gate separately)
 import killswitch

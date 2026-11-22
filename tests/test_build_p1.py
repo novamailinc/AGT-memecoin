@@ -7,6 +7,8 @@ Plain script, no network: parsers run on synthetic account bytes in
 the VERIFIED PumpSwap layout; the watcher runs on injected messages;
 the grad engine runs on stubbed feeds exactly like test_grad.py.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import base64
 import json
 import os
@@ -16,7 +18,7 @@ import tempfile
 import time
 from unittest.mock import patch
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

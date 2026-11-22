@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Tap journal tests (Phase 0). Isolated HOME via env var before import."""
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
@@ -7,7 +9,7 @@ import tempfile
 
 _tmp = tempfile.mkdtemp(prefix="tapj-")
 os.environ["FOREX_AGENT_HOME"] = _tmp
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 import tap_journal
 from tap_journal import journal_tap, tap_stats
 

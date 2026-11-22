@@ -48,7 +48,8 @@ from daemon.launch_scanner import reserves  # noqa: E402
 from daemon.launch_scanner import sources  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PUSH_REPO = "/home/hatch/workspace/github-deploy/push_repo.py"
+_PUSH_REPO = os.path.join(_ROOT, "tools", "github-deploy",
+                          "push_repo.py")
 
 FAILS = []
 

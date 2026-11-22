@@ -14,6 +14,8 @@ Chainstack -32005 + try_again_in), timeout, unsupported methods
 (zero HTTP calls), key hygiene (no key material in source or logs),
 WSS URL resolution, configured_providers.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import io
 import json
 import os
@@ -21,7 +23,7 @@ import sys
 import tempfile
 import types
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import provider_capabilities as CAPS

@@ -5,6 +5,8 @@ decay, and the private-data-never-in-repo guarantee.
 No network — all RPC is faked. Nothing here touches the real
 ~/.forex-agent runtime files: every path constant is patched to /tmp.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import json
 import os
@@ -386,7 +388,7 @@ class PrivateDataPathsTest(unittest.TestCase):
         # under the public repo tree.
         home = str(deployers._HOME)
         repo = str(Path(
-            "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+            _REPO_ROOT
         ).resolve())
         self.assertTrue(home, "deployers._HOME is empty")
         self.assertFalse(home.startswith(repo))

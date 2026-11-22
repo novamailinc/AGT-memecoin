@@ -1077,8 +1077,12 @@ class FlashSpamLogstreamTest(unittest.TestCase):
         from agent import events as event_bus
         from daemon.launch_scanner import logstream, safety
         state = self._state()
+        # The traction pre-gate (2026-11-16) is covered by
+        # tests/test_flash_pregate.py; this test exercises the
+        # drain -> consider -> publish plumbing, so the gate is off.
         cfg = SimpleNamespace(degen=_degen(early_safety_flash=True,
-                                           sniper_tier_threshold=0.0))
+                                           sniper_tier_threshold=0.0,
+                                           flash_pregate_enabled=False))
         ls = logstream.LogStream.__new__(logstream.LogStream)
         import queue as _q
         ls._q = _q.Queue()

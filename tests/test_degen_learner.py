@@ -9,13 +9,15 @@
 4. degen-feed counterfactual log: bounded JSONL records for all
    decisions, logging only.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 import time
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 
 
 def load_script(name):

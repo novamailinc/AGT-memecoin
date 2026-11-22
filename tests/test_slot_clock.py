@@ -11,6 +11,8 @@ background getSlot would burn ~43k credits/day against a
 1M/month free tier). No network: the slot source is injected,
 and time.monotonic is patched to a controllable fake clock.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import os
 import sys
@@ -18,7 +20,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

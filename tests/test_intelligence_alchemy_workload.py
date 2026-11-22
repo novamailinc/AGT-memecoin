@@ -27,6 +27,8 @@ counted separately from RPC 429s); no unfiltered program
 subscriptions exist; scheduler + usage tracking honoured on every
 call.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import io
 import json
 import os
@@ -34,7 +36,7 @@ import sys
 import tempfile
 import urllib.error
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import alchemy_workload as AW

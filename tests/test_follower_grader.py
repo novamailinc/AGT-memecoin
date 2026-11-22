@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Follower-P&L grader tests: exit-ladder math and per-wallet aggregation."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 from follower_grader import simulate_buy, grade_followers
 
 fails = []

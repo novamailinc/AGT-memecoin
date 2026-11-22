@@ -12,12 +12,14 @@ fail-soft when the journal path is broken. Veto fixtures follow
 tests/test_veto_log.py (synthetic RugCheck report, run_bundle=False,
 no network).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

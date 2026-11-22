@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Nadir-v0 paper ledger tests: exits, costs, limits, determinism."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 from nadir_paper import Ledger, CFG
 
 fails = []

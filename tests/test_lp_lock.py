@@ -6,9 +6,11 @@ the card_design lp_lock line, and the base/eth feed wiring (pair extraction
 + badge pass-through).
 """
 import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import os
 import sys
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 
 import lp_lock

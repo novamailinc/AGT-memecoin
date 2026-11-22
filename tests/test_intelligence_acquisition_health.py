@@ -9,10 +9,12 @@ Covers: probe blocked-status honesty, doc-resolved probes,
 benchmark latency percentiles, manager+shadow wiring with fake
 transports (live path untouched by shadow).
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys
 import tempfile
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import probes as PR

@@ -10,6 +10,8 @@ through dossiers, window-expired exclusion), plus dossier
 surfacing fail-soft in dossiers.py. No live network: the resolver
 is only ever called with fake transports.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
@@ -19,7 +21,7 @@ import tempfile
 _TMP_HOME = tempfile.mkdtemp(prefix="intel-home-")
 os.environ["FOREX_AGENT_HOME"] = _TMP_HOME
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 

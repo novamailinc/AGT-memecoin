@@ -5,12 +5,14 @@ Plain-script style like the rest of this repo: builds a fake
 FOREX_AGENT_HOME with small ledgers, asserts reply substrings.
 Run: /home/hatch/workspace/Forex-agent/.venv/bin/python tests/test_telegram_check.py
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import sys
 import tempfile
 
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main")
+sys.path.insert(0, _REPO_ROOT)
 from daemon.telegram import commands_check as cc
 
 fails = []

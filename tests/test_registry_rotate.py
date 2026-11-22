@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Registry rotation rule tests (pure function, no disk)."""
+import os
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import importlib.util
 import sys
 
 spec = importlib.util.spec_from_file_location(
-    "rot", "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/smart-registry-rotate")
+    "rot", _REPO_ROOT + "/scripts/smart-registry-rotate")
 # import without running main()
-_src = open("/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/smart-registry-rotate").read()
+_src = open(_REPO_ROOT + "/scripts/smart-registry-rotate").read()
 _ns = {"__name__": "rot_test",
-        "__file__": "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/smart-registry-rotate"}
+        "__file__": _REPO_ROOT + "/scripts/smart-registry-rotate"}
 exec(compile(_src.split('if __name__ == "__main__":')[0], "rot", "exec"), _ns)
 rotation_action = _ns["rotation_action"]
 

@@ -18,6 +18,8 @@ available; Yellowstone gRPC investigation (paid on all three — no
 client built). Live Alchemy/Chainstack verification is DEFERRED to
 AGT; nothing here claims a live result.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import io
 import json
 import os
@@ -26,7 +28,7 @@ import tempfile
 import time
 import urllib.error
 
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = _REPO_ROOT
 sys.path.insert(0, REPO)
 
 from daemon.intelligence.acquisition import chainstack_workload as CW

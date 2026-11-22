@@ -10,11 +10,13 @@ lane, halt path unchanged with enriched HALT event).
 No network, no live state (a temp home isolates everything).
 Plain script — run directly with the venv python, not pytest.
 """
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import sys, os, tempfile, json, time
 # Isolate state
 tmpd = tempfile.mkdtemp()
 os.environ["FOREX_AGENT_HOME"] = tmpd
-sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/daemon/launch_scanner")
+sys.path.insert(0, _REPO_ROOT + "/daemon/launch_scanner")
 # Re-import after env set (module reads env at import)
 import importlib
 import killswitch

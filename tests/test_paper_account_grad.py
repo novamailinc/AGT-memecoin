@@ -139,7 +139,8 @@ importlib.reload(PA)  # picks up FOREX_AGENT_HOME paths as-is
 ps, _mv, _ms = _fresh()
 # Drain the shared account to $1.50 via a direct debit so the next
 # $1 grad entry fits but a second one cannot.
-ok, _, _pid = PA.try_debit("other-lane", "DRAIN1", 8.50)
+ok, _, _pid = PA.try_debit("other-lane", "DRAIN1", 8.50, 8.50,
+                           "drain-1")
 check("fixture: shared account drained to $1.50",
       ok and PA.snapshot()["cash"] == 1.50)
 

@@ -1120,7 +1120,16 @@ def _consider_candidate(cand, now):
         # cash freed by another lane's close re-enables entries.
         _pa = _paper_account()
         if _pa is not None:
-            _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake)
+            # Stable op_id from the pool's durable identity (mint +
+            # pool-creation ts, falling back to entry ts), so a
+            # retry of an uncertain debit response — even across a
+            # restart — returns the original outcome instead of
+            # double-spending. qty is the filled unit amount.
+            _born = float(cand.get("created_ts") or 0) or pos["entry_ts"]
+            _qty = _stake / float(pos["entry_price"])
+            _op = "grad:entry:%s:%d" % (mint, int(_born * 1000))
+            _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
+                                            _op)
             if not _ok:
                 return _skip(mint, "paper account: " + _why, False)
             # Pin the open instance so the close can never settle
@@ -1487,7 +1496,12 @@ def _finalize(d, mint, pos, closed_reason):
     # account module and never blocks the lane's own settle.
     _pa = _paper_account()
     if _pa is not None:
-        _ok, _why = _pa.credit(LANE, mint, realized,
+        # Full close (qty=None settles all remaining units); op_id
+        # is stable per position instance so a retried close after
+        # an uncertain response cannot double-credit.
+        _op = "grad:close:%s:%s" % (mint, pos.get("pa_pos_id")
+                                    or "legacy")
+        _ok, _why = _pa.credit(LANE, mint, realized, _op,
                                pos_id=pos.get("pa_pos_id"))
         if not _ok:
             logger.warning("grad: shared paper account credit "

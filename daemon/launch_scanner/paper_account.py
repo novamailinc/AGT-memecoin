@@ -14,10 +14,10 @@ now". This module is the single source of truth for paper capital:
   * lanes DEBIT on entry and CREDIT on close; a debit that the
     cash balance cannot cover is refused (fail-closed), so two
     lanes can never spend the same dollars,
-  * account-level exposure = cash + open cost basis, per-lane and
-    daily P/L are tracked here so account-level risk enforcement
-    (Stage 2: daily-loss / drawdown gates) has verified numbers to
-    gate on,
+  * account-level exposure = cash + open allocated cost basis;
+    per-lane, per-position and daily P/L are tracked here so
+    account-level risk enforcement (Stage 2: daily-loss / drawdown
+    gates) has verified numbers to gate on,
   * every mutation is journaled append-only BEFORE the ledger
     write, so a crashed writer never silently drops money.
 
@@ -30,8 +30,31 @@ falls back to the shadow; if both are unreadable, debits are
 REFUSED (fail-closed) while credits are journaled so no realized
 money is lost.
 
-Crash-journal contract (Stage 1.2, 2026-11-22 review):
+Accounting contract (Stage 1.3, 2026-11-22 review):
 
+  * POSITIONS track quantity and ALLOCATED cost basis (average
+    cost), never stake-minus-proceeds: entry records qty and cost;
+    each sale (partial or final) allocates basis in proportion to
+    the units sold, realizes P/L = (gross proceeds - fees) minus
+    the allocated basis, and credits NET proceeds to cash. A
+    profitable tranche that recovers more than the original stake
+    realizes the gain immediately; remaining basis is per-unit
+    allocated and can never go negative. Tracked separately per
+    position: remaining qty, remaining basis, cumulative realized
+    P/L, cumulative net proceeds, cumulative fees.
+  * CONSERVATION INVARIANT (no external flows): after any sale,
+    cash + remaining basis == prior cash + prior basis + net
+    realized P/L of the sale. Tests pin this against hand-computed
+    examples, including profitable and losing partial sales.
+  * OPERATION IDs. Every mutation carries a stable caller-supplied
+    op_id (distinct from the WAL seq): an uncertain response must
+    be retryable, so a repeated op_id returns the ORIGINAL outcome
+    without re-applying — even after the position was closed and
+    reopened (the retry must not attach to the new instance). The
+    same op_id with different parameters is a caller bug and is
+    refused. Each journaled mutation also gets an immutable event
+    id (ev#<seq>) so repeated tranches of one position are
+    distinct in the audit trail.
   * POSITION IDs. Every open instance carries an immutable pos_id
     "lane/mint#<debit-seq>". A mint can be closed and REOPENED
     (ceo has a 24h cooldown, not a ban); lane+mint alone cannot
@@ -47,13 +70,17 @@ Crash-journal contract (Stage 1.2, 2026-11-22 review):
     other unparseable record, or a hole/inversion in the seq
     chain, means the WAL cannot be trusted: the account is
     DEGRADED — debits are refused, credits are journaled for
-    manual reconciliation but not applied, so a suspect ledger
-    never silently gains or resurrects money.
-  * PARTIAL CLOSES. The shared account only ever credits a FULL
-    close. A lane scaling out in tranches keeps the unsold
-    remainder in its own ledger; the shared stake stays reserved
-    until the position fully closes. Conservative on purpose: the
-    account never under-reserves.
+    manual reconciliation but not applied, and replay is skipped
+    (an incomplete WAL must not drive state).
+  * EQUITY BASELINES. Day-start and peak equity are captured only
+    from trustworthy marks (marks_status "ok") and persisted. At a
+    rollover with no trustworthy mark the previous baseline
+    CARRIES and gate inputs report unavailable (fail-closed); a
+    baseline is NEVER reset to a later favorable value on the same
+    day. A mark's value is the liquidation value of the REMAINING
+    units of the position (the lane owns units; net proceeds of
+    past tranches are already in cash, so marked equity can
+    neither lose nor double-count them).
 
 PAPER ONLY. This account is simulated dollars; nothing here
 touches, custodies, or prices real funds.
@@ -92,6 +119,7 @@ DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
 _MUTATION_EVENTS = ("debit", "credit")
+_EPS = 1e-9
 
 
 def _env_f(name: str, default: Optional[float]) -> Optional[float]:
@@ -129,6 +157,13 @@ def _new_ledger() -> Dict[str, Any]:
         "day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "day_realized_pnl": 0.0,
         "lanes": {},
+        # op_id -> {"event": kind, "lane":, "mint":, "pos_id":,
+        #           "event_id":, params...}: caller-retry dedupe.
+        "ops": {},
+        # Equity baselines: captured only from trustworthy marks,
+        # never reset to a later favorable value (see docstring).
+        "day_baseline": None,   # {"day":, "value":, "ts":}
+        "peak_equity": None,    # {"value":, "ts":}
     }
 
 
@@ -144,6 +179,24 @@ def _pos_id(lane: str, mint: str, seq: int) -> str:
     """Immutable ID of one open instance: unique per debit, stable
     across reopens of the same mint."""
     return "%s/%s#%d" % (lane, mint, seq)
+
+
+def _pos_basis(pos: Dict[str, Any]) -> float:
+    """Remaining allocated cost basis (v2) or full stake (legacy
+    Stage-1 record, which has no quantity tracking)."""
+    if "basis" in pos:
+        return float(pos["basis"])
+    return float(pos["stake"])
+
+
+def _pos_qty(pos: Dict[str, Any]) -> Optional[float]:
+    q = pos.get("qty")
+    return float(q) if isinstance(q, (int, float)) else None
+
+
+def _valid_amount(v: Any) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
 
 
 @contextlib.contextmanager
@@ -274,6 +327,82 @@ def _seq_violation(entries: List[Dict[str, Any]]
     return None
 
 
+def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
+                 stake: float, qty: Optional[float], pid: str,
+                 ts: Optional[float]) -> None:
+    """Shared debit mutation. Caller holds the lock and has
+    validated input and cash."""
+    led["cash"] = round(float(led["cash"]) - stake, 6)
+    st = _lane(led, lane)
+    st["open"][mint] = {
+        "pos_id": pid,
+        "qty": qty,                 # remaining units
+        "basis": stake,             # remaining allocated cost
+        "entry_qty": qty,
+        "entry_cost": stake,
+        "realized_pnl": 0.0,
+        "proceeds": 0.0,            # cumulative NET proceeds
+        "fees": 0.0,
+        "ts": ts or time.time(),
+    }
+    st["n_entries"] += 1
+
+
+def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
+                  qty_sold: Optional[float], net: float, fee: float,
+                  final: bool) -> Tuple[Optional[float], str]:
+    """Shared credit mutation. Returns (realized_delta, "") or
+    (None, reason) leaving state untouched. Average-cost
+    allocation; a partial sale realizes P/L against the allocated
+    basis of the units sold. Caller holds the lock."""
+    st = _lane(led, lane)
+    pos = st["open"].get(mint)
+    if pos is None:
+        return None, "no open position"
+    basis = _pos_basis(pos)
+    have_qty = _pos_qty(pos)
+    if final or qty_sold is None:
+        if qty_sold is not None and have_qty is not None \
+                and qty_sold < have_qty - _EPS:
+            return None, "qty under remaining: not final"
+        alloc = basis
+        realized = round(net - alloc, 6)
+        st["open"].pop(mint)
+        pos["basis"] = 0.0
+        pos["qty"] = 0.0 if have_qty is not None else None
+        closed = True
+    elif have_qty is None or "basis" not in pos:
+        # Legacy Stage-1 record: no quantity tracking, so no
+        # allocation is possible. Full close only.
+        return None, "legacy position: full close only"
+    else:
+        if not _valid_amount(qty_sold) or qty_sold <= 0:
+            return None, "bad qty"
+        if qty_sold > have_qty + _EPS:
+            return None, "qty exceeds remaining units"
+        alloc = round(basis * (qty_sold / have_qty), 6)
+        alloc = min(alloc, basis)
+        realized = round(net - alloc, 6)
+        pos["qty"] = round(have_qty - qty_sold, 12)
+        pos["basis"] = round(basis - alloc, 6)
+        closed = False
+    pos["realized_pnl"] = round(
+        float(pos.get("realized_pnl") or 0.0) + realized, 6)
+    pos["proceeds"] = round(
+        float(pos.get("proceeds") or 0.0) + net, 6)
+    pos["fees"] = round(float(pos.get("fees") or 0.0) + fee, 6)
+    led["cash"] = round(float(led["cash"]) + net, 6)
+    led["realized_pnl"] = round(
+        float(led["realized_pnl"]) + realized, 6)
+    led["day_realized_pnl"] = round(
+        float(led.get("day_realized_pnl") or 0.0) + realized, 6)
+    st["realized_pnl"] = round(
+        float(st["realized_pnl"]) + realized, 6)
+    if closed:
+        st["n_closes"] += 1
+    return realized, ""
+
+
 def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Replay journaled mutations the ledger has not reached.
@@ -284,10 +413,14 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
     more. Without reconciliation, restoring that shadow would
     RESURRECT a settled position, and its later close would credit
     the money a second time. Every mutation carries a monotonic
-    seq (the state version AFTER the mutation) and an immutable
-    pos_id (the open INSTANCE it moved); replay applies journaled
-    entries past the ledger's seq, idempotently:
+    seq (the state version AFTER the mutation), an immutable
+    event id, the caller's op_id, and the pos_id of the open
+    INSTANCE it moved; replay applies journaled entries past the
+    ledger's seq, idempotently:
 
+      any event whose op_id is already recorded in the state is
+      skipped (caller retry that reached the journal twice, or a
+      stale shadow re-seeing an applied op);
       debit  — skipped when the same pos_id is already open,
                applied when the mint is closed; a mint open under
                a DIFFERENT pos_id is a divergence (stop, degraded);
@@ -295,7 +428,8 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                when the mint is fully closed (already settled); a
                mint open under a different pos_id is a divergence
                (a credit for instance #1 must never settle a
-               reopened instance #2).
+               reopened instance #2). Partial credits replay with
+               the journaled qty/fee so tranche math is identical.
 
     Entries without a seq predate this scheme; reconciliation runs
     only over seq-bearing entries, and anything ambiguous is a
@@ -307,6 +441,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
     led_seq = led.get("seq")
     if not isinstance(led_seq, int):
         return led, "ledger has no seq"
+    ops = led.setdefault("ops", {})
     pending = []
     for ev in entries:
         ev_seq = ev.get("seq")
@@ -321,12 +456,21 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
     for ev_seq, ev in pending:
         kind = ev.get("event")
         lane, mint = ev.get("lane"), ev.get("mint")
+        op_id = ev.get("op_id")
+        if kind in _MUTATION_EVENTS and op_id and op_id in ops:
+            # Caller op already applied: idempotent skip. The seq
+            # still advances — the state includes this mutation.
+            led["seq"] = ev_seq
+            continue
         if kind == "debit" and lane and mint:
             pid = ev.get("pos_id") or _pos_id(lane, mint, ev_seq)
             st = _lane(led, lane)
             cur = st["open"].get(mint)
             if cur is not None:
                 if cur.get("pos_id", _pos_id(lane, mint, ev_seq)) == pid:
+                    if op_id:
+                        ops[op_id] = {"event": "debit",
+                                      "pos_id": pid}
                     led["seq"] = ev_seq
                     continue  # state already has it: idempotent
                 return led, ("replay divergence: debit %s but %s "
@@ -336,11 +480,12 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             if stake <= 0 or float(led["cash"]) < stake:
                 return led, ("replay cannot apply debit %s "
                              "(bad stake or cash)" % pid)
-            led["cash"] = round(float(led["cash"]) - stake, 6)
-            st["open"][mint] = {"stake": stake,
-                                "ts": ev.get("ts") or time.time(),
-                                "pos_id": pid}
-            st["n_entries"] += 1
+            _apply_debit(led, lane, mint, stake, ev.get("qty"),
+                         pid, ev.get("ts"))
+            if op_id:
+                ops[op_id] = {"event": "debit", "pos_id": pid,
+                              "lane": lane, "mint": mint,
+                              "stake": stake, "qty": ev.get("qty")}
             replayed += 1
         elif kind == "credit" and lane and mint:
             st = _lane(led, lane)
@@ -353,19 +498,25 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                 return led, ("replay divergence: credit %s but %s "
                              "open as %s"
                              % (pid, mint, pos["pos_id"]))
-            pos = st["open"].pop(mint)
-            proceeds = float(ev.get("proceeds") or 0)
-            stake = float(pos["stake"])
-            pnl = round(proceeds - stake, 6)
-            led["cash"] = round(float(led["cash"]) + proceeds, 6)
-            led["realized_pnl"] = round(
-                float(led["realized_pnl"]) + pnl, 6)
-            led["day_realized_pnl"] = round(
-                float(led.get("day_realized_pnl") or 0.0) + pnl, 6)
-            st["realized_pnl"] = round(
-                float(st["realized_pnl"]) + pnl, 6)
-            st["n_closes"] += 1
+            realized, why = _apply_credit(
+                led, lane, mint, ev.get("qty"),
+                float(ev.get("net") if ev.get("net") is not None
+                      else (float(ev.get("proceeds") or 0)
+                            - float(ev.get("fee") or 0))),
+                float(ev.get("fee") or 0),
+                bool(ev.get("final", True)))
+            if realized is None:
+                return led, ("replay cannot apply credit %s/%s: %s"
+                             % (lane, mint, why))
+            if op_id:
+                ops[op_id] = {"event": "credit", "lane": lane,
+                              "mint": mint, "pos_id": pid,
+                              "realized": realized}
             replayed += 1
+        # The seq advances only for entries actually processed: on
+        # a divergence return above it stays BEHIND the offending
+        # entry, so the next load sees the divergence again and
+        # keeps the account degraded instead of healing silently.
         led["seq"] = ev_seq
     if replayed:
         logger.warning("paper_account: reconciled %d journaled "
@@ -421,6 +572,7 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
                          "failing closed (debits refused)")
             return None, False, degraded or "ledger unreadable"
         logger.warning("paper_account: restored from shadow copy")
+    led.setdefault("ops", {})
     if degraded is None:
         # Only a clean WAL may drive replay: with a torn journal or
         # a seq hole the entries cannot be trusted to be complete,
@@ -431,15 +583,14 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
         if divergence is not None:
             degraded = divergence
             logger.error("paper_account: %s", divergence)
-    else:
-        seq_before = led.get("seq")
-    if led.get("seq") != seq_before:
-        # Persist the reconciled state: otherwise the on-disk file
-        # stays behind the journal and the NEXT load replays the
-        # same mutations over the same stale state (a credit would
-        # count twice). On divergence the partial replay up to the
-        # offending entry is valid and is kept.
-        _save_locked(led)
+        if led.get("seq") != seq_before:
+            # Persist the reconciled state: otherwise the on-disk
+            # file stays behind the journal and the NEXT load
+            # replays the same mutations over the same stale state
+            # (a credit would count twice). On divergence the
+            # partial replay up to the offending entry is valid
+            # and is kept.
+            _save_locked(led)
     # Day rollover: reset the daily counter, keep the cumulative.
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if led.get("day") != today:
@@ -470,10 +621,37 @@ def _save_locked(led: Dict[str, Any]) -> None:
         pass
 
 
-def try_debit(lane: str, mint: str, stake: float,
-              ts: Optional[float] = None
+def _op_lookup(led: Dict[str, Any], op_id: str, kind: str,
+               lane: str, mint: str, params: Dict[str, Any]
+               ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Caller-retry dedupe. Returns (record, None) when op_id was
+    already applied with the SAME shape (caller should get the
+    original outcome, never a re-apply), or (None, reason) when
+    the op_id was used for something else (caller bug), or
+    (None, None) when the op_id is new."""
+    rec = led.get("ops", {}).get(op_id)
+    if rec is None:
+        return None, None
+    if (rec.get("event") != kind or rec.get("lane") != lane
+            or rec.get("mint") != mint):
+        return None, ("op_id %r already used for %s %s/%s"
+                      % (op_id, rec.get("event"), rec.get("lane"),
+                         rec.get("mint")))
+    for k, v in params.items():
+        if rec.get(k) is not None and rec.get(k) != v:
+            return None, ("op_id %r parameter conflict on %s"
+                          % (op_id, k))
+    return rec, None
+
+
+def try_debit(lane: str, mint: str, stake: float, qty: float,
+              op_id: str, ts: Optional[float] = None
               ) -> Tuple[bool, str, Optional[str]]:
-    """Reserve `stake` paper dollars for `lane` buying `mint`.
+    """Reserve `stake` paper dollars for `lane` buying `qty` units
+    of `mint`. op_id is the caller's stable operation ID: an
+    uncertain response may be retried with the SAME op_id and gets
+    the original outcome back without re-applying — even if the
+    position was closed and reopened meanwhile.
 
     Returns (True, "ok", pos_id) or (False, reason, None). The
     pos_id immutably names this open instance; pass it back to
@@ -482,14 +660,16 @@ def try_debit(lane: str, mint: str, stake: float,
     inconsistency refuses the debit — a refused paper entry costs
     nothing, a doubled one quietly invents money.
     """
-    try:
-        stake = float(stake)
-    except (TypeError, ValueError):
-        return False, "bad stake %r" % (stake,), None
-    if not (stake > 0):
-        return False, "stake must be positive", None
+    if not _valid_amount(stake) or stake <= 0:
+        return False, "stake must be a positive finite number", None
+    if not _valid_amount(qty) or qty <= 0:
+        return False, "qty must be a positive finite number", None
+    stake = float(stake)
+    qty = float(qty)
     if not lane or not mint:
         return False, "lane and mint are required", None
+    if not op_id or not isinstance(op_id, str):
+        return False, "caller op_id is required", None
     with _lock():
         led, healthy, degraded = _load_locked()
         if not healthy or led is None:
@@ -497,6 +677,12 @@ def try_debit(lane: str, mint: str, stake: float,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        rec, conflict = _op_lookup(led, op_id, "debit", lane, mint,
+                                   {"stake": stake, "qty": qty})
+        if conflict:
+            return False, conflict, None
+        if rec is not None:
+            return True, "ok (retry of applied op)", rec["pos_id"]
         cash = float(led["cash"])
         if cash < stake:
             return (False, ("account cash $%.2f < stake $%.2f"
@@ -507,7 +693,7 @@ def try_debit(lane: str, mint: str, stake: float,
                             % (lane, mint)), None)
         cap = lane_cap()
         if cap is not None:
-            open_basis = sum(float(p["stake"])
+            open_basis = sum(_pos_basis(p)
                              for p in st["open"].values())
             if open_basis + stake > cap:
                 return (False, ("lane cap $%.2f would be exceeded "
@@ -515,94 +701,126 @@ def try_debit(lane: str, mint: str, stake: float,
                                 % (cap, open_basis, stake)), None)
         led["seq"] = int(led.get("seq") or 0) + 1
         pid = _pos_id(lane, mint, led["seq"])
-        led["cash"] = round(cash - stake, 6)
-        st["open"][mint] = {"stake": stake, "ts": ts or time.time(),
-                            "pos_id": pid}
-        st["n_entries"] += 1
-        _journal({"event": "debit", "lane": lane, "mint": mint,
-                  "stake": stake, "cash_after": led["cash"],
+        _apply_debit(led, lane, mint, stake, qty, pid, ts)
+        led["ops"][op_id] = {"event": "debit", "lane": lane,
+                             "mint": mint, "pos_id": pid,
+                             "stake": stake, "qty": qty}
+        _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
+                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "stake": stake, "qty": qty,
+                  "cash_after": led["cash"],
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
         return True, "ok", pid
 
 
-def credit(lane: str, mint: str, proceeds: float,
-           ts: Optional[float] = None,
-           pos_id: Optional[str] = None) -> Tuple[bool, str]:
-    """Return `proceeds` paper dollars (stake + realized P/L) from
-    closing lane's position in mint. FULL closes only: a lane
-    scaling out in tranches tracks the remainder in its own
-    ledger and credits the shared account when the position is
-    fully closed (see module docstring).
+def credit(lane: str, mint: str, proceeds: float, op_id: str,
+           ts: Optional[float] = None, pos_id: Optional[str] = None,
+           qty: Optional[float] = None, fee: float = 0.0
+           ) -> Tuple[bool, str]:
+    """Settle a sale of `qty` units of `mint` (None = ALL remaining
+    units, i.e. a full close) for `proceeds` gross paper dollars
+    with `fee` in fees. Net proceeds (gross - fee) credit the
+    shared cash immediately — tranche receipts are never held
+    outside the account. Average-cost allocation: the sold units
+    carry basis proportionally, and realized P/L = net - allocated
+    basis is booked per sale (a profitable tranche that recovers
+    more than the original stake realizes the gain while units
+    remain; remaining basis is per-unit allocated and never goes
+    negative).
 
-    When pos_id is given it must match the open instance; a
-    mismatch means the caller holds a stale close (the mint was
-    reopened since) and the credit is refused + journaled rather
-    than settling the wrong instance. P/L is computed against the
-    recorded stake. Returns (True, "ok") or (False, reason); a
-    False return means nothing was credited — the event is still
-    journaled so the money movement is recoverable by hand. On a
-    DEGRADED account credits are journaled-only (never applied):
-    a suspect ledger must not silently gain money.
+    op_id is the caller's stable operation ID for THIS settlement
+    (each tranche gets its own): retries return the original
+    outcome without re-applying. When pos_id is given it must
+    match the open instance; a mismatch means the caller holds a
+    stale close (the mint was reopened since) and the credit is
+    refused + journaled rather than settling the wrong instance.
+    Returns (True, "ok") or (False, reason); a False return means
+    nothing was credited — the event is still journaled so the
+    money movement is recoverable by hand. On a DEGRADED account
+    credits are journaled-only (never applied): a suspect ledger
+    must not silently gain money.
     """
-    try:
-        proceeds = float(proceeds)
-    except (TypeError, ValueError):
-        return False, "bad proceeds %r" % (proceeds,)
-    if not (proceeds >= 0):
-        return False, "proceeds cannot be negative"
+    if not _valid_amount(proceeds) or proceeds < 0:
+        return False, "proceeds must be a nonnegative finite number"
+    if not _valid_amount(fee) or fee < 0:
+        return False, "fee must be a nonnegative finite number"
+    proceeds = float(proceeds)
+    fee = float(fee)
+    if fee > proceeds:
+        return False, "fee exceeds gross proceeds"
+    if qty is not None and (not _valid_amount(qty) or qty <= 0):
+        return False, "qty must be a positive finite number"
     if not lane or not mint:
         return False, "lane and mint are required"
+    if not op_id or not isinstance(op_id, str):
+        return False, "caller op_id is required"
+    net = round(proceeds - fee, 6)
     with _lock():
         led, healthy, degraded = _load_locked()
         if not healthy or led is None:
             # Never drop realized money silently: journal it even
             # when the ledger cannot be updated.
             _journal({"event": "credit_dropped", "lane": lane,
-                      "mint": mint, "proceeds": proceeds, "ts": ts,
-                      "pos_id": pos_id,
+                      "mint": mint, "proceeds": proceeds,
+                      "fee": fee, "qty": qty, "ts": ts,
+                      "op_id": op_id, "pos_id": pos_id,
                       "reason": "ledger unreadable"})
             return False, "account ledger unreadable (journaled)"
         if degraded:
             _journal({"event": "credit_degraded", "lane": lane,
-                      "mint": mint, "proceeds": proceeds, "ts": ts,
-                      "pos_id": pos_id, "reason": degraded})
+                      "mint": mint, "proceeds": proceeds,
+                      "fee": fee, "qty": qty, "ts": ts,
+                      "op_id": op_id, "pos_id": pos_id,
+                      "reason": degraded})
             return False, ("account degraded: %s (journaled for "
                            "manual reconciliation)" % degraded)
+        rec, conflict = _op_lookup(led, op_id, "credit", lane, mint,
+                                   {})
+        if conflict:
+            return False, conflict
+        if rec is not None:
+            return True, "ok (retry of applied op)"
         st = _lane(led, lane)
         pos = st["open"].get(mint)
         if pos is None:
             _journal({"event": "credit_orphan", "lane": lane,
-                      "mint": mint, "proceeds": proceeds, "ts": ts,
-                      "pos_id": pos_id})
+                      "mint": mint, "proceeds": proceeds,
+                      "fee": fee, "qty": qty, "ts": ts,
+                      "op_id": op_id, "pos_id": pos_id})
             return False, ("no open %s position for %s (journaled)"
                            % (mint, lane))
         if pos_id and pos.get("pos_id") and pos["pos_id"] != pos_id:
             _journal({"event": "credit_orphan", "lane": lane,
-                      "mint": mint, "proceeds": proceeds, "ts": ts,
-                      "pos_id": pos_id,
+                      "mint": mint, "proceeds": proceeds,
+                      "fee": fee, "qty": qty, "ts": ts,
+                      "op_id": op_id, "pos_id": pos_id,
                       "reason": "pos_id mismatch (open is %s)"
                                 % pos["pos_id"]})
             return False, ("stale pos_id %s: %s is open as %s "
                            "(journaled, not applied)"
                            % (pos_id, mint, pos["pos_id"]))
-        pos = st["open"].pop(mint)
-        stake = float(pos["stake"])
-        pnl = round(proceeds - stake, 6)
-        led["cash"] = round(float(led["cash"]) + proceeds, 6)
-        led["realized_pnl"] = round(
-            float(led["realized_pnl"]) + pnl, 6)
-        led["day_realized_pnl"] = round(
-            float(led.get("day_realized_pnl") or 0.0) + pnl, 6)
-        st["realized_pnl"] = round(
-            float(st["realized_pnl"]) + pnl, 6)
-        st["n_closes"] += 1
+        pid = pos.get("pos_id")
+        realized, why = _apply_credit(led, lane, mint, qty, net,
+                                      fee, qty is None)
+        if realized is None:
+            _journal({"event": "credit_orphan", "lane": lane,
+                      "mint": mint, "proceeds": proceeds,
+                      "fee": fee, "qty": qty, "ts": ts,
+                      "op_id": op_id, "pos_id": pid,
+                      "reason": why})
+            return False, "%s (journaled, not applied)" % why
         led["seq"] = int(led.get("seq") or 0) + 1
-        _journal({"event": "credit", "lane": lane, "mint": mint,
-                  "stake": stake, "proceeds": proceeds, "pnl": pnl,
+        led["ops"][op_id] = {"event": "credit", "lane": lane,
+                             "mint": mint, "pos_id": pid,
+                             "realized": realized}
+        _journal({"event": "credit", "event_id": "ev#%d" % led["seq"],
+                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "qty": qty, "proceeds": proceeds, "fee": fee,
+                  "net": net, "realized": realized,
+                  "final": mint not in st["open"],
                   "cash_after": led["cash"],
-                  "seq": led["seq"],
-                  "pos_id": pos.get("pos_id"), "ts": ts})
+                  "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
         return True, "ok"
 
@@ -610,7 +828,9 @@ def credit(lane: str, mint: str, proceeds: float,
 def _mark_value(mark: Any, now: float, ttl: float
                 ) -> Tuple[Optional[float], Optional[str]]:
     """Validate one mark: {value, ts, source} with a finite,
-    nonnegative value and a timestamp within the TTL. Returns
+    nonnegative value and a timestamp within the TTL. The value is
+    the liquidation value of the position's REMAINING units (net
+    proceeds of past tranches are already in cash). Returns
     (value, None) or (None, problem). A mark that cannot prove it
     is fresh and well-formed is not a mark."""
     if not isinstance(mark, dict):
@@ -635,19 +855,21 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
     """Read-only account view. None when the ledger is unreadable.
     Includes "degraded": reason when the WAL is untrusted.
 
-    ACCOUNTING CONTRACT (2026-11-22 review): cash + open cost basis
-    is BOOK value, NOT liquidation equity — a position down 80%
-    still carries its full cost in book_value, so a drawdown gate
-    reading book_value would miss the unrealized loss. The four
-    quantities are kept explicitly separate:
+    ACCOUNTING CONTRACT (2026-11-22 review): cash + open allocated
+    basis is BOOK value, NOT liquidation equity — a position down
+    80% still carries its full remaining cost in book_value, so a
+    drawdown gate reading book_value would miss the unrealized
+    loss. The four quantities are kept explicitly separate:
 
-      cash            uncommitted dollars
-      cost_exposure   open positions at entry cost
+      cash            uncommitted dollars (including net proceeds
+                      of partial tranches already settled)
+      cost_exposure   open positions at remaining allocated basis
       book_value      cash + cost_exposure (accounting identity,
                       never a drawdown input)
       realized_pnl    settled P/L only (cumulative + daily)
 
-    `marks` optionally supplies current executable values as
+    `marks` optionally supplies current liquidation values of the
+    REMAINING units as
     {lane: {mint: {"value": usd, "ts": epoch, "source": str}}}
     (the lanes own honest-fill marks; this module never fabricates
     them). Every mark is validated: finite, nonnegative, provenance
@@ -655,9 +877,19 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
     EVERY open position has a valid fresh mark does the view add
     marked_exposure / marked_equity / unrealized_pnl with
     marks_status "ok". Otherwise the marked fields are None and
-    marks_status names the failure ("stale", "invalid", "partial",
-    "unavailable") — a stale or missing mark must degrade a gate
-    to fail-closed, never silently fall back to cost.
+    marks_status names the failure ("stale", "invalid", "no
+    mark", "unavailable") — a stale or missing mark must degrade a
+    gate to fail-closed, never silently fall back to cost.
+
+    EQUITY BASELINES (gate inputs for Stage 2): on every snapshot
+    with marks_status "ok" the marked equity is recorded as the
+    day-start baseline when none exists for the current UTC day,
+    and folded into the all-time peak. A baseline is NEVER reset
+    to a later favorable value on the same day; when no
+    trustworthy mark exists after a rollover the previous baseline
+    carries and day_start_equity is reported with its own day so
+    the gate can see it is stale and fail closed. Both are None
+    until the first trustworthy mark.
     """
     try:
         with _lock():
@@ -670,7 +902,7 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
             for name, st in led.get("lanes", {}).items():
                 basis = 0.0
                 for mint, p in st.get("open", {}).items():
-                    basis += float(p["stake"])
+                    basis += _pos_basis(p)
                     open_positions.append((name, mint))
                 exposure += basis
                 out_lanes[name] = {
@@ -727,6 +959,49 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
                 out["marked_exposure"] = None
                 out["marked_equity"] = None
                 out["unrealized_pnl"] = None
+            # Equity baselines: capture only from trustworthy marks,
+            # never reset to a later favorable value.
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            baseline = led.get("day_baseline")
+            peak = led.get("peak_equity")
+            changed = False
+            if marked is not None:
+                me = out["marked_equity"]
+                now = time.time()
+                if not isinstance(baseline, dict) \
+                        or baseline.get("day") != today:
+                    baseline = {"day": today, "value": me, "ts": now}
+                    led["day_baseline"] = baseline
+                    changed = True
+                if not isinstance(peak, dict) \
+                        or not _valid_amount(peak.get("value")) \
+                        or me > float(peak["value"]):
+                    peak = {"value": me, "ts": now}
+                    led["peak_equity"] = peak
+                    changed = True
+                if changed:
+                    _save_locked(led)
+            out["day_start_equity"] = (
+                dict(baseline) if isinstance(baseline, dict) else None)
+            out["peak_equity"] = (
+                dict(peak) if isinstance(peak, dict) else None)
+            # Gate inputs, None unless both ends are trustworthy.
+            if (marked is not None and isinstance(baseline, dict)
+                    and baseline.get("day") == today):
+                out["daily_loss"] = round(
+                    max(0.0, float(baseline["value"])
+                        - out["marked_equity"]), 6)
+            else:
+                out["daily_loss"] = None
+            if (marked is not None and isinstance(peak, dict)
+                    and _valid_amount(peak.get("value"))
+                    and float(peak["value"]) > 0):
+                out["drawdown_pct"] = round(
+                    max(0.0, (float(peak["value"])
+                              - out["marked_equity"])
+                        / float(peak["value"]) * 100.0), 6)
+            else:
+                out["drawdown_pct"] = None
             return out
     except Exception:
         logger.exception("paper_account: snapshot failed")

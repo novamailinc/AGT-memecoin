@@ -118,8 +118,12 @@ check("mimic: killswitch CFG has mimic {100,100}",
       '"mimic":' in ks_text and "min_trades" in ks_text)
 with open(os.path.join(_ROOT, "scripts", "supervisor")) as f:
     sup_text = f.read()
-check("mimic: supervisor roster has mimic-trader",
-      '"mimic-trader"' in sup_text)
+# The mimic family was permanently removed from the fleet
+# 2026-11-02 (see scripts/supervisor and tests/test_supervisor.py,
+# which pins the 28-entry roster). The lane code stays in the repo
+# for audit; the roster must NOT carry it.
+check("mimic: supervisor roster omits the removed mimic-trader",
+      '"mimic-trader"' not in sup_text)
 with open(os.path.join(_ROOT, "scripts", "forex-watchdog")) as f:
     wd_text = f.read()
 check("mimic: watchdog guards mimic-trader",

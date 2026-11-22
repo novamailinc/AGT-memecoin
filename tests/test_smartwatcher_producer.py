@@ -144,6 +144,10 @@ SW.send_card = lambda text, mint="", chain="solana", source="": (
     sent_cards.append(text), True)[1]
 SW._HAS_LPLOCK = False
 SW._HAS_SATURATION = False
+# Exercise the card path: shipped code kills cards (_CARDS_ENABLED
+# False, suppressing Telegram cards while still publishing the bus
+# signal). These checks target card construction, so force it on.
+SW._CARDS_ENABLED = True
 mirror_calls = []
 MIRROR.mirror_card = lambda *a, **kw: (mirror_calls.append((a, kw)),
                                        (True, "opened"))[1]

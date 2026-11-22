@@ -140,6 +140,26 @@ def _target_file(directory, date_str, line_len):
         return base
 
 
+_last_write_ns = 0
+
+
+def _stamp_monotonic(path):
+    """Bump the just-written file's mtime forward when the clock did
+    not move. _prune orders by mtime; on filesystems with coarse
+    timestamps (or fast bursts) several files share one mtime, and
+    recycled rotation names then make 'newest' ambiguous, so pruning
+    can delete the just-written records. Never raises."""
+    global _last_write_ns
+    try:
+        now = time.time_ns()
+        if now <= _last_write_ns:
+            now = _last_write_ns + 1
+        _last_write_ns = now
+        os.utime(path, ns=(now, now))
+    except Exception:
+        pass
+
+
 def _prune(directory):
     """Enforce MAX_DIR_BYTES: delete oldest files until the dir is
     under the cap. 'Oldest' is by mtime, NOT filename: a pruned
@@ -159,11 +179,20 @@ def _prune(directory):
         for p in _list_all_files(directory):
             try:
                 st = os.stat(p)
-                entries.append((st.st_mtime, p, st.st_size))
+                # st_mtime_ns, not st_mtime: at epoch magnitude the
+                # float rounds several fast writes to one value, and
+                # ties make 'newest' ambiguous (newest files pruned).
+                entries.append((st.st_mtime_ns, p, st.st_size))
                 total += st.st_size
             except Exception:
                 continue
-        entries.sort(key=lambda t: (t[0], t[1]))
+        # Tie-break equal mtimes by the recorder's own name order
+        # (day, roll index): lexicographic path order misranks
+        # '.10' before '.2' and can delete genuinely newer files.
+        def _tie_key(path):
+            parsed = _parse_file_name(os.path.basename(path))
+            return parsed if parsed is not None else ("", -1)
+        entries.sort(key=lambda t: (t[0], _tie_key(t[1])))
         # Oldest first; keep at least the newest file.
         for _mtime, p, size in entries[:-1]:
             if total <= max_dir:
@@ -202,6 +231,7 @@ def record(kind, payload=None, ts=None):
             path = _target_file(directory, _date_str(ts), line_len)
             with open(path, "a") as f:
                 f.write(line)
+            _stamp_monotonic(path)
             _prune(directory)
         return True
     except Exception:

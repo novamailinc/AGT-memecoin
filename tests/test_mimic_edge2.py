@@ -205,8 +205,10 @@ check("edge2: killswitch CFG has mimic_edge2 {100,100}",
       '"mimic_edge2":' in ks_text and "min_trades" in ks_text)
 with open(os.path.join(_ROOT, "scripts", "supervisor")) as f:
     sup_text = f.read()
-check("edge2: supervisor roster has mimic-edge2-trader",
-      '"mimic-edge2-trader"' in sup_text)
+# Removed from the fleet 2026-11-02 (see scripts/supervisor and
+# tests/test_supervisor.py's pinned 28-entry roster).
+check("edge2: supervisor roster omits the removed mimic-edge2-trader",
+      '"mimic-edge2-trader"' not in sup_text)
 with open(os.path.join(_ROOT, "scripts", "forex-watchdog")) as f:
     wd_text = f.read()
 check("edge2: watchdog guards mimic-edge2-trader",

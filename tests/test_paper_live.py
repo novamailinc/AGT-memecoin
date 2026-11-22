@@ -134,12 +134,21 @@ check("paper_live: killswitch CFG has paper_live {100,100}",
       '"paper_live":' in ks_text)
 with open(os.path.join(_ROOT, "scripts", "supervisor")) as f:
     sup_text = f.read()
-check("paper_live: supervisor roster has paper-live-trader",
-      '"paper-live-trader"' in sup_text)
+# Superseded by live10-demo-mirror 2026-11-02 (see
+# scripts/supervisor and tests/test_supervisor.py's pinned roster).
+check("paper_live: supervisor roster omits the superseded "
+      "paper-live-trader",
+      '"paper-live-trader"' not in sup_text)
 with open(os.path.join(_ROOT, "scripts", "forex-watchdog")) as f:
     wd_text = f.read()
-check("paper_live: watchdog guards paper-live-trader",
-      "scripts/paper-live-trader" in wd_text)
+# The watchdog no longer restarts it: the lane is retired, so
+# its guard block must be absent or commented out.
+check("paper_live: watchdog does not run the superseded "
+      "paper-live-trader",
+      "scripts/paper-live-trader" not in wd_text
+      or all(l.strip().startswith("#")
+             for l in wd_text.splitlines()
+             if "scripts/paper-live-trader" in l))
 check("paper_live: trader script exists",
       os.path.exists(os.path.join(_ROOT, "scripts",
                                   "paper-live-trader")))

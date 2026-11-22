@@ -80,7 +80,7 @@ _B58 = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 _NON_ACTORS = {
     "11111111111111111111111111111111",           # System Program
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "TokenzQdBNbLQZWM1GjTbvYDbPknHBzqALDFpHHFmDWd",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
 }
 
 

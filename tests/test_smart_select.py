@@ -790,10 +790,12 @@ restore = _install_filter_fixture(
     _pass_index("SelMintCost1111111111111111111111111pump"),
     _PASS_CURVE, _FakeSaturation({}))
 try:
+    # Scan 10s after migration: inside Rule A's 30s ENTRY_MAX_AGE_S
+    # (2026-11-16 tuning) so the candidate reaches the cost gate.
     res = SS.scan_once(
         eng2,
         signals=[_fire("SelMintCost1111111111111111111111111pump",
-                       "CST", NOW + 40)], now=NOW + 40)
+                       "CST", NOW + 10)], now=NOW + 10)
     d = eng2._read()
     check("cost gate: 60% modeled cost -> NO entry, watchlist "
           "dropped as blocked",

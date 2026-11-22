@@ -53,7 +53,7 @@ def _switch_log(home):
 
 
 WATCH = os.path.join(REPO, "scripts", "helius-429-watch")
-VENV = "/home/hatch/workspace/Forex-agent/.venv/bin/python"
+VENV = sys.executable  # relocatable: the interpreter running the suite
 
 # ---------------- (a) auto-quiet engages at >=5 429s --------------
 home_a = tempfile.mkdtemp(prefix="switch-wire-a-")

@@ -87,8 +87,11 @@ check("PROTECT" in pre["terms"]["ladder"], "tranche_protect prereg ladder names 
 RT = load("raw_tight_mod", os.path.join(_LS, "raw_tight.py"))
 check(RT.LANE == "raw_tight", "raw_tight LANE")
 check(RT.LEDGER_PATH.endswith("raw_tight_ledger.json"), "raw_tight ledger path")
-check(RT.NOTIONAL_USD == 25.00 and RT.BANKROLL_START == 100.00,
-      "raw_tight keeps raw $25 stake / $100 bankroll")
+# Bankroll was raised $100 -> $500 on 2026-10-31 (see the comment at
+# raw_tight.BANKROLL_START: verdict judges expectancy per close, so a
+# larger paper bankroll cannot flatter it). The $25 stake is unchanged.
+check(RT.NOTIONAL_USD == 25.00 and RT.BANKROLL_START == 500.00,
+      "raw_tight keeps raw $25 stake / $500 bankroll")
 eng2 = RT.make_engine()
 check(eng2.LANE == "raw_tight", "raw_tight engine lane")
 check(eng2.HARD_STOP_MULT == 0.75, "raw_tight engine HARD_STOP_MULT 0.75")

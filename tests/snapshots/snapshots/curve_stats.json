@@ -13,6 +13,7 @@
     ]
   ],
   "curve_stats": {
+    "cache": "miss",
     "capped": false,
     "created_ts": 1794787202.0,
     "creation_slot": 300000100,
@@ -20,6 +21,7 @@
     "oldest_sig": "CREATEsig11111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
     "reason": null,
     "rpc_error": null,
+    "rpc_source": null,
     "trades": 3
   },
   "curve_stats_rpc_calls": [

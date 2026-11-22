@@ -1,11 +1,10 @@
 name: deploy-worker
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "worker/**"
-      - ".github/workflows/deploy-worker.yml"
+  # Automatic deployment disabled (2026-11-22, user decision): the
+  # worker is the optional cloud/sync companion, not the bot's host
+  # (the bot runs on AGT). Deploy manually via workflow_dispatch once
+  # a real D1 database_id and CLOUDFLARE_API_TOKEN are configured.
   workflow_dispatch:
 
 jobs:

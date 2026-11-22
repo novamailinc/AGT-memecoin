@@ -399,7 +399,10 @@ class TestNoBrokerSdk(unittest.TestCase):
     KNOWN_THIRD_PARTY = {"pytest",      # tests only
                          "yaml",        # optional, config/defaults.yaml
                          "solders",     # broker/memecoin/execution only (devnet tx signing)
-                         "numpy", "pandas", "sklearn", "xgboost"}  # intelligence/ml trainer only
+                         "numpy", "pandas", "sklearn", "xgboost",  # intelligence/ml trainer only
+                         "fpdf",       # tools/scripts/reports weekly PDF only
+                         "websocket",  # intelligence Helius streams only
+                         "dynamic_credentials"}  # connector SDK: connectors/*/bin + helius_vault/push_repo credential lookups
 
     @staticmethod
     def _launch_scanner_sibling_modules(base):
@@ -435,6 +438,24 @@ class TestNoBrokerSdk(unittest.TestCase):
         base = os.path.join(os.path.dirname(registry.__file__), "..", "..")
         first_party = (self.FIRST_PARTY
                        | self._launch_scanner_sibling_modules(base))
+        # Repo-local module names (the 2026-10-23 launch_scanner
+        # rule, generalized): repo scripts in tools/**, tests/** and
+        # deploy/** import other repo modules bare (import foot_check3,
+        # import _fakes, import status_server) because each runner
+        # puts the owning directory on sys.path first. A name
+        # qualifies ONLY when a same-named .py file exists somewhere
+        # in the repo, so a genuine third-party SDK import (ccxt,
+        # requests, a broker SDK, ...) still fails exactly as before:
+        # no such file exists.
+        repo_modules = set()
+        for _p in glob.glob(os.path.join(base, "**", "*.py"),
+                            recursive=True):
+            if "/.git/" in _p or "/node_modules/" in _p \
+                    or "__pycache__" in _p:
+                continue
+            repo_modules.add(
+                os.path.splitext(os.path.basename(_p))[0])
+
         hits = []
         for path in glob.glob(os.path.join(base, "**", "*.py"),
                               recursive=True):
@@ -446,6 +467,7 @@ class TestNoBrokerSdk(unittest.TestCase):
                 tree = ast.parse(open(path).read())
             except (SyntaxError, OSError):
                 continue
+            siblings = repo_modules
             for node in ast.walk(tree):
                 names = []
                 if isinstance(node, ast.Import):
@@ -457,9 +479,11 @@ class TestNoBrokerSdk(unittest.TestCase):
                     top = name.split(".")[0]
                     if (top not in sys.stdlib_module_names
                             and top not in first_party
+                            and top not in siblings
                             and top not in self.KNOWN_THIRD_PARTY):
                         hits.append("%s: %s" % (path, name))
-        self.assertEqual(hits, [], "unknown third-party import: %s" % hits)
+        self.assertEqual(hits, [], "unknown third-party import: %s"
+                         % hits)
 
 
 if __name__ == "__main__":

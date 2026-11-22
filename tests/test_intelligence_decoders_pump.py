@@ -153,7 +153,9 @@ def test_discriminators():
 # ---------------------------------------------------------------------------
 # 2. Envelope contract: every decoded event carries the required fields
 # ---------------------------------------------------------------------------
-def test_envelope(events, signature, slot):
+def check_envelope(events, signature, slot):
+    """Shared envelope assertions, called by the test_* cases
+    below with explicit args (not itself a pytest test)."""
     required = ("signature", "slot", "block_time", "program_id",
                 "event_type", "instruction", "fields", "raw",
                 "decoder_version", "validation")
@@ -177,7 +179,7 @@ def test_pumpfun_atx():
     tx = load_fixture("atx_create.json")
     sig = "2avAXaepDw4uPC4Ue3khKWx9fpQzXPvm3pNYtZi1VwJfvNsD8GY25WzYaXvAWmKsTgdtAT5NRHxgzmDF67RRfih"
     events = pf.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472184636)
+    check_envelope(events, sig, 472184636)
     check("atx_create event set",
           types(events) == ["event:CreateEvent", "event:TradeEvent",
                             "instruction:buy_v2",
@@ -238,7 +240,7 @@ def test_pumpfun_atx():
     tx = load_fixture("atx_buy.json")
     sig = "2o4dRrK92ea1xLf68EaGwQpP2aSqVzPGdMTJuo6R5W2BX5CAjYi6h2Rqud8Vj2fcu2dVvPLoNS42tJtDHxywqxRx"
     events = pf.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472184744)
+    check_envelope(events, sig, 472184744)
     check("atx_buy event set",
           types(events) == [
               "event:CloseUserVolumeAccumulatorEvent",
@@ -278,7 +280,7 @@ def test_pumpfun_atx():
     tx = load_fixture("atx_sell.json")
     sig = "3oLYGxBsTbC3oazfiyUAM18SW48NZXNB6EPH7qdDXvMHj2wR7KXyMdSUvXSc2tnqeqLx93cTuEyWZkuxsxdzsoJH"
     events = pf.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472184670)
+    check_envelope(events, sig, 472184670)
     check("atx_sell event set",
           types(events) == ["event:TradeEvent", "instruction:sell_v3"])
     six = by_type(events, "instruction:sell_v3")
@@ -308,7 +310,7 @@ def test_pumpfun_atx():
     tx = load_fixture("atx_migrate.json")
     sig = "56zVpuKUKGWBodxDdnrknT3CPV1Zaq5gvhpJjg329dwiK6vF3KTPyVw2a8veVh6hu65nBX77NWRQ4BwRtPGaHDG8"
     events = pf.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472184748)
+    check_envelope(events, sig, 472184748)
     check("atx_migrate (pumpfun) event set",
           types(events) == ["event:CompletePumpAmmMigrationEvent",
                             "instruction:migrate_v2"])
@@ -376,7 +378,7 @@ def test_pumpswap_atx():
     tx = load_fixture("atx_migrate.json")
     sig = "56zVpuKUKGWBodxDdnrknT3CPV1Zaq5gvhpJjg329dwiK6vF3KTPyVw2a8veVh6hu65nBX77NWRQ4BwRtPGaHDG8"
     events = ps.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472184748)
+    check_envelope(events, sig, 472184748)
     check("atx_migrate (pumpswap) event set",
           types(events) == ["event:CreatePoolEvent",
                             "event:InitBoostEvent",
@@ -424,7 +426,7 @@ def test_pumpswap_atx():
     tx = load_fixture("atx_pumpswap_sell.json")
     sig = "5eLyyz6ZR1PBGXVAHKWTk2jjg4GK1GdyBaTCPFUJ43BNBBPwWmN4WZbMrxcYyHM7JabNCd49SKoRNoLa6xuRWxVo"
     events = ps.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472474446)
+    check_envelope(events, sig, 472474446)
     check("atx_pumpswap_sell event set",
           types(events) == ["event:SellEvent", "instruction:sell_v2"])
     six = by_type(events, "instruction:sell_v2")
@@ -444,7 +446,7 @@ def test_pumpswap_atx():
     tx = load_fixture("atx_pumpswap_buy.json")
     sig = "2BVW5dm6uVn4xkdttb53YzkYxbcvwErixHL17w6v5jQhQR97QfxUFQj6RXEMSvY31FBTpL1UbsnZcFbnZDq5FuKz"
     events = ps.decode_transaction(tx, sig)
-    test_envelope(events, sig, 472449694)
+    check_envelope(events, sig, 472449694)
     check("atx_pumpswap_buy event set",
           types(events) == ["event:BuyEvent",
                             "instruction:buy_exact_quote_in_v2"])

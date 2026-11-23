@@ -480,6 +480,31 @@ for _m in (_FORGED, _GTLIKE):
     TAPES.pop(_m, None)
     QUOTES.pop(_m, None)
 
+# The other two fingerprints veto at entry too: wash-skew (heavy buys,
+# literally zero sells) and bot-swarm (newborn pair, 100+ h1 buys).
+_WASH = "WashMint00000000000000000000000000000000000001"
+_SWARM = "SwarmMint0000000000000000000000000000000000001"
+TAPES[_WASH] = dict(GOOD_TAPE, buys_m5=60, sells_m5=0, vol_m5=500.0)
+TAPES[_SWARM] = dict(GOOD_TAPE, buys_m5=10, sells_m5=8, vol_m5=500.0,
+                     buys_h1=150, sells_h1=20,
+                     pair_created_ms=(time.time() - 60) * 1000)
+QUOTES[_WASH] = 0.001
+QUOTES[_SWARM] = 0.001
+_fw = fire(_WASH)
+_fs = fire(_SWARM)
+W.process_new_fires(now=_fw["ts"] + 0.5, signals=[_fw])
+W.process_new_fires(now=_fs["ts"] + 0.5, signals=[_fs])
+d = W._read()
+check("entry safety: wash-skew tape vetoed at entry, never opened",
+      _WASH in d.get("dead_mints", {}) and _WASH not in d["positions"]
+      and "one-sided" in d["dead_mints"][_WASH].get("reason", ""))
+check("entry safety: bot-swarm tape vetoed at entry, never opened",
+      _SWARM in d.get("dead_mints", {}) and _SWARM not in d["positions"]
+      and "bot swarm" in d["dead_mints"][_SWARM].get("reason", ""))
+for _m in (_WASH, _SWARM):
+    TAPES.pop(_m, None)
+    QUOTES.pop(_m, None)
+
 print()
 if fails:
     print("FAILURES: %d" % len(fails))

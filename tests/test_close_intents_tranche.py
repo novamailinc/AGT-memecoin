@@ -68,8 +68,12 @@ _bus_tmp = tempfile.mkdtemp(prefix="ci-tranche-bus-")
 BUS.BUS_PATH = os.path.join(_bus_tmp, "signal_bus.jsonl")
 C.BUS_PATH = BUS.BUS_PATH
 
+# Verifiably CLEAN tape for the entry-time toxicity re-check
+# (2026-11-23): volume/h1 txns present, pairCreatedAt 1h old.
 GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "buys_m5": 100, "sells_m5": 40,
+             "vol_m5": 9000.0, "buys_h1": 400, "sells_h1": 150,
+             "pair_created_ms": (time.time() - 3600) * 1000,
              "price_usd": 0.001, "tape_source": "test"}
 
 

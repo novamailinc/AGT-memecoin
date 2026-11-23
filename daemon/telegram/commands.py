@@ -651,6 +651,13 @@ def _memecoin_gate_lines():
     lines.append("human halt (/halt): %s" % (
         "ENGAGED" if engaged is True
         else "not engaged" if engaged is False else "unknown"))
+    if engaged is True:
+        lines.append("effective state: ALL lanes blocked by the global "
+                     "halt - new entries refused everywhere regardless "
+                     "of the per-lane list below")
+    elif engaged is None:
+        lines.append("effective state: unknown - lanes fail closed and "
+                     "refuse new entries while the latch is unreadable")
     try:
         st = ks.status()
     except Exception:
@@ -1949,7 +1956,10 @@ def _cmd_halt(ctx, chat_id, user_id, update_id, args):
         _audit(ctx, chat_id, user_id, update_id, "halt.failed", str(exc)[:200], False)
         return
     if res.get("ok"):
-        ctx.send(chat_id, "🛑 Kill switch ENGAGED. New entries blocked; open positions are being swept closed.",
+        ctx.send(chat_id, "🛑 Kill switch ENGAGED. New entries blocked on "
+                 "every lane. Open memecoin paper positions are NOT force-"
+                 "closed: they keep their normal exit ladder and close "
+                 "themselves; exits still credit while halted.",
                  None)
         _audit(ctx, chat_id, user_id, update_id, "halt", reason, True)
     else:

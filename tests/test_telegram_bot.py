@@ -543,6 +543,67 @@ class CommandTests(unittest.TestCase):
         tg_commands.handle_message(ctx, CHAT, USER, 22, "/confirm %s" % code)
         self.assertIn(("kill_switch", False, "released from Telegram"), ctx.tools.calls)
 
+    def test_halt_reply_does_not_claim_sweep(self):
+        # /halt blocks entries only; memecoin exits follow the normal
+        # ladder. The reply must never claim positions are swept closed.
+        client, ctx, sec, published, audit = self._paired()
+        client.sent.clear()
+        tg_commands.handle_message(ctx, CHAT, USER, 20, "/halt x")
+        texts = [t for _, t, _ in client.sent]
+        self.assertTrue(any("ENGAGED" in t for t in texts))
+        self.assertFalse(any("swept" in t for t in texts))
+        self.assertTrue(any("NOT force-closed" in t for t in texts))
+
+    def test_resume_confirm_expired_releases_nothing(self):
+        # Expired confirm code through the real command path: no release.
+        client, ctx, sec, published, audit = self._paired()
+        tg_commands.handle_message(ctx, CHAT, USER, 21, "/resume")
+        code = next(iter(sec.state["pending_confirms"]))
+        future = time.time() + tg_security.CONFIRM_TTL_S + 5
+        with patch.object(tg_security.time, "time", return_value=future):
+            tg_commands.handle_message(ctx, CHAT, USER, 22, "/confirm %s" % code)
+        self.assertFalse(any(c[0] == "kill_switch" and c[1] is False
+                             for c in ctx.tools.calls))
+        self.assertTrue(any("expired" in t.lower() for _, t, _ in client.sent))
+        self.assertTrue(any(a["action"] == "confirm.rejected" for a in audit))
+
+    def test_resume_confirm_from_stranger_never_runs(self):
+        # An unauthorized chat cannot reach /confirm at all: the gate
+        # drops it before the handler, the code stays pending, nothing
+        # executes, and the attempt is published as unauthorized.
+        client, ctx, sec, published, audit = self._paired()
+        tg_commands.handle_message(ctx, CHAT, USER, 21, "/resume")
+        code = next(iter(sec.state["pending_confirms"]))
+        tg_commands.handle_message(ctx, CHAT2, USER2, 22, "/confirm %s" % code)
+        self.assertEqual(ctx.tools.calls, [])
+        self.assertIn(code, sec.state["pending_confirms"])
+        self.assertTrue(any(e.get("event") == "telegram.unauthorized"
+                            for e, _ in published))
+
+    def test_status_global_halt_blocks_all_lanes(self):
+        # With the /halt latch engaged, /status must show the effective
+        # all-lanes block, not just the (empty) per-lane halted list.
+        from daemon.launch_scanner import killswitch as ks
+        client, ctx, sec, published, audit = self._paired()
+        client.sent.clear()
+        with patch.object(ks, "_human_halt_engaged", return_value=True), \
+             patch.object(ks, "status", return_value={}):
+            tg_commands.handle_message(ctx, CHAT, USER, 2, "/status")
+        texts = [t for _, t, _ in client.sent]
+        self.assertTrue(any("ALL lanes blocked" in t for t in texts))
+        self.assertTrue(any("ENGAGED" in t for t in texts))
+
+    def test_status_latch_unreadable_shows_unknown_not_clear(self):
+        from daemon.launch_scanner import killswitch as ks
+        client, ctx, sec, published, audit = self._paired()
+        client.sent.clear()
+        with patch.object(ks, "_human_halt_engaged", return_value=None), \
+             patch.object(ks, "status", side_effect=RuntimeError("io")):
+            tg_commands.handle_message(ctx, CHAT, USER, 2, "/status")
+        texts = [t for _, t, _ in client.sent]
+        self.assertTrue(any("unknown" in t for t in texts))
+        self.assertFalse(any("not engaged" in t for t in texts))
+
     def test_live_request_refused_and_audited(self):
         client, ctx, sec, published, audit = self._paired()
         tg_commands.handle_message(ctx, CHAT, USER, 30, "/live")

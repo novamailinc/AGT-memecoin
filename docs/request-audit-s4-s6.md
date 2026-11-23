@@ -58,8 +58,12 @@ Items marked FIXED name the landing commit.
   and settled outcomes, generates deterministic per-band summaries, and journals
   context IDs in grad_select. No lesson-based verdict gate or point-in-time lesson
   application is built. lane_bandit + lane-bandit-shadow are diagnostic allocations,
-  not verified entry consumers. ceo.lessons_context has no production caller found;
-  the auto-tune comment does not prove runtime LLM consumption.
+  not verified entry consumers. ceo.lessons_context has no production caller found
+  (definition ceo.py:117, only tests/test_lessons.py references it); the auto-tune
+  comment describes intent, not a wired consumer. FIXED (point-in-time strategy
+  memory): lessons.generate_lessons_as_of computes the lesson payload ONLY from
+  decisions settled at or before as_of (close_ts event time) - no hindsight;
+  invalid as_of is labeled, never full-history (tests in test_lessons.py).
 - 4.5 Operational memory: IMPLEMENTED — acquisition/provider_health.py
   (ok/degraded/down/unconfigured, latency/error/429 surfacing, public-fallback-only
   alert), health_monitor.py, event_recovery.py, helius_ratelimit.py,

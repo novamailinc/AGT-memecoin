@@ -179,11 +179,14 @@ def test_decision_durable_append_and_read():
     with open(promotion._path(home), "a") as f:
         f.write("{torn\n")
     loaded = promotion.load_decisions(home=home)
-    check("promotion: durable record readable, torn line skipped",
-          len(loaded) == 1
-          and loaded[0].get("candidate_id") == "cand-durable"
-          and loaded[0].get("activation") == "not_authorized"
-          and loaded[0].get("research_only") is True)
+    check("promotion: durable record readable, torn line counted",
+          len(loaded.get("records")) == 1
+          and loaded["records"][0].get("candidate_id") == "cand-durable"
+          and loaded["records"][0].get("activation")
+          == "not_authorized"
+          and loaded["records"][0].get("research_only") is True
+          and loaded.get("partial") is True
+          and loaded.get("unreadable_lines") == 1)
 
 
 def test_torn_tail_repaired_before_append():
@@ -203,8 +206,10 @@ def test_torn_tail_repaired_before_append():
     st = promotion.decisions_status(home=home)
     check("promotion: new record survives the torn tail, fragment "
           "counted unreadable",
-          len(loaded) == 1
-          and loaded[0].get("candidate_id") == "cand-repair"
+          len(loaded.get("records")) == 1
+          and loaded["records"][0].get("candidate_id")
+          == "cand-repair"
+          and loaded.get("partial") is True
           and st.get("unreadable_lines") == 1
           and st.get("records") == 1)
 
@@ -222,7 +227,8 @@ def test_lock_failure_fails_closed():
     check("promotion: lock failure fails closed, never an unlocked "
           "silent append",
           promotion.append_decision(dec, home=home) is False
-          and promotion.load_decisions(home=home) == [])
+          and promotion.load_decisions(home=home).get("records")
+          == [])
 
 
 def test_research_limits_recorded():

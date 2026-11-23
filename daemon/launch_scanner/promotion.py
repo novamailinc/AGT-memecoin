@@ -63,6 +63,18 @@ RESEARCH_LIMITS = [
 NOT_ELIGIBLE = "not_eligible_research_only"
 
 
+def _sanitize_criteria(criteria):
+    """Echo the caller's criteria with any approval flag renamed:
+    a caller assertion is recorded as such, never as approval."""
+    if not isinstance(criteria, dict):
+        return criteria
+    out = dict(criteria)
+    if "approved" in out:
+        out["caller_assertion_not_approval"] = bool(
+            out.pop("approved"))
+    return out
+
+
 def _num(v):
     try:
         f = float(v)
@@ -179,7 +191,7 @@ def evaluate_promotion(candidate_id, records, score_incumbent,
         "record_type": "promotion_decision",
         "candidate_id": str(candidate_id or "unknown"),
         "created_ts": now,
-        "criteria": criteria,
+        "criteria": _sanitize_criteria(criteria),
         # A caller flag never confers eligibility: eligibility is
         # fixed not-eligible while the research limits stand.
         "promotion_eligibility": NOT_ELIGIBLE,
@@ -337,20 +349,28 @@ def decisions_status(home=None):
 
 
 def load_decisions(home=None, limit=1000):
-    """Decision records, newest first; unreadable lines skipped,
-    never misread. Never raises."""
+    """Decision records with the paired read contract: records
+    newest first PLUS the read status (unreadable-line count,
+    partial flag), so a consumer always sees whether the log read
+    clean. Never raises."""
     try:
+        st = decisions_status(home)
         out = []
-        with open(_path(home)) as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(rec, dict) and rec.get(
-                        "record_type") == "promotion_decision":
-                    out.append(rec)
-        out.reverse()
-        return out[:limit]
+        if st.get("available"):
+            with open(_path(home)) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(rec, dict) and rec.get(
+                            "record_type") == "promotion_decision":
+                        out.append(rec)
+            out.reverse()
+        return {"records": out[:limit],
+                "available": bool(st.get("available")),
+                "unreadable_lines": st.get("unreadable_lines", 0),
+                "partial": st.get("unreadable_lines", 0) > 0}
     except Exception:
-        return []
+        return {"records": [], "available": False,
+                "unreadable_lines": 0, "partial": False}

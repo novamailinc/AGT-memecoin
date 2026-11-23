@@ -565,6 +565,24 @@ check("hygiene: whitespace close reason excluded as incomplete",
 check("hygiene: numeric-string PnL follows numeric schema",
       L.generate_lessons("grad_select", [dict(hq[0], pnl_usd="2.5")])["n_qualified"] == 1)
 
+# Point-in-time strategy memory (4.4): as-of queries see no future.
+hq2 = [dict(hq[0], close_ts=BASE + 100, pnl_usd=10.0),
+       dict(hq[0], mint="MINT-PIT2", close_ts=BASE + 200,
+            pnl_usd=-4.0)]
+pit = L.generate_lessons_as_of("grad_select", hq2, BASE + 150)
+check("point-in-time: outcomes settled after as_of are invisible",
+      pit.get("point_in_time") is True
+      and pit.get("as_of") == BASE + 150
+      and pit.get("n_settled") == 1
+      and pit.get("resolved_at") == BASE + 100)
+full = L.generate_lessons_as_of("grad_select", hq2, BASE + 500)
+check("point-in-time: as_of past all settles equals full history",
+      full.get("n_settled") == 2)
+bad = L.generate_lessons_as_of("grad_select", hq2, None)
+check("point-in-time: invalid as_of labeled, never full-history",
+      bad.get("error") == "invalid_as_of"
+      and bad.get("n_settled") == 0)
+
 print()
 if fails:
     print("FAILURES: %d" % len(fails))

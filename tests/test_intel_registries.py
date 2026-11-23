@@ -217,7 +217,8 @@ check("rugger: unknown deployer -> zero record, no raise",
       RR.lookup("whatever") == {"launches": 0, "dead": 0,
                                 "flagged": False, "examples": []})
 check("rugger: stats count deployers + flagged",
-      RR.stats() == {"deployers": 3, "flagged": 1})
+      RR.stats() == {"deployers": 3, "flagged": 1,
+                     "unjoined_dead_mints": 0})
 
 # ---------------- rugger: mint-level dead_mints via dossiers ----------------
 DEPM = _mk("Tt")
@@ -343,12 +344,18 @@ DEPA = _mk("9h")
 DEPB = _mk("1i")
 assert FC.is_plausible_wallet(DEPA) and FC.is_plausible_wallet(DEPB)
 mints_a = [_mk("3j"), _mk("4k"), _mk("5m")]
-for _m in mints_a:
+MINT_NOJOIN = _mk("6n")
+for _m in mints_a + [MINT_NOJOIN]:
     assert FC.is_plausible_wallet(_m), _m
+_ledger_mints = {m: {"ts": 1.0, "reason":
+                     "safety: rugcheck danger: rug"} for m in mints_a}
+# A dead mint NOTHING can join to a deployer: no live dossier, no
+# archive record, no tracker entry. It must surface as visible
+# missingness, never let the registry read as complete.
+_ledger_mints[MINT_NOJOIN] = {"ts": 1.0,
+                              "reason": "safety: rugcheck danger: rug"}
 with open(os.path.join(HOME3, "grad_ledger.json"), "w") as f:
-    json.dump({"dead_mints": {m: {"ts": 1.0, "reason":
-                                  "safety: rugcheck danger: rug"}
-                              for m in mints_a}}, f)
+    json.dump({"dead_mints": _ledger_mints}, f)
 _recs = [{"v": 1, "record_type": "launch", "mint": m,
           "deployer": DEPA, "archived_ts": 1.0,
           "safety_verdict": "conclusive"} for m in mints_a]
@@ -384,6 +391,13 @@ _srcs = _reg["deployers"][DEPA]["sources"]
 check("rugger: archive evidence auditable in sources",
       "launch_archive" in _srcs
       and "dead_mints+launch_archive" in _srcs)
+check("rugger: unjoinable dead mint is visible missingness",
+      _reg.get("unjoined_dead_mints_count") == 1
+      and MINT_NOJOIN in (_reg.get("unjoined_dead_mints") or []))
+check("rugger: stats carry the missingness count",
+      RR.stats().get("unjoined_dead_mints") == 1)
+check("rugger: joined evidence unaffected by the unjoined mint",
+      RR.lookup(DEPA)["dead"] == 3)
 
 
 print()

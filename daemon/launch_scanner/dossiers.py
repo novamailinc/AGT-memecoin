@@ -463,6 +463,35 @@ def launch_memory(mint, now=None):
         return None
 
 
+_last_registry_refresh = 0.0
+REGISTRY_REFRESH_S = int(os.environ.get(
+    "DOSSIER_REGISTRY_REFRESH_S", "900"))
+
+
+def _maybe_refresh_registry(now):
+    """Advisory registry UPDATE RULE (2026-11-23, section 4 memory
+    semantics): nothing else in the runtime refreshes the rugger
+    registry - the only refresher was a manually-run script, so
+    the advisory record could go arbitrarily stale. The sweep
+    re-derives it from the evidence files (including this
+    archive) at most once per REGISTRY_REFRESH_S. Advisory only:
+    the registry stays measurement/display, no rule or threshold
+    changes, and a refresh failure changes nothing. Never
+    raises."""
+    global _last_registry_refresh
+    try:
+        if now - _last_registry_refresh < REGISTRY_REFRESH_S:
+            return
+        _last_registry_refresh = now
+        try:
+            from daemon.launch_scanner import rugger_registry as _rr
+        except Exception:
+            import rugger_registry as _rr  # type: ignore
+        _rr.refresh()
+    except Exception:
+        pass
+
+
 def _sweep(now):
     """Opportunistic TTL cleanup + deployer census. Runs inside
     event handlers at most once per 300s of wall time."""
@@ -491,6 +520,7 @@ def _sweep(now):
             except Exception:
                 continue
         _maybe_compact_archive(now)
+        _maybe_refresh_registry(now)
         # Lever 3 (2026-11-16): clean per-mint lock files whose
         # dossier is gone/expired. Only unlink when no builder
         # holds the lock (flock EX|NB succeeds) — a held lock

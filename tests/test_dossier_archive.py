@@ -831,7 +831,39 @@ def test_end_to_end_memory_consumed_after_restart():
             rr.REGISTRY_PATH = real_reg
 
 
+def test_sweep_refreshes_registry_on_cadence():
+    """The runtime (not a manual script) keeps the advisory
+    registry fresh: the dossier sweep re-derives it at most once
+    per REGISTRY_REFRESH_S."""
+    from daemon.launch_scanner import rugger_registry as rr
+    with _Ctx() as c:
+        real_reg = rr.REGISTRY_PATH
+        real_last = dossiers._last_registry_refresh
+        real_s = dossiers.REGISTRY_REFRESH_S
+        rr.REGISTRY_PATH = os.path.join(c.home, "rugger_registry.json")
+        dossiers._last_registry_refresh = 0.0
+        dossiers.REGISTRY_REFRESH_S = 900
+        try:
+            now = time.time()
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now)
+            check("cadence: sweep refreshes the registry (no script)",
+                  os.path.exists(rr.REGISTRY_PATH))
+            os.unlink(rr.REGISTRY_PATH)
+            dossiers._sweep(now + 400)  # past sweep gate, within cadence
+            check("cadence: throttled within REGISTRY_REFRESH_S",
+                  not os.path.exists(rr.REGISTRY_PATH))
+            dossiers._sweep(now + 1000)  # past both gates
+            check("cadence: refreshes again after the interval",
+                  os.path.exists(rr.REGISTRY_PATH))
+        finally:
+            rr.REGISTRY_PATH = real_reg
+            dossiers._last_registry_refresh = real_last
+            dossiers.REGISTRY_REFRESH_S = real_s
+
+
 def main():
+    test_sweep_refreshes_registry_on_cadence()
     test_end_to_end_memory_consumed_after_restart()
     test_exit_price_kind_labels()
     test_deployer_history_current_price_only()

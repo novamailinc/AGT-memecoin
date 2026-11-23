@@ -196,6 +196,7 @@ def _evidence(home):
 
     # 2. dead_mints from both grad ledgers.
     dead_mints = {}      # mint -> reason (first ledger wins)
+    joined_dead = set()  # dead mints joined to a deployer
     for fn in ("grad_ledger.json", "grad_raw_ledger.json"):
         led = _load_json(os.path.join(home, fn), {})
         dm = led.get("dead_mints") if isinstance(led, dict) else None
@@ -225,6 +226,7 @@ def _evidence(home):
             continue
         dossier_mints.setdefault(dep, set()).add(mint)
         if mint in dead_mints:
+            joined_dead.add(mint)
             s = slot(dep)
             s["dead_mint_set"].add(mint)
             s["sources"].add("dead_mints+dossiers")
@@ -262,6 +264,7 @@ def _evidence(home):
                         continue
                     archive_mints.setdefault(dep, set()).add(mint)
                     if mint in dead_mints:
+                        joined_dead.add(mint)
                         s = slot(dep)
                         s["dead_mint_set"].add(mint)
                         s["sources"].add("dead_mints+launch_archive")
@@ -283,15 +286,21 @@ def _evidence(home):
             s["sources"].add("launch_archive")
     except Exception:
         pass
-    return agg
+    # Dead-mint evidence that NO source could join to a deployer
+    # (no live dossier, no durable archive record, no tracker
+    # entry) is MISSING linkage, not absent evidence: report it
+    # visibly instead of letting the registry read as complete.
+    unjoined = sorted(m for m in dead_mints if m not in joined_dead)
+    return agg, unjoined
 
 
 def build_records(home=None):
     """Evidence -> registry records (pure aggregation + the flag
-    rule; no file writes). Never raises."""
+    rule; no file writes). Returns (records, unjoined_dead_mints).
+    Never raises."""
     try:
         home = home or _home()
-        agg = _evidence(home)
+        agg, unjoined = _evidence(home)
         out = {}
         for dep, s in agg.items():
             mint_dead = len(s["dead_mint_set"])
@@ -305,19 +314,25 @@ def build_records(home=None):
                 "examples": sorted(s["dead_mint_set"])[:_MAX_EXAMPLES],
                 "sources": sorted(s["sources"]),
             }
-        return out
+        return out, unjoined
     except Exception as e:
         logger.warning("rugger build_records failed: %s", e)
-        return {}
+        return {}, []
 
 
 def refresh(home=None):
     """Rebuild the registry from live evidence and persist it.
     Returns stats(). Never raises."""
     try:
-        records = build_records(home=home)
+        records, unjoined = build_records(home=home)
         reg = {"version": 1, "updated_ts": time.time(),
-               "deployers": records}
+               "deployers": records,
+               # Visible missingness: dead-mint evidence no source
+               # could join to a deployer. The registry is
+               # INCOMPLETE while this is non-empty; consumers
+               # must not read it as a complete record.
+               "unjoined_dead_mints_count": len(unjoined),
+               "unjoined_dead_mints": unjoined[:_MAX_EXAMPLES]}
         try:
             with _registry_lock():
                 tmp = REGISTRY_PATH + ".tmp"
@@ -357,9 +372,13 @@ def lookup(deployer):
 def stats():
     """Registry headline numbers. Never raises."""
     try:
-        deps = load_registry().get("deployers") or {}
+        reg = load_registry()
+        deps = reg.get("deployers") or {}
         return {"deployers": len(deps),
                 "flagged": sum(1 for r in deps.values()
-                               if isinstance(r, dict) and r.get("flagged"))}
+                               if isinstance(r, dict) and r.get("flagged")),
+                "unjoined_dead_mints": int(
+                    reg.get("unjoined_dead_mints_count") or 0)}
     except Exception:
-        return {"deployers": 0, "flagged": 0}
+        return {"deployers": 0, "flagged": 0,
+                "unjoined_dead_mints": 0}

@@ -217,3 +217,21 @@ An actual run_once cycle fixture joins discovery to grade/co-buy state commit an
 second-cycle dedup, with unrelated network/drain functions stubbed and stop-before-
 scan enabled. This is not whole scan/qualification or AGT runtime acceptance.
 The broader acquisition inventory remains open.
+
+
+## Shared unknown execution status
+
+The wider acquisition audit found tx_guards.tx_succeeded accepted an explicit
+meta object without an err field as success. It now requires an explicit err=None;
+missing status reports tx_unknown. The same gate is used by logstream transaction
+mint resolution, deployer resolution, wallet exit-copy measurement and migration
+price readers. Actual reader fixtures refuse unknown before parsing balances or
+naming a signer. This is execution-status validation only, not response signature
+binding, full account identity validation or all-source acquisition coverage.
+
+Classification from actual call sites: wallet_discovery mines proposal-only
+candidates, exit_copy measures exits, bundle/funding_clusters read wallet behavior,
+grad_raw/moon_lane/raw_tight/grad_select read migration prices, deployers resolves
+creator/funder data, and logstream is a separate launch-event acquisition path.
+The logstream seen-before-detail-fetch order remains an open retry-loss boundary;
+these readers are not covered by scanner wallet outbox acceptance.

@@ -18,7 +18,7 @@ def _parsed_tx(mint):
                 }],
             },
         },
-        "meta": {"preTokenBalances": [], "postTokenBalances": [],
+        "meta": {"err": None, "preTokenBalances": [], "postTokenBalances": [],
                  "innerInstructions": []},
     }
 
@@ -65,6 +65,12 @@ class LogStreamDegradationTest(unittest.TestCase):
         ls._last_rpc_warn = 0.0
         ls._http_rpc = lambda method, params: _parsed_tx("RPCMINT")
         self.assertEqual(ls._mint_for_signature("sig"), "RPCMINT")
+    def test_missing_execution_status_refuses_fetched_mint(self):
+        ls=LogStream.__new__(LogStream);ls._last_rpc_ts=0.0
+        tx=_parsed_tx('UNKNOWN');del tx['meta']['err']
+        ls._http_rpc=lambda *args:tx
+        self.assertIsNone(ls._mint_for_signature('sig'))
+
     def test_unreachable_ws_degrades_not_crashes(self):
         # Nothing listening on this port: the thread must fail, back off,
         # and leave the scanner on polling — never raise.

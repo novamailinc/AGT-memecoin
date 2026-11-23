@@ -30,8 +30,9 @@ def check(name, cond):
 # 1. tx_succeeded: True only on a dict meta with err None.
 check("succeeded: err None",
       TG.tx_succeeded({"meta": {"err": None}}) is True)
-check("succeeded: err key absent (meta without err)",
-      TG.tx_succeeded({"meta": {}}) is True)
+check("unknown: err key absent (meta without err)",
+      TG.tx_succeeded({"meta": {}}) is False)
+check("reason: unknown on absent err", TG.tx_reverted_reason({"meta": {}})=="tx_unknown")
 check("succeeded: bare meta dict",
       TG.tx_succeeded({"err": None}) is True)
 check("reverted: dict err",

@@ -338,7 +338,7 @@ class ExitCopyTests(unittest.TestCase):
             if method == "getSignaturesForAddress":
                 return [{"signature": "sig1", "blockTime": 1500.0}]
             if method == "getTransaction":
-                return {"meta": {
+                return {"meta": {"err": None,
                     "preTokenBalances": [
                         {"owner": wallet, "mint": MINT,
                          "uiTokenAmount": {"uiAmount": 100.0}}],

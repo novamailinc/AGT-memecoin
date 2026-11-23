@@ -49,13 +49,13 @@ def tx_succeeded(tx):
     """True only when the transaction demonstrably succeeded.
 
     ``tx`` is a getTransaction result (or its meta dict). True
-    exactly when meta is a dict AND meta.get("err") is None.
+    exactly when meta is a dict with an explicit err key equal to None.
     Missing meta, a non-dict meta, or any err value (including a
     dict err) is NOT success — fail closed. Never raises."""
     meta = _meta_of(tx)
     if meta is None:
         return False
-    return meta.get("err") is None
+    return "err" in meta and meta["err"] is None
 
 
 def tx_reverted_reason(tx):
@@ -65,7 +65,7 @@ def tx_reverted_reason(tx):
     meta is missing/unreadable (fail-closed, same as refused).
     Never raises."""
     meta = _meta_of(tx)
-    if meta is None:
+    if meta is None or "err" not in meta:
         return "tx_unknown"
     if meta.get("err") is None:
         return None

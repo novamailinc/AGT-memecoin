@@ -63,10 +63,17 @@ Items marked FIXED name the landing commit.
   comment describes intent, not a wired consumer. PARTIAL progress (outcome-event
   cutoff): lessons.generate_lessons_as_of computes the lesson payload only from
   decisions whose close_ts (outcome event time) is at or before as_of; non-finite
-  as_of rejected, future as_of labeled. This is NOT knowledge-time versioning:
-  late backfill/reclassification settled before the cutoff is still included and
-  feature availability timestamps are untracked - knowledge-time immutable
-  versions remain UNBUILT (tests in test_lessons.py).
+  as_of rejected, future as_of labeled. mode="knowledge_time" filters on
+  settled_ts (the append time stamped by the settle paths): records closed
+  before the cutoff but recorded after it are excluded, records recorded after
+  their close are counted in late_backfill_included, and records lacking a
+  finite settled_ts (ledger-rebuilt/legacy) are excluded and counted in
+  unknown_availability_excluded - never silently treated as known.
+  knowledge_replay_limits labels the remaining gap: feature values carry no
+  per-field timestamps and post-hoc file edits are unversioned, so this is an
+  append-time replay of the known-availability subset, NOT a verified
+  leak-free reconstruction of model inputs at as_of (immutable per-field
+  versions remain UNBUILT). Unknown modes rejected (tests in test_lessons.py).
 - 4.5 Operational memory: IMPLEMENTED — acquisition/provider_health.py
   (ok/degraded/down/unconfigured, latency/error/429 surfacing, public-fallback-only
   alert), health_monitor.py, event_recovery.py, helius_ratelimit.py,

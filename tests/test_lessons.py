@@ -593,6 +593,47 @@ fut = L.generate_lessons_as_of("grad_select", hq2, BASE + 500,
 check("point-in-time: future as_of labeled explicitly",
       fut.get("as_of_in_future") is True)
 
+# Knowledge-time mode (4.4): cutoff on settled_ts (when the outcome
+# was RECORDED), not close_ts (when it happened).
+kt = [dict(hq[0], close_ts=BASE + 100, settled_ts=BASE + 100,
+           pnl_usd=10.0),
+      dict(hq[0], mint="MINT-KT2", close_ts=BASE + 120,
+           settled_ts=BASE + 400, pnl_usd=-4.0),  # late backfill
+      dict(hq[0], mint="MINT-KT3", close_ts=BASE + 130,
+           pnl_usd=7.0)]  # no settled_ts: unknown availability
+kres = L.generate_lessons_as_of("grad_select", kt, BASE + 150,
+                                mode="knowledge_time")
+check("knowledge-time: recorded-after-cutoff invisible despite "
+      "close before cutoff",
+      kres.get("n_settled") == 1
+      and kres.get("resolved_at") == BASE + 100
+      and kres.get("cutoff_mode") == "knowledge_time"
+      and kres.get("cutoff_semantics")
+      == "append_recorded_time_known_availability_subset")
+check("knowledge-time: unknown availability excluded and labeled, "
+      "never silently known",
+      kres.get("unknown_availability_excluded") == 1)
+kres2 = L.generate_lessons_as_of("grad_select", kt, BASE + 500,
+                                 mode="knowledge_time")
+check("knowledge-time: late backfill included once recorded, "
+      "labeled separately",
+      kres2.get("n_settled") == 2
+      and kres2.get("late_backfill_included") == 1
+      and kres2.get("unknown_availability_excluded") == 1)
+check("knowledge-time: replay limits labeled, not claimed leak-free",
+      "leak-free" in str(kres2.get("knowledge_replay_limits"))
+      and "not a verified" in str(kres2.get("knowledge_replay_limits")))
+badmode = L.generate_lessons_as_of("grad_select", kt, BASE + 150,
+                                   mode="everything")
+check("knowledge-time: unknown mode rejected, never full history",
+      badmode.get("error") == "invalid_mode"
+      and badmode.get("n_settled") == 0)
+defkt = L.generate_lessons_as_of("grad_select", kt, BASE + 500)
+check("knowledge-time: default mode stays outcome-event",
+      defkt.get("cutoff_mode") == "outcome_event"
+      and defkt.get("n_settled") == 3
+      and "unknown_availability_excluded" not in defkt)
+
 print()
 if fails:
     print("FAILURES: %d" % len(fails))

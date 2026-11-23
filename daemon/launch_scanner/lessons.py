@@ -667,36 +667,87 @@ def generate_lessons(lane, decisions, generated_at=None):
 
 
 def generate_lessons_as_of(lane, decisions, as_of_ts,
-                           generated_at=None):
-    """Outcome-EVENT-time cutoff for the lesson payload (section
-    4.4): computed ONLY from decisions whose close_ts (the outcome
-    event time) is at or before as_of_ts. This is an outcome-event
-    cutoff ONLY - it is NOT knowledge-time versioning: a record
-    settled before the cutoff but recorded or reclassified later
-    (late backfill) is still included, and feature availability
-    timestamps are not tracked, so the payload is not a leak-free
-    reconstruction of what the bot knew at as_of. Non-finite or
-    missing as_of is rejected (labeled, never silently full
-    history); an as_of in the future is labeled explicitly.
-    Never raises."""
+                           generated_at=None, mode="outcome_event"):
+    """Point-in-time lesson payload (section 4.4).
+
+    mode="outcome_event" (default): computed ONLY from decisions
+    whose close_ts (the outcome event time) is at or before
+    as_of_ts. This is an outcome-event cutoff ONLY - it is NOT
+    knowledge-time: a record closed before the cutoff but recorded
+    or reclassified later (late backfill) is still included, and
+    feature availability timestamps are not tracked.
+
+    mode="knowledge_time": computed ONLY from settled decisions
+    whose settled_ts (the append time stamped by the settle paths
+    when the outcome was RECORDED) is at or before as_of_ts - the
+    subset the bot had recorded by as_of. Records lacking a finite
+    settled_ts (ledger-rebuilt or legacy records) have unknown
+    first-knowledge time: they are EXCLUDED and counted in
+    unknown_availability_excluded, never silently treated as
+    known. Records recorded after their close (late backfill)
+    are included when recorded by as_of and counted in
+    late_backfill_included. knowledge_replay_limits labels the
+    remaining gap: feature values were stamped at entry/merge
+    time without per-field timestamps and post-hoc file edits
+    are unversioned, so this is an append-time replay of the
+    known-availability subset, not a verified leak-free
+    reconstruction of model inputs at as_of.
+
+    Non-finite or missing as_of, and unknown modes, are rejected
+    (labeled, never silently full history); an as_of in the
+    future is labeled explicitly. Never raises."""
     try:
         cutoff = _num(as_of_ts)
         if cutoff is None or not math.isfinite(cutoff):
             return {"lane": lane, "generated_at": generated_at or 0,
                     "resolved_at": None, "n_settled": 0,
                     "lessons": [], "error": "invalid_as_of"}
+        if mode not in ("outcome_event", "knowledge_time"):
+            return {"lane": lane, "generated_at": generated_at or 0,
+                    "resolved_at": None, "n_settled": 0,
+                    "lessons": [], "error": "invalid_mode"}
         gen = generated_at or time.time()
-        visible = [r for r in (decisions or [])
-                   if isinstance(r, dict)
-                   and _num(r.get("close_ts")) is not None
-                   and math.isfinite(_num(r.get("close_ts")))
-                   and _num(r.get("close_ts")) <= cutoff]
+        visible = []
+        unknown_availability = 0
+        late_backfill = 0
+        for r in (decisions or []):
+            if not isinstance(r, dict):
+                continue
+            ct = _num(r.get("close_ts"))
+            if ct is None or not math.isfinite(ct):
+                continue
+            if mode == "outcome_event":
+                if ct <= cutoff:
+                    visible.append(r)
+                continue
+            st = _num(r.get("settled_ts"))
+            if st is None or not math.isfinite(st):
+                unknown_availability += 1
+                continue
+            if st > cutoff:
+                continue
+            visible.append(r)
+            if st > ct:
+                late_backfill += 1
         payload = generate_lessons(lane, visible,
                                    generated_at=generated_at)
         payload["as_of"] = cutoff
         payload["as_of_in_future"] = bool(cutoff > gen)
+        payload["cutoff_mode"] = mode
         payload["cutoff_semantics"] = (
-            "outcome_event_time_only_not_knowledge_time")
+            "outcome_event_time_only_not_knowledge_time"
+            if mode == "outcome_event"
+            else "append_recorded_time_known_availability_subset")
+        if mode == "knowledge_time":
+            payload["unknown_availability_excluded"] = \
+                unknown_availability
+            payload["late_backfill_included"] = late_backfill
+            payload["knowledge_replay_limits"] = (
+                "append-time replay of the known-availability "
+                "subset only; feature values carry no per-field "
+                "timestamps and post-hoc file edits are "
+                "unversioned, so this is not a verified leak-free "
+                "reconstruction of model inputs at as_of")
         return payload
     except Exception:
         return {"lane": lane, "generated_at": generated_at or 0,

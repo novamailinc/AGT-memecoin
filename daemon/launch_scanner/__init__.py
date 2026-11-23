@@ -379,6 +379,12 @@ class LaunchScanner(Daemon):
             return
         try:
             self._manage_exits(config, adapter, state)
+            try:
+                settle = getattr(adapter, "retry_pending_usd", None)
+                if settle is not None:
+                    settle()
+            except Exception:
+                logger.exception("launch_scanner: shared USD settlement remains pending")
             self._retry_pending(config, adapter, state)
             try:
                 # Smart-money wallet poll + fast-track (#4a): poll_wallets

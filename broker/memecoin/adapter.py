@@ -480,6 +480,19 @@ class MemecoinAdapter(BrokerAdapter):
         path.unlink()
         _fsync_dir(path.parent)
 
+    def retry_pending_usd(self):
+        """Existing scanner cadence retries dated FX, never blocking native exits."""
+        if self._shared_account is None:
+            return []
+        snapshot=self._shared_account.snapshot()
+        if not any(p.get("lane")=="main" for p in snapshot.get("pending_sol",[])):
+            return []
+        try:
+            fx=self._observe_entry_fx()
+        except Exception:
+            return [{"ok":False,"reason":"USD settlement pending current FX"}]
+        return self.settle_pending_usd(fx)
+
     def settle_pending_usd(self, fx: dict) -> list:
         """Explicit dated SOL-to-USD settlement; no token exit or native rollback.
 

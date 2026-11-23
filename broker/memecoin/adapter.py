@@ -320,6 +320,8 @@ class MemecoinAdapter(BrokerAdapter):
                 if any(not p.get("shared_pos_id") for p in intent["before"]["positions"].values()):
                     raise BrokerError(BROKER_UNAVAILABLE, "unbound legacy native inventory")
                 fx = self._entry_pricing_fx
+                fill["price_evidence"]={"kind":"USD_ratio","fx":fx,
+                                        "token":self._entry_token_evidence}
                 identity = fill.get("idempotency_key") or fill["native_op_id"]
                 intent["shared_entry"] = entry_plan(
                     "main", self._market.mint_for(fill["symbol"]), fill["ticket"],
@@ -702,6 +704,22 @@ class MemecoinAdapter(BrokerAdapter):
                 if pos["symbol"] == symbol and pos.get("shared_mint") != mint:
                     raise BrokerError(INVALID_ORDER, "symbol mapping differs from immutable entry mint")
 
+    def _validated_usd_quote(self, symbol, quote):
+        if not isinstance(quote,dict):
+            raise BrokerError(BROKER_UNAVAILABLE,"token USD observation unavailable")
+        observed=quote.get("ts")
+        if isinstance(observed,datetime): observed=observed.timestamp()
+        usd=quote.get("price_usd")
+        if (quote.get("mint")!=self._market.mint_for(symbol)
+                or not isinstance(quote.get("source"),str) or not quote["source"]
+                or isinstance(observed,bool) or not isinstance(observed,(int,float))
+                or not math.isfinite(observed) or not 0<=time.time()-observed<=_SOL_PRICE_TTL
+                or isinstance(usd,bool) or not isinstance(usd,(int,float))
+                or not math.isfinite(usd) or usd<=0):
+            raise BrokerError(BROKER_UNAVAILABLE,"token USD observation invalid or stale")
+        return {"mint":quote["mint"],"source":quote["source"],"observed_at":observed,
+                "price_usd":usd,"pair":quote.get("pair")}
+
     def _shared_price_sol(self, symbol):
         self._verify_position_mints(symbol)
         quote = self._market.get_quote(symbol)
@@ -723,13 +741,10 @@ class MemecoinAdapter(BrokerAdapter):
                 "quote_mint":quote["price_sol_quote_mint"], "pair":quote.get("pair")}
             return float(native)
         fx = self._observe_entry_fx()
-        usd = quote.get("price_usd")
-        if (isinstance(usd,bool) or not isinstance(usd,(int,float))
-                or not math.isfinite(usd) or usd <= 0):
-            raise BrokerError(BROKER_UNAVAILABLE,"shared native token price unavailable")
-        price=usd/fx["usd_per_sol"]
+        token_evidence=self._validated_usd_quote(symbol,quote)
+        price=token_evidence["price_usd"]/fx["usd_per_sol"]
         self._shared_last_exit_price={"kind":"USD_ratio", "price_sol":price,
-                                     "mint":self._market.mint_for(symbol),"fx":fx}
+                                     "mint":self._market.mint_for(symbol),"fx":fx,"token":token_evidence}
         return price
 
     def _price_sol(self, symbol: str) -> float:
@@ -1129,11 +1144,8 @@ class MemecoinAdapter(BrokerAdapter):
             # SOL cache must not silently manufacture token units at another rate.
             self._entry_pricing_fx = self._observe_entry_fx()
             quote = self._market.get_quote(symbol)
-            usd = quote.get("price_usd") if isinstance(quote, dict) else None
-            if (isinstance(usd, bool) or not isinstance(usd, (int, float))
-                    or not math.isfinite(usd) or usd <= 0):
-                raise BrokerError(BROKER_UNAVAILABLE, "native entry token price unavailable")
-            price_sol = usd / self._entry_pricing_fx["usd_per_sol"]
+            self._entry_token_evidence = self._validated_usd_quote(symbol,quote)
+            price_sol = self._entry_token_evidence["price_usd"] / self._entry_pricing_fx["usd_per_sol"]
         elif self._shared_account is not None:
             price_sol = self._shared_price_sol(symbol)
         else:

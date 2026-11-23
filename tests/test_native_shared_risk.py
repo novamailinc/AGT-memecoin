@@ -170,3 +170,15 @@ class TestNativeSharedRisk:
         assert snapshot['pending_sol_basis']==2.
         with pytest.raises(BrokerError):
             a.account_info()
+
+    @pytest.mark.parametrize('field,value',[('mint','wrong'),('source',''),('ts',0.)])
+    def test_usd_ratio_entry_rejects_unbound_token_observation(self, account, tmp_path, field, value):
+        market=FakeMarket({'SOL':100.,'BONK':.0001})
+        a=_adapter(str(tmp_path),market,shared_account=pa,
+             fx_observer=lambda:{'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'})
+        a.connect({})
+        quote=market.get_quote('BONK');quote[field]=value
+        market.get_quote=lambda symbol:quote
+        with pytest.raises(BrokerError,match='token USD observation'):
+            a.submit_order(_req('BONK','BUY',.02,'a'))
+        assert pa.snapshot()['cash']==10. and not a._positions

@@ -3468,10 +3468,22 @@ class LaunchScanner(Daemon):
                 "compaction_failures"))
             series_source = ("journal" if series and not window_only
                              else ("window" if series else "none"))
-            series_complete = (bool(snaps) and not truncated
-                               and series_gaps == 0
-                               and series_source == "journal"
-                               and jfailures == 0)
+            # Qualified integrity label - a DIAGNOSTIC, never a proof
+            # that no poll is missing: the gap check only catches
+            # intervals above max(5x median, 300s), so "no detected
+            # gaps" must not be read as perfect completeness.
+            if not snaps:
+                series_integrity = "no-series"
+            elif truncated:
+                series_integrity = "window-truncated-irrecoverable"
+            elif jfailures > 0:
+                series_integrity = "journal-failures-reported"
+            elif series_gaps > 0:
+                series_integrity = series_source + "-gaps-detected"
+            elif series_source == "journal":
+                series_integrity = "journal-whole-no-detected-gaps"
+            else:
+                series_integrity = "window-no-detected-gaps"
             saf = cand.get("safety") or {}
             if verdict == "confirm":
                 first = float(cand.get("first_mcap") or 0)
@@ -3500,7 +3512,10 @@ class LaunchScanner(Daemon):
                 "window_truncated": truncated,
                 "series_source": series_source,
                 "series_gaps": series_gaps,
-                "series_complete": series_complete,
+                # Qualified diagnostic, NOT a completeness proof; only
+                # "journal-whole-no-detected-gaps" counts as whole for
+                # engine tallies.
+                "series_integrity": series_integrity,
                 "journal_failures": jfailures,
                 "mint": mint, "symbol": cand.get("symbol") or "",
                 "chain": cand.get("chain") or "",

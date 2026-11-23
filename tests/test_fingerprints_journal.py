@@ -144,6 +144,56 @@ class TestSeriesJournal(unittest.TestCase):
             self.assertIsNotNone(full)  # still there, not compacted away
             self.assertEqual(full[0][0], 10.0)
 
+    def test_writer_paused_across_replacement_loses_nothing(self):
+        # The split-inode race: compaction os.replace()s the journal, so
+        # a writer holding a lock on the OLD fd would append into an
+        # unlinked file. The sidecar lock must serialize them: an
+        # append issued while compaction holds the lock lands in the
+        # NEW file, and compaction waits for a held append lock.
+        import fcntl as _fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "journal.jsonl")
+            tr = fp.FingerprintTracker(_Cfg(path))
+            tr.observe("MINTA", _stats(), now=1.0)  # aged-out entry
+            # Bypass the size-floor early-return so compaction actually
+            # takes the lock in this small test.
+            self.patch = getattr(self, "patch", None)
+            old_floor = fp._COMPACT_MIN_BYTES
+            fp._COMPACT_MIN_BYTES = 0
+            self.addCleanup(setattr, fp, "_COMPACT_MIN_BYTES", old_floor)
+            # Hold the sidecar lock; compaction must block behind it.
+            with open(path + ".lock", "a") as lf:
+                _fcntl.flock(lf.fileno(), _fcntl.LOCK_EX)
+                done = []
+                t = threading.Thread(
+                    target=lambda: (tr._journal_compact(9e9),
+                                    done.append(True)))
+                t.start()
+                t.join(timeout=2.0)
+                self.assertFalse(done)  # compaction blocked by the lock
+                # An append behind the same lock also blocks; issue it
+                # from a thread, then release.
+                appended = []
+                t2 = threading.Thread(
+                    target=lambda: (tr.observe("MINTB", _stats(),
+                                               now=9e9),
+                                    appended.append(True)))
+                t2.start()
+                t2.join(timeout=2.0)
+                self.assertFalse(appended)  # writer paused across swap
+                _fcntl.flock(lf.fileno(), _fcntl.LOCK_UN)
+            t.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            self.assertTrue(done and appended)
+            self.assertEqual(tr.journal_status()["compactions"], 1)
+            # Compaction dropped the aged entry; the paused append
+            # landed in the REPLACED file - nothing lost.
+            self.assertIsNone(tr.journal_series("MINTA"))
+            fresh = tr.journal_series("MINTB")
+            self.assertIsNotNone(fresh)
+            self.assertEqual(len(fresh), 1)
+
     def test_concurrent_writers_no_torn_lines(self):
         # Two tracker instances appending to the same path: every line
         # stays valid JSON and no entry is lost.

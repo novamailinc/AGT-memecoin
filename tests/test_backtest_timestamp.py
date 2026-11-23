@@ -170,35 +170,38 @@ class TestRugProvenanceGuard(unittest.TestCase):
 
 
 class TestSeriesCompletenessLabels(unittest.TestCase):
+    WHOLE = "journal-whole-no-detected-gaps"
+
     def test_incomplete_series_surfaced_on_trades(self):
-        # A record with middle gaps / truncation can never qualify as a
-        # complete series: the engine flags the trade and counts it.
+        # A record with middle gaps can never qualify as whole: the
+        # engine flags the trade with the qualified diagnostic.
         h = _hist(safety_eval_t=0.0)
         h["series_gaps"] = 2
-        h["series_complete"] = False
+        h["series_integrity"] = "journal-gaps-detected"
         rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
         self.assertEqual(rep["n_trades"], 1)
         self.assertEqual(rep["n_incomplete_series_trades"], 1)
-        self.assertFalse(rep["trades"][0]["series_complete"])
-        self.assertEqual(rep["trades"][0]["series_gaps"], 2)
+        self.assertEqual(rep["trades"][0]["series_integrity"],
+                         "journal-gaps-detected")
+        self.assertEqual(rep["per_series_integrity"]
+                         ["journal-gaps-detected"]["trades"], 1)
 
     def test_legacy_unlabeled_record_is_incomplete(self):
-        # Pre-journal records carry NO series labels: their history is
-        # window-truncated and irrecoverable - they must not qualify as
-        # complete by silence.
+        # Pre-journal records carry NO integrity label: their history
+        # is window-truncated and irrecoverable - they must not qualify
+        # by silence.
         rep = _engine(backtest.REPLAY_MODEL_V2).run(
             [_hist(safety_eval_t=0.0)])
-        self.assertEqual(rep["trades"][0]["series_complete"], False)
+        self.assertEqual(rep["trades"][0]["series_integrity"],
+                         "legacy-unlabeled")
         self.assertEqual(rep["n_incomplete_series_trades"], 1)
 
-    def test_complete_series_labeled(self):
+    def test_whole_series_labeled(self):
         h = _hist(safety_eval_t=0.0)
-        h["series_source"] = "journal"
-        h["series_gaps"] = 0
-        h["window_truncated"] = False
-        h["series_complete"] = True
+        h["series_integrity"] = self.WHOLE
         rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
-        self.assertTrue(rep["trades"][0]["series_complete"])
+        self.assertEqual(rep["trades"][0]["series_integrity"],
+                         self.WHOLE)
         self.assertEqual(rep["n_incomplete_series_trades"], 0)
 
 

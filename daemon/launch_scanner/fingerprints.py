@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from contextlib import contextmanager
 
 try:
     import fcntl  # POSIX; concurrent-writer journal lock
@@ -61,8 +62,11 @@ MAX_TRACKED = 500
 #   surviving entries (original raw evidence preserved verbatim), and
 #   swaps atomically via os.replace.
 # - Concurrent writers: appends and compaction hold an exclusive
-#   fcntl.flock on the file, so interleaved daemon/test writers cannot
-#   tear lines or lose entries to a compaction swap.
+#   fcntl.flock on a STABLE SIDECAR lock file (<journal>.lock) - never
+#   the journal fd itself, because os.replace would swap the inode and
+#   a writer paused across the swap would lock the old, unlinked file
+#   and lose its append. With the sidecar, no writer can be mid-append
+#   while compaction replaces the journal.
 # - Never-raises is NOT silent success: write/read/compaction failures
 #   increment journal_status() counters and record last_error; callers
 #   must surface them (the backtest recorder labels series_source and
@@ -127,6 +131,28 @@ class FingerprintTracker:
             "last_error": None,
         }
 
+    @contextmanager
+    def _journal_lock(self):
+        """Exclusive lock on the STABLE sidecar file. Falls back to a
+        no-op where fcntl is unavailable (non-POSIX)."""
+        lf = None
+        try:
+            parent = os.path.dirname(self._journal_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            lf = open(self._journal_path + ".lock", "a")
+            if fcntl is not None:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if lf is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    lf.close()
+                except Exception:
+                    pass
+
     def journal_status(self) -> Dict[str, Any]:
         """Journal health: failure counters, never raises. A nonzero
         failure count means recorded history may be incomplete - the
@@ -175,18 +201,10 @@ class FingerprintTracker:
         if not self._journal_enabled:
             return
         try:
-            parent = os.path.dirname(self._journal_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(self._journal_path, "a", encoding="utf-8") as fh:
-                if fcntl is not None:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                try:
+            with self._journal_lock():
+                with open(self._journal_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps({"mint": mint, "obs": list(obs)})
                              + "\n")
-                finally:
-                    if fcntl is not None:
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             self._journal_appends += 1
             if self._journal_appends % _COMPACT_EVERY == 0:
                 self._journal_compact(obs[0])
@@ -205,11 +223,12 @@ class FingerprintTracker:
             cutoff = float(now) - self._journal_retention_s
             kept: List[str] = []
             # Surviving entries are preserved VERBATIM (original raw
-            # evidence); only aged-out lines are dropped.
-            with open(self._journal_path, "r", encoding="utf-8") as fh:
-                if fcntl is not None:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                try:
+            # evidence); only aged-out lines are dropped. The sidecar
+            # lock is held across read+replace so no append can land in
+            # the old inode or be lost across the swap.
+            with self._journal_lock():
+                with open(self._journal_path, "r",
+                          encoding="utf-8") as fh:
                     for line in fh:
                         line = line.strip()
                         if not line:
@@ -220,13 +239,10 @@ class FingerprintTracker:
                                 kept.append(line)
                         except Exception:
                             continue  # malformed: drop on compaction
-                finally:
-                    if fcntl is not None:
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            tmp = self._journal_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(kept) + ("\n" if kept else ""))
-            os.replace(tmp, self._journal_path)
+                tmp = self._journal_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(kept) + ("\n" if kept else ""))
+                os.replace(tmp, self._journal_path)
             self._journal_health["compactions"] += 1
         except Exception as exc:
             self._journal_health["compaction_failures"] += 1

@@ -8,6 +8,8 @@ on cards and in logs, but they never allow, block, or drop a CA.
 
 import json
 import os
+import shutil
+import tempfile
 import time
 import unittest
 from types import SimpleNamespace
@@ -245,7 +247,8 @@ class BacktestRecorderTest(unittest.TestCase):
         # but truncated because the first observation (t=1000) is at
         # detection and there are no middle gaps.
         self.assertEqual(rec["series_source"], "journal")
-        self.assertIn("series_complete", rec)
+        self.assertEqual(rec["series_integrity"],
+                         "journal-whole-no-detected-gaps")
 
 
 class IntelCardTest(unittest.TestCase):
@@ -419,6 +422,14 @@ class IntelEndToEndTest(unittest.TestCase):
         import broker as broker_mod
         import core.execution.broker_guard as bg
         from daemon.launch_scanner import scoreboard as sb_mod
+
+        # Self-contained environment: the killswitch gate resolves its
+        # state dir from FOREX_AGENT_HOME. Without this the test only
+        # passed when an earlier suite module had already set the env
+        # var (order dependence) and failed standalone.
+        _home = tempfile.mkdtemp(prefix="ks-home-")
+        self.addCleanup(shutil.rmtree, _home, True)
+        os.environ["FOREX_AGENT_HOME"] = _home
 
         @contextmanager
         def _scope():

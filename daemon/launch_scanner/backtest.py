@@ -418,6 +418,9 @@ class BacktestEngine:
             # Trades whose series has missing middle intervals or
             # journal failures: also NOT complete series.
             "n_incomplete_series_trades": 0,
+            # Buckets of the qualified series_integrity diagnostic per
+            # trade (legacy records: "legacy-unlabeled").
+            "per_series_integrity": {},
             "trades": [],
             # Stage A cost-model accounting (0 / absent when disabled).
             "costs_enabled": self.costs_enabled,
@@ -505,8 +508,11 @@ class BacktestEngine:
                 "failed_exit_attempts", 0)
             if hist.get("window_truncated"):
                 report["n_window_truncated_trades"] += 1
-            if (hist.get("window_truncated") or hist.get("series_gaps")
-                    or not hist.get("series_complete")):
+            integrity = hist.get("series_integrity") or "legacy-unlabeled"
+            bucket = report["per_series_integrity"].setdefault(
+                integrity, {"trades": 0})
+            bucket["trades"] += 1
+            if integrity != "journal-whole-no-detected-gaps":
                 report["n_incomplete_series_trades"] += 1
             pnl = trade["pnl_mult"]
             mult = trade["proceeds_mult"]
@@ -550,10 +556,10 @@ class BacktestEngine:
                 "entry_price": trade.get("entry_price"),
                 "window_truncated": bool(hist.get("window_truncated")),
                 "series_gaps": int(hist.get("series_gaps") or 0),
-                "series_complete": bool(
-                    hist.get("series_complete")
-                    and not hist.get("window_truncated")
-                    and not hist.get("series_gaps")),
+                # Qualified diagnostic, never a completeness proof;
+                # records predating the journal carry no label.
+                "series_integrity": (
+                    hist.get("series_integrity") or "legacy-unlabeled"),
                 "proceeds_mult": round(mult, 4),
                 "pnl_mult": round(pnl, 4),
                 "exit_reason": trade["exit_reason"],

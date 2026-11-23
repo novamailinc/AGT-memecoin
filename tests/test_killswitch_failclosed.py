@@ -39,6 +39,7 @@ sys.path.insert(0, REPO)
 import killswitch
 importlib.reload(killswitch)
 KS = killswitch
+KS._ensure_state_dir()  # dir creation is lazy (first use), not import
 
 fails = []
 

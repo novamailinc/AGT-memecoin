@@ -26,7 +26,20 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 # restores) is unchanged.
 SHADOW_FILE = os.path.join(STATE_DIR, "state.json.bak")
 LOCK_FILE = os.path.join(STATE_DIR, "state.lock")
-os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def _ensure_state_dir() -> None:
+    """Create STATE_DIR on FIRST USE, never at import.
+
+    Import-time makedirs made `import killswitch` fail outright in any
+    environment where the home path was unwritable (e.g. a test sandbox
+    without FOREX_AGENT_HOME), which is why callers needed a bare-import
+    fallback dance. Deferring keeps the fail-closed contract exactly:
+    a state dir that cannot be created raises here, _load/_lock
+    propagate, and is_halted/gate fail closed on the error - identical
+    to today's outcome, without the import-time side effect.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
 
 # Config per lane: (window_trades, min_trades_before_kill, halt_on_negative)
 CFG = {
@@ -187,6 +200,7 @@ _WARNED_CORRUPT = False
 
 def _load() -> Dict:
     global _WARNED_CORRUPT
+    _ensure_state_dir()
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
@@ -228,6 +242,7 @@ def _lock():
 
     @contextlib.contextmanager
     def _locked():
+        _ensure_state_dir()
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)

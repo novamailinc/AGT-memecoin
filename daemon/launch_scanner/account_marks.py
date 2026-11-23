@@ -128,6 +128,14 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
         logger.warning("account marks: bad snapshot shape: %s",
                        type(e).__name__)
         return {}
+    from daemon.solana_ids import WSOL_MINT
+    for pending in snap.get("pending_sol") or []:
+        qty = pending.get("proceeds_sol")
+        if isinstance(qty, (int, float)) and qty >= 0:
+            wanted.append((pending["lane"], WSOL_MINT, float(qty),
+                           pending["pending_id"], pending["pending_id"]))
+            if WSOL_MINT not in mints:
+                mints.append(WSOL_MINT)
     if not wanted:
         return {}
     try:

@@ -119,7 +119,7 @@ LOCK_FILE = os.path.join(ACCOUNT_DIR, ".lock")
 DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
-_MUTATION_EVENTS = ("debit", "credit", "write_down")
+_MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -842,6 +842,12 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                                   "reason": ev.get("reason")}
                                  if ev.get("instance") is True else {})}
             replayed += 1
+        elif kind in ("pending_sol", "settle_sol"):
+            from daemon.launch_scanner import pending_sol
+            reason = pending_sol.apply(led, ev, __import__(__name__, fromlist=["*"]))
+            if reason:
+                return led, "replay divergence: " + reason
+            replayed += 1
         # The seq advances only for entries actually processed: on
         # a divergence return above it stays BEHIND the offending
         # entry, so the next load sees the divergence again and
@@ -904,6 +910,11 @@ def _derive_buckets_locked(led: Dict[str, Any],
                 return led, ("cash-split migration: write_down "
                              "%s: %s; manual reconciliation "
                              "required" % (ev.get("op_id"), why))
+        elif ev["event"] in ("pending_sol", "settle_sol"):
+            from daemon.launch_scanner import pending_sol
+            reason = pending_sol.apply(gen, ev, __import__(__name__, fromlist=["*"]))
+            if reason:
+                return led, "cash-split migration: " + reason
         else:  # credit
             gst = _lane(gen, lane)
             pos = gst["open"].get(_position_key(gst, mint, ev.get("pos_id")))
@@ -1165,8 +1176,9 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                             % (lane, mint)), None)
         cap = lane_cap()
         if cap is not None:
-            open_basis = sum(_pos_basis(p)
-                             for p in st["open"].values())
+            open_basis = sum(_pos_basis(p) for p in st["open"].values())
+            open_basis += sum(float(p["basis"]) for p in
+                              led.get("pending_sol", {}).values() if p["lane"] == lane)
             if open_basis + stake > cap:
                 return (False, ("lane cap $%.2f would be exceeded "
                                 "($%.2f open + $%.2f new)"
@@ -1502,7 +1514,10 @@ def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:
         fields = ("event", "lane", "mint", "pos_id", "instance")
         fields += {"debit": ("stake", "qty"),
                    "credit": ("proceeds", "fee", "qty", "price_kind", "realized"),
-                   "write_down": ("qty", "reason")}.get(rec.get("event"), ())
+                   "write_down": ("qty", "reason"),
+                   "pending_sol": ("qty", "proceeds_sol", "ticket", "native_basis_sol",
+                                   "sold_at", "fee_sol"),
+                   "settle_sol": ("pending_id", "fx", "proceeds")}.get(rec.get("event"), ())
         if any(event.get(k) != rec.get(k) for k in fields):
             return None, "operation WAL/state parameter disagreement"
         return copy.deepcopy(rec), None
@@ -1642,7 +1657,8 @@ def _view_locked(led: Dict[str, Any],
     exposure = 0.0
     open_positions = []
     for name, st in led.get("lanes", {}).items():
-        basis = 0.0
+        basis = sum(float(p["basis"]) for p in led.get("pending_sol", {}).values()
+                    if p["lane"] == name)
         positions = []
         for mint, p in st.get("open", {}).items():
             pb = _pos_basis(p)
@@ -1659,14 +1675,22 @@ def _view_locked(led: Dict[str, Any],
         exposure += basis
         out_lanes[name] = {
             "open_count": len(st.get("open", {})),
+            "pending_sol_count": sum(p["lane"] == name for p in
+                                     led.get("pending_sol", {}).values()),
             "open_basis": round(basis, 6),
             "realized_pnl": st.get("realized_pnl", 0.0),
             "n_entries": st.get("n_entries", 0),
             "n_closes": st.get("n_closes", 0),
             "positions": positions,
         }
+    # Pending proceeds are SOL holdings, never still-live token inventory.
+    for pending_id, p in led.get("pending_sol", {}).items():
+        open_positions.append((p["lane"], pending_id, p["proceeds_sol"], pending_id))
     cash = float(led["cash"])
     out = {
+        "pending_sol": list(copy.deepcopy(led.get("pending_sol", {})).values()),
+        "pending_sol_basis": round(sum(float(p["basis"]) for p in
+                                       led.get("pending_sol", {}).values()), 6),
         "start_balance": led["start_balance"],
         "cash": round(cash, 6),
         "unresolved": sorted(

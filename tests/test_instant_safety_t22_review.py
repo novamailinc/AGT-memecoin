@@ -114,10 +114,12 @@ check("interest-bearing named and flagged for review (score 90)",
       rep["passed"] and rep["score"] == 90
       and any("interest-bearing" in f and "review" in f
               for f in rep["flags"]))
+# Canonical RPC jsonParsed names (UiExtension camelCase serde,
+# agave account-decoder-client-types token.rs v3.1.8).
 rep = run("named review extensions", make_rpc(
     holders=ONE_HOLDER,
-    extensions=[ext("memoTransfer"), ext("pausable"),
-                ext("scaledUiAmount"),
+    extensions=[ext("memoTransfer"), ext("pausableConfig"),
+                ext("scaledUiAmountConfig"),
                 ext("interestBearingConfig")]))
 check("memo/pausable/scaled/interest named, not generic "
       "unrecognized",
@@ -130,8 +132,28 @@ check("memo/pausable/scaled/interest named, not generic "
 check("named review extensions keep REVIEW class (flag, pass)",
       rep["passed"] and not rep["fails"]
       and rep["instant"]["token2022_extensions"]
-      == ["memoTransfer", "pausable", "scaledUiAmount",
+      == ["memoTransfer", "pausableConfig", "scaledUiAmountConfig",
           "interestBearingConfig"])
+rep = run("decoder-unparseable extension", make_rpc(
+    holders=ONE_HOLDER,
+    extensions=[ext("unparseableExtension")]))
+check("RPC-unparseable extension flagged for review, never silent",
+      rep["passed"] and not rep["fails"]
+      and any("could not parse" in f for f in rep["flags"]))
+rep = run("confidential mint/burn", make_rpc(
+    holders=ONE_HOLDER,
+    extensions=[ext("confidentialMintBurn")]))
+check("confidentialMintBurn named, not unrecognized",
+      rep["passed"]
+      and any("confidential mint/burn" in f for f in rep["flags"]))
+rep = run("mutable fee authority", make_rpc(
+    holders=ONE_HOLDER,
+    extensions=[ext("transferFeeConfig", {
+        "transferFeeConfigAuthority": WALLET,
+        "newerTransferFee": {"transferFeeBasisPoints": 50}})]))
+check("low current fee still flags authority-mutable schedule",
+      rep["passed"] and not rep["fails"]
+      and any("authority-mutable" in f for f in rep["flags"]))
 rep = run("unknown future extension", make_rpc(
     holders=ONE_HOLDER,
     extensions=[ext("quantumTransfer", {})]))

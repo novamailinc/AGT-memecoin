@@ -482,12 +482,15 @@ def _maybe_refresh_registry(now):
     try:
         if now - _last_registry_refresh < REGISTRY_REFRESH_S:
             return
-        _last_registry_refresh = now
         try:
             from daemon.launch_scanner import rugger_registry as _rr
         except Exception:
             import rugger_registry as _rr  # type: ignore
         _rr.refresh()
+        # Stamp AFTER the attempt: a failed attempt (import or
+        # internal failure) must not suppress the next retry for
+        # a whole cadence.
+        _last_registry_refresh = now
     except Exception:
         pass
 
@@ -499,6 +502,8 @@ def _sweep(now):
     if now - _last_sweep < 300:
         return
     _last_sweep = now
+    # Each phase runs in its own guard: an eviction-loop failure
+    # must not skip compaction or the registry refresh.
     try:
         os.makedirs(DOSSIER_DIR, exist_ok=True)
         for fn in os.listdir(DOSSIER_DIR):
@@ -519,8 +524,14 @@ def _sweep(now):
                         os.unlink(p)
             except Exception:
                 continue
+    except Exception:
+        pass
+    try:
         _maybe_compact_archive(now)
-        _maybe_refresh_registry(now)
+    except Exception:
+        pass
+    _maybe_refresh_registry(now)
+    try:
         # Lever 3 (2026-11-16): clean per-mint lock files whose
         # dossier is gone/expired. Only unlink when no builder
         # holds the lock (flock EX|NB succeeds) — a held lock
@@ -812,6 +823,11 @@ def _intel_fields(deployer):
         except Exception:
             import rugger_registry as _rr  # type: ignore
             import funding_clusters as _fc  # type: ignore
+        # Read-path freshness: on a quiet stream the sweep may not
+        # run for a while; the CONSUMER of the advisory record
+        # maintains its own cadence-bound update (same throttle,
+        # advisory only, never raises).
+        _maybe_refresh_registry(time.time())
         try:
             r = _rr.lookup(deployer)
             if r and int(r.get("launches") or 0) > 0:
@@ -820,6 +836,18 @@ def _intel_fields(deployer):
                     "launches": int(r.get("launches") or 0),
                     "dead": int(r.get("dead") or 0),
                 }
+            try:
+                unjoined = int((_rr.stats() or {}).get(
+                    "unjoined_dead_mints") or 0)
+            except Exception:
+                unjoined = 0
+            if unjoined > 0:
+                # Dead-mint evidence exists that NO source could
+                # join to a deployer: the registry is incomplete.
+                # Surface the missingness on every dossier intel
+                # view instead of letting it read as complete.
+                out["registry_incomplete"] = {
+                    "unjoined_dead_mints": unjoined}
         except Exception:
             pass
         try:

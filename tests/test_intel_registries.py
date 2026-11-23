@@ -398,6 +398,10 @@ check("rugger: stats carry the missingness count",
       RR.stats().get("unjoined_dead_mints") == 1)
 check("rugger: joined evidence unaffected by the unjoined mint",
       RR.lookup(DEPA)["dead"] == 3)
+_d = D._intel_fields(DEPA)
+check("intel: missingness surfaced on the dossier intel view",
+      (_d.get("registry_incomplete") or {})
+      .get("unjoined_dead_mints") == 1)
 
 
 print()

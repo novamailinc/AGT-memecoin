@@ -968,7 +968,36 @@ def test_build_path_replay_drives_memory_consumption():
             dossiers._res = real_res
 
 
+def test_registry_refresh_stamps_only_after_success():
+    """A failed refresh attempt must not suppress the retry for a
+    whole cadence (validator lifecycle finding)."""
+    from daemon.launch_scanner import rugger_registry as rr
+    with _Ctx() as c:
+        real_reg = rr.REGISTRY_PATH
+        real_last = dossiers._last_registry_refresh
+        rr.REGISTRY_PATH = os.path.join(c.home, "rugger_registry.json")
+        dossiers._last_registry_refresh = 0.0
+        real_refresh = rr.refresh
+        try:
+            def _boom(*a, **k):
+                raise RuntimeError("forced")
+            rr.refresh = _boom
+            dossiers._maybe_refresh_registry(1000.0)
+            check("lifecycle: failed attempt leaves cadence unstamped",
+                  dossiers._last_registry_refresh == 0.0)
+            rr.refresh = real_refresh
+            dossiers._maybe_refresh_registry(1001.0)
+            check("lifecycle: retry after failure runs immediately",
+                  dossiers._last_registry_refresh == 1001.0
+                  and os.path.exists(rr.REGISTRY_PATH))
+        finally:
+            rr.refresh = real_refresh
+            rr.REGISTRY_PATH = real_reg
+            dossiers._last_registry_refresh = real_last
+
+
 def main():
+    test_registry_refresh_stamps_only_after_success()
     test_build_path_replay_drives_memory_consumption()
     test_sweep_refreshes_registry_on_cadence()
     test_end_to_end_memory_consumed_after_restart()

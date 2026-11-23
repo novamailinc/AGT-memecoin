@@ -1012,7 +1012,26 @@ def _process_bus(out):
 
 # ---- exits (the user's ladder, mirror-identical constants) -----------------
 
-def _close_leg(pos, leg_key, exit_price, reason):
+# Exit price provenance (2026-11-22): additive settlement labels.
+try:
+    from daemon.launch_scanner import exit_provenance as _pk
+except Exception:
+    try:
+        import exit_provenance as _pk  # type: ignore
+    except Exception:
+        _pk = None  # type: ignore
+
+
+def _pkind(reason, pkind=None):
+    """Resolve the exit price kind for one settlement tranche."""
+    if pkind:
+        return pkind
+    if _pk is None:
+        return None
+    return _pk.classify_reason(
+        reason, getattr(_f2, "F2_REASON", None) if _f2 else None)
+
+def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     chain = pos["chain"]
     leg = pos["legs"][leg_key]
@@ -1033,13 +1052,14 @@ def _close_leg(pos, leg_key, exit_price, reason):
     gas_out = _costs.tx_cost_usd(chain, gross)
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
-               realized_usd=round(net, 6), exit_reason=reason)
+               realized_usd=round(net, 6), exit_reason=reason,
+               exit_price_kind=_pkind(reason, pkind))
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key)
     return net
 
 
-def _close_remaining(pos, exit_price, reason):
+def _close_remaining(pos, exit_price, reason, pkind=None):
     """Close all remaining legs as ONE combined exit (one tx cost) —
     same rule as mirror.py (audit 2026-10-18)."""
     chain = pos["chain"]
@@ -1066,7 +1086,8 @@ def _close_remaining(pos, exit_price, reason):
         share = (pos["tokens"] * leg["frac"]) / total_tokens \
             if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
-                   realized_usd=round(net * share, 6), exit_reason=reason)
+                   realized_usd=round(net * share, 6), exit_reason=reason,
+                   exit_price_kind=_pkind(reason, pkind))
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     _pa_settle(pos, total_tokens, gross, gas_out,
                "remaining:%s" % "".join(open_legs))
@@ -1127,7 +1148,8 @@ def _finalize(d, mint, pos, closed_reason):
         "legs": {k: {"done": v["done"],
                      "exit_price": v.get("exit_price", 0),
                      "realized_usd": v.get("realized_usd", 0),
-                     "exit_reason": v.get("exit_reason", "")}
+                     "exit_reason": v.get("exit_reason", ""),
+                     "exit_price_kind": v.get("exit_price_kind")}
                  for k, v in pos["legs"].items()},
         "entry_snapshot": pos["entry_snapshot"],
         "entry_features": pos.get("entry_features", {}),
@@ -1142,6 +1164,10 @@ def _finalize(d, mint, pos, closed_reason):
         "transitions": list(pos.get("transitions") or []),
     }
     rec.update(_peak_fields(pos))
+    rec["exit_price_kind"] = (
+        _pk.aggregate(v.get("exit_price_kind")
+                      for v in pos["legs"].values() if v.get("done"))
+        if _pk is not None else "unknown")
     # F2 stamp (2026-10-23): pos["_f2"] is set ONLY by the F2 exit
     # branch — its presence is the unmistakable marker, copied into
     # the record and the verdict-ledger payload below.

@@ -1313,7 +1313,27 @@ def _scan_once(out, now, feed=None, fetch_gt=True):
 
 # ---- exits (the user's ladder, ceo/mirror-identical constants) ------------
 
-def _close_leg(pos, leg_key, exit_price, reason):
+# Exit price provenance (2026-11-22): additive settlement labels.
+try:
+    from daemon.launch_scanner import exit_provenance as _pk
+except Exception:
+    try:
+        import exit_provenance as _pk  # type: ignore
+    except Exception:
+        _pk = None  # type: ignore
+
+
+def _pkind(reason, pkind=None):
+    """Resolve the exit price kind for one settlement tranche."""
+    if pkind:
+        return pkind
+    if _pk is None:
+        return None
+    return _pk.classify_reason(
+        reason, getattr(_f2, "F2_REASON", None) if _f2 else None)
+
+
+def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     leg = pos["legs"][leg_key]
     if leg["done"]:
@@ -1333,7 +1353,8 @@ def _close_leg(pos, leg_key, exit_price, reason):
     gas_out = _costs.tx_cost_usd(pos["chain"], gross, venue=VENUE)
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
-               realized_usd=round(net, 6), exit_reason=reason)
+               realized_usd=round(net, 6), exit_reason=reason,
+               exit_price_kind=_pkind(reason, pkind))
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     return net
 
@@ -1366,6 +1387,10 @@ def _close_twap_slice(pos, exit_price):
     gas_out = _costs.tx_cost_usd(pos["chain"], gross, venue=VENUE)
     net = gross - gas_out
     tw["done"] += 1
+    if _pk is not None:
+        _pks = set(tw.get("price_kinds") or [])
+        _pks.add(_pk.CURRENT)
+        tw["price_kinds"] = sorted(_pks)
     tw["sold_tokens"] = round(tw["sold_tokens"] + slice_tokens, 6)
     tw["sold_usd"] = round(tw["sold_usd"] + net, 6)
     tw["last_exit_price"] = filled_exit
@@ -1373,7 +1398,7 @@ def _close_twap_slice(pos, exit_price):
     return net
 
 
-def _close_remaining(pos, exit_price, reason):
+def _close_remaining(pos, exit_price, reason, pkind=None):
     """Close all remaining legs as ONE combined exit (one tx cost) —
     same rule as ceo.py/mirror.py."""
     if pos.get("twap") is not None:
@@ -1398,7 +1423,12 @@ def _close_remaining(pos, exit_price, reason):
         tw["remainder"] = {"tokens": round(remaining, 6),
                            "exit_price": filled_exit,
                            "realized_usd": round(net, 6),
-                           "exit_reason": reason}
+                           "exit_reason": reason,
+                           "exit_price_kind": _pkind(reason, pkind)}
+        if _pk is not None:
+            _pks = set(tw.get("price_kinds") or [])
+            _pks.add(tw["remainder"]["exit_price_kind"])
+            tw["price_kinds"] = sorted(_pks)
         pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
         return net
     open_legs = [k for k in ("a", "b", "c") if not pos["legs"][k]["done"]]
@@ -1423,7 +1453,8 @@ def _close_remaining(pos, exit_price, reason):
         share = (pos["tokens"] * leg["frac"]) / total_tokens \
             if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
-                   realized_usd=round(net * share, 6), exit_reason=reason)
+                   realized_usd=round(net * share, 6), exit_reason=reason,
+                   exit_price_kind=_pkind(reason, pkind))
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     return net
 
@@ -1549,7 +1580,8 @@ def _finalize(d, mint, pos, closed_reason):
         "legs": {k: {"done": v["done"],
                      "exit_price": v.get("exit_price", 0),
                      "realized_usd": v.get("realized_usd", 0),
-                     "exit_reason": v.get("exit_reason", "")}
+                     "exit_reason": v.get("exit_reason", ""),
+                     "exit_price_kind": v.get("exit_price_kind")}
                  for k, v in pos["legs"].items()},
         "entry_snapshot": pos["entry_snapshot"],
         "entry_features": pos.get("entry_features", {}),
@@ -1572,6 +1604,11 @@ def _finalize(d, mint, pos, closed_reason):
         rec["legs"] = {}
         rec["twap"] = dict(pos["twap"])
     rec.update(_peak_fields(pos))
+    _pkinds = [v.get("exit_price_kind")
+               for v in pos["legs"].values() if v.get("done")]
+    _pkinds += list((pos.get("twap") or {}).get("price_kinds") or [])
+    rec["exit_price_kind"] = (_pk.aggregate(_pkinds)
+                              if _pk is not None else "unknown")
     # F2 stamp (2026-10-23): pos["_f2"] is set ONLY by the F2 exit
     # branch, immediately before _close_remaining/_finalize — its
     # presence is the unmistakable marker. Copied into the close
@@ -1746,7 +1783,10 @@ def poll_time_exits():
                                   if reason.startswith("twap")
                                   else "time_stop_24h_unquotable")
                         pos["last_price_source"] = "unquotable"
-                    _close_remaining(pos, px, reason)
+                    _close_remaining(
+                        pos, px, reason,
+                        pkind=((_pk.STALE if px > 0 else _pk.WRITEDOWN)
+                               if _pk is not None else None))
                     closes.append(_finalize(d, mint, pos, reason))
                 except Exception as e:
                     logger.warning("grad poll_time_exits %s failed: "

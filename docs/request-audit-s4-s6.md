@@ -182,22 +182,33 @@ Items marked FIXED name the landing commit.
   every result carries last_observed_ts + observed_age_s, no imposed freshness
   policy) and pool migration (causal: baselines use ONLY pre-transition samples,
   post-transition state is the LATEST observation so drained-then-recovered is a
-  labeled conflict; markers bind to one transition only within a time tolerance;
-  provenance explicit > inferred_from_reserves > unrecorded/unknown - pool
-  appearance alone is never canonical proof and absent evidence fails unknown,
-  not inference). All ratios/windows are UNVALIDATED ADVISORY HEURISTICS, labeled
+  labeled conflict; a marker proves a transition only when it names the target
+  pool (migration_to) or when exactly ONE transition sits within its tolerance -
+  a bare marker near two transitions is ambiguous and binds neither, unknown
+  never guessed; provenance explicit > inferred_from_reserves >
+  unrecorded/unknown - pool appearance alone is never canonical proof and
+  absent evidence fails unknown, not inference). All ratios/windows are UNVALIDATED ADVISORY HEURISTICS, labeled
   in every result; no trading threshold approval exists or is claimed. Runtime
   wiring: armed_watch records a snapshot from each vault resolution it ALREADY
   performs (arming + reconnect reconcile) AND from websocket accountNotification
   pushes (identity from the watcher's own subscription map, raw units identical
   to resolve_vaults, arrival time; both sides required with per-side observation
-  ts, an unobserved side is unrecorded never zero-filled) - no new RPC, no added
-  polling, cadence unchanged, monitor failure can never break the watch loop
-  (negative test). BOUNDARY: detection output is advisory surface only; no gate,
+  ts and pair_skew_s exposed, never freshness-qualified; an unobserved side is
+  unrecorded never zero-filled). Subscriptions capture pool + armed-identity
+  GENERATION at subscribe time: a delayed notification from an older identity is
+  discarded and counted (stale_sub_drops), never stored against a newer pool or
+  paired with a newer other side; set_positions purges cached amounts whose
+  pool/vault identity changed (exit price policy untouched). Meta sidecar
+  corruption is isolated: non-int counter values are labeled meta_corrupt,
+  propagated as partial in every result, and reset-and-counted on the next
+  write - never coerced into plausible counts and never crashing a read -
+  no new RPC, no added polling, cadence unchanged, monitor failure can never
+  break the watch loop (negative test). BOUNDARY: detection output is advisory surface only; no gate,
   score, entry, or exit reads it, and continuous COVERAGE is bounded by armed
-  positions (tests test_reserve_monitor.py, 28 checks incl. push-notification
-  fixtures, causality probes, wiring + negative tests; armed_watch guard suite
-  unchanged green).
+  positions (tests test_reserve_monitor.py, 34 checks incl. push-notification
+  fixtures, stale-generation/position-change probes, marker ambiguity probes,
+  corrupt-sidecar probes, causality probes, wiring + negative tests;
+  armed_watch guard suite unchanged green).
 - 6.3 Wallet intelligence: see 4.2 + insiders.py, holder_tracker.py, holder_quality.py,
   dust_holders.py, anticrowd.py, funding_clusters.py.
 - 6.4 Trading intelligence: IMPLEMENTED — momentum.py, smartgrade.py, fusion.py

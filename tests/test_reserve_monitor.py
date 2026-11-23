@@ -253,6 +253,73 @@ class ReserveMonitorTest(unittest.TestCase):
             POOL_A, MINT, self.t0, 1.0, 2.0,
             base_ts=float("nan"), home=self.home))
 
+    def test_bare_marker_near_two_transitions_binds_neither(self):
+        POOL_C = "PoolCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        self._snap(2, pool=POOL_A, start=self.t0)
+        # Bare marker (no target identity) on B, within tolerance of
+        # BOTH the A->B and B->C anchors: ambiguous, binds neither.
+        self._snap(1, pool=POOL_B, start=self.t0 + 500.0,
+                   migration_event="graduation")
+        self._snap(1, pool=POOL_C, start=self.t0 + 900.0)
+        self.assertTrue(rm.record_snapshot(
+            POOL_B, MINT, self.t0 + 1200.0, 10.0, 95.0,
+            home=self.home))
+        self.assertTrue(rm.record_snapshot(
+            POOL_C, MINT, self.t0 + 1300.0, 10.0, 90.0,
+            home=self.home))
+        out = rm.detect_migration(MINT, home=self.home)
+        for tr in out["transitions"]:
+            self.assertNotEqual(tr["provenance"], "explicit",
+                                tr)
+
+    def test_marker_with_target_identity_binds_named_transition(self):
+        POOL_C = "PoolCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        self._snap(2, pool=POOL_A, start=self.t0)
+        self._snap(1, pool=POOL_B, start=self.t0 + 500.0)
+        self._snap(1, pool=POOL_C, start=self.t0 + 900.0)
+        # Marker names the B->C target explicitly.
+        self.assertTrue(rm.record_snapshot(
+            POOL_B, MINT, self.t0 + 950.0, 10.0, 1.0,
+            migration_event="graduation", migration_to=POOL_C,
+            home=self.home))
+        out = rm.detect_migration(MINT, home=self.home)
+        trs = {(t["from_pool"], t["to_pool"]): t
+               for t in out["transitions"]}
+        self.assertEqual(trs[(POOL_B, POOL_C)]["provenance"],
+                         "explicit")
+        self.assertNotEqual(trs[(POOL_A, POOL_B)]["provenance"],
+                            "explicit")
+
+    def test_corrupt_sidecar_isolated_never_crashes_reads(self):
+        self._snap(3)
+        rm._meta_file(self.home).write_text(json.dumps({
+            "samples_dropped_by_cap": "many",
+            "torn_tail_repairs": None,
+            "compaction_dropped_unreadable": True}))
+        hist = rm.pool_history(POOL_A, home=self.home)
+        self.assertEqual(hist["status"], "ok")
+        self.assertTrue(hist["retention"]["meta_corrupt"])
+        self.assertTrue(hist["retention"]["partial"])
+        abn = rm.detect_abnormal(POOL_A, home=self.home)
+        self.assertTrue(abn["retention"]["meta_corrupt"])
+        mig = rm.detect_migration(MINT, home=self.home)
+        self.assertTrue(mig["retention"]["meta_corrupt"])
+        # A later write resets the corrupt value, never propagates.
+        rm._meta_bump("snapshots_recorded", home=self.home)
+        meta = rm._meta_read(self.home)
+        self.assertIsInstance(meta.get("samples_dropped_by_cap"),
+                              int)
+
+    def test_torn_repair_marks_retention_partial(self):
+        self._snap(2)
+        with open(rm._file(self.home), "a") as f:
+            f.write('{"v": 1, "record_type": "reserve_snap')
+        self._snap(1)
+        hist = rm.pool_history(POOL_A, home=self.home)
+        self.assertTrue(hist["retention"]["partial"])
+        self.assertEqual(
+            hist["retention"]["torn_tail_repairs_total"], 1)
+
     def test_no_history_for_mint_is_no_history(self):
         self._snap(3, pool=POOL_A, mint="OtherMintXXXXXXXXXXXXXXXXXXXXX")
         out = rm.detect_migration(MINT, home=self.home)
@@ -397,8 +464,8 @@ class ArmedWatchWiringTest(unittest.TestCase):
         from daemon.launch_scanner import reserve_monitor as rmod
         w = aw.ArmedWatcher(lambda *a, **k: None)
         w._want[MINT] = {"pool": POOL_A, "decimals": 6}
-        w._subs[11] = (MINT, "base")
-        w._subs[22] = (MINT, "quote")
+        w._subs[11] = (MINT, "base", POOL_A, w._generation)
+        w._subs[22] = (MINT, "quote", POOL_A, w._generation)
         # One side only: unobserved side is unrecorded, never zero.
         w._handle(None, self._push_msg(11, 1000))
         hist = rmod.pool_history(POOL_A, home=self.tmp)
@@ -413,6 +480,66 @@ class ArmedWatchWiringTest(unittest.TestCase):
         self.assertEqual(s["decimals"], 6)
         # Per-side observation times recorded; base side is older.
         self.assertLess(s["base_ts"], s["quote_ts"])
+        self.assertIn("pair_skew_s", s)
+
+    def test_stale_generation_push_discarded_position_change(self):
+        from unittest.mock import patch
+        from daemon.launch_scanner import armed_watch as aw
+        from daemon.launch_scanner import reserve_monitor as rmod
+        POOL_NEW = "PoolNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN"
+        vaults_a = {"base_vault": "BV1", "quote_vault": "QV1",
+                    "base_amount": 1.0, "quote_amount": 2.0,
+                    "quote_virtual": 0}
+        vaults_new = {"base_vault": "BV2", "quote_vault": "QV2",
+                      "base_amount": 3.0, "quote_amount": 4.0,
+                      "quote_virtual": 0}
+        w = aw.ArmedWatcher(lambda *a, **k: None)
+        with patch.object(aw._res, "resolve_vaults",
+                          return_value=vaults_a), \
+                patch.object(aw._res, "mint_decimals", return_value=6):
+            w.set_positions({MINT: {"pair": POOL_A}})
+        gen1 = w._generation
+        # Old subscription captured under generation 1.
+        w._subs[11] = (MINT, "base", POOL_A, gen1)
+        # Position changes to a different pool: new generation.
+        with patch.object(aw._res, "resolve_vaults",
+                          return_value=vaults_new), \
+                patch.object(aw._res, "mint_decimals", return_value=6):
+            w.set_positions({MINT: {"pair": POOL_NEW}})
+        self.assertGreater(w._generation, gen1)
+        # Cached amounts for the old pool identity are purged, and
+        # the fresh resolve re-seeded them under the new identity.
+        self.assertEqual(w._amounts[MINT]["base"], 3.0)
+        drops_before = w._stale_sub_drops
+        # Delayed notification on the OLD subscription: discarded,
+        # never stored against the new pool or paired with the new
+        # other side.
+        w._handle(None, self._push_msg(11, 999999))
+        self.assertEqual(w._stale_sub_drops, drops_before + 1)
+        self.assertEqual(w._amounts[MINT]["base"], 3.0)
+        hist = rmod.pool_history(POOL_NEW, home=self.tmp)
+        self.assertNotIn(999999.0,
+                         [s["base_amount"] for s in hist["samples"]])
+
+    def test_same_identity_rearm_keeps_generation(self):
+        from unittest.mock import patch
+        from daemon.launch_scanner import armed_watch as aw
+        vaults = {"base_vault": "BV1", "quote_vault": "QV1",
+                  "base_amount": 1.0, "quote_amount": 2.0,
+                  "quote_virtual": 0}
+        w = aw.ArmedWatcher(lambda *a, **k: None)
+        with patch.object(aw._res, "resolve_vaults",
+                          return_value=vaults), \
+                patch.object(aw._res, "mint_decimals", return_value=6):
+            w.set_positions({MINT: {"pair": POOL_A}})
+            gen1 = w._generation
+            # Re-arm with the SAME identity (reconnect path): want
+            # unchanged, generation stable, pushes still accepted.
+            w.set_positions({MINT: {"pair": POOL_A}})
+            self.assertEqual(w._generation, gen1)
+        w._subs[11] = (MINT, "base", POOL_A, gen1)
+        w._handle(None, self._push_msg(11, 4242))
+        self.assertEqual(w._amounts[MINT]["base"], 4242)
 
     def test_monitor_failure_never_breaks_watch_loop(self):
         from unittest.mock import patch

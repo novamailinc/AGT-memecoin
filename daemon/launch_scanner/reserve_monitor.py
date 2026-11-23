@@ -147,13 +147,37 @@ def _meta_write(meta: Dict[str, Any], home: Optional[str] = None) -> None:
         pass
 
 
+def _meta_int(meta: Dict[str, Any], key: str) -> Any:
+    """Clean non-bool int from the sidecar, else None (corrupt value:
+    isolated by the caller, never coerced into a plausible count and
+    never allowed to crash a read)."""
+    v = meta.get(key)
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+        return v
+    if v is None:
+        return 0
+    return None
+
+
 def _meta_bump(key: str, n: int = 1, home: Optional[str] = None) -> None:
     """Increment a persistent meta counter under the lock. Best-effort;
-    never raises. Caller must already hold the lock OR accept the tiny
-    race on a diagnostic counter."""
+    never raises. A corrupt stored value is reset to the increment and
+    counted, never propagated."""
     try:
         meta = _meta_read(home)
-        meta[key] = int(meta.get(key) or 0) + n
+        # Any corrupt stored counter is reset and counted, never
+        # propagated or coerced into a plausible count.
+        resets = 0
+        for k in list(meta):
+            if k == "meta_values_reset":
+                continue
+            if _meta_int(meta, k) is None:
+                meta[k] = 0
+                resets += 1
+        if resets:
+            meta["meta_values_reset"] = (
+                _meta_int(meta, "meta_values_reset") or 0) + resets
+        meta[key] = (_meta_int(meta, key) or 0) + n
         _meta_write(meta, home)
     except Exception:
         pass
@@ -186,6 +210,7 @@ def _valid_amounts(base: Any, quote: Any) -> bool:
 def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
                     quote_amount: Any, source: str = "caller",
                     migration_event: Optional[str] = None,
+                    migration_to: Optional[str] = None,
                     quote_mint: Optional[str] = None,
                     decimals: Optional[int] = None,
                     slot: Optional[int] = None,
@@ -204,8 +229,11 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
     whole record - half-grounded context is worse than none.
 
     migration_event: optional caller-supplied marker (e.g.
-    "pumpswap_graduation"). It binds only to a transition anchored
-    within _MARKER_TOLERANCE_S of this snapshot's ts on this pool."""
+    "pumpswap_graduation"). A marker proves a transition only when it
+    also names the target pool via migration_to, or when exactly ONE
+    transition for this mint sits within the marker tolerance - a
+    bare marker near several transitions is ambiguous and binds none
+    (unknown, never guessed)."""
     if not isinstance(pool, str) or not pool:
         _meta_bump("snapshots_rejected_invalid", home=home)
         return False
@@ -237,6 +265,8 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
            "quote_amount": float(quote_amount), "source": source}
     if migration_event:
         rec["migration_event"] = str(migration_event)[:64]
+    if migration_to:
+        rec["migration_to"] = str(migration_to)[:64]
     if quote_mint:
         rec["quote_mint"] = quote_mint
     if decimals is not None:
@@ -247,6 +277,10 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
         rec["base_ts"] = float(base_ts)
     if quote_ts is not None:
         rec["quote_ts"] = float(quote_ts)
+    if base_ts is not None and quote_ts is not None:
+        # Skew exposed, never freshness-qualified: the consumer
+        # judges whether the pair is fresh enough for its purpose.
+        rec["pair_skew_s"] = abs(float(base_ts) - float(quote_ts))
     line = json.dumps(rec) + "\n"
     try:
         with _lock(home):
@@ -302,8 +336,11 @@ def _read_records(home: Optional[str] = None):
 
 
 def _compact_if_needed(home: Optional[str] = None) -> None:
-    """Bound the file: per-pool newest _MAX_SAMPLES_PER_POOL samples
-    and a hard byte cap. Dropped samples are counted, never silent.
+    """Bound growth: per-pool newest _MAX_SAMPLES_PER_POOL samples,
+    applied when the byte-cap trigger fires compaction. Neither is a
+    hard bound - many pools can keep the file past the byte cap, and
+    a pool's sample count is bounded only at compaction time.
+    Dropped samples are counted, never silent.
     Caller holds the lock."""
     p = _file(home)
     try:
@@ -354,19 +391,30 @@ def _retention(home: Optional[str] = None,
                unreadable_this_read: int = 0) -> Dict[str, Any]:
     """Retention/corruption provenance propagated into EVERY result:
     cumulative sidecar counters plus this read's unreadable lines.
-    partial=True whenever any history was ever dropped or unreadable,
-    so no consumer can read a compacted/corrupted history as clean."""
-    meta = _meta_read(home)
-    dropped_samples = int(meta.get("samples_dropped_by_cap") or 0)
-    dropped_unreadable = int(
-        meta.get("compaction_dropped_unreadable") or 0)
-    torn = int(meta.get("torn_tail_repairs") or 0)
+    partial=True whenever any history was ever dropped, unreadable,
+    torn, or the sidecar itself held corrupt values - no consumer can
+    read a damaged history as clean. Never raises on a corrupt
+    sidecar: corrupt values are isolated and labeled, not coerced."""
+    try:
+        meta = _meta_read(home)
+    except Exception:
+        meta = {}
+    dropped_samples = _meta_int(meta, "samples_dropped_by_cap")
+    dropped_unreadable = _meta_int(meta, "compaction_dropped_unreadable")
+    torn = _meta_int(meta, "torn_tail_repairs")
+    resets = _meta_int(meta, "meta_values_reset")
+    corrupt = any(v is None for v in (
+        dropped_samples, dropped_unreadable, torn, resets))
+    dropped_samples = dropped_samples or 0
+    dropped_unreadable = dropped_unreadable or 0
+    torn = torn or 0
     return {"unreadable_this_read": unreadable_this_read,
             "samples_dropped_by_cap_total": dropped_samples,
             "compaction_dropped_unreadable_total": dropped_unreadable,
             "torn_tail_repairs_total": torn,
+            "meta_corrupt": corrupt,
             "partial": bool(dropped_samples or dropped_unreadable
-                            or unreadable_this_read)}
+                            or torn or unreadable_this_read or corrupt)}
 
 
 def pool_history(pool: str, home: Optional[str] = None) -> Dict[str, Any]:
@@ -459,14 +507,32 @@ def detect_abnormal(pool: str, home: Optional[str] = None,
             "retention": retention}
 
 
-def _marker_binds(recs: List[Dict[str, Any]], anchor: float) -> bool:
-    """A migration marker binds to a transition only when it sits on
-    one of the two pools involved, within the tolerance of the
-    transition anchor. A marker elsewhere in time never launders an
-    earlier or later transition."""
-    return any(r.get("migration_event")
-               and abs(r["ts"] - anchor) <= _MARKER_TOLERANCE_S
-               for r in recs)
+def _explicit_transitions(pairs, by_pool, first_ts):
+    """Indices of transitions proven by a migration marker.
+
+    A marker with migration_to binds the ONE transition whose target
+    pool it names (and only when it sits on one of the two pools
+    involved, within the tolerance of the anchor). A marker WITHOUT
+    target identity binds only when exactly one transition for this
+    mint is within tolerance of its ts on its own pool - near two
+    transitions it is ambiguous and binds neither."""
+    explicit = set()
+    for i, (old, new) in enumerate(pairs):
+        anchor = first_ts[new]
+        for r in by_pool[old] + by_pool[new]:
+            if (r.get("migration_event")
+                    and r.get("migration_to") == new
+                    and abs(r["ts"] - anchor) <= _MARKER_TOLERANCE_S):
+                explicit.add(i)
+    markers = [(p, r) for p, recs in by_pool.items() for r in recs
+               if r.get("migration_event") and not r.get("migration_to")]
+    for pool, r in markers:
+        cand = [i for i, (old, new) in enumerate(pairs)
+                if pool in (old, new)
+                and abs(r["ts"] - first_ts[new]) <= _MARKER_TOLERANCE_S]
+        if len(cand) == 1:
+            explicit.add(cand[0])
+    return explicit
 
 
 def detect_migration(mint: str, home: Optional[str] = None,
@@ -495,12 +561,13 @@ def detect_migration(mint: str, home: Optional[str] = None,
         recs.sort(key=lambda r: r["ts"])
     first_ts = {p: recs[0]["ts"] for p, recs in by_pool.items()}
     pools_by_appearance = sorted(by_pool, key=lambda p: first_ts[p])
+    pairs = list(zip(pools_by_appearance, pools_by_appearance[1:]))
+    explicit_idx = _explicit_transitions(pairs, by_pool, first_ts)
     transitions = []
-    for old, new in zip(pools_by_appearance, pools_by_appearance[1:]):
+    for idx, (old, new) in enumerate(pairs):
         old_recs, new_recs = by_pool[old], by_pool[new]
         anchor = first_ts[new]
-        explicit = (_marker_binds(old_recs, anchor)
-                    or _marker_binds(new_recs, anchor))
+        explicit = idx in explicit_idx
         # Causal baseline: pre-transition samples only. No baseline
         # means no inference at all - unknown, not guessed.
         baseline = [r for r in old_recs if r["ts"] < anchor]

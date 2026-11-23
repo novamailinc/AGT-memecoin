@@ -193,9 +193,14 @@ class ArmedWatcher:
         self._thread = None
         self._want = {}        # mint -> {"pool","decimals"}
         self._vault_cache = {}  # pool -> vaults (resolution is stable)
-        self._subs = {}        # subid -> (mint, role)
-        self._pending = {}     # request id -> (mint, role)
+        self._subs = {}        # subid -> (mint, role, pool, generation)
+        self._pending = {}     # request id -> (mint, role, pool, gen)
         self._amounts = {}     # mint -> {"base": int, "quote": int}
+        self._generation = 0   # armed-identity generation; a
+                               # notification captured under an older
+                               # generation is discarded, never
+                               # stored against the new pool
+        self._stale_sub_drops = 0
         self._last_px = {}     # mint -> last emitted price
         self._state = "STALE"
         self._last_msg_ts = 0.0
@@ -237,6 +242,7 @@ class ArmedWatcher:
         set. Vault resolutions are cached on the pos dict itself
         (pos['pool_vaults']) when the caller passes live dicts."""
         want = {}
+        fresh_amounts = {}
         for mint, pos in (positions or {}).items():
             try:
                 pool = str(pos.get("pair") or "")
@@ -264,13 +270,13 @@ class ArmedWatcher:
                         pos["pool_vaults"] = vaults
                     except Exception:
                         pass
-                    with self._lock:
-                        self._amounts[mint] = {
-                            "base": v["base_amount"],
-                            "quote": v["quote_amount"],
-                            "ts": time.time(),
-                            "base_ts": time.time(),
-                            "quote_ts": time.time()}
+                    now_cap = time.time()
+                    fresh_amounts[mint] = {
+                        "base": v["base_amount"],
+                        "quote": v["quote_amount"],
+                        "ts": now_cap,
+                        "base_ts": now_cap,
+                        "quote_ts": now_cap}
                     # decimals unrecorded here: mint_decimals runs
                     # below when the armed entry is built; the
                     # snapshot never blocks on it.
@@ -283,8 +289,28 @@ class ArmedWatcher:
                 continue
         with self._lock:
             if want != self._want:
+                old = self._want
                 self._want = want
+                # A new armed identity is a new generation: amounts
+                # cached against a pool/vault identity that changed
+                # (or vanished) are purged, never paired with the
+                # new pool; old-generation notifications are dropped
+                # by the generation check in _handle.
+                self._generation += 1
+                for m in list(self._amounts):
+                    if m in fresh_amounts:
+                        continue
+                    w_old, w_new = old.get(m), want.get(m)
+                    if (not w_old or not w_new
+                            or w_new.get("pool") != w_old.get("pool")
+                            or w_new.get("base_vault")
+                            != w_old.get("base_vault")
+                            or w_new.get("quote_vault")
+                            != w_old.get("quote_vault")):
+                        self._amounts.pop(m, None)
                 self._dirty.set()
+            for m, a in fresh_amounts.items():
+                self._amounts[m] = a
 
     # -- internals ------------------------------------------------------
 
@@ -485,15 +511,20 @@ class ArmedWatcher:
                 pass
 
     def _subscribe_all(self, ws):
+        rid = int(time.time() * 1000) % 100000
         with self._lock:
             want = dict(self._want)
+            gen = self._generation
             self._subs = {}
-        rid = int(time.time() * 1000) % 100000
         for mint, w in want.items():
             for role, vault in (("base", w["base_vault"]),
                                 ("quote", w["quote_vault"])):
                 rid += 1
-                self._pending[rid] = (mint, role)
+                # Identity bound at capture time: pool and generation
+                # travel with the subscription, so a delayed
+                # notification can never be stored against a newer
+                # armed identity.
+                self._pending[rid] = (mint, role, w["pool"], gen)
                 ws.send_text(json.dumps({
                     "jsonrpc": "2.0", "id": rid,
                     "method": "accountSubscribe",
@@ -528,7 +559,13 @@ class ArmedWatcher:
                 key = self._subs.get(sub)
                 if not key:
                     return
-                mint, role = key
+                mint, role, pool, gen = key
+                if gen != self._generation:
+                    # Delayed notification from an older armed
+                    # identity: discarded, never stored against the
+                    # new pool or paired with a newer other side.
+                    self._stale_sub_drops += 1
+                    return
                 now = time.time()
                 amt = self._amounts.setdefault(
                     mint, {"base": 0, "quote": 0, "ts": 0.0,
@@ -537,15 +574,13 @@ class ArmedWatcher:
                 amt[role + "_ts"] = now
                 amt["ts"] = now
                 amt_snap = dict(amt)
-                pool = (self._want.get(mint) or {}).get("pool")
                 dec = (self._want.get(mint) or {}).get("decimals")
                 base, quote = amt.get("base"), amt.get("quote")
-            if pool:
-                _record_push_snapshot(
-                    pool, mint, amt_snap,
-                    quote_mint=(self._vault_cache.get(pool) or {})
-                    .get("quote_mint"),
-                    decimals=dec)
+            _record_push_snapshot(
+                pool, mint, amt_snap,
+                quote_mint=(self._vault_cache.get(pool) or {})
+                .get("quote_mint"),
+                decimals=dec)
             quote_mint_px = ((self._vault_cache.get(
                 (self._want.get(mint) or {}).get("pool") or "")
                 or {}).get("quote_mint"))
@@ -580,10 +615,11 @@ class ArmedWatcher:
                 _record_reserve_snapshot(w["pool"], mint, v,
                                          decimals=w.get("decimals"))
                 with self._lock:
+                    now_rec = time.time()
                     self._amounts[mint] = {
                         "base": v["base_amount"],
-                        "quote": v["quote_amount"], "ts": time.time(),
-                        "base_ts": time.time(), "quote_ts": time.time()}
+                        "quote": v["quote_amount"], "ts": now_rec,
+                        "base_ts": now_rec, "quote_ts": now_rec}
                     old = float(self._last_px.get(mint) or 0)
                 px = _res.amounts_price(v["base_amount"],
                                         v["quote_effective"],

@@ -3429,13 +3429,30 @@ class LaunchScanner(Daemon):
             mint = cand.get("mint") or ""
             snaps = []
             tr = getattr(self, "_fp_tracker", None)
-            series = getattr(tr, "_series", {}).get(mint) if tr else None
+            series = None
+            window_only = False
+            if tr is not None:
+                # Audit F3: prefer the durable full-series journal; the
+                # in-memory deque (truncated to fp_window_polls) is the
+                # fallback and marks the record window-truncated.
+                journaled = getattr(tr, "journal_series", None)
+                if callable(journaled):
+                    series = journaled(mint, now)
+                if not series:
+                    series = getattr(tr, "_series", {}).get(mint)
+                    window_only = bool(series)
             if series:
                 for o in series:
                     snaps.append({
                         "t": o[0], "mcap_usd": o[1], "price_usd": o[2],
                         "vol5m_usd": o[3], "buys5m": int(o[4]),
                         "sells5m": int(o[5]), "liq_usd": o[6]})
+            # Window-truncation label (irrecoverable historical gap):
+            # the first retained snapshot postdates first detection.
+            first_ts = float(cand.get("first_ts") or 0)
+            truncated = bool(snaps) and (
+                window_only or (first_ts > 0
+                                and float(snaps[0]["t"]) > first_ts + 1.0))
             saf = cand.get("safety") or {}
             if verdict == "confirm":
                 first = float(cand.get("first_mcap") or 0)
@@ -3457,6 +3474,11 @@ class LaunchScanner(Daemon):
                 # None = unknown -> timestamp-correct replay marks the
                 # record explicitly ineligible; never backfilled.
                 "safety_eval_t": cand.get("safety_eval_t"),
+                # Audit F3: True when the snapshots come from the
+                # truncated in-memory window or start after first
+                # detection - the missing earlier observations are
+                # IRRECOVERABLE, never reconstructed.
+                "window_truncated": truncated,
                 "mint": mint, "symbol": cand.get("symbol") or "",
                 "chain": cand.get("chain") or "",
                 "source": cand.get("source") or "",

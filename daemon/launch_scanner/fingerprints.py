@@ -26,6 +26,7 @@ signal, and capped so one crazy poll can't max the score alone.
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -34,6 +35,19 @@ _RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
 
 # Hard cap on tracked mints so daemon state stays small.
 MAX_TRACKED = 500
+
+# Durable series journal (2026-11-23, Stage A audit F3): every
+# observation is ALSO appended to a bounded jsonl journal so backtest
+# records can carry the FULL series from detection, not the truncated
+# in-memory deque. Bounded: entries older than the retention window
+# are compacted away; compaction runs at most every _COMPACT_EVERY
+# appends and only when the file exceeds _COMPACT_MIN_BYTES. Historical
+# data recorded before the journal existed is window-truncated and
+# irrecoverable - records flag it, never reconstruct it.
+_JOURNAL_RETENTION_S = 6 * 3600.0
+_COMPACT_EVERY = 256
+_COMPACT_MIN_BYTES = 1_000_000
+_JOURNAL_DEFAULT = "~/.forex-agent/launch_scanner/fp_series_journal.jsonl"
 
 
 def _f(value: Any) -> float:
@@ -75,6 +89,15 @@ class FingerprintTracker:
         self.max_age_s = 3600.0
         self._series: Dict[str, Deque[Tuple[float, ...]]] = {}
         # obs tuple: (ts, mcap, price, vol_m5, buys, sells, liq, holders|None)
+        # Durable full-series journal (audit F3). Never raises.
+        self._journal_enabled = bool(
+            getattr(cfg, "fp_series_journal_enabled", True))
+        self._journal_path = os.path.expanduser(str(
+            getattr(cfg, "fp_series_journal_path", _JOURNAL_DEFAULT)))
+        self._journal_retention_s = float(
+            getattr(cfg, "fp_series_journal_retention_s",
+                    _JOURNAL_RETENTION_S))
+        self._journal_appends = 0
 
     # -- state hygiene ------------------------------------------------
     def prune(self, now: float) -> None:
@@ -99,12 +122,93 @@ class FingerprintTracker:
         q = self._series.get(mint)
         if q is None:
             q = self._series[mint] = deque(maxlen=self.window)
-        q.append((float(now), _f(stats.get("usd_market_cap")),
-                  _f(stats.get("price_usd")), _f(stats.get("vol_m5")),
-                  float(stats.get("buys_m5") or 0),
-                  float(stats.get("sells_m5") or 0),
-                  _f(stats.get("usd_liquidity")),
-                  float(holders) if holders else None))
+        obs = (float(now), _f(stats.get("usd_market_cap")),
+               _f(stats.get("price_usd")), _f(stats.get("vol_m5")),
+               float(stats.get("buys_m5") or 0),
+               float(stats.get("sells_m5") or 0),
+               _f(stats.get("usd_liquidity")),
+               float(holders) if holders else None)
+        q.append(obs)
+        self._journal_append(mint, obs)
+
+    # -- durable full-series journal (audit F3) ------------------------
+    def _journal_append(self, mint: str, obs: Tuple[float, ...]) -> None:
+        """Append one observation to the durable journal. Crash-safe:
+        never raises; journal trouble never affects live tracking."""
+        if not self._journal_enabled:
+            return
+        try:
+            parent = os.path.dirname(self._journal_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self._journal_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"mint": mint, "obs": list(obs)})
+                         + "\n")
+            self._journal_appends += 1
+            if self._journal_appends % _COMPACT_EVERY == 0:
+                self._journal_compact(obs[0])
+        except Exception:
+            pass
+
+    def _journal_compact(self, now: float) -> None:
+        """Drop entries older than the retention window (bounded
+        durable storage). Never raises."""
+        try:
+            if not os.path.exists(self._journal_path):
+                return
+            if os.path.getsize(self._journal_path) < _COMPACT_MIN_BYTES:
+                return
+            cutoff = float(now) - self._journal_retention_s
+            kept: List[str] = []
+            with open(self._journal_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if _f((rec.get("obs") or [0])[0]) >= cutoff:
+                            kept.append(line)
+                    except Exception:
+                        continue  # malformed line: drop on compaction
+            tmp = self._journal_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(kept) + ("\n" if kept else ""))
+            os.replace(tmp, self._journal_path)
+        except Exception:
+            pass
+
+    def journal_series(self, mint: str,
+                       now: Optional[float] = None
+                       ) -> Optional[List[Tuple[float, ...]]]:
+        """Full journaled series for one mint (oldest first), or None
+        when the journal is disabled/unavailable/has nothing - callers
+        then fall back to the truncated in-memory window and MUST flag
+        the record window-truncated. Tolerates malformed lines."""
+        if not self._journal_enabled or not mint:
+            return None
+        out: List[Tuple[float, ...]] = []
+        try:
+            with open(self._journal_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("mint") != mint:
+                        continue
+                    obs = rec.get("obs")
+                    if isinstance(obs, list) and len(obs) == 8:
+                        out.append(tuple(_f(v) if i != 7 or v is not None
+                                         else None
+                                         for i, v in enumerate(obs)))
+        except Exception:
+            return None
+        out.sort(key=lambda o: o[0])
+        return out or None
 
     def observations(self, mint: str) -> List[Tuple[float, ...]]:
         """Read-only copy of the raw per-mint observation series.

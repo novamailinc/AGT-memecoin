@@ -411,6 +411,10 @@ class BacktestEngine:
             # v2: rug labels kept out of eligibility for lack of
             # contemporaneous provenance (trades still simulated).
             "n_rug_future_label_ignored": 0,
+            # Trades replayed from window-truncated records (audit F3):
+            # their missing earlier observations are IRRECOVERABLE, so
+            # their entries are later than real detection would allow.
+            "n_window_truncated_trades": 0,
             "trades": [],
             # Stage A cost-model accounting (0 / absent when disabled).
             "costs_enabled": self.costs_enabled,
@@ -496,6 +500,8 @@ class BacktestEngine:
             trade = self._simulate(snaps, entry_idx)
             report["n_failed_exit_executions"] += trade.get(
                 "failed_exit_attempts", 0)
+            if hist.get("window_truncated"):
+                report["n_window_truncated_trades"] += 1
             pnl = trade["pnl_mult"]
             mult = trade["proceeds_mult"]
             report["n_trades"] += 1
@@ -536,6 +542,7 @@ class BacktestEngine:
                 "narratives": [str(t) for t in narrs if str(t)],
                 "entry_t": trade.get("entry_t"),
                 "entry_price": trade.get("entry_price"),
+                "window_truncated": bool(hist.get("window_truncated")),
                 "proceeds_mult": round(mult, 4),
                 "pnl_mult": round(pnl, 4),
                 "exit_reason": trade["exit_reason"],

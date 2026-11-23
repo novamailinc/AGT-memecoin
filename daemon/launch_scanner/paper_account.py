@@ -570,7 +570,7 @@ def _seq_violation(entries: List[Dict[str, Any]]
 
 def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
                  stake: float, qty: Optional[float], pid: str,
-                 ts: Optional[float]) -> None:
+                 ts: Optional[float], instance: bool = False) -> None:
     """Shared debit mutation. Caller holds the lock and has
     validated input and cash."""
     led["cash"] = round(float(led["cash"]) - stake, 6)
@@ -578,7 +578,9 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
         float(led.get("cash_spendable", led["cash"] + stake))
         - stake, 6)
     st = _lane(led, lane)
-    st["open"][mint] = {
+    key = pid if instance else mint
+    st["open"][key] = {
+        **({"mint": mint, "instance": True} if instance else {}),
         "pos_id": pid,
         "qty": qty,                 # remaining units
         "basis": stake,             # remaining allocated cost
@@ -590,6 +592,15 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
         "ts": ts or time.time(),
     }
     st["n_entries"] += 1
+
+
+def _position_key(st: dict, mint: str, pos_id: Optional[str]) -> str:
+    if pos_id is not None:
+        pos = st["open"].get(pos_id)
+        if (isinstance(pos, dict) and pos.get("instance") is True
+                and pos.get("mint") == mint and pos.get("pos_id") == pos_id):
+            return pos_id
+    return mint
 
 
 def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
@@ -605,7 +616,8 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
     allocation; a partial sale realizes P/L against the allocated
     basis of the units sold. Caller holds the lock."""
     st = _lane(led, lane)
-    pos = st["open"].get(mint)
+    key = _position_key(st, mint, pos_id)
+    pos = st["open"].get(key)
     if pos is None:
         return None, "no open position"
     basis = _pos_basis(pos)
@@ -618,7 +630,7 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
         disposed = have_qty
         alloc = basis
         realized = round(net - alloc, 6)
-        st["open"].pop(mint)
+        st["open"].pop(key)
         pos["basis"] = 0.0
         pos["qty"] = 0.0 if have_qty is not None else None
         closed = True
@@ -640,7 +652,7 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
             disposed = have_qty
             alloc = basis
             realized = round(net - alloc, 6)
-            st["open"].pop(mint)
+            st["open"].pop(key)
             pos["basis"] = 0.0
             pos["qty"] = 0.0
             closed = True
@@ -754,12 +766,15 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         if kind == "debit" and lane and mint:
             pid = ev.get("pos_id") or _pos_id(lane, mint, ev_seq)
             st = _lane(led, lane)
-            cur = st["open"].get(mint)
+            key = pid if ev.get("instance") is True else mint
+            cur = st["open"].get(key)
             if cur is not None:
                 if cur.get("pos_id", _pos_id(lane, mint, ev_seq)) == pid:
                     if op_id:
-                        ops[op_id] = {"event": "debit",
-                                      "pos_id": pid}
+                        ops[op_id] = {"event": "debit", "pos_id": pid,
+                                      "lane": lane, "mint": mint,
+                                      "stake": ev.get("stake"), "qty": ev.get("qty"),
+                                      **({"instance": True} if ev.get("instance") is True else {})}
                     led["seq"] = ev_seq
                     continue  # state already has it: idempotent
                 return led, ("replay divergence: debit %s but %s "
@@ -770,16 +785,19 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                 return led, ("replay cannot apply debit %s "
                              "(bad stake or cash)" % pid)
             _apply_debit(led, lane, mint, stake, ev.get("qty"),
-                         pid, ev.get("ts"))
+                         pid, ev.get("ts"), instance=ev.get("instance") is True)
             if op_id:
                 ops[op_id] = {"event": "debit", "pos_id": pid,
                               "lane": lane, "mint": mint,
-                              "stake": stake, "qty": ev.get("qty")}
+                              "stake": stake, "qty": ev.get("qty"),
+                              **({"instance": True} if ev.get("instance") is True else {})}
             replayed += 1
         elif kind == "credit" and lane and mint:
             st = _lane(led, lane)
-            pos = st["open"].get(mint)
+            pos = st["open"].get(_position_key(st, mint, ev.get("pos_id")))
             if pos is None:
+                if ev.get("instance") is True:
+                    return led, "replay divergence: instance credit has no matching lot"
                 led["seq"] = ev_seq
                 continue  # already settled: idempotent skip
             pid = ev.get("pos_id")
@@ -802,7 +820,11 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             if op_id:
                 ops[op_id] = {"event": "credit", "lane": lane,
                               "mint": mint, "pos_id": pid,
-                              "realized": realized}
+                              "realized": realized,
+                              **({"instance": True, "proceeds": ev.get("proceeds"),
+                                  "fee": ev.get("fee"), "qty": ev.get("qty"),
+                                  "price_kind": ev.get("price_kind")}
+                                 if ev.get("instance") is True else {})}
             replayed += 1
         elif kind == "write_down" and lane and mint:
             ok, why = _apply_write_down(
@@ -869,7 +891,7 @@ def _derive_buckets_locked(led: Dict[str, Any],
             _apply_debit(gen, lane, mint, stake, ev.get("qty"),
                          ev.get("pos_id")
                          or _pos_id(lane, mint, int(ev["seq"])),
-                         ev.get("ts"))
+                         ev.get("ts"), instance=ev.get("instance") is True)
         elif ev["event"] == "write_down":
             ok, why = _apply_write_down(
                 gen, lane, mint, ev.get("pos_id"),
@@ -879,7 +901,8 @@ def _derive_buckets_locked(led: Dict[str, Any],
                              "%s: %s; manual reconciliation "
                              "required" % (ev.get("op_id"), why))
         else:  # credit
-            pos = _lane(gen, lane)["open"].get(mint)
+            gst = _lane(gen, lane)
+            pos = gst["open"].get(_position_key(gst, mint, ev.get("pos_id")))
             if pos is None:
                 return led, ("cash-split migration: orphan credit "
                              "%s (position not open in genesis "
@@ -1052,7 +1075,26 @@ def _op_lookup(led: Dict[str, Any], op_id: str, kind: str,
 
 def try_debit(lane: str, mint: str, stake: float, qty: float,
               op_id: str, ts: Optional[float] = None,
-              marks: Optional[Dict[str, Dict[str, Any]]] = None
+              marks: Optional[Dict[str, Dict[str, Any]]] = None):
+    """Legacy one-open-mint reservation; behavior and WAL shape unchanged."""
+    return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=False)
+
+
+def try_debit_instance(lane: str, mint: str, stake: float, qty: float,
+                       op_id: str, ts: Optional[float] = None,
+                       marks: Optional[Dict[str, Dict[str, Any]]] = None):
+    """Reserve an independent exact lot UNDER the existing lane and caps.
+
+    Only this API admits multiple same-mint lots. Credit and marks must name
+    the returned pos_id. Legacy calls cannot overwrite or absorb these lots.
+    """
+    return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=True)
+
+
+def _try_debit(lane: str, mint: str, stake: float, qty: float,
+              op_id: str, ts: Optional[float] = None,
+              marks: Optional[Dict[str, Dict[str, Any]]] = None,
+              instance: bool = False
               ) -> Tuple[bool, str, Optional[str]]:
     """Reserve `stake` paper dollars for `lane` buying `qty` units
     of `mint`. op_id is the caller's stable operation ID: an
@@ -1097,10 +1139,13 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
         if degraded:
             return False, "account degraded: %s" % degraded, None
         rec, conflict = _op_lookup(led, op_id, "debit", lane, mint,
-                                   {"stake": stake, "qty": qty})
+                                   {"stake": stake, "qty": qty,
+                                    "instance": instance})
         if conflict:
             return False, conflict, None
         if rec is not None:
+            if bool(rec.get("instance")) != instance:
+                return False, "op_id instance ownership conflict", None
             return True, "ok (retry of applied op)", rec["pos_id"]
         cash = float(led["cash"])
         spendable = float(led.get("cash_spendable", 0.0))
@@ -1110,7 +1155,8 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
                             "estimated proceeds)"
                             % (spendable, stake, cash)), None)
         st = _lane(led, lane)
-        if mint in st["open"]:
+        if (mint in st["open"] or (not instance and any(
+                p.get("mint") == mint for p in st["open"].values()))):
             return (False, ("%s already has an open %s position"
                             % (lane, mint)), None)
         cap = lane_cap()
@@ -1134,13 +1180,15 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
                 return False, refusal, None
         led["seq"] = int(led.get("seq") or 0) + 1
         pid = _pos_id(lane, mint, led["seq"])
-        _apply_debit(led, lane, mint, stake, qty, pid, ts)
+        _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
         led["ops"][op_id] = {"event": "debit", "lane": lane,
                              "mint": mint, "pos_id": pid,
-                             "stake": stake, "qty": qty}
+                             "stake": stake, "qty": qty,
+                             **({"instance": True} if instance else {})}
         _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "stake": stake, "qty": qty,
+                  **({"instance": True} if instance else {}),
                   "cash_after": led["cash"],
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
@@ -1214,9 +1262,15 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         if conflict:
             return False, conflict
         if rec is not None:
+            if rec.get("instance") is True:
+                params = {"proceeds": proceeds, "fee": fee, "qty": qty,
+                          "price_kind": price_kind, "pos_id": pos_id}
+                if any(rec.get(k) != v for k, v in params.items()):
+                    return False, "op_id instance settlement parameter conflict"
             return True, "ok (retry of applied op)"
         st = _lane(led, lane)
-        pos = st["open"].get(mint)
+        key = _position_key(st, mint, pos_id)
+        pos = st["open"].get(key)
         if pos is None:
             _journal({"event": "credit_orphan", "lane": lane,
                       "mint": mint, "proceeds": proceeds,
@@ -1249,12 +1303,16 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "credit", "lane": lane,
                              "mint": mint, "pos_id": pid,
-                             "realized": realized}
+                             "realized": realized,
+                             **({"instance": True, "proceeds": proceeds,
+                                 "fee": fee, "qty": qty, "price_kind": price_kind}
+                                if pos.get("instance") is True else {})}
         _journal({"event": "credit", "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "qty": qty, "proceeds": proceeds, "fee": fee,
+                  **({"instance": True} if pos.get("instance") is True else {}),
                   "net": net, "realized": realized,
-                  "final": mint not in st["open"],
+                  "final": key not in st["open"],
                   "cash_after": led["cash"],
                   "price_kind": price_kind,
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
@@ -1278,10 +1336,11 @@ def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
     always recompose the original cost and units exactly."""
     reg = led.setdefault("unresolved", {})
     st = _lane(led, lane)
+    key = _position_key(st, mint, pid)
     if (qty is None and pid in reg
-            and st["open"].get(mint, {}).get("pos_id") != pid):
+            and st["open"].get(key, {}).get("pos_id") != pid):
         return True, "already unresolved"
-    pos = st["open"].get(mint)
+    pos = st["open"].get(key)
     if pos is None:
         if pid in reg:
             return True, "already unresolved"
@@ -1315,7 +1374,7 @@ def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
     entry["reason"] = reason
     entry["ts"] = ts or entry["ts"]
     if final:
-        st["open"].pop(mint)
+        st["open"].pop(key)
     else:
         pos["qty"] = round(have_qty - move_qty, 8)
         pos["basis"] = round(basis - alloc, 6)
@@ -1359,7 +1418,8 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, ("account degraded (%s): write-down "
                            "journaled, not applied" % degraded)
         pid = pos_id
-        pos = _lane(led, lane)["open"].get(mint)
+        st = _lane(led, lane)
+        pos = st["open"].get(_position_key(st, mint, pid))
         if pid is None and pos is not None:
             pid = pos.get("pos_id")
         if pid is None:
@@ -1528,9 +1588,13 @@ def _view_locked(led: Dict[str, Any],
         for mint, p in st.get("open", {}).items():
             pb = _pos_basis(p)
             basis += pb
-            open_positions.append((name, mint, _pos_qty(p),
+            mark_key = p["pos_id"] if p.get("instance") is True else mint
+            real_mint = p.get("mint", mint)
+            open_positions.append((name, mark_key, _pos_qty(p),
                                    p.get("pos_id")))
-            positions.append({"mint": mint, "qty": _pos_qty(p),
+            positions.append({"mint": real_mint, "qty": _pos_qty(p),
+                              **({"mark_key": mark_key, "instance": True}
+                                 if p.get("instance") is True else {}),
                               "basis": round(pb, 6),
                               "pos_id": p.get("pos_id")})
         exposure += basis

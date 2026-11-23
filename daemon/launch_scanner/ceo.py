@@ -146,6 +146,56 @@ SEEN_TTL_S = 72 * 3600  # processed-line hashes kept 72h (bus holds ~days)
 
 BANKROLL_START = 100.00
 NOTIONAL_USD = 1.00       # the user's $1/shot rule
+
+
+def _paper_account():
+    """The shared cross-lane paper account (2026-11-22), or None
+    when disabled. Same opt-in and fail-open-import semantics as
+    grad's: PAPER_ACCOUNT_ENABLED=1 makes the shared account the
+    authoritative capital gate for entries and the settlement
+    target for exits; default OFF preserves historical behavior.
+    A defensive import failure disables the gate for the call
+    rather than breaking the lane."""
+    if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1":
+        return None
+    try:
+        from . import paper_account
+        return paper_account
+    except Exception:
+        logger.exception("ceo: paper account unavailable; shared "
+                         "gate disabled for this call")
+        return None
+
+
+def _pa_settle(pos, qty, gross, fee, suffix):
+    """Credit the shared account for one settlement tranche, when
+    this position was opened through it. `qty` units sold for
+    `gross` paper dollars with `fee` in fees; the account books
+    net proceeds immediately and allocates basis average-cost, so
+    partial legs shrink the position's remaining units and basis
+    while their receipts land in shared cash (never held outside
+    the account, never double-counted at finalize). The op_id is
+    stable per tranche (pinned position instance + suffix), so a
+    retried close after an uncertain response cannot double-credit.
+    Positions without a pinned pa_pos_id (opened with the flag
+    off) are skipped: their stake never left the account, and a
+    lane+mint match could settle a LATER reopen of the same mint
+    after the 24h cooldown. Failures are journaled by the account
+    module and never block the lane's own settle."""
+    pa_pos_id = pos.get("pa_pos_id")
+    if not pa_pos_id:
+        return
+    _pa = _paper_account()
+    if _pa is None:
+        return
+    mint = pos["mint"]
+    _op = "ceo:%s:%s:%s" % (suffix, mint, pa_pos_id)
+    _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
+                           qty=qty, fee=fee)
+    if not _ok:
+        logger.warning("ceo: shared paper account credit for %s "
+                       "(%s) failed: %s (journaled)", mint, suffix,
+                       _why)
 MAX_OPEN = 10
 COOLDOWN_S = 24 * 3600    # a closed mint rests 24h before re-entry
 LANE = "ceo"
@@ -828,6 +878,29 @@ def _consider_card(sig):
                 return _skip(mint, "closed within 24h cooldown (race)")
         if len(d["positions"]) >= MAX_OPEN:
             return _skip(mint, "max open positions (%d) (race)" % MAX_OPEN)
+        # Shared cross-lane paper account (2026-11-22): when enabled
+        # it is the AUTHORITATIVE capital gate — the entry happens
+        # only if the shared cash covers the stake, so two lanes can
+        # never spend the same dollars. Lock order is lane-ledger ->
+        # account (the account never calls back), same as grad; the
+        # debit lands immediately before the position insert, which
+        # cannot fail. Fail-closed and transient: cash freed by a
+        # close re-enables entries. The op_id keys on the pool's
+        # durable identity (mint + entry ts) so a retry of an
+        # uncertain response returns the original outcome instead of
+        # double-spending; a legitimate REOPEN after the 24h cooldown
+        # is a new instance with a new entry ts.
+        _pa = _paper_account()
+        if _pa is not None:
+            _op = "ceo:entry:%s:%d" % (mint,
+                                       int(pos["entry_ts"] * 1000))
+            _ok, _why, _pid = _pa.try_debit(LANE, mint, NOTIONAL_USD,
+                                            tokens, _op)
+            if not _ok:
+                return _skip(mint, "paper account: " + _why)
+            # Pin the open instance so no close can settle a later
+            # reopen of the same mint.
+            pos["pa_pos_id"] = _pid
         d["bankroll"] = round(float(d["bankroll"]) - NOTIONAL_USD, 6)
         d["positions"][mint] = pos
         _write(d)
@@ -957,6 +1030,7 @@ def _close_leg(pos, leg_key, exit_price, reason):
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+    _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key)
     return net
 
 
@@ -989,6 +1063,8 @@ def _close_remaining(pos, exit_price, reason):
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+    _pa_settle(pos, total_tokens, gross, gas_out,
+               "remaining:%s" % "".join(open_legs))
     return net
 
 

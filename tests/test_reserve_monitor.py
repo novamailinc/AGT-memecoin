@@ -23,13 +23,14 @@ class ReserveMonitorTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="resmon_")
         self.home = self.tmp
-        self.t0 = time.time() - 1000.0
+        self.t0 = time.time() - 10000.0
 
     def _snap(self, n, quote=100.0, pool=POOL_A, mint=MINT, base=10.0,
-              step=10.0, **kw):
+              step=10.0, start=None, **kw):
+        t = self.t0 if start is None else start
         for i in range(n):
             self.assertTrue(rm.record_snapshot(
-                pool, mint, self.t0 + i * step, base, quote,
+                pool, mint, t + i * step, base, quote,
                 home=self.home, **kw))
 
     def test_record_and_read_roundtrip_ts_ordered(self):
@@ -104,9 +105,9 @@ class ReserveMonitorTest(unittest.TestCase):
         self.assertEqual(out["status"], "baseline_unusable")
         self.assertIsNone(out["movement"])
 
-    def test_migration_explicit_marker(self):
+    def test_migration_explicit_marker_bound_to_transition(self):
         self._snap(3, pool=POOL_A)
-        self._snap(2, pool=POOL_B, step=10.0,
+        self._snap(2, pool=POOL_B, start=self.t0 + 500.0,
                    migration_event="pumpswap_graduation")
         out = rm.detect_migration(MINT, home=self.home)
         self.assertEqual(out["status"], "ok")
@@ -115,31 +116,142 @@ class ReserveMonitorTest(unittest.TestCase):
         self.assertEqual(tr["from_pool"], POOL_A)
         self.assertEqual(tr["to_pool"], POOL_B)
         self.assertEqual(tr["provenance"], "explicit")
+        self.assertFalse(tr["conflict_both_active"])
+
+    def test_marker_never_launders_a_later_transition(self):
+        POOL_C = "PoolCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+        self._snap(2, pool=POOL_A)
+        # Marker on B near the A->B anchor binds that transition only.
+        self._snap(2, pool=POOL_B, start=self.t0 + 500.0,
+                   migration_event="pumpswap_graduation")
+        # B stays active after C appears: B->C is NOT explicit, and
+        # the still-active old pool is a labeled conflict.
+        self._snap(2, pool=POOL_C, start=self.t0 + 2000.0)
+        self.assertTrue(rm.record_snapshot(
+            POOL_B, MINT, self.t0 + 2010.0, 10.0, 95.0, home=self.home))
+        out = rm.detect_migration(MINT, home=self.home)
+        trs = {(t["from_pool"], t["to_pool"]): t
+               for t in out["transitions"]}
+        self.assertEqual(trs[(POOL_A, POOL_B)]["provenance"], "explicit")
+        later = trs[(POOL_B, POOL_C)]
+        self.assertNotEqual(later["provenance"], "explicit")
+        self.assertTrue(later["conflict_both_active"])
 
     def test_migration_inferred_from_reserves(self):
-        # Old pool drains to near zero as the new pool appears.
+        # Causal baseline (pre-transition) drained in the LATEST
+        # post-transition observation.
         self._snap(3, quote=100.0, pool=POOL_A)
+        self._snap(2, pool=POOL_B, start=self.t0 + 500.0)
         self.assertTrue(rm.record_snapshot(
-            POOL_A, MINT, self.t0 + 500.0, 10.0, 2.0, home=self.home))
-        self._snap(2, pool=POOL_B, step=10.0)
-        # POOL_B first seen at t0 (before drain ts) - reorder: give B
-        # later ts so appearance order is A then B.
+            POOL_A, MINT, self.t0 + 510.0, 10.0, 2.0, home=self.home))
         out = rm.detect_migration(MINT, home=self.home)
         tr = out["transitions"][0]
         self.assertEqual(tr["provenance"], "inferred_from_reserves")
         self.assertTrue(tr["old_pool_drained"])
         self.assertFalse(tr["conflict_both_active"])
+        self.assertEqual(tr["baseline_peak"], 100.0)
+        self.assertEqual(tr["latest_old_quote"], 2.0)
+
+    def test_drained_then_recovered_old_pool_is_conflict(self):
+        # A 100 -> B appears -> A dips to 10 -> A recovers to 100:
+        # historical minimum must NOT hide the recovery; latest state
+        # governs and both-active is a labeled conflict.
+        self._snap(3, quote=100.0, pool=POOL_A)
+        self._snap(2, pool=POOL_B, start=self.t0 + 500.0)
+        self.assertTrue(rm.record_snapshot(
+            POOL_A, MINT, self.t0 + 510.0, 10.0, 10.0, home=self.home))
+        self.assertTrue(rm.record_snapshot(
+            POOL_A, MINT, self.t0 + 520.0, 10.0, 100.0, home=self.home))
+        out = rm.detect_migration(MINT, home=self.home)
+        tr = out["transitions"][0]
+        self.assertTrue(tr["conflict_both_active"])
+        self.assertFalse(tr["old_pool_drained"])
+        self.assertNotEqual(tr["provenance"], "inferred_from_reserves")
+
+    def test_no_post_transition_observation_is_unknown_not_inference(self):
+        # Old pool never observed after the new one appears: pool
+        # appearance alone is not canonical proof - unknown, never
+        # an inference presented as authority.
+        self._snap(3, quote=100.0, pool=POOL_A)
+        self._snap(2, pool=POOL_B, start=self.t0 + 500.0)
+        out = rm.detect_migration(MINT, home=self.home)
+        tr = out["transitions"][0]
+        self.assertEqual(tr["provenance"], "unknown")
+        self.assertIsNone(tr["old_pool_drained"])
 
     def test_migration_unrecorded_and_conflict_labeled(self):
-        # Pool set changes with no marker and old pool stays active.
+        # Old pool observed after the transition, still near baseline.
         self._snap(3, quote=100.0, pool=POOL_A)
+        self._snap(2, pool=POOL_B, start=self.t0 + 500.0)
         self.assertTrue(rm.record_snapshot(
-            POOL_A, MINT, self.t0 + 500.0, 10.0, 95.0, home=self.home))
-        self._snap(2, pool=POOL_B, step=10.0)
+            POOL_A, MINT, self.t0 + 510.0, 10.0, 95.0, home=self.home))
         out = rm.detect_migration(MINT, home=self.home)
         tr = out["transitions"][0]
         self.assertEqual(tr["provenance"], "unrecorded")
         self.assertTrue(tr["conflict_both_active"])
+
+    def test_missing_mint_counted_unreadable_never_keyerror(self):
+        self._snap(2)
+        with open(rm._file(self.home), "a") as f:
+            f.write(json.dumps({"record_type": "reserve_snapshot",
+                                "pool": POOL_B, "ts": self.t0,
+                                "base_amount": 1.0,
+                                "quote_amount": 1.0}) + "\n")
+        hist = rm.pool_history(POOL_A, home=self.home)
+        self.assertEqual(hist["unreadable"], 1)
+        out = rm.detect_migration(MINT, home=self.home)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["unreadable"], 1)
+        self.assertEqual(out["pools_seen"], 1)
+
+    def test_retention_propagates_to_history_and_detectors(self):
+        orig_bytes, orig_cap = rm._MAX_FILE_BYTES, rm._MAX_SAMPLES_PER_POOL
+        rm._MAX_FILE_BYTES, rm._MAX_SAMPLES_PER_POOL = 400, 10
+        try:
+            self._snap(40)
+        finally:
+            rm._MAX_FILE_BYTES, rm._MAX_SAMPLES_PER_POOL = (
+                orig_bytes, orig_cap)
+        hist = rm.pool_history(POOL_A, home=self.home)
+        self.assertTrue(hist["retention"]["partial"])
+        self.assertGreaterEqual(
+            hist["retention"]["samples_dropped_by_cap_total"], 1)
+        abn = rm.detect_abnormal(POOL_A, home=self.home)
+        self.assertTrue(abn["retention"]["partial"])
+        mig = rm.detect_migration(MINT, home=self.home)
+        self.assertTrue(mig["retention"]["partial"])
+
+    def test_detector_carries_observed_age_and_threshold_provenance(self):
+        self._snap(7, quote=100.0)
+        now = self.t0 + 1000.0
+        out = rm.detect_abnormal(POOL_A, home=self.home, now=now)
+        self.assertEqual(out["last_observed_ts"], self.t0 + 60.0)
+        self.assertEqual(out["observed_age_s"], 940.0)
+        self.assertEqual(out["thresholds_provenance"],
+                         "unvalidated_advisory_heuristic")
+        mig = rm.detect_migration(MINT, home=self.home, now=now)
+        self.assertEqual(mig["last_observed_ts"], self.t0 + 60.0)
+        self.assertEqual(mig["observed_age_s"], 940.0)
+
+    def test_optional_context_recorded_only_when_grounded(self):
+        self.assertTrue(rm.record_snapshot(
+            POOL_A, MINT, self.t0, 1.0, 2.0,
+            quote_mint="So11111111111111111111111111111111111111112",
+            decimals=6, slot=12345, base_ts=self.t0 - 5.0,
+            quote_ts=self.t0, home=self.home))
+        s = rm.pool_history(POOL_A, home=self.home)["samples"][0]
+        self.assertEqual(s["decimals"], 6)
+        self.assertEqual(s["slot"], 12345)
+        self.assertEqual(s["base_ts"], self.t0 - 5.0)
+        # Supplied-but-invalid optional context rejects the record.
+        self.assertFalse(rm.record_snapshot(
+            POOL_A, MINT, self.t0, 1.0, 2.0, decimals=True,
+            home=self.home))
+        self.assertFalse(rm.record_snapshot(
+            POOL_A, MINT, self.t0, 1.0, 2.0, slot=-1, home=self.home))
+        self.assertFalse(rm.record_snapshot(
+            POOL_A, MINT, self.t0, 1.0, 2.0,
+            base_ts=float("nan"), home=self.home))
 
     def test_no_history_for_mint_is_no_history(self):
         self._snap(3, pool=POOL_A, mint="OtherMintXXXXXXXXXXXXXXXXXXXXX")
@@ -267,6 +379,40 @@ class ArmedWatchWiringTest(unittest.TestCase):
         s = hist["samples"][0]
         self.assertEqual(s["quote_amount"], 34.5)
         self.assertEqual(s["source"], "armed_watch")
+
+    def _push_msg(self, sub, amount):
+        import base64 as b64
+        raw = bytearray(165)
+        raw[0:32] = b"\x01" * 32
+        raw[64:72] = int(amount).to_bytes(8, "little")
+        return json.dumps({
+            "method": "accountNotification",
+            "params": {"subscription": sub,
+                       "result": {"value": {
+                           "data": [b64.b64encode(bytes(raw)).decode(),
+                                    "base64"]}}}})
+
+    def test_push_notification_ingests_both_sides_grounded(self):
+        from daemon.launch_scanner import armed_watch as aw
+        from daemon.launch_scanner import reserve_monitor as rmod
+        w = aw.ArmedWatcher(lambda *a, **k: None)
+        w._want[MINT] = {"pool": POOL_A, "decimals": 6}
+        w._subs[11] = (MINT, "base")
+        w._subs[22] = (MINT, "quote")
+        # One side only: unobserved side is unrecorded, never zero.
+        w._handle(None, self._push_msg(11, 1000))
+        hist = rmod.pool_history(POOL_A, home=self.tmp)
+        self.assertEqual(len(hist["samples"]), 0)
+        w._handle(None, self._push_msg(22, 5000))
+        hist = rmod.pool_history(POOL_A, home=self.tmp)
+        self.assertEqual(len(hist["samples"]), 1)
+        s = hist["samples"][0]
+        self.assertEqual(s["source"], "armed_watch_ws_push")
+        self.assertEqual(s["base_amount"], 1000.0)
+        self.assertEqual(s["quote_amount"], 5000.0)
+        self.assertEqual(s["decimals"], 6)
+        # Per-side observation times recorded; base side is older.
+        self.assertLess(s["base_ts"], s["quote_ts"])
 
     def test_monitor_failure_never_breaks_watch_loop(self):
         from unittest.mock import patch

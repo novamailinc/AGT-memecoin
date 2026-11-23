@@ -168,22 +168,36 @@ Items marked FIXED name the landing commit.
   curve_cache.py, liquidity_mirage.py, exit_liquidity_clock.py, price-impact modeling
   in backtest.py. FIXED (monitoring depth, measurement-only): reserve_monitor.py
   keeps a durable per-pool reserve-snapshot history (append-only JSONL under flock,
-  torn-tail repair counted, per-pool sample cap with labeled drops, byte-cap
-  compaction, missing file = unknown_missing never clean empty; bool/NaN/negative
-  reserves rejected and counted at the boundary) and derives two advisory
-  detections: abnormal movement (drain/spike vs the pool's OWN trailing median,
-  explicit insufficient_history / baseline_unusable labels, never a fabricated
-  baseline) and pool migration (per-mint canonical-pool transitions with
-  three-valued provenance: explicit marker > inferred_from_reserves > unrecorded;
-  both-pools-active labeled conflict, never silently resolved). Runtime wiring:
-  armed_watch records a snapshot from each vault resolution it ALREADY performs
-  (position arming + reconnect reconcile) - no new RPC, no added polling, cadence
-  unchanged, monitor failure can never break the watch loop (negative test).
-  BOUNDARY: detection output is advisory surface only (monitor_status /
-  detect_abnormal / detect_migration); no gate, score, entry, or exit reads it,
-  and continuous COVERAGE is bounded by armed positions - pools outside the
-  armed set have no history unless a caller feeds them (tests
-  test_reserve_monitor.py, 20 checks incl. wiring + negative probes).
+  torn-tail repair counted, missing file = unknown_missing never clean empty;
+  bool/NaN/negative reserves rejected and counted at the boundary; optional
+  quote_mint/decimals/slot/per-side observation ts recorded only when the caller
+  grounds them, supplied-but-invalid rejects the record). Retention honesty: the
+  byte cap is a compaction TRIGGER, not a hard bound (compaction keeps per-pool
+  newest samples, which many pools can still push past the cap); dropped samples
+  and unreadable lines are counted and propagated into EVERY history/detector
+  result (retention block, partial flag), never vanishing into a separate status;
+  meta writes are best-effort without fsync. Detections, all advisory:
+  abnormal movement (drain/spike vs the pool's OWN trailing median, explicit
+  insufficient_history / baseline_unusable labels, never a fabricated baseline;
+  every result carries last_observed_ts + observed_age_s, no imposed freshness
+  policy) and pool migration (causal: baselines use ONLY pre-transition samples,
+  post-transition state is the LATEST observation so drained-then-recovered is a
+  labeled conflict; markers bind to one transition only within a time tolerance;
+  provenance explicit > inferred_from_reserves > unrecorded/unknown - pool
+  appearance alone is never canonical proof and absent evidence fails unknown,
+  not inference). All ratios/windows are UNVALIDATED ADVISORY HEURISTICS, labeled
+  in every result; no trading threshold approval exists or is claimed. Runtime
+  wiring: armed_watch records a snapshot from each vault resolution it ALREADY
+  performs (arming + reconnect reconcile) AND from websocket accountNotification
+  pushes (identity from the watcher's own subscription map, raw units identical
+  to resolve_vaults, arrival time; both sides required with per-side observation
+  ts, an unobserved side is unrecorded never zero-filled) - no new RPC, no added
+  polling, cadence unchanged, monitor failure can never break the watch loop
+  (negative test). BOUNDARY: detection output is advisory surface only; no gate,
+  score, entry, or exit reads it, and continuous COVERAGE is bounded by armed
+  positions (tests test_reserve_monitor.py, 28 checks incl. push-notification
+  fixtures, causality probes, wiring + negative tests; armed_watch guard suite
+  unchanged green).
 - 6.3 Wallet intelligence: see 4.2 + insiders.py, holder_tracker.py, holder_quality.py,
   dust_holders.py, anticrowd.py, funding_clusters.py.
 - 6.4 Trading intelligence: IMPLEMENTED — momentum.py, smartgrade.py, fusion.py

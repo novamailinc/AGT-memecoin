@@ -58,18 +58,45 @@ MOVE_JOURNAL_PCT = 20.0   # reconnect moves worth journaling
 _RECV_TICK_S = 5.0
 
 
-def _record_reserve_snapshot(pool, mint, v):
+def _record_reserve_snapshot(pool, mint, v, decimals=None):
     """Feed the 6.2 reserve monitor from a vault resolution the
     watcher ALREADY made - no new RPC, no added polling, cadence
     unchanged. Measurement only: the monitor never gates, scores, or
-    exits, and a monitor failure must never affect the watch loop."""
+    exits, and a monitor failure must never affect the watch loop.
+    Units are the raw vault amounts resolve_vaults returns; quote_mint
+    and decimals are passed only when grounded by the resolution."""
     try:
         if not isinstance(v, dict):
             return
         _resmon.record_snapshot(pool, mint, time.time(),
                                 v.get("base_amount"),
                                 v.get("quote_amount"),
-                                source="armed_watch")
+                                source="armed_watch",
+                                quote_mint=v.get("quote_mint"),
+                                decimals=decimals)
+    except Exception:
+        pass
+
+
+def _record_push_snapshot(pool, mint, amt, quote_mint=None,
+                          decimals=None):
+    """Feed the monitor from a websocket accountNotification: pushed
+    vault amounts stay RAW (same units as resolve_vaults), identity
+    comes from our own subscription map, time is arrival time. The
+    two sides can be observed at different times - per-side
+    observation ts are recorded, never merged into a fake single
+    reading. Records only when BOTH sides have been observed at
+    least once; an unobserved side is unrecorded, never zero-filled."""
+    try:
+        if not (amt.get("base_ts") and amt.get("quote_ts")):
+            return
+        _resmon.record_snapshot(pool, mint, time.time(),
+                                amt.get("base"), amt.get("quote"),
+                                source="armed_watch_ws_push",
+                                quote_mint=quote_mint,
+                                decimals=decimals,
+                                base_ts=amt.get("base_ts"),
+                                quote_ts=amt.get("quote_ts"))
     except Exception:
         pass
 
@@ -241,7 +268,12 @@ class ArmedWatcher:
                         self._amounts[mint] = {
                             "base": v["base_amount"],
                             "quote": v["quote_amount"],
-                            "ts": time.time()}
+                            "ts": time.time(),
+                            "base_ts": time.time(),
+                            "quote_ts": time.time()}
+                    # decimals unrecorded here: mint_decimals runs
+                    # below when the armed entry is built; the
+                    # snapshot never blocks on it.
                     _record_reserve_snapshot(pool, mint, v)
                 want[mint] = {"pool": pool,
                               "decimals": _res.mint_decimals(mint),
@@ -497,12 +529,23 @@ class ArmedWatcher:
                 if not key:
                     return
                 mint, role = key
+                now = time.time()
                 amt = self._amounts.setdefault(
-                    mint, {"base": 0, "quote": 0, "ts": 0.0})
+                    mint, {"base": 0, "quote": 0, "ts": 0.0,
+                           "base_ts": 0.0, "quote_ts": 0.0})
                 amt[role] = ta["amount"]
-                amt["ts"] = time.time()
+                amt[role + "_ts"] = now
+                amt["ts"] = now
+                amt_snap = dict(amt)
+                pool = (self._want.get(mint) or {}).get("pool")
                 dec = (self._want.get(mint) or {}).get("decimals")
                 base, quote = amt.get("base"), amt.get("quote")
+            if pool:
+                _record_push_snapshot(
+                    pool, mint, amt_snap,
+                    quote_mint=(self._vault_cache.get(pool) or {})
+                    .get("quote_mint"),
+                    decimals=dec)
             quote_mint_px = ((self._vault_cache.get(
                 (self._want.get(mint) or {}).get("pool") or "")
                 or {}).get("quote_mint"))
@@ -534,11 +577,13 @@ class ArmedWatcher:
                 v = _res.resolve_vaults(w["pool"], mint)
                 if not v:
                     continue
-                _record_reserve_snapshot(w["pool"], mint, v)
+                _record_reserve_snapshot(w["pool"], mint, v,
+                                         decimals=w.get("decimals"))
                 with self._lock:
                     self._amounts[mint] = {
                         "base": v["base_amount"],
-                        "quote": v["quote_amount"], "ts": time.time()}
+                        "quote": v["quote_amount"], "ts": time.time(),
+                        "base_ts": time.time(), "quote_ts": time.time()}
                     old = float(self._last_px.get(mint) or 0)
                 px = _res.amounts_price(v["base_amount"],
                                         v["quote_effective"],

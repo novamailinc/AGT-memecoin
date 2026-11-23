@@ -4,12 +4,15 @@
 This module prepares offline evaluation evidence only. It is NOT a
 promotion controller and it CANNOT approve anything:
 
-- There is no source-approved promotion criteria in the system, so
-  every durable record is explicitly research-only and NOT ELIGIBLE
-  for promotion. Preparation (computing labeled evidence) may
-  proceed; a validated recommendation may not.
-- Verdicts are descriptive only: NEED-CRITERIA (no approved
-  criteria supplied), NEED-DATA (criteria supplied but the settled
+- Every durable record is explicitly research-only and NOT
+  ELIGIBLE for promotion: promotion_eligibility is always
+  "not_eligible_research_only" while the unresolved requirements
+  stand. A caller-supplied "approved" flag grants NOTHING - no
+  caller can confer eligibility on itself. Preparation (computing
+  labeled evidence) may proceed; a validated recommendation may
+  not.
+- Verdicts are descriptive only: NEED-CRITERIA (criteria missing
+  or incomplete), NEED-DATA (criteria supplied but the settled
   sample is too small under it), or EVALUATED (labeled evidence
   computed). No verdict implies promotion-worthiness.
 - No activation path exists: degen-learner save_weights refuses
@@ -57,7 +60,7 @@ RESEARCH_LIMITS = [
     "callable_leakage_unprovable",
 ]
 
-NOT_ELIGIBLE = "not_eligible_no_source_approved_criteria"
+NOT_ELIGIBLE = "not_eligible_research_only"
 
 
 def _num(v):
@@ -98,8 +101,26 @@ def _settled(records):
                                  "exit_price_kind": kind,
                                  "realized_mult": mult})
                 continue
+            # Entry schema hygiene: a scorer is only honest when
+            # its entry-time view is well formed - finite entry_ts
+            # not after the settle, and a dict of features.
+            entry_ts = _num(rec.get("entry_ts"))
+            if entry_ts is None:
+                excluded.append({
+                    "reason": "missing_or_invalid_entry_ts",
+                    "realized_mult": mult})
+                continue
+            if entry_ts > ts:
+                excluded.append({"reason": "entry_after_settled",
+                                 "realized_mult": mult})
+                continue
+            if not isinstance(rec.get("features"), dict):
+                excluded.append({
+                    "reason": "missing_or_invalid_features",
+                    "realized_mult": mult})
+                continue
             settled.append({
-                "entry": {"entry_ts": _num(rec.get("entry_ts")),
+                "entry": {"entry_ts": entry_ts,
                           "features": rec.get("features")},
                 "settled_ts": ts,
                 "realized_mult": mult,
@@ -152,7 +173,6 @@ def evaluate_promotion(candidate_id, records, score_incumbent,
     source-approved criteria the candidate is NOT ELIGIBLE, and
     preparation (labeled evidence) is all this produces."""
     now = time.time() if now is None else now
-    criteria_approved = bool((criteria or {}).get("approved"))
     settled, excluded = _settled(records)
     dec = {
         "v": 1,
@@ -160,10 +180,9 @@ def evaluate_promotion(candidate_id, records, score_incumbent,
         "candidate_id": str(candidate_id or "unknown"),
         "created_ts": now,
         "criteria": criteria,
-        "criteria_approved": criteria_approved,
-        "promotion_eligibility": (
-            "eligible_per_supplied_criteria" if criteria_approved
-            else NOT_ELIGIBLE),
+        # A caller flag never confers eligibility: eligibility is
+        # fixed not-eligible while the research limits stand.
+        "promotion_eligibility": NOT_ELIGIBLE,
         "research_only": True,
         "research_limits": list(RESEARCH_LIMITS),
         "activation": "not_authorized",
@@ -176,20 +195,16 @@ def evaluate_promotion(candidate_id, records, score_incumbent,
         "provenance": "simulated_current_price_only",
         "qualified_performance": False,
     }
-    if not criteria_approved:
+    val_frac = _num((criteria or {}).get("val_frac"))
+    min_settled = _num((criteria or {}).get("min_settled"))
+    min_val = _num((criteria or {}).get("min_val"))
+    if val_frac is None or min_settled is None or min_val is None:
         dec["verdict"] = "NEED-CRITERIA"
         dec["descriptive_only"] = True
         dec["all_settled_incumbent"] = _economics(
             settled, score_incumbent)
         dec["all_settled_candidate"] = _economics(
             settled, score_candidate)
-        return dec
-    val_frac = _num(criteria.get("val_frac"))
-    min_settled = _num(criteria.get("min_settled"))
-    min_val = _num(criteria.get("min_val"))
-    if val_frac is None or min_settled is None or min_val is None:
-        dec["verdict"] = "NEED-CRITERIA"
-        dec["reason"] = "approved_criteria_missing_split_fields"
         return dec
     train, val = _chronological_split(settled, val_frac)
     dec["train_incumbent"] = _economics(train, score_incumbent)
@@ -218,12 +233,16 @@ def _lock_path(home=None):
     return _path(home) + ".lock"
 
 
+class _LockUnavailable(Exception):
+    pass
+
+
 @contextlib.contextmanager
 def _write_lock(home=None):
     """Exclusive cross-process lock (the verdict_ledger lock
-    pattern). Never raises: on lock failure the writer proceeds
-    WITHOUT the lock - the reader tolerates a torn line and the
-    alternative is losing the record entirely."""
+    pattern). FAIL CLOSED: a lock failure raises _LockUnavailable
+    and the append reports failure - durability is never claimed
+    from an unlocked write."""
     fd = None
     try:
         fd = os.open(_lock_path(home), os.O_CREAT | os.O_RDWR, 0o600)
@@ -234,32 +253,87 @@ def _write_lock(home=None):
                 os.close(fd)
             except Exception:
                 pass
-            fd = None
+        raise _LockUnavailable("lock unavailable")
     try:
         yield
     finally:
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-            except Exception:
-                pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        except Exception:
+            pass
 
 
 def append_decision(decision, home=None):
     """One locked, fsync'd append to the durable decision log.
-    Returns True only when the record is durably written.
+    Returns True only when the record is durably written. A file
+    whose tail is a torn fragment is repaired under the lock (the
+    fragment stays its own unreadable line, counted by
+    decisions_status) so a new record never glues onto it. The
+    file is fsync'd; the directory fsync is best-effort (some
+    filesystems refuse it) and is the stated durability limit.
     Never raises."""
     try:
-        os.makedirs(os.path.dirname(_path(home)), exist_ok=True)
+        p = _path(home)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
         with _write_lock(home):
-            with open(_path(home), "a") as f:
+            with open(p, "a+") as f:
+                # Torn-tail repair: a partial last line must not
+                # glue onto the new record.
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size:
+                    f.seek(size - 1)
+                    if f.read(1) != "\n":
+                        f.seek(0, os.SEEK_END)
+                        f.write("\n")
+                f.seek(0, os.SEEK_END)
                 f.write(json.dumps(decision, sort_keys=True) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            try:
+                dfd = os.open(os.path.dirname(p), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except Exception:
+                pass  # directory fsync is best-effort
         return True
     except Exception:
         return False
+
+
+def decisions_status(home=None):
+    """Reader-side status: availability plus the unreadable-line
+    count, so a torn fragment is reported, never silently dropped.
+    Never raises."""
+    try:
+        p = _path(home)
+        if not os.path.exists(p):
+            return {"available": False, "error": "missing",
+                    "unreadable_lines": 0, "records": 0}
+        unreadable = 0
+        records = 0
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if isinstance(rec, dict) and rec.get(
+                            "record_type") == "promotion_decision":
+                        records += 1
+                    else:
+                        unreadable += 1
+                except Exception:
+                    unreadable += 1
+        return {"available": True, "unreadable_lines": unreadable,
+                "records": records}
+    except Exception as e:
+        return {"available": False, "error": str(e),
+                "unreadable_lines": 0, "records": 0}
 
 
 def load_decisions(home=None, limit=1000):

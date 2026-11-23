@@ -40,30 +40,54 @@ CRITERIA = {"approved": True, "min_settled": 30, "min_val": 10,
             "val_frac": 0.25}
 
 
-def test_no_approved_criteria_is_not_eligible():
+def test_entry_schema_hygiene():
+    recs = _recs([1.2, 0.8] * 20)
+    recs.append({"settled_ts": 1_700_500_000,
+                 "realized_mult": 1.3, "features": {"band": "x"},
+                 "exit_price_kind": "current_price_simulated_fill"})
+    recs.append({"entry_ts": 1_700_600_000,
+                 "settled_ts": 1_700_500_000,
+                 "realized_mult": 1.3, "features": {"band": "x"},
+                 "exit_price_kind": "current_price_simulated_fill"})
+    recs.append({"entry_ts": 1_700_400_000,
+                 "settled_ts": 1_700_500_000,
+                 "realized_mult": 1.3, "features": None,
+                 "exit_price_kind": "current_price_simulated_fill"})
+    dec = promotion.evaluate_promotion(
+        "cand-schema", recs, TAKE_ALL, TAKE_ALL,
+        criteria=dict(CRITERIA))
+    check("promotion: invalid entry schema excluded with reasons, "
+          "never scored",
+          dec.get("n_settled") == 40
+          and dec.get("excluded_reasons")
+          == ["entry_after_settled", "missing_or_invalid_entry_ts",
+              "missing_or_invalid_features"])
+
+
+def test_no_criteria_is_not_eligible():
     dec = promotion.evaluate_promotion(
         "cand-nocrit", _recs([1.2, 0.8] * 20), TAKE_ALL, TAKE_ALL)
-    check("promotion: no source-approved criteria -> NEED-CRITERIA "
-          "and not eligible, never a recommendation",
+    check("promotion: no criteria -> NEED-CRITERIA and not "
+          "eligible, never a recommendation",
           dec.get("verdict") == "NEED-CRITERIA"
           and dec.get("promotion_eligibility")
-          == promotion.NOT_ELIGIBLE
+          == "not_eligible_research_only"
           and dec.get("research_only") is True
           and dec.get("activation") == "not_authorized"
           and "PROMOTE" not in str(dec.get("verdict")))
 
 
-def test_evaluated_with_approved_criteria():
+def test_approved_flag_grants_no_eligibility():
     recs = _recs([1.0 + (0.4 if i % 2 == 0 else -0.2)
                   for i in range(40)])
     dec = promotion.evaluate_promotion(
         "cand-eval", recs, TAKE_ALL,
         lambda entry: True, criteria=dict(CRITERIA))
-    check("promotion: approved criteria yields EVALUATED evidence, "
-          "never a promote verdict",
+    check("promotion: caller 'approved' flag grants nothing - "
+          "EVALUATED evidence stays not eligible",
           dec.get("verdict") == "EVALUATED"
           and dec.get("promotion_eligibility")
-          == "eligible_per_supplied_criteria"
+          == "not_eligible_research_only"
           and dec.get("qualified_performance", False) is False
           and dec.get("val_candidate", {}).get("taken") == 10)
     small = promotion.evaluate_promotion(
@@ -160,6 +184,45 @@ def test_decision_durable_append_and_read():
           and loaded[0].get("candidate_id") == "cand-durable"
           and loaded[0].get("activation") == "not_authorized"
           and loaded[0].get("research_only") is True)
+
+
+def test_torn_tail_repaired_before_append():
+    home = tempfile.mkdtemp(prefix="promotion-")
+    os.makedirs(os.path.dirname(promotion._path(home)),
+                exist_ok=True)
+    # A fragment WITHOUT a trailing newline: a naive append would
+    # glue the new record onto it and the read would lose both.
+    with open(promotion._path(home), "w") as f:
+        f.write("{torn-fragment")
+    dec = promotion.evaluate_promotion(
+        "cand-repair", _recs([1.1] * 40), TAKE_ALL, TAKE_ALL,
+        criteria=dict(CRITERIA))
+    check("promotion: append after torn tail still lands",
+          promotion.append_decision(dec, home=home) is True)
+    loaded = promotion.load_decisions(home=home)
+    st = promotion.decisions_status(home=home)
+    check("promotion: new record survives the torn tail, fragment "
+          "counted unreadable",
+          len(loaded) == 1
+          and loaded[0].get("candidate_id") == "cand-repair"
+          and st.get("unreadable_lines") == 1
+          and st.get("records") == 1)
+
+
+def test_lock_failure_fails_closed():
+    home = tempfile.mkdtemp(prefix="promotion-")
+    os.makedirs(os.path.dirname(promotion._path(home)),
+                exist_ok=True)
+    # Lock path as a directory: os.open fails -> append must NOT
+    # proceed unlocked or claim durability.
+    os.mkdir(promotion._lock_path(home))
+    dec = promotion.evaluate_promotion(
+        "cand-lockfail", _recs([1.1] * 40), TAKE_ALL, TAKE_ALL,
+        criteria=dict(CRITERIA))
+    check("promotion: lock failure fails closed, never an unlocked "
+          "silent append",
+          promotion.append_decision(dec, home=home) is False
+          and promotion.load_decisions(home=home) == [])
 
 
 def test_research_limits_recorded():

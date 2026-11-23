@@ -128,8 +128,11 @@ convergence-policy approximations are not repaired by acquisition persistence.
 ## Remaining durability boundaries
 
 Bus, convergence, seen and intake are separate commits, not one transaction.
-Crashes can replay downstream effects. Fixed temporary paths and unlocked
-read-modify-write in shared bus/convergence writers lack demonstrated
-cross-process serialization; sell grading effects are not idempotent by
-transaction signature. Passing poll recovery is not proof of exactly-once
+Crashes can replay downstream effects. Shared bus publication now holds flock over the entire read/merge/replace
+and uses private unique temporary snapshots with file/directory fsync. A
+12-process/144-publication fixture checks complete retention below the existing
+5000-line bound; replace failure preserves the previous snapshot and returns
+false. This does not make duplicate replay exactly once. Convergence still has
+fixed temporary paths and no demonstrated cross-process read-modify-write
+serialization; sell grading effects are not idempotent by transaction signature. Passing poll recovery is not proof of exactly-once
 signal/notification/sell execution or full acquisition coverage.

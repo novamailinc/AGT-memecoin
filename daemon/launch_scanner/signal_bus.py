@@ -17,6 +17,8 @@ Design (nova-design.md):
 Free-only: stdlib only, no network calls in this module.
 """
 import json
+import fcntl
+import tempfile
 import os
 import time
 
@@ -139,24 +141,31 @@ def publish(sig):
         return False
     try:
         os.makedirs(os.path.dirname(BUS_PATH), exist_ok=True)
-        lines = []
-        try:
-            with open(BUS_PATH) as f:
-                lines = f.read().splitlines()
-        except FileNotFoundError:
-            pass
-        lines.append(json.dumps(sig, separators=(",", ":")))
-        lines = lines[-MAX_BUS_LINES:]
-        tmp = BUS_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            f.write("\n".join(lines) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, BUS_PATH)
-        directory_fd=os.open(os.path.dirname(BUS_PATH),os.O_RDONLY)
-        try:os.fsync(directory_fd)
-        finally:os.close(directory_fd)
+        # Lock the whole read/merge/replace, not just append or rename.
+        # Readers see either complete snapshot via atomic replace.
+        with open(BUS_PATH+'.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            lines = []
+            try:
+                with open(BUS_PATH) as f:
+                    lines = f.read().splitlines()
+            except FileNotFoundError:
+                pass
+            lines.append(json.dumps(sig, separators=(",", ":")))
+            lines = lines[-MAX_BUS_LINES:]
+            fd,tmp=tempfile.mkstemp(dir=os.path.dirname(BUS_PATH),prefix='.signal-bus-')
+            try:
+                os.fchmod(fd,0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write("\n".join(lines) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, BUS_PATH)
+                directory_fd=os.open(os.path.dirname(BUS_PATH),os.O_RDONLY)
+                try:os.fsync(directory_fd)
+                finally:os.close(directory_fd)
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
         return True
     except Exception:
         return False

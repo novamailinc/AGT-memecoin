@@ -144,7 +144,7 @@ _TX = {"transaction": {"message": {
     "accountKeys": [{"pubkey": W_NEW, "signer": True}],
     "instructions": [{"parsed": {"type": "transfer", "info": {
         "source": FUNDER, "destination": W_NEW, "lamports": 1000000}}}]}},
-    "meta": {"innerInstructions": []}}
+    "meta": {"err": None, "innerInstructions": []}}
 
 
 def _fake_rpc(method, params):
@@ -166,14 +166,18 @@ check("resolver: parse handles garbage tx -> None",
 
 _TX_PAYER = {"transaction": {"message": {
     "accountKeys": [{"pubkey": FUNDER}, {"pubkey": W_NEW}],
-    "instructions": []}}, "meta": {}}
+    "instructions": []}}, "meta": {"err": None}}
 check("resolver: fee-payer fallback when no transfer present",
       FC.parse_funder_from_tx(_TX_PAYER, W_NEW) == FUNDER)
 _TX_SELF = {"transaction": {"message": {
-    "accountKeys": [{"pubkey": W_NEW}], "instructions": []}}, "meta": {}}
+    "accountKeys": [{"pubkey": W_NEW}], "instructions": []}}, "meta": {"err": None}}
 check("resolver: self-funded tx (payer == wallet) -> None",
       FC.parse_funder_from_tx(_TX_SELF, W_NEW) is None)
 
+
+unknown_tx = dict(_TX, meta=dict(_TX['meta']))
+del unknown_tx['meta']['err']
+check("resolver: missing execution status stays unavailable", FC.parse_funder_from_tx(unknown_tx,W_NEW) is None)
 
 def _deep_rpc(method, params):
     if method == "getSignaturesForAddress":

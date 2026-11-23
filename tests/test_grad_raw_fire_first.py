@@ -186,7 +186,7 @@ def mig_item(mint, sig="SigFireFirst1111111111111111111111111111",
 
 # ---------------- pure tx parse ----------------
 WSOL = "So11111111111111111111111111111111111111112"
-fake_tx = {"meta": {"postTokenBalances": [
+fake_tx = {"meta": {"err": None, "postTokenBalances": [
     {"owner": "DecoyWallet111111111111111111111111111111",
      "mint": MINT,
      "uiTokenAmount": {"amount": "5000000000", "decimals": 6}},
@@ -205,14 +205,19 @@ check("tx parse: price from the pool's own initial reserves",
 check("tx parse: mcap = price x fixed supply, inside bounds",
       info is not None
       and abs(info["mcap_usd"] - exp_px * 1e9) < 1e-3)
-info2, why2 = GR._ff_parse_tx_price({"meta": {"postTokenBalances": [
+unknown_tx = dict(fake_tx, meta=dict(fake_tx['meta']))
+del unknown_tx['meta']['err']
+unknown_info, unknown_reason = GR._ff_parse_tx_price(unknown_tx,MINT,sol_usd=100.0)
+check("tx parse: missing status stays unknown", unknown_info is None and 'tx_unknown' in unknown_reason)
+
+info2, why2 = GR._ff_parse_tx_price({"meta": {"err": None, "postTokenBalances": [
     {"owner": "PoolOwner1111111111111111111111111111111111",
      "mint": MINT,
      "uiTokenAmount": {"amount": "206900000000000", "decimals": 6}},
 ]}}, MINT, sol_usd=200.0)
 check("tx parse: no paired WSOL vault -> no payload price",
       info2 is None and "no paired" in why2)
-info3, why3 = GR._ff_parse_tx_price({"meta": {"postTokenBalances": [
+info3, why3 = GR._ff_parse_tx_price({"meta": {"err": None, "postTokenBalances": [
     {"owner": "PoolOwner1111111111111111111111111111111111",
      "mint": MINT,
      "uiTokenAmount": {"amount": "206900000000000", "decimals": 6}},

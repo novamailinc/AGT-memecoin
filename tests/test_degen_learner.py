@@ -116,6 +116,51 @@ except RuntimeError:
     _promotion_refused = True
 check("learner: direct weight promotion refused", _promotion_refused)
 
+# --- 2b. mandatory dry-run reaches past the 10-feature gate and writes no weights ---
+import contextlib, io, subprocess
+_home = tempfile.mkdtemp(prefix="learner-e2e-")
+outcomes = {}
+peaks = {}
+now = time.time()
+for i in range(10):
+    mint = "winner%d" % i
+    outcomes[mint] = {"symbol": "W%d" % i, "alert_ts": now - 9000,
+                      "alert_mcap": 100.0,
+                      "components": {"freshness": 10.0,
+                                     "buy_pressure": 20.0,
+                                     "buyer_count": 9.0}}
+    peaks[mint] = {"peak_mult": 4.0}
+for i in range(10):
+    mint = "loser%d" % i
+    outcomes[mint] = {"symbol": "L%d" % i, "alert_ts": now - 9000,
+                      "alert_mcap": 100.0,
+                      "components": {"freshness": 1.0,
+                                     "buy_pressure": 2.0,
+                                     "buyer_count": 1.0}}
+    peaks[mint] = {"peak_mult": 1.0}
+with open(os.path.join(_home, "degen_outcomes.json"), "w") as f:
+    json.dump(outcomes, f)
+with open(os.path.join(_home, "degen_peaks.json"), "w") as f:
+    json.dump(peaks, f)
+weight_before = open(os.path.join(REPO, "scripts", "degen-weights.json"),
+                     "rb").read()
+env = dict(os.environ, FOREX_AGENT_HOME=_home)
+proc = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "degen-learner")],
+                      env=env, capture_output=True, text=True, timeout=30)
+check("learner: mandatory dry-run past evidence gate exits cleanly",
+      proc.returncode == 0 and "gated=False" in proc.stdout
+      and "weights file NOT written" in proc.stdout)
+check("learner: weight file byte-identical", open(
+    os.path.join(REPO, "scripts", "degen-weights.json"), "rb").read()
+      == weight_before)
+# A permissive accidental caller cannot re-enable writes by argv either.
+proc2 = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "degen-learner"),
+                        "--apply", "--promote"], env=env,
+                       capture_output=True, text=True, timeout=30)
+check("learner: unknown promotion flags do not write",
+      proc2.returncode == 0 and "weights file NOT written" in proc2.stdout
+      and open(os.path.join(REPO, "scripts", "degen-weights.json"),
+               "rb").read() == weight_before)
 # --- 3. peak tracker: durable peaks + candidates ----------------------
 P = load_script("degen-peak-tracker")
 now = time.time()

@@ -32,6 +32,7 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         FAILS.append(name)
+        raise AssertionError(name)
 
 
 WALLET = "Fn9n3ftUzjhcmoLwXbTqJdATzamCp3xPEu4LmLSS8ELr"  # on-curve

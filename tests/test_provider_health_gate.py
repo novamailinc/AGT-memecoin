@@ -27,6 +27,7 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         FAILS.append(name)
+        raise AssertionError(name)
 
 
 def fresh(home, enabled=None, providers=None, mode=None):

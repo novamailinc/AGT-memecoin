@@ -1006,6 +1006,10 @@ class LaunchScanner(Daemon):
         ls = getattr(self, "_logstream", None)
         if ls is None:
             return
+        # A loaded committed batch may need only ACK after a crash.
+        if state.get('logstream_committed_refs'):
+            ls.acknowledge(state['logstream_committed_refs'])
+            state['logstream_committed_refs']=[]
         for item in ls.drain():
             if getattr(self, "_stop", False):
                 logger.warning("logstream drain stopping on SIGTERM — "
@@ -1025,10 +1029,30 @@ class LaunchScanner(Daemon):
                           "signature": item.get("signature")},
                 "url": "https://pump.fun/coin/%s" % mint,
             }
+            import copy
+            import uuid
+            before=copy.deepcopy(state)
+            durable=False
             try:
                 self._consider(config, adapter, state, c)
+                token=uuid.uuid4().hex
+                state['logstream_commit']=token
+                state['logstream_committed_refs']=[item['signature']]
+                store=get_store()
+                store.journal_add({'kind':'daemon_state','symbol':self.name,'detail':dict(state)})
+                rows=store.journal_query(kind='daemon_state',symbol=self.name,limit=1)
+                if not rows or (rows[0].get('detail') or {}).get('logstream_commit')!=token:
+                    raise OSError('logstream handoff persistence not verified')
+                durable=True
+                ls.acknowledge([item['signature']])
+                state['logstream_committed_refs']=[]
+                try:store.prune_journal(kind='daemon_state',symbol=self.name,keep=10)
+                except Exception:logger.warning('logstream state prune failed',exc_info=True)
             except Exception:
-                logger.exception("logstream consider failed for %s", mint)
+                if not durable:
+                    state.clear();state.update(before)
+                logger.exception("logstream consider/commit failed for %s", mint)
+                break  # preserve ordering and stop repeated failing commits
 
     # -- PumpPortal WebSocket discovery --------------------------------
     def _ensure_pumpportal(self, config) -> None:

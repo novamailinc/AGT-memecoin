@@ -233,5 +233,26 @@ Classification from actual call sites: wallet_discovery mines proposal-only
 candidates, exit_copy measures exits, bundle/funding_clusters read wallet behavior,
 grad_raw/moon_lane/raw_tight/grad_select read migration prices, deployers resolves
 creator/funder data, and logstream is a separate launch-event acquisition path.
-The logstream seen-before-detail-fetch order remains an open retry-loss boundary;
-these readers are not covered by scanner wallet outbox acceptance.
+Logstream has its separate received-signature handoff described below; these
+readers are not covered by scanner wallet outbox acceptance.
+
+
+## Received logstream signatures and handoff
+
+Logstream stages successfully reported envelope signatures in a separate atomic,
+locked intake before fetching details. Unknown/failed/mismatched transaction
+responses remain pending. Existing HTTP pool, pacer and 0.5s per-detail politeness
+are unchanged; retry checks every30s process at most10 unresolved signatures and
+rotate unavailable ones. Received/resolved work survives process restart; pending
+work is not evicted. Accepted signature history retains5000 IDs, not lifetime dedup.
+
+Actual scanner drain no longer removes the whole batch before consideration.
+Resolved snapshots stay pending through stop, consideration exception, state-write
+or readback failure. Direct scanner state commit/readback precedes intake ACK;
+committed references finish missed ACK on restart. In-memory partial-state rollback
+does not undo already published notifications or other external side effects.
+No global scanner writer serialization, network-disconnection backfill, semantic
+instruction ownership proof, whole-bot crash safety or source completeness is
+claimed. Valid successful no-mint and definitive failed fetched details currently
+remain pending too, so diagnostic backlog can grow. Websocket receipt still has a
+small receive-to-stage crash gap; messages not durably received are not recovered.

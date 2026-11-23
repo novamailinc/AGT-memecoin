@@ -1083,11 +1083,10 @@ class FlashSpamLogstreamTest(unittest.TestCase):
         cfg = SimpleNamespace(degen=_degen(early_safety_flash=True,
                                            sniper_tier_threshold=0.0,
                                            flash_pregate_enabled=False))
-        ls = logstream.LogStream.__new__(logstream.LogStream)
-        import queue as _q
-        ls._q = _q.Queue()
-        ls._q.put({"mint": "LOGMINT1", "signature": "sig1",
-                   "ts": time.time()})
+        import tempfile
+        scratch=tempfile.TemporaryDirectory();self.addCleanup(scratch.cleanup)
+        ls = logstream.LogStream(intake_home=scratch.name)
+        ls._intake.receive('sig1');ls._intake.resolve('sig1','LOGMINT1')
         self.sc._logstream = ls
         ok = {"passed": True, "unknown": False, "score": 90}
         with patch.object(event_bus, "publish") as pub, \

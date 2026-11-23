@@ -11,6 +11,7 @@ from daemon.launch_scanner.logstream import LogStream, WSClient, WSError, extrac
 def _parsed_tx(mint):
     return {
         "transaction": {
+            "signatures":["sig"],
             "message": {
                 "instructions": [{
                     "parsed": {"type": "initializeMint",
@@ -50,15 +51,22 @@ class ExtractMintTest(unittest.TestCase):
 
 
 class LogStreamDegradationTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+
+    def stream(self):
+        return LogStream(intake_home=self.tmp.name)
+
     def test_http_rpc_method_not_shadowed_by_url_attr(self):
         # Regression: __init__ once stored the URL string in self._http_rpc,
         # shadowing the _http_rpc() method -> "'str' object is not callable".
-        ls = LogStream()
+        ls = self.stream()
         self.assertTrue(callable(ls._http_rpc))
         self.assertIsInstance(ls._http_rpc_url, str)
 
     def test_mint_for_signature_uses_rpc(self):
-        ls = LogStream.__new__(LogStream)
+        ls = self.stream()
         ls._http_rpc_url = "http://x/"
         ls._last_rpc_ts = 0.0
         ls._rpc_fail_count = 0
@@ -74,7 +82,7 @@ class LogStreamDegradationTest(unittest.TestCase):
     def test_unreachable_ws_degrades_not_crashes(self):
         # Nothing listening on this port: the thread must fail, back off,
         # and leave the scanner on polling — never raise.
-        ls = LogStream(ws_url="ws://127.0.0.1:1")
+        ls = LogStream(ws_url="ws://127.0.0.1:1",intake_home=self.tmp.name)
         ls.start()
         try:
             time.sleep(0.5)
@@ -83,17 +91,18 @@ class LogStreamDegradationTest(unittest.TestCase):
         finally:
             ls.stop()
 
-    def test_drain_returns_queued_items(self):
-        ls = LogStream.__new__(LogStream)
-        ls._q = queue.Queue()
-        ls._q.put({"mint": "M1", "signature": "s1", "ts": 1.0})
-        ls._q.put({"mint": "M2", "signature": "s2", "ts": 2.0})
-        out = ls.drain()
-        self.assertEqual([i["mint"] for i in out], ["M1", "M2"])
-        self.assertEqual(ls.drain(), [])
+    def test_drain_returns_unaccepted_items(self):
+        ls=self.stream()
+        for sig,mint in (('s1','M1'),('s2','M2')):
+            ls._intake.receive(sig);ls._intake.resolve(sig,mint)
+        out=ls.drain()
+        self.assertEqual([i['mint'] for i in out],['M1','M2'])
+        self.assertEqual(ls.drain(),out)
+        ls.acknowledge(['s1','s2'])
+        self.assertEqual(ls.drain(),[])
 
     def test_failed_tx_notifications_ignored(self):
-        ls = LogStream.__new__(LogStream)
+        ls = self.stream()
         ls._q = queue.Queue()
         ls._seen_sigs = set()
         ls._mint_for_signature = lambda sig: (_ for _ in ()).throw(
@@ -106,7 +115,7 @@ class LogStreamDegradationTest(unittest.TestCase):
         self.assertEqual(ls.drain(), [])
 
     def test_duplicate_signatures_deduped(self):
-        ls = LogStream.__new__(LogStream)
+        ls = self.stream()
         ls._q = queue.Queue()
         ls._seen_sigs = set()
         ls._mint_for_signature = lambda sig: "DUPMINT"

@@ -21,7 +21,6 @@ import http.client
 import json
 import logging
 import os
-import queue
 import socket
 import ssl
 import struct
@@ -344,14 +343,15 @@ def extract_mint(tx: Dict[str, Any]) -> Optional[str]:
 class LogStream:
     """Background program-log subscriber.
 
-    ``drain()`` returns ``[{mint, signature, ts}]`` detected since the last
-    drain. Never raises out of its thread; when the websocket is down the
+    ``drain()`` returns unaccepted ``[{mint, signature, ts}]`` snapshots.
+    Only explicit scanner commit acknowledgement consumes detections. Never raises out of its thread; when the websocket is down the
     scanner simply keeps polling.
     """
 
     def __init__(self, ws_url: str = WS_URL, http_rpc: Optional[str] = None,
                  programs: Tuple[str, ...] = (PUMP_PROGRAM,),
-                 http_rpcs: Optional[List[str]] = None):
+                 http_rpcs: Optional[List[str]] = None,
+                 intake_home=None):
         self._ws_url = ws_url
         if http_rpcs:
             urls = [u for u in http_rpcs if u]
@@ -366,12 +366,14 @@ class LogStream:
         self._rpc_health = {u: 1.0 for u in urls}
         self._rpc_active = urls[0]
         self._programs = programs
-        self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._healthy = False
-        self._seen_sigs = set()
+        from pathlib import Path
+        from .stream_intake import StreamIntake
+        self._intake=StreamIntake(intake_home or os.environ.get('FOREX_AGENT_HOME',Path.home()/'.forex-agent'))
+        self._last_retry_ts=0.0
         # RPC politeness / failure accounting (worker thread only).
         self._last_rpc_ts = 0.0
         self._rpc_fail_count = 0
@@ -410,12 +412,23 @@ class LogStream:
             return self._healthy
 
     def drain(self) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        while True:
-            try:
-                out.append(self._q.get_nowait())
-            except queue.Empty:
-                return out
+        """Snapshot resolved unaccepted detections; never consumes them."""
+        return [dict(rec,signature=sig) for sig,rec in self._intake.pending().items() if rec.get('mint')]
+
+    def acknowledge(self,signatures):
+        self._intake.accept(signatures)
+
+    def _retry_pending(self):
+        # Existing HTTP source/pacer and per-detail politeness remain intact.
+        now=time.monotonic()
+        if now-self._last_retry_ts<30:return
+        self._last_retry_ts=now
+        for sig,rec in [(s,r) for s,r in self._intake.pending().items() if not r.get('mint')][:10]:
+            if self._stop.is_set():break
+            if rec.get('mint'):continue
+            mint=self._mint_for_signature(sig)
+            if mint:self._intake.resolve(sig,mint)
+            else:self._intake.defer(sig)
 
     # -- internals ------------------------------------------------------
     def _set_healthy(self, value: bool) -> None:
@@ -426,6 +439,7 @@ class LogStream:
         backoff = 5.0
         while not self._stop.is_set():
             try:
+                self._retry_pending()
                 self._serve()
             except Exception as exc:
                 logger.warning("logstream connection failed: %s", exc)
@@ -453,6 +467,7 @@ class LogStream:
             logger.warning("logstream subscribed to %d program(s)",
                            len(self._programs))
             while not self._stop.is_set():
+                self._retry_pending()
                 msg = ws.recv_text()
                 if msg is None:
                     raise WSError("server closed the stream")
@@ -468,27 +483,22 @@ class LogStream:
             data = json.loads(msg)
         except Exception:
             return
-        if data.get("method") != "logsNotification":
+        if not isinstance(data,dict) or data.get("method") != "logsNotification":
             return  # subscribe acks etc.
         try:
             value = ((data.get("params") or {}).get("result", {})
                      .get("value", {})) or {}
         except Exception:
             return
-        if value.get("err"):
-            return  # failed transaction — ignore
+        if not isinstance(value,dict) or "err" not in value or value["err"] is not None:
+            return  # unknown/failed envelope is not successful receipt
         sig = value.get("signature")
-        if not sig or not isinstance(sig, str) or sig in self._seen_sigs:
+        if not sig or not isinstance(sig, str):
             return
-        self._seen_sigs.add(sig)
-        if len(self._seen_sigs) > 5000:
-            self._seen_sigs = set(list(self._seen_sigs)[-2500:])
-        mint = self._mint_for_signature(sig)
-        if mint:
-            logger.warning("logstream detected new mint %s (sig %s...)",
-                           mint, sig[:12])
-            self._q.put({"mint": mint, "signature": sig,
-                         "ts": time.time()})
+        if not self._intake.receive(sig):return
+        mint=self._mint_for_signature(sig)
+        if mint:self._intake.resolve(sig,mint)
+        else:self._intake.defer(sig)
 
     def _mint_for_signature(self, sig: str) -> Optional[str]:
         # Politeness: at most ~2 transaction fetches/sec so the public RPC
@@ -507,6 +517,9 @@ class LogStream:
         # already refused failed txs, but the fetched tx is the
         # authority — a reverted create names no mint.
         if not _txg.tx_succeeded(tx):
+            return None
+        signatures=(tx.get('transaction') or {}).get('signatures')
+        if not isinstance(signatures,list) or not signatures or signatures[0]!=sig:
             return None
         return extract_mint(tx)
 

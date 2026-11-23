@@ -221,3 +221,13 @@ class TestNativeSharedEntry:
         assert all(x['ok'] for x in a.settle_pending_usd({
              'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'}))
         assert pa.snapshot()['cash']==10.
+
+    def test_shared_explicit_nonzero_close_cannot_reuse_prior_price_evidence(self, account, tmp_path):
+        a=adapter(tmp_path)
+        a.submit_order(_req('BONK','BUY',.02,'a'))
+        a._shared_price_sol('BONK')
+        before=a._state_path().read_bytes()
+        with pytest.raises(BrokerError,match='dead-pool zero'):
+            a.close_position_at(1,.000001,'manual')
+        assert a._state_path().read_bytes()==before
+        assert pa.snapshot()['pending_sol']==[]

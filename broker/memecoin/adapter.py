@@ -719,7 +719,8 @@ class MemecoinAdapter(BrokerAdapter):
                 and 0<=time.time()-observed<=_SOL_PRICE_TTL
                 and isinstance(quote.get("source"),str) and quote["source"]):
             self._shared_last_exit_price = {"kind":"native_SOL_pair", "price_sol":native,
-                "mint":quote["mint"],"source":quote["source"],"observed_at":observed}
+                "mint":quote["mint"],"source":quote["source"],"observed_at":observed,
+                "quote_mint":quote["price_sol_quote_mint"], "pair":quote.get("pair")}
             return float(native)
         fx = self._observe_entry_fx()
         usd = quote.get("price_usd")
@@ -1425,6 +1426,8 @@ class MemecoinAdapter(BrokerAdapter):
                     INVALID_ORDER,
                     f"no open paper position with ticket {ticket}")
             price_sol = float(price_sol)
+            if self._shared_account is not None and price_sol != 0.0:
+                raise BrokerError(INVALID_ORDER, "shared explicit close is restricted to confirmed dead-pool zero")
             del self._positions[str(ticket)]
             proceeds = p["tokens"] * price_sol
             realized = (price_sol - p["entry_price_sol"]) * p["tokens"]

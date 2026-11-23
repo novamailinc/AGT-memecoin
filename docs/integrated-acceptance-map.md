@@ -108,8 +108,10 @@ storage is deliberately not hard-capped or evicted, so prolonged outages can gro
 it. Corruption is unavailable, never rebaselined. First-time bootstrap explicitly
 records no pre-start backfill; pageback overflow or an absent previous cursor
 records incomplete coverage, never a full-history claim. Page fetch failure does
-not advance. Convergence write failure prevents acknowledgement; successful
-convergence and seen snapshots fsync before it.
+not advance. Convergence write failure prevents acknowledgement; proposed in-memory seen
+changes are applied only after that save, so the next poll cannot bypass the
+failed handler. Bus publish false/exception is a failed fire, not a resolved
+sighting; successful bus/convergence/seen snapshots fsync before acknowledgement.
 
 Tests at the actual poll seam cover failed detail then fresh-interpreter retry,
 valid empty versus invalid evidence, failed chain execution, disk/persistence

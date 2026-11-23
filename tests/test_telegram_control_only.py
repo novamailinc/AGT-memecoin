@@ -60,11 +60,11 @@ class TestControlOnly(unittest.TestCase):
              patch('daemon.telegram.get_daemon_state',return_value={}), \
              patch('daemon.telegram.save_daemon_state'), \
              patch('daemon.telegram.event_bus.configure'), \
-             patch.object(d,'_fan_out'), \
+             patch.object(d,'_fan_out') as fanout, \
              patch('daemon.telegram._blink.maybe_poll') as blink, \
              patch('daemon.telegram._thesis_watch.maybe_check') as thesis:
             d.run_once()
-        blink.assert_not_called();thesis.assert_not_called()
+        blink.assert_not_called();thesis.assert_not_called();fanout.assert_not_called()
 
     def test_successful_delivery_records_api_acceptance_not_read_receipt(self):
         client=Mock();client.send_message.return_value={'message_id':42}
@@ -92,3 +92,12 @@ class TestControlOnly(unittest.TestCase):
             roster=module._active_roster()
         self.assertEqual([s.name for s in roster],['telegram'])
         self.assertIn('--control-only',roster[0].argv)
+
+    def test_malformed_send_results_never_record_acceptance(self):
+        for result in (None,{}, {'message_id':None},{'message_id':False},
+                       {'message_id':0},{'message_id':'123'}):
+            client=Mock();client.send_message.return_value=result
+            state={}
+            TelegramDaemon()._make_sender(client,state)(111,'fixture response',None)
+            self.assertNotIn('last_command_delivery',state)
+            self.assertEqual(state['command_send_failures'],1)

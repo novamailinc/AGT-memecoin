@@ -245,7 +245,8 @@ class TelegramDaemon(Daemon):
 
         # 2. fan out alerts ----------------------------------------------
         # Runs even when the update pull above failed.
-        self._fan_out(ctx, client, sec, state, store)
+        if not control_only():
+            self._fan_out(ctx, client, sec, state, store)
 
         if not control_only():
             # 3. card pulse ---------------------------------------------------
@@ -304,6 +305,10 @@ class TelegramDaemon(Daemon):
         def _send(chat_id: Any, text: str, reply_markup: Optional[Dict[str, Any]]) -> None:
             try:
                 result=client.send_message(chat_id, text, reply_markup=reply_markup)
+                if control_only() and (not isinstance(result,dict)
+                        or type(result.get('message_id')) is not int
+                        or result['message_id']<=0):
+                    raise TelegramError('send result has no valid Telegram message ID')
                 if state is not None and control_only():
                     import time
                     state['last_command_delivery']={

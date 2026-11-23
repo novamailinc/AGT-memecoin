@@ -739,9 +739,12 @@ def fire_card(mint, info, safety_reason, n_wallets, wallet_names,
                 sig["age_min"] = feat["age_min"]
             else:
                 sig.pop("age_min", None)
-            publish(sig)
+            if publish(sig) is not True:
+                logger.error('smart watcher bus signal was not accepted for %s',mint[:12])
+                return False
         except Exception:
-            pass
+            logger.exception('smart watcher bus publish failed for %s',mint[:12])
+            return False
         # Paper mirror (2026-10-17): every Solana card opens a $1 paper
         # position with honest fills + the user's exit ladder. Never
         # affects the card. Solana only. No score is passed: the lane
@@ -999,8 +1002,11 @@ def handle_sighting(wallet, buy, registry, seen):
     last = float(rec.get("last_attempt_ts") or 0)
     if last and now - last < RETRY_EVERY_S:
         return save_convergence(ledger)  # attempt spacing — the retry sweep owns the next try
-    outcome = _attempt_fire(mint, rec, n_groups, seen, retry=False)
+    proposed_seen=set(seen)
+    outcome = _attempt_fire(mint, rec, n_groups, proposed_seen, retry=False)
     saved = save_convergence(ledger)
+    if saved:
+        seen.update(proposed_seen)
     if outcome != "fired":
         logger.warning("CONVERGENCE HELD %s: %s (%s) — retrying for "
                        "up to %dm while it keeps running", mint[:8],
@@ -1017,6 +1023,7 @@ def sweep_expired_convergence(seen):
     ledger = load_convergence()
     now = time.time()
     changed = False
+    proposed_seen=set(seen)
     for mint, rec in list(ledger.items()):
         if not isinstance(rec, dict) or rec.get("card_fired"):
             continue
@@ -1031,10 +1038,10 @@ def sweep_expired_convergence(seen):
             logger.warning("CONVERGENCE EXPIRED %s: %d group(s) in 30m, "
                            "no card", mint[:8], n)
             rec["card_fired"] = True
-            seen.add(mint)
+            proposed_seen.add(mint)
             changed = True
-    if changed:
-        save_convergence(ledger)
+    if changed and save_convergence(ledger):
+        seen.update(proposed_seen)
 
 
 def retry_convergences(seen):
@@ -1052,6 +1059,7 @@ def retry_convergences(seen):
         ledger = load_convergence()
         now = time.time()
         changed = False
+        proposed_seen=set(seen)
         for mint, rec in list(ledger.items()):
             if not isinstance(rec, dict) or rec.get("card_fired"):
                 continue
@@ -1063,7 +1071,7 @@ def retry_convergences(seen):
             if first and now - first > RETRY_WINDOW_S:
                 rec["card_fired"] = True
                 rec["resolved"] = "retry-window-expired"
-                seen.add(mint)
+                proposed_seen.add(mint)
                 changed = True
                 logger.warning(
                     "CONVERGENCE EXPIRED %s: %d group(s), %d attempt(s), "
@@ -1073,7 +1081,7 @@ def retry_convergences(seen):
             last = float(rec.get("last_attempt_ts") or 0)
             if last and now - last < RETRY_EVERY_S:
                 continue
-            outcome = _attempt_fire(mint, rec, n_groups, seen,
+            outcome = _attempt_fire(mint, rec, n_groups, proposed_seen,
                                     retry=True)
             changed = True
             if outcome != "fired":
@@ -1081,8 +1089,8 @@ def retry_convergences(seen):
                                "(attempt %d)", mint[:8], outcome,
                                rec.get("last_block_reason") or "?",
                                int(rec.get("attempts") or 0))
-        if changed:
-            save_convergence(ledger)
+        if changed and save_convergence(ledger):
+            seen.update(proposed_seen)
     except Exception:
         logger.exception("convergence retry sweep failed")
 
@@ -1314,36 +1322,44 @@ def poll_wallet(wallet, api_key, registry, seen, intake):
     explicitly recorded as incomplete coverage, not silently called complete.
     """
     state = intake.wallet(wallet)
-    first = rpc("getSignaturesForAddress", [wallet, {"limit": SIG_LIMIT}], api_key)
-    if first and isinstance(first, list):
-        prev = state['cursor'] if state else None
-        newest = first[0].get('signature')
-        if not state:
-            # Preserve startup posture: establish a starting cursor,
-            # not a fabricated promise of pre-start backfill.
-            intake.stage(wallet, None, newest, [], gap='bootstrap_no_prestart_backfill')
-        else:
-            page, discovered, pages, gap, complete = first, [], 0, None, False
-            while page:
-                found = False
-                for item in page:
-                    sig = item.get('signature')
-                    if not isinstance(sig,str) or not sig:
+    try:
+        first = rpc("getSignaturesForAddress", [wallet, {"limit": SIG_LIMIT}], api_key)
+        if first and isinstance(first, list):
+            prev = state['cursor'] if state else None
+            newest = first[0].get('signature')
+            if not state:
+                # Preserve startup posture: establish a starting cursor,
+                # not a fabricated promise of pre-start backfill.
+                intake.stage(wallet, None, newest, [], gap='bootstrap_no_prestart_backfill')
+            else:
+                page, discovered, pages, gap, complete = first, [], 0, None, False
+                while page:
+                    found = False
+                    if not isinstance(page,list):
                         raise ValueError('malformed signature page')
-                    if sig == prev:
-                        found = True;break
-                    if sig not in discovered:discovered.append(sig)
-                if found or len(page) < SIG_LIMIT:
-                    if not found:gap='cursor_not_found_in_available_history'
-                    complete=True;break
-                if pages >= PAGEBACK_MAX:
-                    gap='pageback_limit_incomplete_history';complete=True;break
-                page=rpc('getSignaturesForAddress',
-                         [wallet, {'limit':SIG_LIMIT,'before':page[-1]['signature']}],api_key)
-                pages+=1
-                if not page:break
-            if complete:
-                intake.stage(wallet,prev,newest,list(reversed(discovered)),gap=gap)
+                    for item in page:
+                        if not isinstance(item,dict):
+                            raise ValueError('malformed signature record')
+                        sig = item.get('signature')
+                        if not isinstance(sig,str) or not sig:
+                            raise ValueError('malformed signature page')
+                        if sig == prev:
+                            found = True;break
+                        if sig not in discovered:discovered.append(sig)
+                    if found or len(page) < SIG_LIMIT:
+                        if not found:gap='cursor_not_found_in_available_history'
+                        complete=True;break
+                    if pages >= PAGEBACK_MAX:
+                        gap='pageback_limit_incomplete_history';complete=True;break
+                    page=rpc('getSignaturesForAddress',
+                             [wallet, {'limit':SIG_LIMIT,'before':page[-1]['signature']}],api_key)
+                    pages+=1
+                    if not page:break
+                if complete:
+                    intake.stage(wallet,prev,newest,list(reversed(discovered)),gap=gap)
+    except (ValueError,TypeError,AttributeError):
+        # Malformed discovery cannot starve already durable detail work.
+        logger.warning('signature discovery unavailable for %s',wallet[:6])
     state=intake.wallet(wallet)
     pending=(state or {}).get('pending',[])[:SIG_LIMIT*(PAGEBACK_MAX+1)]
     def fetch(signature):

@@ -167,5 +167,44 @@ with patch.object(sw,'rpc',return_value=[]),patch.object(sw,'_shared_rpc_transpo
         self.assertEqual(self.intake.wallet('W')['pending'],['new'])
 
 
+    def test_malformed_signature_page_cannot_starve_existing_pending(self):
+        for page in ([None],[{'signature':'later'},None],{'unexpected':'shape'}):
+            home=WalletIntake(self.tmp.name)
+            old=home.wallet('W')['cursor']
+            home.stage('W',old,'new',['new'])
+            self.poll(transaction(),page=page)
+            self.assertEqual(home.wallet('W')['pending'],[])
+            self.assertEqual(home.wallet('W')['cursor'],'new')
+
+    def test_real_fire_seen_commits_only_after_convergence_persistence(self):
+        # A successful production _attempt_fire mutates only proposed seen.
+        # Failed save must force the NEXT poll through the handler again.
+        with patch.object(sw,'eval_convergence',return_value=(2,True)), \
+             patch.object(sw,'try_fire_converged_card',return_value='fired') as fire, \
+             patch.object(sw,'save_convergence',return_value=False):
+            with self.assertRaises(OSError):self.poll(transaction())
+            self.assertNotIn('Mpump',self.seen)
+            self.assertEqual(self.intake.wallet('W')['pending'],['new'])
+            with self.assertRaises(OSError):self.poll(transaction())
+            self.assertEqual(fire.call_count,2)
+            self.assertNotIn('Mpump',self.seen)
+        with patch.object(sw,'eval_convergence',return_value=(2,True)), \
+             patch.object(sw,'try_fire_converged_card',return_value='fired'):
+            self.poll(transaction())
+        self.assertIn('Mpump',self.seen)
+        self.assertEqual(self.intake.wallet('W')['pending'],[])
+
+
+    def test_bus_false_or_exception_cannot_claim_fire_success(self):
+        import signal_bus
+        info={'symbol':'FIX','price':1,'mcap':100000,'liq':50000,'vol':10000}
+        with patch.object(sw,'_HAS_CARDS',False),patch.object(sw,'_CARDS_ENABLED',False):
+            for behavior in (False, OSError('bus disk fixture')):
+                with patch.object(signal_bus,'publish') as publish:
+                    if isinstance(behavior,Exception):publish.side_effect=behavior
+                    else:publish.return_value=behavior
+                    self.assertIs(sw.fire_card('Mpump',info,'fixture',2,'W'),False)
+
+
 
 if __name__=='__main__':unittest.main()

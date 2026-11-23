@@ -150,8 +150,13 @@ def publish(sig):
         tmp = BUS_PATH + ".tmp"
         with open(tmp, "w") as f:
             f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, BUS_PATH)
+        directory_fd=os.open(os.path.dirname(BUS_PATH),os.O_RDONLY)
+        try:os.fsync(directory_fd)
+        finally:os.close(directory_fd)
         return True
     except Exception:
         return False

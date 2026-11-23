@@ -22,11 +22,11 @@ The normal Telegram long-poll cadence remains unchanged. Shared supervision reta
 - `/account`, `/positions`, `/perf`: the local memecoin simulated account only. Missing ledger is unavailable, never test money or proof of zero trading history. No legacy forex account is substituted.
 - `/halt`: persist the actual local global-entry latch and verify its state, without constructing a broker/executor. All connected components must share the same configured database.
 
-Trade, resume, configuration mutation, research/price commands and inline callbacks cannot execute in this mode. Price/blink/thesis side loops do not run. Normal authorized commands remain unchanged outside this mode.
+Trade, resume, configuration mutation, research/price commands and inline callbacks cannot execute in this mode. Journal alert fanout, quiet digests and price/blink/thesis side loops do not run. Normal authorized commands remain unchanged outside this mode.
 
 ## Delivery and lifetime
 
-Command sends record `last_command_delivery` in durable Telegram daemon state only after Telegram's API accepts the send, including returned message ID and acceptance time. This is not a read receipt. Failed sends increment `command_send_failures`, not a success record. Older replies without this instrumentation have no stored acceptance proof.
+Command sends record `last_command_delivery` in durable Telegram daemon state only after Telegram's API accepts the send, including returned message ID and acceptance time. This is not a read receipt. Only a positive exact-integer returned message ID establishes acceptance. Failed or malformed sends increment `command_send_failures`, not a success record. Input updates are consumed before sending and a failed reply is not retried, so command-reply at-least-once delivery is NOT guaranteed. Older replies without this instrumentation have no stored acceptance proof.
 
 The supervisor restores a stopped Telegram child within its restart policy; durable pairing and update offset survive a process restart. Neither process by itself proves boot persistence. If the development host shuts down, service stops unless an independently configured host boot service restores it. Do not promise permanent hosting from a detached process or a supervised child restart.
 

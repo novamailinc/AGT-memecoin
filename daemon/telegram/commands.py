@@ -163,7 +163,7 @@ HELP_TEXT = (
 # ----------------------------------------------------------------------
 CONTROL_ONLY_HELP = (
     'AGT-memecoin control room connected. Owner-only development control mode.\n'
-    'Trading and market-data processes are NOT running. Stage A is unpassed.\n'
+    'This control room does not start trading or market-data processes. Stage A is unpassed.\n'
     '/status - actual local runtime and gate state\n'
     '/account - shared simulated account, if present\n'
     '/positions - stored simulated positions\n'

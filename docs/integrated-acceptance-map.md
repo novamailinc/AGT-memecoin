@@ -132,7 +132,12 @@ Crashes can replay downstream effects. Shared bus publication now holds flock ov
 and uses private unique temporary snapshots with file/directory fsync. A
 12-process/144-publication fixture checks complete retention below the existing
 5000-line bound; replace failure preserves the previous snapshot and returns
-false. This does not make duplicate replay exactly once. Convergence still has
-fixed temporary paths and no demonstrated cross-process read-modify-write
-serialization; sell grading effects are not idempotent by transaction signature. Passing poll recovery is not proof of exactly-once
+false. A directory fsync failure after replace can return false with the new
+signal already visible: durability is uncertain, not rollback/no publication,
+and a retry can duplicate it. This does not make duplicate replay exactly once.
+Convergence production sighting/expiry/retry paths now serialize whole RMW under
+flock, use unique private atomic snapshots and reject existing unreadable/invalid
+state instead of silently resetting it. Eight processes recording64distinct mints
+check actual handle_sighting retention. Sell grading effects remain non-idempotent
+by transaction signature; separate-stage commits and replay remain open. Passing poll recovery is not proof of exactly-once
 signal/notification/sell execution or full acquisition coverage.

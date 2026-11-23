@@ -23,6 +23,9 @@ only decides card firing. Never raises.
 from __future__ import annotations
 
 import json
+import functools
+import fcntl
+import tempfile
 import logging
 import os
 import re
@@ -114,34 +117,65 @@ def is_expired(first_ts: float, now_ts: float,
         return False
 
 
+class ConvergenceUnavailable(ValueError):
+    pass
+
+
+def serialized_convergence(fn):
+    """Serialize the entire production read/modify/write, not just save."""
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        _LEDGER_FILE.parent.mkdir(parents=True,exist_ok=True)
+        with open(str(_LEDGER_FILE)+'.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return fn(*args,**kwargs)
+    return wrapped
+
+
 def load_convergence() -> Dict[str, Any]:
-    """{mint: {sightings: [...], first_ts, card_fired}}. Never raises."""
+    """Missing starts empty; existing unavailable state never resets.
+
+    Callers doing read/modify/write must hold serialized_convergence for
+    the whole operation. The public load/save pair alone is not a transaction.
+    """
     try:
         data = json.loads(_LEDGER_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
+    except (OSError,ValueError) as exc:
+        raise ConvergenceUnavailable('convergence state unavailable') from exc
+    if not isinstance(data,dict):
+        raise ConvergenceUnavailable('invalid convergence root')
+    for mint,rec in data.items():
+        if (not isinstance(mint,str) or not isinstance(rec,dict)
+                or not isinstance(rec.get('sightings'),list)
+                or any(not isinstance(item,dict) for item in rec['sightings'])):
+            raise ConvergenceUnavailable('invalid convergence record')
+    return data
 
 
 def save_convergence(ledger: Dict[str, Any]) -> bool:
+    tmp=None
     try:
         _LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _LEDGER_FILE.with_suffix(".tmp")
-        with open(tmp, 'w') as f:
-            os.chmod(tmp, 0o600)
-            json.dump(ledger, f)
+        fd,tmp=tempfile.mkstemp(dir=_LEDGER_FILE.parent,prefix='.convergence-')
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(ledger, f,allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
-        tmp.replace(_LEDGER_FILE)
+        os.replace(tmp,_LEDGER_FILE)
         directory_fd = os.open(_LEDGER_FILE.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
         return True
-    except OSError as exc:
-        logger.warning("could not save convergence ledger: %s", exc)
+    except (OSError,ValueError,TypeError) as exc:
+        logger.warning('could not save convergence ledger: %s',exc)
         return False
+    finally:
+        if tmp and os.path.exists(tmp):os.unlink(tmp)
 
 
 def add_sighting(ledger: Dict[str, Any], mint: str, wallet: str,

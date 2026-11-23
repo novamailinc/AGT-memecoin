@@ -206,5 +206,41 @@ with patch.object(sw,'rpc',return_value=[]),patch.object(sw,'_shared_rpc_transpo
                     self.assertIs(sw.fire_card('Mpump',info,'fixture',2,'W'),False)
 
 
+    def test_corrupt_convergence_preserved_and_intake_not_acknowledged(self):
+        path=Path(self.tmp.name)/'convergence.json'
+        for content in ('{','[]', '{"Mpump":{"sightings":[null]}}'):
+            path.write_text(content)
+            with self.assertRaises(ValueError):self.poll(transaction())
+            self.assertEqual(path.read_text(),content)
+            self.assertEqual(self.intake.wallet('W')['pending'],['new'])
+            self.assertNotIn('Mpump',self.seen)
+
+    def test_parallel_real_sightings_retain_all_distinct_mints(self):
+        code="""
+import importlib.machinery,os,time
+from pathlib import Path
+sw=importlib.machinery.SourceFileLoader('parallel_sw','scripts/smart-watcher').load_module()
+sw.enrich=lambda mint:None
+while not Path(os.environ['CONV_BARRIER']).exists():time.sleep(.005)
+for i in range(8):
+    assert sw.handle_sighting('W',{'mint':os.environ['CONV_ID']+str(i)+'pump',
+      'tokens_bought':1,'sol_spent':1,'block_ts':time.time()}, {},set()) is True
+"""
+        barrier=Path(self.tmp.name)/'ready'
+        workers=[subprocess.Popen([sys.executable,'-c',code],cwd=ROOT,
+                 env=dict(os.environ,FOREX_AGENT_HOME=self.tmp.name,CONV_BARRIER=str(barrier),CONV_ID=str(i)+':'),
+                 text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE) for i in range(8)]
+        barrier.touch()
+        try:
+            for worker in workers:
+                out,err=worker.communicate(timeout=25)
+                self.assertEqual(worker.returncode,0,out+err)
+        finally:
+            for worker in workers:
+                if worker.poll() is None:worker.kill();worker.wait()
+        path=Path(self.tmp.name)/'launch_scanner/smart_convergence.json'
+        self.assertEqual(len(json.loads(path.read_text())),64)
+
+
 
 if __name__=='__main__':unittest.main()

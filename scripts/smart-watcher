@@ -28,12 +28,13 @@ except ImportError:
 try:
     from smartwatch_filters import (wallet_group, is_stale, eval_convergence,
                                     is_expired, load_convergence,
-                                    save_convergence, add_sighting,
+                                    save_convergence, add_sighting, serialized_convergence,
                                     CONVERGENCE_WINDOW_S)
     from toxicity import check_toxicity, check_toxicity_detailed
     _HAS_FILTERS = True
 except ImportError:
     _HAS_FILTERS = False
+    def serialized_convergence(fn):return fn
 try:
     import lp_lock
     _HAS_LPLOCK = True
@@ -950,6 +951,7 @@ def _retry_pending(rec, now):
         return False
 
 
+@serialized_convergence
 def handle_sighting(wallet, buy, registry, seen):
     """Route one detected wallet buy through the convergence filter.
 
@@ -1016,6 +1018,7 @@ def handle_sighting(wallet, buy, registry, seen):
     return saved
 
 
+@serialized_convergence
 def sweep_expired_convergence(seen):
     """Expire single-wallet sightings past the 5-min window (no card)."""
     if not _HAS_FILTERS:
@@ -1044,6 +1047,7 @@ def sweep_expired_convergence(seen):
         seen.update(proposed_seen)
 
 
+@serialized_convergence
 def retry_convergences(seen):
     """Re-attempt converged cards that were blocked on their first try.
 

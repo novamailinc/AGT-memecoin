@@ -202,6 +202,37 @@ def main():
             pass
         check("marker without machine name refuses", True)
 
+        # Truthy-but-not-true "armed" values must NOT arm: only the
+        # boolean true arms. A string from a hand-edited marker or a
+        # test/config default can never accidentally enable sends.
+        for bad_armed in ("true", 1, "yes", "armed"):
+            with open(marker_path, "w") as f:
+                json.dump({"machine": "test-vm", "armed": bad_armed}, f)
+            try:
+                ex.arm_live()
+                raise AssertionError("armed with %r" % (bad_armed,))
+            except BrokerError:
+                pass
+            check("arm_live refuses armed=%r" % (bad_armed,), True)
+        check("still dry-run after truthy-string arm attempts",
+              ex.dry_run is True)
+
+        # Unreadable marker file refuses (fail closed, never a silent
+        # fall-through to a default).
+        with open(marker_path, "w") as f:
+            json.dump({"machine": "test-vm", "armed": True}, f)
+        os.chmod(marker_path, 0o000)
+        try:
+            ex.connect()
+            raise AssertionError("connected with unreadable marker")
+        except BrokerError:
+            pass
+        except PermissionError:
+            pass  # also fail-closed: no connect either way
+        finally:
+            os.chmod(marker_path, 0o644)
+        check("unreadable marker refuses", True)
+
     # -- ATA derivation -------------------------------------------------
     ata = associated_token_address(
         pubkey, "So11111111111111111111111111111111111111112")

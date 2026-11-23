@@ -586,23 +586,19 @@ def _status_mode_lines():
         "scanner cycle %ds ago (market-feed freshness not separately "
         "tracked)" % int(age)))
 
-    # --- mode verdict: only on consistent evidence --------------------
+    # --- mode verdict: only an explicit authoritative mode record ----
+    # No component above PROVES an operating mode: a fresh scanner
+    # heartbeat can come from offline/fixture operation, a ledger can
+    # come from genesis or tests, and their absence proves nothing
+    # either. The system today has no explicit authoritative mode
+    # record, so the honest verdict is UNKNOWN - observed states are
+    # reported separately above and never fused into an inferred mode.
     if armed:
-        lines.append("Mode: UNKNOWN/CONFLICT (mainnet marker armed; "
-                     "verify immediately)")
-    elif demo_present and runtime == "running":
-        lines.append("Mode: LIVE-MARKET DEMO (simulated capital; no real "
-                     "transactions)")
-    elif demo_present and runtime == "stopped":
-        lines.append("Mode: DEMO CONFIGURED, STOPPED (simulated capital)")
-    elif demo_present:
-        lines.append("Mode: UNKNOWN (demo ledger exists but scanner "
-                     "runtime unreadable)")
-    elif runtime == "running":
-        lines.append("Mode: SCANNING ONLY (no demo account ledger)")
+        lines.append("Mode: UNKNOWN/CONFLICT (mainnet deployment marker "
+                     "is armed; verify immediately)")
     else:
-        lines.append("Mode: HISTORICAL/OFFLINE (no demo account, no "
-                     "live-market runtime detected)")
+        lines.append("Mode: UNKNOWN (no explicit authoritative mode "
+                     "configuration; observed states above)")
     return lines
 
 

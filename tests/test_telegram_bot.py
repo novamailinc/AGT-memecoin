@@ -314,10 +314,11 @@ class CommandTests(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"FOREX_AGENT_HOME": tmp}):
                 # 1. nothing at all: historical/offline, mainnet gate absent
+                # 1. nothing at all: no inferred mode; observed unknowns
                 with patch.object(common, "get_store", return_value=object()), \
                      patch.object(common, "get_daemon_state", return_value={}):
                     text = status_text(2)
-                self.assertIn("Mode: HISTORICAL/OFFLINE", text)
+                self.assertIn("Mode: UNKNOWN", text)
                 self.assertIn("Mainnet: DISABLED (no deployment marker", text)
                 self.assertIn("Scanner runtime: unknown", text)
 
@@ -333,23 +334,39 @@ class CommandTests(unittest.TestCase):
                 self.assertNotIn("Mode: LIVE-MARKET DEMO", text)
                 self.assertIn("Demo account: present (simulated capital", text)
 
-                # 3. ledger + stale scanner state: configured but stopped
+                # 3. ledger + stale/failed feed: observed stopped, no mode
                 with patch.object(common, "get_store", return_value=object()), \
                      patch.object(common, "get_daemon_state",
                                   return_value={"_state_saved_ts":
                                                 time.time() - 7200}):
                     text = status_text(4)
-                self.assertIn("Mode: DEMO CONFIGURED, STOPPED", text)
+                self.assertIn("Mode: UNKNOWN", text)
+                self.assertIn("Scanner runtime: stopped", text)
+                self.assertNotIn("Mode: LIVE-MARKET DEMO", text)
 
-                # 4. ledger + fresh scanner state: live-market demo
+                # 4. ledger + fresh heartbeat: still NO live claim - a
+                #    heartbeat can come from offline/fixture operation
                 with patch.object(common, "get_store", return_value=object()), \
                      patch.object(common, "get_daemon_state",
                                   return_value={"_state_saved_ts":
                                                 time.time()}):
                     text = status_text(5)
-                self.assertIn("Mode: LIVE-MARKET DEMO", text)
-                self.assertIn("simulated capital", text)
+                self.assertIn("Mode: UNKNOWN", text)
+                self.assertIn("Scanner runtime: running", text)
+                self.assertNotIn("Mode: LIVE-MARKET DEMO", text)
                 self.assertIn("Mainnet: DISABLED", text)
+
+                # 4b. scanner running with NO ledger (offline/fixture run):
+                #     still no mode inference
+                shutil.rmtree(os.path.join(tmp, "paper_account"))
+                with patch.object(common, "get_store", return_value=object()), \
+                     patch.object(common, "get_daemon_state",
+                                  return_value={"_state_saved_ts":
+                                                time.time()}):
+                    text = status_text(7)
+                self.assertIn("Mode: UNKNOWN", text)
+                self.assertIn("Demo account: none found", text)
+                self.assertNotIn("SCANNING ONLY", text)
 
                 # 5. armed deployment marker: conflict, never a clean mode
                 os.makedirs(os.path.join(tmp, "live"))

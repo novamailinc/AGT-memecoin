@@ -175,3 +175,34 @@ class TestNativeSharedEntry:
                 a.submit_order(_req('BONK',side,.01,'new-'+side))
         assert a._state_path().read_bytes()==before
         assert pa.snapshot()['cash']==8.
+
+    def test_actual_scanner_two_tier_real_adapter_shared_pool(self, account, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from daemon.launch_scanner import LaunchScanner, killswitch, veto, scoreboard
+        monkeypatch.setenv('FOREX_AGENT_TESTING','1')
+        monkeypatch.setattr(killswitch,'gate',lambda lane:True)
+        monkeypatch.setattr(veto,'veto_check',lambda *a,**k:{'passed':True,'vetoes':[]})
+        monkeypatch.setattr(scoreboard,'load_degen_closes',lambda *a:[])
+        a=adapter(tmp_path)
+        mint=a._market.mint_for('BONK')
+        scanner=LaunchScanner.__new__(LaunchScanner)
+        state={'degen_positions':{}}
+        card={'entry':None,'note':'','tier':'early','source':'pumpfun',
+              'extra':{'complete':True}}
+        degen=SimpleNamespace(entry_sol=.04,stop_loss_pct=30.,take_profit_pct=200.,
+             max_hold_hours=4.,daily_max_loss_sol=1.,two_tier_enabled=True,
+             tier_b_max_hold_hours=24.,speed_game_min_age_min=0.)
+        assert scanner._paper_enter(None,a,state,card,degen,mint,'BONK')
+        assert len(state['degen_positions'])==2
+        assert pa.snapshot()['cash']==6.
+        assert pa.snapshot()['lanes']['main']['open_count']==2
+        tickets={p['ticket'] for p in state['degen_positions'].values()}
+        assert tickets=={1,2}
+        assert card['entry']['volume_sol']==.04
+        a.close_position(1)
+        a.close_position(2)
+        pending=pa.snapshot()['pending_sol']
+        assert len(pending)==2 and pa.snapshot()['cash']==6.
+        assert all(x['ok'] for x in a.settle_pending_usd({
+             'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'}))
+        assert pa.snapshot()['cash']==10.

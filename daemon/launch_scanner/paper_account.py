@@ -1195,7 +1195,10 @@ def write_down(lane: str, mint: str, op_id: str,
         if pid is None and pos is not None:
             pid = pos.get("pos_id")
         if pid is None:
-            return False, "no open position"
+            _journal({"event": "write_down_orphan", "lane": lane,
+                      "mint": mint, "op_id": op_id,
+                      "pos_id": pos_id, "reason": reason, "ts": ts})
+            return False, "no open position (journaled)"
         ok, why = _apply_write_down(led, lane, mint, pid, reason,
                                     ts, qty=qty)
         if not ok:
@@ -1216,6 +1219,36 @@ def write_down(lane: str, mint: str, op_id: str,
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
+
+
+def op_outcome(op_id: str) -> str:
+    """Journal-backed outcome for one op_id (Stage C, 2026-11-22):
+
+      'applied'  the op settled (credit / write_down journal event)
+      'orphan'   the op was deliberately NOT applied because the
+                 account never held the units (credit_orphan /
+                 write_down_orphan): a CONVERGED outcome for
+                 pre-flag positions, not ledger divergence
+      'unknown'  anything else - including a hard refusal
+                 (write_down_refused), a degraded-account intent
+                 note, or no record at all
+
+    The cross-ledger close-intent recovery uses this to distinguish
+    a benign orphan from a settle failure it must freeze."""
+    entries, status, _ = _journal_read()
+    if status == "torn":
+        return "unknown"
+    outcome = "unknown"
+    for ev in entries:
+        if ev.get("op_id") != op_id:
+            continue
+        kind = ev.get("event")
+        if kind in ("credit", "write_down", "debit"):
+            outcome = "applied"
+        elif kind in ("credit_orphan", "write_down_orphan") \
+                and outcome != "applied":
+            outcome = "orphan"
+    return outcome
 
 
 def _mark_value(mark: Any, now: float, ttl: float,

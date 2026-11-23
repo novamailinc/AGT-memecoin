@@ -411,6 +411,74 @@ class DeployerArchiveTest(unittest.TestCase):
         self.assertEqual(out2["records"][0]["launches_seen"], 9)
         self.assertEqual(out2["records"][0]["segments_merged"], 1)
 
+    def test_stale_snapshot_never_overwrites_fresh_counters(self):
+        # Unlocked registry RMW makes this reachable: eviction
+        # archives launches=9, a stale retry of the SAME segment id
+        # lands later with launches=3. Monotonic merge keeps the
+        # larger cumulative value and labels the regression.
+        e9 = {"first_seen": 100.0, "launches_seen": 9,
+              "hits_2x": 2, "rugs": 1, "dead": 0}
+        e3 = dict(e9, launches_seen=3, hits_2x=1)
+        self.assertTrue(deployers._archive_deployer(DEP1, e9, 300.0))
+        self.assertTrue(deployers._archive_deployer(DEP1, e3, 301.0))
+        out = deployers.deployer_archive(DEP1)
+        rec = out["records"][0]
+        self.assertEqual(rec["launches_seen"], 9)
+        self.assertEqual(rec["hits_2x"], 2)
+        self.assertEqual(rec["regression_conflicts"], 1)
+        self.assertFalse(rec["partial"])
+        self.assertEqual(rec["segments_merged"], 1)
+        # Same result when the stale snapshot is read after
+        # compaction, and when it arrives first.
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            deployers._archive_deployer(
+                DEP2, {"first_seen": 1.0, "launches_seen": 1}, 302.0)
+        out2 = deployers.deployer_archive(DEP1)
+        self.assertEqual(out2["records"][0]["launches_seen"], 9)
+        self.assertEqual(
+            out2["records"][0].get("regression_conflicts"), 1)
+
+    def test_malformed_archived_ts_isolated_not_poisoning(self):
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "segment_id": "bad:1", "deployer": DEP1,
+                        "archived_ts": "not-a-number",
+                        "launches_seen": 7})
+            + "\n"
+            + json.dumps({"v": 1, "record_type": "deployer_archive",
+                          "segment_id": "ok:1", "deployer": DEP2,
+                          "archived_ts": 5.0, "launches_seen": 2})
+            + "\n")
+        out = deployers.deployer_archive()
+        # Good deployers stay visible; the poison record is counted.
+        self.assertEqual(len(out["records"]), 1)
+        self.assertEqual(out["records"][0]["deployer"], DEP2)
+        self.assertEqual(
+            out["archive_status"].get("unusable_records"), 1)
+        # Compaction drops it with a persistent count, not silently.
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            deployers._archive_deployer(
+                DEP3, {"first_seen": 1.0, "launches_seen": 1}, 10.0)
+        out2 = deployers.deployer_archive()
+        self.assertEqual(len(out2["records"]), 2)
+        self.assertGreaterEqual(
+            out2["archive_status"].get("dropped_unreadable_total"),
+            1)
+
+    def test_missing_first_seen_fails_closed_no_fabricated_id(self):
+        self.assertFalse(deployers._archive_deployer(
+            DEP1, {"launches_seen": 4}, 100.0))
+        self.assertFalse(self.arc.exists())
+        # Entry retained on eviction attempt: nothing is dropped.
+        deployers.record_launch(DEP2)
+        deployers.record_launch(DEP3)
+        hist = deployers.load_registry()
+        dep1 = {"launches_seen": 4}  # no first_seen
+        hist[DEP1] = dep1
+        deployers.save_registry(hist)
+        deployers.record_launch("DeplDDDD44444444444444444444444444444444444")
+        self.assertIn(DEP1, deployers.load_registry())
+
     def test_many_segments_survive_repeated_compactions(self):
         with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
             for i in range(60):

@@ -54,19 +54,26 @@ though the live entry is gone. Memory semantics (code-defined):
   is repaired under the lock before the next append, and repairs are
   counted in the meta file;
 - segments, not snapshots: each eviction archives one SEGMENT with a
-  stable ``segment_id`` (deployer + its registry first_seen). A
-  re-appearing deployer's later segment never erases an earlier one:
-  reads and compaction keep a PER-SEGMENT entry per segment id (the
-  dedup identity compaction cannot erase) and upsert by id - a
-  retried eviction with updated counters REPLACES that id's older
-  contribution, never double-counts and never silently keeps the
-  stale value. Totals sum only over verifiable values (any
-  corrupt/missing counter marks the row partial, never silently
-  summed). Segment detail grows with distinct evictions per
-  deployer, bounded in practice by activity, NOT by an enforceable
-  constant (no lifetime-dedup claim beyond the persisted ids).
-  Live risk counters are NEVER rehydrated from the archive: a
-  re-appearing deployer's live entry starts fresh;
+  stable ``segment_id`` (deployer + its registry first_seen; an entry
+  without a verifiable first_seen has no deterministic identity and
+  archiving FAILS CLOSED, the live entry retained, rather than
+  fabricating recency). A re-appearing deployer's later segment
+  never erases an earlier one: reads and compaction keep a
+  PER-SEGMENT entry per segment id (the dedup identity compaction
+  cannot erase). Append time is NOT the logical version (an
+  unlocked registry read-modify-write can archive a stale snapshot
+  after a fresh one), so same-id snapshots merge by monotonic
+  maximum per cumulative counter; a decrease is an explicit
+  regression_conflict label, never an invented total and never a
+  silent overwrite. Totals sum only over verifiable values (any
+  corrupt/missing counter marks the row partial). Records with a
+  corrupt archived_ts or no id are isolated and counted
+  (``unusable_records`` / ``dropped_unreadable_total``), never
+  poisoning the read. Segment detail grows with distinct evictions
+  per deployer, bounded in practice by activity, NOT by an
+  enforceable constant (no lifetime-dedup claim beyond the
+  persisted ids). Live risk counters are NEVER rehydrated from
+  the archive: a re-appearing deployer's live entry starts fresh;
 - availability: a missing archive file is UNKNOWN (absence cannot
   prove zero history), reported as ``unknown_missing``; unreadable
   lines are counted in ``archive_status``; compaction-dropped
@@ -476,7 +483,7 @@ def _meta_write(meta: Dict[str, Any]) -> None:
 _SEG_FIELDS = ("archived_ts", "first_seen", "last_seen",
                "launches_seen", "hits_2x", "rugs", "dead",
                "launch_ts", "outcome_ts", "evicted_reason",
-               "memory_provenance", "partial")
+               "memory_provenance", "partial", "regression_conflict")
 _COUNTER_FIELDS = ("launches_seen", "hits_2x", "rugs", "dead")
 
 
@@ -484,32 +491,101 @@ def _seg_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     return {k: rec.get(k) for k in _SEG_FIELDS if k in rec}
 
 
+def _merge_ts_lists(a, b, cap):
+    """Union of two bounded timestamp digests, deduped by value,
+    sorted by timestamp, capped. Never raises."""
+    try:
+        seen = {}
+        for v in list(a or []) + list(b or []):
+            try:
+                seen[json.dumps(v, sort_keys=True)] = v
+            except Exception:
+                continue
+
+        def _key(v):
+            if isinstance(v, dict):
+                t = v.get("ts")
+                return float(t) if isinstance(t, (int, float)) else 0.0
+            if isinstance(v, (int, float)):
+                return float(v)
+            return 0.0
+
+        vals = sorted(seen.values(), key=_key)
+        return vals[-cap:]
+    except Exception:
+        return list(a or [])[-cap:]
+
+
 def _upsert_segment(state: Dict[str, Any], sid: str,
                     seg: Dict[str, Any]) -> None:
-    """Newer archived_ts for the same segment id REPLACES the older
-    contribution (a retried eviction updates, never double-counts,
-    never silently keeps the stale value)."""
+    """Merge one snapshot into a segment id's accumulated state.
+    Append time is NOT the logical version (an unlocked registry
+    read-modify-write can archive a stale snapshot after a fresh
+    one): counters are cumulative, so the merge takes the
+    monotonic maximum per counter; a DECREASE within the same id
+    is an explicit regression_conflict label, never an invented
+    total and never a silent overwrite of the larger value.
+    Snapshot recency (archived_ts) and last_seen take the maximum;
+    first_seen the minimum; timestamp digests union (bounded)."""
     old = state.get(sid)
-    if old is None or float(seg.get("archived_ts") or 0) >= float(
-            old.get("archived_ts") or 0):
+    if old is None:
         state[sid] = seg
+        return
+    merged = dict(old)
+    conflict = bool(old.get("regression_conflict")) \
+        or bool(seg.get("regression_conflict"))
+    for k in _COUNTER_FIELDS:
+        a, b = old.get(k), seg.get(k)
+        if isinstance(a, int) and isinstance(b, int):
+            merged[k] = max(a, b)
+            if b < a:
+                conflict = True
+        else:
+            keep = a if isinstance(a, int) else b
+            if isinstance(keep, int):
+                merged[k] = keep
+            elif k in merged:
+                merged.pop(k)
+    for k, fn in (("archived_ts", max), ("last_seen", max),
+                  ("first_seen", min)):
+        vals = [v for v in (old.get(k), seg.get(k))
+                if isinstance(v, (int, float))]
+        if vals:
+            merged[k] = fn(vals)
+    merged["launch_ts"] = _merge_ts_lists(
+        old.get("launch_ts"), seg.get("launch_ts"), _MAX_LAUNCH_TS)
+    merged["outcome_ts"] = _merge_ts_lists(
+        old.get("outcome_ts"), seg.get("outcome_ts"), _MAX_OUTCOME_TS)
+    if bool(old.get("partial")) or bool(seg.get("partial")):
+        merged["partial"] = True
+    if conflict:
+        merged["regression_conflict"] = True
+    state[sid] = merged
 
 
-def _fold_record(state: Dict[str, Any], rec: Dict[str, Any]) -> bool:
+def _fold_record(state: Dict[str, Any], rec: Dict[str, Any]) -> int:
     """Fold one file record (raw segment or compacted merged row)
-    into per-deployer {segment_id: segment} state. Returns False
-    for an unidentifiable record (counted by the caller)."""
+    into per-deployer {segment_id: segment} state. Returns the
+    number of UNUSABLE segments skipped (no id, or a non-numeric
+    archived_ts, which can never be ordered or merged safely) so
+    the caller can count them instead of letting one bad record
+    poison the whole read."""
+    dropped = 0
     segs = rec.get("segments")
     if isinstance(segs, dict) and segs:
         for sid, seg in segs.items():
-            if isinstance(seg, dict):
-                _upsert_segment(state, sid, _seg_from_record(seg))
-        return True
+            if not isinstance(seg, dict) or not isinstance(
+                    seg.get("archived_ts"), (int, float)):
+                dropped += 1
+                continue
+            _upsert_segment(state, sid, _seg_from_record(seg))
+        return dropped
     sid = rec.get("segment_id")
-    if not sid:
-        return False
+    if not sid or not isinstance(
+            rec.get("archived_ts"), (int, float)):
+        return 1
     _upsert_segment(state, sid, _seg_from_record(rec))
-    return True
+    return 0
 
 
 def _row_from_segments(deployer: str,
@@ -537,6 +613,10 @@ def _row_from_segments(deployer: str,
     if any(seg.get("partial") for seg in segs.values()):
         partial = True
     row["partial"] = partial
+    conflicts = sum(1 for seg in segs.values()
+                    if seg.get("regression_conflict"))
+    if conflicts:
+        row["regression_conflicts"] = conflicts
     first = [s.get("first_seen") for s in segs.values()]
     last = [s.get("last_seen") for s in segs.values()]
     arch = [s.get("archived_ts") for s in segs.values()]
@@ -635,8 +715,7 @@ def _maybe_compact_archive(meta: Dict[str, Any]) -> None:
                 if not dep:
                     dropped += 1
                     continue
-                if not _fold_record(states.setdefault(dep, {}), rec):
-                    dropped += 1
+                dropped += _fold_record(states.setdefault(dep, {}), rec)
         if dropped:
             meta["dropped_unreadable_total"] = int(
                 meta.get("dropped_unreadable_total") or 0) + dropped
@@ -663,18 +742,20 @@ def _archive_deployer(deployer: str, entry: Optional[Dict[str, Any]],
                       now: float) -> bool:
     """Archive one evicted registry entry as a segment with a stable
     id (deployer + its registry first_seen, so a retried eviction
-    UPSERTS - newer archived_ts replaces that id's older
-    contribution at read/compaction time - and a re-appearing
-    deployer's new entry forms a NEW segment instead of erasing the
-    old one). The archived counters and timestamps are RECORDED
-    values, labeled as such - not verified skill. Never raises;
-    returns True only when durable."""
+    UPSERTS - monotonic cumulative merge, never a double-count or a
+    stale overwrite - and a re-appearing deployer's new entry forms
+    a NEW segment instead of erasing the old one). An entry with no
+    verifiable first_seen has no deterministic identity: archiving
+    FAILS CLOSED (the caller retains the live entry) rather than
+    fabricating recency. The archived counters and timestamps are
+    RECORDED values, labeled as such - not verified skill. Never
+    raises; returns True only when durable."""
     try:
         e = entry if isinstance(entry, dict) else {}
         first_seen = e.get("first_seen")
-        sid = "%s:%s" % (deployer, first_seen
-                         if first_seen is not None
-                         else "ts-%s" % now)
+        if not isinstance(first_seen, (int, float)):
+            return False  # fail closed: no deterministic identity
+        sid = "%s:%s" % (deployer, first_seen)
         rec = {"v": _ARCHIVE_SCHEMA_V, "record_type": "deployer_archive",
                "segment_id": sid,
                "deployer": deployer,
@@ -744,7 +825,9 @@ def deployer_archive(deployer: Optional[str] = None,
                     continue
                 if deployer is not None and dep != deployer:
                     continue
-                _fold_record(states.setdefault(dep, {}), rec)
+                status["unusable_records"] = (
+                    status.get("unusable_records") or 0) + \
+                    _fold_record(states.setdefault(dep, {}), rec)
         recs = sorted(
             (_row_from_segments(dep, st)
              for dep, st in states.items() if st),

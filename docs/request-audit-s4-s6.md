@@ -57,12 +57,19 @@ Items marked FIXED name the landing commit.
   timestamps (outcome_ts) alongside the bounded launch_ts, and segments with
   stable ids (deployer + registry first_seen): a re-appearing deployer's later
   segment never erases an earlier one - reads and compaction keep PER-SEGMENT
-  detail per segment id (the dedup identity compaction cannot erase) and upsert
-  by id, so a retried eviction with updated counters replaces the stale value,
-  never double-counts; totals sum only over verifiable counters (corrupt
-  counters mark the row partial); segment detail grows with distinct evictions
-  (bounded in practice by activity, no enforceable-constant or lifetime-dedup
-  claim); live risk counters are never rehydrated from the archive. Compaction
+  detail per segment id (the dedup identity compaction cannot erase). Append
+  time is NOT the logical version (an unlocked registry read-modify-write can
+  archive a stale snapshot after a fresh one), so same-id snapshots merge by
+  monotonic maximum per cumulative counter; a decrease is an explicit
+  regression_conflict label, never an invented total and never a silent
+  overwrite. Entries without a verifiable first_seen have no deterministic
+  identity: archiving fails closed (entry retained) rather than fabricating
+  recency. Records with corrupt archived_ts or no id are isolated and counted
+  (unusable_records / dropped_unreadable_total), never poisoning the read.
+  Totals sum only over verifiable counters (corrupt counters mark the row
+  partial); segment detail grows with distinct evictions (bounded in practice
+  by activity, no enforceable-constant or lifetime-dedup claim); live risk
+  counters are never rehydrated from the archive. Compaction
   past the byte cap rewrites one row per deployer as above; dropped corrupt or
   unidentifiable lines, compaction failures and torn-tail repairs persist in a
   sidecar meta file surfaced by deployer_archive() (missing file =

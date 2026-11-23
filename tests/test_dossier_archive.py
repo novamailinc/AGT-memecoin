@@ -862,7 +862,114 @@ def test_sweep_refreshes_registry_on_cadence():
             dossiers.REGISTRY_REFRESH_S = real_s
 
 
+def test_build_path_replay_drives_memory_consumption():
+    """Runtime-wiring proof with recorded responses injected at
+    the provider seams (the instant_safety fake-RPC pattern):
+    observe_births -> background _build -> dossier carries the
+    recorded safety precompute -> TTL eviction archives ->
+    registry joins dead_mints through the archive -> the NEXT
+    birth by the same deployer consumes the durable record AT
+    BUILD TIME through the same real code path."""
+    from daemon.launch_scanner import rugger_registry as rr
+
+    class _FakeSafety:
+        @staticmethod
+        def check_token(chain, mint, timeout=10):
+            return {"unknown": False, "passed": True,
+                    "source": "recorded-replay", "score": 95}
+
+    with _Ctx() as c:
+        real_reg = rr.REGISTRY_PATH
+        real_safety = dossiers._safety
+        real_res = dossiers._res
+        rr.REGISTRY_PATH = os.path.join(c.home, "rugger_registry.json")
+        dossiers._safety = _FakeSafety
+        dossiers._res = None
+        try:
+            now = time.time()
+            born = now - 90000  # already past TTL for the sweep
+            mints = ["MINT-B1", "MINT-B2", "MINT-B3"]
+            for m in mints:
+                item = {"source": "pumpportal-new", "mint": m,
+                        "symbol": m[-2:], "created_ts": born,
+                        "extra": {"trader": "DEP-B",
+                                  "initial_buy_sol": 1.0,
+                                  "market_cap_sol": 30.0,
+                                  "bonding_curve": "BC"}}
+                q = dossiers.observe_births([item], now=born)
+                check("replay: %s accepted by the real intake" % m,
+                      q == 1)
+            # Wait for the background worker to build all three.
+            # (read_dossier hides already-expired dossiers, so read
+            # the raw files here.)
+            def _raw(m):
+                try:
+                    with open(os.path.join(dossiers.DOSSIER_DIR,
+                                           m + ".json")) as f:
+                        return json.load(f)
+                except Exception:
+                    return None
+            built = {}
+            for _ in range(200):
+                built = {m: _raw(m) for m in mints}
+                if all(built.values()):
+                    break
+                time.sleep(0.05)
+            check("replay: _build wrote all three dossiers",
+                  all(built.values()))
+            check("replay: recorded safety precompute attached",
+                  all((d.get("safety") or {}).get("report", {})
+                      .get("source") == "recorded-replay"
+                      for d in built.values()))
+            # TTL eviction archives all three (real sweep).
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now)
+            check("replay: eviction archived + unlinked all three",
+                  not os.listdir(dossiers.DOSSIER_DIR)
+                  and len([r for r in dossiers.launch_archive(
+                      deployer="DEP-B", limit=10)
+                      if r.get("record_type", "launch") == "launch"])
+                  == 3)
+            # Dead-mint evidence joins through the ARCHIVE only.
+            with open(os.path.join(c.home, "grad_ledger.json"),
+                      "w") as f:
+                json.dump({"dead_mints": {
+                    m: {"ts": now, "reason":
+                        "safety: rugcheck danger: rug"}
+                    for m in mints}}, f)
+            rr.refresh()
+            r = rr.lookup("DEP-B")
+            check("replay: registry flags via the archive join",
+                  r["flagged"] is True and r["dead"] == 3)
+            # The NEXT birth consumes the durable record at build
+            # time through the same real path.
+            item4 = {"source": "pumpportal-new", "mint": "MINT-B4",
+                     "symbol": "B4", "created_ts": now,
+                     "extra": {"trader": "DEP-B",
+                               "initial_buy_sol": 1.0,
+                               "market_cap_sol": 30.0,
+                               "bonding_curve": "BC"}}
+            dossiers.observe_births([item4], now=now)
+            d4 = None
+            for _ in range(200):
+                d4 = dossiers.read_dossier("MINT-B4")
+                if d4 and d4.get("deployer_rugger"):
+                    break
+                time.sleep(0.05)
+            check("replay: next build consumes rugger advisory",
+                  ((d4 or {}).get("deployer_rugger") or {})
+                  .get("flagged") is True)
+            check("replay: next build consumes durable history",
+                  ((d4 or {}).get("deployer_history") or {})
+                  .get("archived_launches") == 3)
+        finally:
+            rr.REGISTRY_PATH = real_reg
+            dossiers._safety = real_safety
+            dossiers._res = real_res
+
+
 def main():
+    test_build_path_replay_drives_memory_consumption()
     test_sweep_refreshes_registry_on_cadence()
     test_end_to_end_memory_consumed_after_restart()
     test_exit_price_kind_labels()

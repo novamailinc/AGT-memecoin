@@ -1,0 +1,18 @@
+{
+ "captured": "2026-11-22 ~18:10 PST via public Solana RPC (read-only)",
+ "source": "live chain state; token HZ3v1udvxPbZoi93y9NDNmYDdbn5H8sXxJRNTDagpump (PUMP-quoted curve, pre-graduation)",
+ "idl_reference": "https://github.com/pump-fun/pump-public-docs (pump.json IDL, fetched same day)",
+ "curve_pregrad": {
+  "mint": "HZ3v1udvxPbZoi93y9NDNmYDdbn5H8sXxJRNTDagpump",
+  "pda": "FhLw5SNecSGuSPaCq9wTKZGDJUoG5UJKFskBwZGycMYT",
+  "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+  "len": 166,
+  "b64": "F7f4N2DYrGC0MLY3LSECAOqP9UlSAgAAtJij65siAQAuMZJKBgEAAACAxqR+jQMAAKLUVLXrBwrLSuumtX5Rn5EJ+/kTuNAIrbd2aqQ2DRz4AAAMRfffjZ5ylWKEkz9tmLdXAy6D34RgT7XhF//2HVsS+WQAAAAAAAAAAACA0p0BAAAAAMqQxAAAAAAAALxeY/9LAQAAAAAAAAAAAAAAAAAAAAAAAA=="
+ },
+ "mint_pregrad": {
+  "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+  "len": 416,
+  "b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDGpH6NAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPXw3ySuFce43CZt0GJqRPNUUWoceooo4Mx71pHydwbfEwCyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA9fDfJK4Vx7jcJm3QYmpE81RRahx6iijgzHvWkfJ3Bt8JAAAATm9kZUNyYWZ0CQAAAE5vZGVDcmFmdFAAAABodHRwczovL2lwZnMuaW8vaXBmcy9iYWZrcmVpYTZycGFvdDRhYzZuZ3c0b25paXFsMmJ2dXltZmxndGRpN3A0NHgyZTY2NG1lMnpmYjNnNAAAAAA="
+ },
+ "graduated_note": "graduated token DTsMPr9UAisgBkZ2WGjZipaoALuhuoYCbR6euExi5JAQ: curve PDA CpBra9JDDzXN84xFrsEDnLFGQvTFbKHcZ346vEdKK8of returns NO account (closed after graduation) - graduated tokens are unpriceable from the curve, as designed"
+}

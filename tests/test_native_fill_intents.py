@@ -284,3 +284,24 @@ class TestNativeFillIntents:
             a.submit_order(request)
         assert a._state_path().read_bytes() == before
         assert len(fills(a)) == 1
+
+    def test_cross_ticket_request_collision_preserves_all_sources(self, tmp_path):
+        a = ready(tmp_path)
+        a.submit_order(_req('BONK', 'BUY', 1., 'first'))
+        with patch.object(a, '_save_state', side_effect=OSError('stop')):
+            with pytest.raises(OSError):
+                a.submit_order(_req('BONK', 'BUY', 1., 'second'))
+        entries = fills(a)
+        entries[0]['idempotency_key'] = 'second'
+        a._fills_path().write_text(''.join(json.dumps(x)+'\n' for x in entries))
+        paths = [a._state_path(), a._fills_path(), a._intent_path()]
+        before = [p.read_bytes() for p in paths]
+        with pytest.raises(ValueError, match='request identity conflicts'):
+            ready(tmp_path)
+        assert [p.read_bytes() for p in paths] == before
+
+    def test_top_level_numeric_request_equivalence(self, tmp_path):
+        a = ready(tmp_path)
+        result = a.submit_order(_req('BONK', 'BUY', 1, 'op'))
+        assert a.submit_order(_req('BONK','BUY',1.,'op')).ticket == result.ticket
+        assert len(fills(a)) == 1

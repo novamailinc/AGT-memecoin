@@ -336,6 +336,10 @@ class MemecoinAdapter(BrokerAdapter):
                 if request_key in request_keys:
                     raise ValueError("duplicate native request identity")
                 request_keys.add(request_key)
+        request_key = fill.get("idempotency_key")
+        if (not matches and request_key and fill.get("kind") in ("BUY", "SELL")
+                and request_key in request_keys):
+            raise ValueError("pending native request identity conflicts with history")
         self._fill_keys_cache = {pair for pair in keys if not matches or
                                  pair != (fill["ticket"], fill["kind"])}
         self._fill_buy_ts = {e["ticket"]: e.get("ts") for e in entries
@@ -840,6 +844,9 @@ class MemecoinAdapter(BrokerAdapter):
         — that the lock serializes across processes."""
         request = asdict(req)
         request["symbol"] = symbol
+        for field in ("volume", "stop_loss", "take_profit"):
+            if request[field] is not None:
+                request[field] = float(request[field])
         request_fingerprint = hashlib.sha256(json.dumps(
             request, sort_keys=True, allow_nan=False).encode()).hexdigest()
         self._request_fingerprint = request_fingerprint

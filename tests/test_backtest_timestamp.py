@@ -180,7 +180,7 @@ class TestSeriesCompletenessLabels(unittest.TestCase):
         h["series_integrity"] = "journal-gaps-detected"
         rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
         self.assertEqual(rep["n_trades"], 1)
-        self.assertEqual(rep["n_incomplete_series_trades"], 1)
+        self.assertEqual(rep["n_trades_not_journal_whole"], 1)
         self.assertEqual(rep["trades"][0]["series_integrity"],
                          "journal-gaps-detected")
         self.assertEqual(rep["per_series_integrity"]
@@ -194,7 +194,16 @@ class TestSeriesCompletenessLabels(unittest.TestCase):
             [_hist(safety_eval_t=0.0)])
         self.assertEqual(rep["trades"][0]["series_integrity"],
                          "legacy-unlabeled")
-        self.assertEqual(rep["n_incomplete_series_trades"], 1)
+        self.assertEqual(rep["n_trades_not_journal_whole"], 1)
+
+    def test_whole_label_is_diagnostic_not_qualification(self):
+        # The journal-whole label is observed diagnostic coverage: the
+        # report must carry the explicit no-sequence-proof limitation.
+        h = _hist(safety_eval_t=0.0)
+        h["series_integrity"] = self.WHOLE
+        rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
+        self.assertIn("no", rep["series_integrity_note"])
+        self.assertIn("not prove", rep["series_integrity_note"])
 
     def test_whole_series_labeled(self):
         h = _hist(safety_eval_t=0.0)
@@ -202,7 +211,7 @@ class TestSeriesCompletenessLabels(unittest.TestCase):
         rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
         self.assertEqual(rep["trades"][0]["series_integrity"],
                          self.WHOLE)
-        self.assertEqual(rep["n_incomplete_series_trades"], 0)
+        self.assertEqual(rep["n_trades_not_journal_whole"], 0)
 
 
 class TestReplayModelVersioning(unittest.TestCase):

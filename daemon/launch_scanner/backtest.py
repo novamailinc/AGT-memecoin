@@ -39,6 +39,79 @@ REPLAY_MODEL_V1 = "v1-legacy"
 REPLAY_MODEL_V2 = "v2-timestamp-correct"
 REPLAY_MODELS = (REPLAY_MODEL_V1, REPLAY_MODEL_V2)
 
+# Regime tagging (Stage A request section 12, 2026-11-23). DECLARED
+# CONTEMPORANEOUS RULES: every label is computed ONLY from snapshots at
+# or before the trade's own entry - never post-entry prices, outcomes,
+# or dataset-wide hindsight. These are PER-MINT pre-entry regimes.
+# Market-WIDE conditions (launch-heavy, market selloff) need cross-mint
+# context the history records do not carry: regime_context_note says so
+# instead of faking labels from one mint.
+REGIME_RULES = {
+    # entry price vs the first pre-entry snapshot price
+    "trend_up_mult": 1.2,
+    "trend_down_mult": 0.8,
+    # mean |snapshot-to-snapshot return| over the pre-entry window
+    "high_vol_mean_abs_ret": 0.10,
+    # entry-snapshot usd_liquidity
+    "low_liq_usd": 50000.0,
+    # pre-entry peak-to-entry drawdown
+    "selloff_drawdown": 0.40,
+}
+
+
+def _regime_labels(snaps: List[Any], entry_idx: int,
+                   rules: Optional[Dict[str, Any]] = None
+                   ) -> Dict[str, str]:
+    """Contemporaneous per-trade regime labels at entry.
+
+    Reads ONLY snaps[:entry_idx + 1]. Any dimension without enough
+    contemporaneous data is "unknown", never guessed.
+    """
+    r = dict(REGIME_RULES)
+    if rules:
+        r.update(rules)
+    pre = [snap for snap in snaps[:entry_idx + 1]
+           if isinstance(snap, dict) and _f(snap.get("price_usd")) > 0]
+    labels = {"trend": "unknown", "volatility": "unknown",
+              "liquidity": "unknown", "selloff": "unknown"}
+    if not pre:
+        return labels
+    entry_px = _f(pre[-1].get("price_usd"))
+    # trend: entry vs first pre-entry price
+    if len(pre) >= 2:
+        first_px = _f(pre[0].get("price_usd"))
+        mult = entry_px / first_px if first_px > 0 else 1.0
+        labels["trend"] = ("up" if mult >= _f(r["trend_up_mult"])
+                           else "down" if mult <= _f(r["trend_down_mult"])
+                           else "flat")
+    # volatility: mean absolute snap-to-snap return
+    if len(pre) >= 3:
+        rets = []
+        for a, b in zip(pre, pre[1:]):
+            pa, pb = _f(a.get("price_usd")), _f(b.get("price_usd"))
+            if pa > 0:
+                rets.append(abs(pb / pa - 1.0))
+        if rets:
+            labels["volatility"] = (
+                "high-vol"
+                if sum(rets) / len(rets) >= _f(r["high_vol_mean_abs_ret"])
+                else "low-vol")
+    # liquidity: the entry snapshot's own field
+    liq = _f(pre[-1].get("liq_usd"))
+    if liq > 0:
+        labels["liquidity"] = ("low-liq"
+                               if liq < _f(r["low_liq_usd"])
+                               else "normal-liq")
+    # selloff: deepest pre-entry peak-to-entry drawdown
+    if len(pre) >= 2:
+        peak = max(_f(snap.get("price_usd")) for snap in pre)
+        if peak > 0:
+            dd = 1.0 - entry_px / peak
+            labels["selloff"] = ("selloff"
+                                 if dd >= _f(r["selloff_drawdown"])
+                                 else "no-selloff")
+    return labels
+
 _DEFAULT_ENTRY_RULES = {
     "min_safety_score": 50.0,
     "require_known_safety": True,
@@ -417,10 +490,28 @@ class BacktestEngine:
             "n_window_truncated_trades": 0,
             # Trades whose series has missing middle intervals or
             # journal failures: also NOT complete series.
-            "n_incomplete_series_trades": 0,
+            # Observed diagnostic coverage ONLY: counts trades whose
+            # series_integrity is anything other than journal-whole.
+            # NOT a completeness qualification - "journal-whole" itself
+            # carries no sequence proof (see series_integrity_note).
+            "n_trades_not_journal_whole": 0,
             # Buckets of the qualified series_integrity diagnostic per
             # trade (legacy records: "legacy-unlabeled").
             "per_series_integrity": {},
+            # Per-regime tallies (declared contemporaneous rules, see
+            # REGIME_RULES): per dimension, per label.
+            "per_regime": {},
+            "regime_context_note": (
+                "per-mint pre-entry regimes only; market-WIDE "
+                "conditions (launch-heavy, market selloff) need "
+                "cross-mint context the records do not carry"),
+            "series_integrity_note": (
+                "diagnostic coverage only, never a completeness proof: "
+                "the gap check catches intervals > max(5x median, "
+                "300s), so journal-whole-no-detected-gaps means no "
+                "DETECTED gaps/truncation/failures - it does not prove "
+                "every poll exists and must not count as qualified "
+                "complete history"),
             "trades": [],
             # Stage A cost-model accounting (0 / absent when disabled).
             "costs_enabled": self.costs_enabled,
@@ -504,6 +595,7 @@ class BacktestEngine:
                 continue
 
             trade = self._simulate(snaps, entry_idx)
+            trade["regimes"] = _regime_labels(snaps, entry_idx)
             report["n_failed_exit_executions"] += trade.get(
                 "failed_exit_attempts", 0)
             if hist.get("window_truncated"):
@@ -513,7 +605,20 @@ class BacktestEngine:
                 integrity, {"trades": 0})
             bucket["trades"] += 1
             if integrity != "journal-whole-no-detected-gaps":
-                report["n_incomplete_series_trades"] += 1
+                report["n_trades_not_journal_whole"] += 1
+            trade_pnl = _f(trade.get("pnl_mult"))
+            for dim, label in (trade.get("regimes") or {}).items():
+                bucket = report["per_regime"].setdefault(
+                    dim, {}).setdefault(
+                    label, {"trades": 0, "wins": 0, "losses": 0,
+                            "pnl_mult_sum": 0.0})
+                bucket["trades"] += 1
+                if trade_pnl > 0:
+                    bucket["wins"] += 1
+                else:
+                    bucket["losses"] += 1
+                bucket["pnl_mult_sum"] = round(
+                    bucket["pnl_mult_sum"] + trade_pnl, 6)
             pnl = trade["pnl_mult"]
             mult = trade["proceeds_mult"]
             report["n_trades"] += 1
@@ -560,6 +665,7 @@ class BacktestEngine:
                 # records predating the journal carry no label.
                 "series_integrity": (
                     hist.get("series_integrity") or "legacy-unlabeled"),
+                "regimes": trade.get("regimes") or {},
                 "proceeds_mult": round(mult, 4),
                 "pnl_mult": round(pnl, 4),
                 "exit_reason": trade["exit_reason"],

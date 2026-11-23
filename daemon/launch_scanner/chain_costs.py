@@ -14,10 +14,13 @@ is exactly what the user needs to know before gambling real money.
 
 Cost assumptions (documented, knob-tunable, visible in every ledger):
 - solana:     $0.001/tx gas (negligible) PLUS, since the 2026-10-23
-              P3 fee audit, the venue swap fee when a venue is named:
-              pump.fun bonding curve / PumpSwap canonical first tier
-              = 1.25% per swap, verified from pump.fun's own Fees
-              Page (see the venue-fee section below). fills.py
+              P3 fee audit, the venue swap fee when a venue is named,
+              and since the 2026-11-22/23 fee-program capture the
+              venue's OWN dynamic schedule: pump.fun bonding curve /
+              PumpSwap canonical first tier = 1.25% per swap, with the
+              full market-cap tier schedule and quote-category flat
+              fees decoded from the on-chain FeeConfig / GlobalConfig
+              accounts (see the venue-fee section below). fills.py
               slippage is separate and still applies.
 - base:       $0.03/tx  (L2 gas, ~$0.01-0.05 per swap in practice)
 - ethereum:   $5.00/tx  (conservative static estimate; gas is volatile —
@@ -58,69 +61,144 @@ GAS_USD = {
 HL_TAKER_FEE_PCT = 0.035
 
 # ---------------------------------------------------------------------
-# Venue (protocol/AMM) swap fees — P3 fee-model audit, 2026-10-23.
+# Venue (protocol/AMM) swap fees.
 #
-# VERIFIED from a PRIMARY source: pump.fun's own Fees Page, which
-# forms part of its Terms of Use (https://pump.fun/docs/fees, page
-# "Last Updated: 17 October 2026", read 2026-10-23):
+# 2026-10-23 P3 audit: verified from pump.fun's own Fees Page that the
+# bonding curve and first PumpSwap canonical tier charge 1.25% per swap
+# (0.95% protocol + 0.30% creator), collected IN THE QUOTE ASSET on top
+# of price/slippage. Before that audit the model charged Solana trades
+# $0.001 gas ONLY, omitting the ~2.5% round-trip venue drag entirely.
 #
-# - Bonding curve (SOL- and USDC-paired coins), EVERY trade (buy and
-#   sell): total 1.25% = 0.300% creator + 0.95% protocol + 0% LP.
-# - PumpSwap CANONICAL pools (pools created by graduation) are tiered
-#   by market cap, where market cap = token price in SOL (or USDC)
-#   x 1 billion tokens. SOL schedule (total fee):
-#     0-420 SOL: 1.25% (0.300 creator / 0.930 protocol / 0.020 LP)
-#     420-1470: 1.20%   1470-2460: 1.15%   2460-3440: 1.10%
-#     3440-4420: 1.05%  4420-9820: 1.00%   9820-14740: 0.95%
-#     then -0.05% per band down to 0.30% at >= 98240 SOL
-#     (creator share falls, protocol pinned at 0.05%, LP at 0.20%).
-#   Non-canonical PumpSwap pools: flat 0.30% total.
-# - Fees are collected IN THE QUOTE ASSET on every trade: on a buy
-#   the fee is taken out of the SOL spent (only (1 - fee) of the
-#   spend actually buys tokens / enters the curve); on a sell it is
-#   deducted from the proceeds. It is therefore a per-swap % charge
-#   ON TOP OF price/slippage — exactly what tx_cost_usd must add when
-#   a venue is specified.
+# 2026-11-23: the static table was superseded by the captured on-chain
+# fee-program schedule below (the earlier "-0.05% per band" tail was an
+# approximation that overstated the top tiers by up to 2.5 bps).
 #
-# A fresh graduation sits in the FIRST canonical tier (mcap in SOL
-# at graduation is at/below the 420 SOL boundary), so graduation
-# trades pay 1.25% per swap on entry and, for the short holds these
-# lanes take, ~1.25% per exit swap too (a 2-3x run only reaches the
-# 1.20% band — using the flat first-tier rate is conservative by
-# <= 0.05pp on winners and exact for everything that falls). Before
-# this audit the model charged Solana trades $0.001 gas ONLY, i.e.
-# it omitted this ~2.5% round-trip venue drag entirely.
+# 2026-11-23 FEE-PROGRAM CAPTURE: the venue fee schedule is read from
+# the captured on-chain accounts (tests/fixtures/fee_program/, captured
+# via the approved PublicNode read at 2026-11-23T04:21Z; derivation per
+# the pump_fees / pump_amm IDLs and pump-fun/pump-public-docs
+# FEE_PROGRAM_README) through pump_fee_schedule.py, which mirrors
+# pump-fees::get_fees / pump-fees-math::calculate_fee_tier exactly:
 #
-# Scope: ONLY trades that explicitly name venue="pump" pay this.
-# Other Solana venues charge differently (e.g. Raydium AMM 0.25%),
-# so no venue fee is ever guessed for a trade that doesn't name one.
+# - pump.fun bonding curve: FeeConfig fee_tiers currently a SINGLE tier
+#   0.95% protocol + 0.30% creator = 1.25% at every market cap (the
+#   tiered mechanism is live on-chain; the admin can add tiers at any
+#   time).
+# - PumpSwap CANONICAL pools (pool.creator == pump pool authority):
+#   market-cap tiered in QUOTE LAMPORTS. SOL-quote schedule totals:
+#     >=0 SOL: 1.25% (0.02 LP / 0.93 protocol / 0.30 creator)
+#     >=420: 1.20  >=1470: 1.15  >=2460: 1.10  >=3440: 1.05
+#     >=4420: 1.00  >=9820: 0.95  >=14740: 0.90  >=19650: 0.85
+#     >=24560: 0.80  >=29470: 0.75  >=34380: 0.70  >=39300: 0.65
+#     >=44210: 0.60  >=49120: 0.55  >=54030: 0.53  >=58940: 0.50
+#     >=63860: 0.48  >=68770: 0.45  >=73681: 0.43  >=78590: 0.40
+#     >=83500: 0.38  >=88400: 0.35  >=93330: 0.33  >=98240: 0.30
+#   (the LP share is 0.20% and protocol 0.05% in every tier above the
+#   first; the creator share steps down). Stable-quote (USDC) pools use
+#   the separate stable_fee_tiers (thresholds 0 / 59 / 300 / ... /
+#   20000 quote units); other quote mints pay exotic_flat_fees 0.30%.
+#   Non-canonical PumpSwap pools pay flat_fees = 0.30% total.
+# - Fallback when a FeeConfig account is absent: pump program Global
+#   fee_basis_points + creator_fee_basis_points (curve) or PumpSwap
+#   GlobalConfig lp 0.20% + protocol 0.05% + coin creator 0.05%.
+# - Per-coin creator overrides replace the tier creator share when the
+#   config allows it (GlobalConfig creator_fee_configurable=true, max
+#   3.00%); a coin with NO creator set is charged no creator fee.
+# - Fees are taken IN THE QUOTE ASSET on every trade, linear in the
+#   traded quote amount: on a buy the fee comes out of the SOL spent
+#   (only (1 - fee) enters the curve); on a sell it is deducted from
+#   the proceeds. The fee BPS does not depend on trade size.
+# - The captured schedule is AS-OF the capture timestamp; the static
+#   table below is the committed copy of that capture and is used only
+#   when the generated artifact is unreadable. An unknown market cap
+#   selects the HIGHEST-FEE tier (conservative - never an under-charge).
+#
+# Only trades that explicitly name a venue pay a venue fee; no fee is
+# ever guessed for a trade that doesn't name one.
 PUMP_FEE_PCT_BONDING_CURVE = 1.25
 PUMP_FEE_PCT_CANONICAL_LOWEST_TIER = 1.25
+PUMP_FEE_PCT_NONCANONICAL_FLAT = 0.30
 
-# PumpSwap canonical-pool total-fee tiers for SOL-paired coins:
-# (mcap_sol_upper_bound_exclusive, total_fee_pct), ascending.
+# Static copy of the captured PumpSwap canonical SOL-quote tier table
+# ((mcap_sol_upper_bound_exclusive, total_fee_pct), ascending) - the
+# fallback when the generated artifact is missing. Regenerate with
+# scripts/gen_pump_fee_schedule.py; tests keep this in lockstep with
+# the capture.
 PUMP_CANONICAL_TIERS_SOL = (
     (420, 1.25), (1470, 1.20), (2460, 1.15), (3440, 1.10),
     (4420, 1.05), (9820, 1.00), (14740, 0.95), (19650, 0.90),
     (24560, 0.85), (29470, 0.80), (34380, 0.75), (39300, 0.70),
-    (44210, 0.65), (49120, 0.60), (54030, 0.55), (58940, 0.525),
-    (63860, 0.50), (68770, 0.475), (73681, 0.45), (78590, 0.425),
-    (83500, 0.40), (88400, 0.375), (93330, 0.35), (98240, 0.325),
+    (44210, 0.65), (49120, 0.60), (54030, 0.55), (58940, 0.53),
+    (63860, 0.50), (68770, 0.48), (73681, 0.45), (78590, 0.43),
+    (83500, 0.40), (88400, 0.38), (93330, 0.35), (98240, 0.33),
     (float("inf"), 0.30),
 )
 
+_SCHEDULE = None
+_SCHEDULE_TRIED = False
 
-def pump_canonical_fee_pct(mcap_sol=None):
-    """PumpSwap canonical-pool total swap fee % for a SOL-paired coin.
 
-    mcap_sol = token price in SOL x 1e9 (pump.fun's own definition).
-    Unknown/None mcap -> the first-tier rate (1.25%): graduation
-    trades happen at that tier, and defaulting UP is the honest
-    direction for a cost model. Never raises."""
+def _pump_schedule():
+    """The captured on-chain fee schedule, or None when the generated
+    artifact is unavailable (the static tables then apply). Never
+    raises."""
+    global _SCHEDULE, _SCHEDULE_TRIED
+    if _SCHEDULE_TRIED:
+        return _SCHEDULE
+    _SCHEDULE_TRIED = True
     try:
-        if mcap_sol is None:
+        import os
+        from daemon.launch_scanner import pump_fee_schedule as _pfs
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "data", "pump_fee_schedule_captured.json")
+        _SCHEDULE = _pfs.load_schedule_file(path)
+    except Exception:
+        _SCHEDULE = None
+    return _SCHEDULE
+
+
+def _schedule_fee_pct(section, quote_mint=None, mcap_sol=None,
+                      mcap_lamports=None):
+    """Total venue fee % from the captured schedule for one pump
+    surface ("bonding_curve" | "pumpswap"). Unknown market cap selects
+    the highest-fee tier. Never raises."""
+    try:
+        from daemon.launch_scanner import pump_fee_schedule as _pfs
+        sched = _pump_schedule()
+        if sched is None:
+            return None
+        cat = _pfs.quote_category(quote_mint)
+        lamports = mcap_lamports
+        if lamports is None and mcap_sol is not None and \
+                cat == _pfs.QUOTE_SOL:
+            lamports = int(float(mcap_sol) * 1e9)
+        cfg = _pfs.fee_config_from_schedule(sched, section)
+        fees = _pfs.fee_config_fees(cfg, quote_category_=cat,
+                                    market_cap_lamports=lamports,
+                                    is_pump_pool=True)
+        return _pfs.total_fee_pct(fees)
+    except Exception:
+        return None
+
+
+def pump_canonical_fee_pct(mcap_sol=None, mcap_lamports=None,
+                           quote_mint=None):
+    """PumpSwap canonical-pool total swap fee %.
+
+    Market cap selects the tier in QUOTE LAMPORTS (mcap_lamports, or
+    mcap_sol x 1e9 for SOL quotes - pump.fun's own definition: token
+    price in quote x supply). Unknown/None mcap -> the first-tier rate
+    (1.25%): graduation trades happen at that tier, and defaulting UP
+    is the honest direction for a cost model. Never raises."""
+    try:
+        pct = _schedule_fee_pct("pumpswap", quote_mint, mcap_sol,
+                                mcap_lamports)
+        if pct is not None:
+            return pct
+        if mcap_sol is None and mcap_lamports is None:
             return PUMP_FEE_PCT_CANONICAL_LOWEST_TIER
-        m = float(mcap_sol)
+        m = float(mcap_lamports) / 1e9 if mcap_lamports is not None \
+            else float(mcap_sol)
         if m < 0:
             return PUMP_FEE_PCT_CANONICAL_LOWEST_TIER
         for upper, pct in PUMP_CANONICAL_TIERS_SOL:
@@ -131,23 +209,65 @@ def pump_canonical_fee_pct(mcap_sol=None):
         return PUMP_FEE_PCT_CANONICAL_LOWEST_TIER
 
 
-def venue_fee_pct(chain, venue=None, mcap_sol=None):
-    """Per-swap venue (protocol/AMM) fee % for one trade. 0.0 when no
-    venue is named — never guessed. Never raises."""
+def pump_bonding_curve_fee_pct(quote_mint=None, mcap_lamports=None):
+    """pump.fun bonding-curve total swap fee % from the captured
+    FeeConfig (currently a flat 1.25% at every market cap). Never
+    raises."""
     try:
-        if (chain or "").lower() == "solana" and \
-                (venue or "").lower() == "pump":
-            return pump_canonical_fee_pct(mcap_sol)
+        pct = _schedule_fee_pct("bonding_curve", quote_mint,
+                                None, mcap_lamports)
+        if pct is not None:
+            return pct
+        return PUMP_FEE_PCT_BONDING_CURVE
+    except Exception:
+        return PUMP_FEE_PCT_BONDING_CURVE
+
+
+def venue_fee_pct(chain, venue=None, mcap_sol=None, mcap_lamports=None,
+                  quote_mint=None):
+    """Per-swap venue (protocol/AMM) fee % for one trade. 0.0 when no
+    venue is named - never guessed. Never raises.
+
+    venue: "pump" (legacy name: pump venues at the canonical schedule,
+    first tier when the market cap is unknown), "pumpfun_curve"
+    (bonding curve), "pumpswap"/"pumpswap_canonical" (canonical pool
+    tiers), "pumpswap_flat" (non-canonical pool flat fee)."""
+    try:
+        if (chain or "").lower() != "solana":
+            return 0.0
+        v = (venue or "").lower()
+        if v == "pump":
+            return pump_canonical_fee_pct(mcap_sol, mcap_lamports,
+                                          quote_mint)
+        if v == "pumpfun_curve":
+            return pump_bonding_curve_fee_pct(quote_mint,
+                                              mcap_lamports)
+        if v in ("pumpswap", "pumpswap_canonical"):
+            return pump_canonical_fee_pct(mcap_sol, mcap_lamports,
+                                          quote_mint)
+        if v == "pumpswap_flat":
+            try:
+                from daemon.launch_scanner import pump_fee_schedule \
+                    as _pfs
+                sched = _pump_schedule()
+                if sched is not None:
+                    return _pfs.total_fee_pct(
+                        sched["pumpswap"]["flat_fees"])
+            except Exception:
+                pass
+            return PUMP_FEE_PCT_NONCANONICAL_FLAT
         return 0.0
     except Exception:
         return 0.0
 
 
-def venue_fee_usd(chain, traded_usd=1.0, venue=None, mcap_sol=None):
+def venue_fee_usd(chain, traded_usd=1.0, venue=None, mcap_sol=None,
+                  mcap_lamports=None, quote_mint=None):
     """Venue fee in USD for ONE swap of traded_usd. Never raises."""
     try:
         return float(traded_usd or 0) * \
-            venue_fee_pct(chain, venue, mcap_sol) / 100.0
+            venue_fee_pct(chain, venue, mcap_sol, mcap_lamports,
+                          quote_mint) / 100.0
     except Exception:
         return 0.0
 
@@ -163,7 +283,8 @@ COST_GATE_PCT = 25.0
 SUPPORTED = ("solana", "base", "ethereum", "hyperliquid")
 
 
-def tx_cost_usd(chain, notional_usd=1.0, venue=None, mcap_sol=None):
+def tx_cost_usd(chain, notional_usd=1.0, venue=None, mcap_sol=None,
+                mcap_lamports=None, quote_mint=None):
     """Cost of ONE transaction on this chain, in USD: network gas
     plus, when a venue is named, that venue's per-swap fee on the
     traded amount. Default (no venue) is byte-identical to the
@@ -173,13 +294,15 @@ def tx_cost_usd(chain, notional_usd=1.0, venue=None, mcap_sol=None):
         if chain == "hyperliquid":
             return float(notional_usd or 0) * HL_TAKER_FEE_PCT / 100.0
         return float(GAS_USD.get(chain, 0.0)) + \
-            venue_fee_usd(chain, notional_usd, venue, mcap_sol)
+            venue_fee_usd(chain, notional_usd, venue, mcap_sol,
+                          mcap_lamports, quote_mint)
     except Exception:
         return 0.0
 
 
 def round_trip_cost_usd(chain, notional_usd=1.0, n_txs=WORST_CASE_TXS,
-                        venue=None, mcap_sol=None):
+                        venue=None, mcap_sol=None, mcap_lamports=None,
+                        quote_mint=None):
     """Worst-case modeled round-trip tx costs in USD (gas/fees only;
     slippage is modeled separately by fills.py). With a venue named,
     adds the venue fee on TWO full-notional swaps — the entry swap
@@ -192,25 +315,29 @@ def round_trip_cost_usd(chain, notional_usd=1.0, n_txs=WORST_CASE_TXS,
             # per tx (conservative — legs are fractions).
             return float(notional_usd or 0) * HL_TAKER_FEE_PCT / 100.0 * n_txs
         return float(GAS_USD.get(chain, 0.0)) * int(n_txs or 0) + \
-            2.0 * venue_fee_usd(chain, notional_usd, venue, mcap_sol)
+            2.0 * venue_fee_usd(chain, notional_usd, venue, mcap_sol,
+                                mcap_lamports, quote_mint)
     except Exception:
         return 0.0
 
 
 def round_trip_cost_pct(chain, notional_usd=1.0, n_txs=WORST_CASE_TXS,
-                        venue=None, mcap_sol=None):
+                        venue=None, mcap_sol=None, mcap_lamports=None,
+                        quote_mint=None):
     """Worst-case round-trip tx costs as % of notional. Never raises."""
     try:
         n = float(notional_usd or 0)
         if n <= 0:
             return 100.0
-        return round_trip_cost_usd(chain, n, n_txs, venue, mcap_sol) / n * 100.0
+        return round_trip_cost_usd(chain, n, n_txs, venue, mcap_sol,
+                                   mcap_lamports, quote_mint) / n * 100.0
     except Exception:
         return 100.0
 
 
 def cost_gate(chain, notional_usd=1.0, gate_pct=COST_GATE_PCT,
-              venue=None, mcap_sol=None):
+              venue=None, mcap_sol=None, mcap_lamports=None,
+              quote_mint=None):
     """(blocked: bool, reason: str). Pre-registered entry gate.
 
     Blocked when modeled worst-case round-trip tx costs exceed gate_pct
@@ -218,10 +345,14 @@ def cost_gate(chain, notional_usd=1.0, gate_pct=COST_GATE_PCT,
     user — can see exactly why.
     """
     try:
-        pct = round_trip_cost_pct(chain, notional_usd,
-                                  venue=venue, mcap_sol=mcap_sol)
-        usd = round_trip_cost_usd(chain, notional_usd,
-                                  venue=venue, mcap_sol=mcap_sol)
+        pct = round_trip_cost_pct(chain, notional_usd, venue=venue,
+                                  mcap_sol=mcap_sol,
+                                  mcap_lamports=mcap_lamports,
+                                  quote_mint=quote_mint)
+        usd = round_trip_cost_usd(chain, notional_usd, venue=venue,
+                                  mcap_sol=mcap_sol,
+                                  mcap_lamports=mcap_lamports,
+                                  quote_mint=quote_mint)
         if pct > float(gate_pct):
             return True, (
                 "COST-BLOCKED: modeled round-trip ~$%.2f on $%.2f "
@@ -233,15 +364,20 @@ def cost_gate(chain, notional_usd=1.0, gate_pct=COST_GATE_PCT,
         return False, ""
 
 
-def cost_summary(chain, notional_usd=1.0, venue=None, mcap_sol=None):
+def cost_summary(chain, notional_usd=1.0, venue=None, mcap_sol=None,
+                 mcap_lamports=None, quote_mint=None):
     """Human-readable one-liner for ledgers and reports."""
     try:
         return "%s: ~$%.2f round-trip on $%.2f (%.1f%%)" % (
             (chain or "?"),
-            round_trip_cost_usd(chain, notional_usd,
-                                venue=venue, mcap_sol=mcap_sol),
+            round_trip_cost_usd(chain, notional_usd, venue=venue,
+                                mcap_sol=mcap_sol,
+                                mcap_lamports=mcap_lamports,
+                                quote_mint=quote_mint),
             float(notional_usd or 0),
-            round_trip_cost_pct(chain, notional_usd,
-                                venue=venue, mcap_sol=mcap_sol))
+            round_trip_cost_pct(chain, notional_usd, venue=venue,
+                                mcap_sol=mcap_sol,
+                                mcap_lamports=mcap_lamports,
+                                quote_mint=quote_mint))
     except Exception:
         return "%s: cost unknown" % (chain or "?")

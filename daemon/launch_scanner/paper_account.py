@@ -97,6 +97,7 @@ defaults chosen for a $10 demo, flagged here as agent-chosen):
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import glob
 import json
@@ -1470,6 +1471,41 @@ def write_down(lane: str, mint: str, op_id: str,
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
+
+
+def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Read exact durable applied operation after WAL recovery under the lock.
+
+    None with no error means absent, not refused or authorized. A degraded
+    account returns no usable receipt. Bridge recovery must check exact shape,
+    not infer an amount or position ID from the coarser op_outcome helper.
+    """
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None or degraded:
+            return None, degraded or "account ledger unreadable"
+        rec = led.get("ops", {}).get(op_id)
+        entries, status, _ = _journal_read()
+        if status is not None:
+            return None, "operation WAL unreadable"
+        matches = [e for e in entries if e.get("op_id") == op_id
+                   and e.get("event") in _MUTATION_EVENTS]
+        if rec is None:
+            if matches:
+                return None, "operation WAL/state disagreement"
+            return None, None
+        if len(matches) != 1:
+            return None, "operation WAL identity missing or duplicated"
+        event = matches[0]
+        if rec.get("instance") is not True:
+            return None, "operation has no exact instance contract"
+        fields = ("event", "lane", "mint", "pos_id", "instance")
+        fields += {"debit": ("stake", "qty"),
+                   "credit": ("proceeds", "fee", "qty", "price_kind", "realized"),
+                   "write_down": ("qty", "reason")}.get(rec.get("event"), ())
+        if any(event.get(k) != rec.get(k) for k in fields):
+            return None, "operation WAL/state parameter disagreement"
+        return copy.deepcopy(rec), None
 
 
 def op_outcome(op_id: str) -> str:

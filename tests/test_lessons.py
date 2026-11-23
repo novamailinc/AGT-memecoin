@@ -571,7 +571,8 @@ hq2 = [dict(hq[0], close_ts=BASE + 100, pnl_usd=10.0),
             pnl_usd=-4.0)]
 pit = L.generate_lessons_as_of("grad_select", hq2, BASE + 150)
 check("point-in-time: outcomes settled after as_of are invisible",
-      pit.get("point_in_time") is True
+      pit.get("cutoff_semantics")
+      == "outcome_event_time_only_not_knowledge_time"
       and pit.get("as_of") == BASE + 150
       and pit.get("n_settled") == 1
       and pit.get("resolved_at") == BASE + 100)
@@ -582,6 +583,15 @@ bad = L.generate_lessons_as_of("grad_select", hq2, None)
 check("point-in-time: invalid as_of labeled, never full-history",
       bad.get("error") == "invalid_as_of"
       and bad.get("n_settled") == 0)
+nan_cut = L.generate_lessons_as_of("grad_select", hq2, float("nan"))
+inf_cut = L.generate_lessons_as_of("grad_select", hq2, float("inf"))
+check("point-in-time: non-finite as_of rejected, not 0/full",
+      nan_cut.get("error") == "invalid_as_of"
+      and inf_cut.get("error") == "invalid_as_of")
+fut = L.generate_lessons_as_of("grad_select", hq2, BASE + 500,
+                               generated_at=BASE + 300)
+check("point-in-time: future as_of labeled explicitly",
+      fut.get("as_of_in_future") is True)
 
 print()
 if fails:

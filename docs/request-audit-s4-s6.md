@@ -60,10 +60,13 @@ Items marked FIXED name the landing commit.
   application is built. lane_bandit + lane-bandit-shadow are diagnostic allocations,
   not verified entry consumers. ceo.lessons_context has no production caller found
   (definition ceo.py:117, only tests/test_lessons.py references it); the auto-tune
-  comment describes intent, not a wired consumer. FIXED (point-in-time strategy
-  memory): lessons.generate_lessons_as_of computes the lesson payload ONLY from
-  decisions settled at or before as_of (close_ts event time) - no hindsight;
-  invalid as_of is labeled, never full-history (tests in test_lessons.py).
+  comment describes intent, not a wired consumer. PARTIAL progress (outcome-event
+  cutoff): lessons.generate_lessons_as_of computes the lesson payload only from
+  decisions whose close_ts (outcome event time) is at or before as_of; non-finite
+  as_of rejected, future as_of labeled. This is NOT knowledge-time versioning:
+  late backfill/reclassification settled before the cutoff is still included and
+  feature availability timestamps are untracked - knowledge-time immutable
+  versions remain UNBUILT (tests in test_lessons.py).
 - 4.5 Operational memory: IMPLEMENTED — acquisition/provider_health.py
   (ok/degraded/down/unconfigured, latency/error/429 surfacing, public-fallback-only
   alert), health_monitor.py, event_recovery.py, helius_ratelimit.py,

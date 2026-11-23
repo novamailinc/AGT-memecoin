@@ -668,27 +668,35 @@ def generate_lessons(lane, decisions, generated_at=None):
 
 def generate_lessons_as_of(lane, decisions, as_of_ts,
                            generated_at=None):
-    """Point-in-time strategy memory (section 4.4): the lesson
-    payload computed ONLY from decisions settled at or before
-    as_of_ts (close_ts event time). No hindsight: outcomes that
-    settled later are invisible to the summary, not merely
-    uncounted. The payload carries as_of and point_in_time labels;
-    all other fields keep the generate_lessons semantics
-    (simulated, unvalidated, exclusions counted). Never raises."""
+    """Outcome-EVENT-time cutoff for the lesson payload (section
+    4.4): computed ONLY from decisions whose close_ts (the outcome
+    event time) is at or before as_of_ts. This is an outcome-event
+    cutoff ONLY - it is NOT knowledge-time versioning: a record
+    settled before the cutoff but recorded or reclassified later
+    (late backfill) is still included, and feature availability
+    timestamps are not tracked, so the payload is not a leak-free
+    reconstruction of what the bot knew at as_of. Non-finite or
+    missing as_of is rejected (labeled, never silently full
+    history); an as_of in the future is labeled explicitly.
+    Never raises."""
     try:
         cutoff = _num(as_of_ts)
-        if cutoff is None:
+        if cutoff is None or not math.isfinite(cutoff):
             return {"lane": lane, "generated_at": generated_at or 0,
                     "resolved_at": None, "n_settled": 0,
                     "lessons": [], "error": "invalid_as_of"}
+        gen = generated_at or time.time()
         visible = [r for r in (decisions or [])
                    if isinstance(r, dict)
-                   and (_num(r.get("close_ts"))) is not None
+                   and _num(r.get("close_ts")) is not None
+                   and math.isfinite(_num(r.get("close_ts")))
                    and _num(r.get("close_ts")) <= cutoff]
         payload = generate_lessons(lane, visible,
                                    generated_at=generated_at)
         payload["as_of"] = cutoff
-        payload["point_in_time"] = True
+        payload["as_of_in_future"] = bool(cutoff > gen)
+        payload["cutoff_semantics"] = (
+            "outcome_event_time_only_not_knowledge_time")
         return payload
     except Exception:
         return {"lane": lane, "generated_at": generated_at or 0,

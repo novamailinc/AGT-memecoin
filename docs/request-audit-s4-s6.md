@@ -182,12 +182,11 @@ Items marked FIXED name the landing commit.
   every result carries last_observed_ts + observed_age_s, no imposed freshness
   policy) and pool migration (causal: baselines use ONLY pre-transition samples,
   post-transition state is the LATEST observation so drained-then-recovered is a
-  labeled conflict; a marker proves a transition only when it names the target
-  pool (migration_to) or when exactly ONE transition sits within its tolerance -
-  a bare marker near two transitions is ambiguous and binds neither, unknown
-  never guessed; provenance explicit > inferred_from_reserves >
-  unrecorded/unknown - pool appearance alone is never canonical proof and
-  absent evidence fails unknown, not inference). All ratios/windows are UNVALIDATED ADVISORY HEURISTICS, labeled
+  labeled conflict; explicit recorded evidence requires matching origin AND
+  destination, event ID and event time. No runtime event producer exists yet.
+  Bare/destination-only markers are unverified associations, never proof;
+  pool appearance is not canonical identity and reserve-based inference is
+  an unvalidated advisory heuristic. All ratios/windows are UNVALIDATED ADVISORY HEURISTICS, labeled
   in every result; no trading threshold approval exists or is claimed. Runtime
   wiring: armed_watch records a snapshot from each vault resolution it ALREADY
   performs (arming + reconnect reconcile) AND from websocket accountNotification
@@ -198,14 +197,22 @@ Items marked FIXED name the landing commit.
   GENERATION at subscribe time: a delayed notification from an older identity is
   discarded and counted (stale_sub_drops), never stored against a newer pool or
   paired with a newer other side; set_positions purges cached amounts whose
-  pool/vault identity changed (exit price policy untouched). Meta sidecar
+  pool/vault identity changed. Reconcile rechecks captured generation AND
+  pool/vault identity after its unlocked resolver returns; a stale result is
+  discarded. Monitor capture amounts are separate from exit-price amounts.
+  These watcher identity fixes also change shared stale-notification handling
+  and can affect exit-price availability; they are not zero-effect changes.
+  Failed reconnect reads preserve prior observation timestamps, not fresh
+  reseeds. Meta sidecar
   corruption is isolated: non-int counter values are labeled meta_corrupt,
   propagated as partial in every result, and reset-and-counted on the next
-  write - never coerced into plausible counts and never crashing a read -
+  write. meta_values_reset_total keeps that uncertainty partial after repair,
+  never laundering it back to clean. Counters are not coerced into plausible
+  counts and cannot crash a read.
   no new RPC, no added polling, cadence unchanged, monitor failure can never
   break the watch loop (negative test). BOUNDARY: detection output is advisory surface only; no gate,
   score, entry, or exit reads it, and continuous COVERAGE is bounded by armed
-  positions (tests test_reserve_monitor.py, 34 checks incl. push-notification
+  positions (tests test_reserve_monitor.py, 37 checks incl. push-notification
   fixtures, stale-generation/position-change probes, marker ambiguity probes,
   corrupt-sidecar probes, causality probes, wiring + negative tests;
   armed_watch guard suite unchanged green).

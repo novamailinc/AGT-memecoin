@@ -26,15 +26,12 @@ What this adds over the point-in-time reads in reserves.py:
   pool's first observed ts. The old pool's baseline uses ONLY
   pre-transition samples (no look-ahead); its post-transition state
   is the LATEST observation, so a drained-then-recovered pool is a
-  labeled conflict, not a silent pass. A migration marker binds to
-  one transition only: it must sit on the old or new pool within
-  the marker tolerance of the transition anchor - a marker on one
-  transition never launders an earlier or later one. Provenance is
-  "explicit" (bound marker), "inferred_from_reserves" (causal
-  pre-transition baseline drained in the latest post-transition
-  observation), or "unknown"/"unrecorded" when the evidence is
-  absent: pool appearance alone is never canonical proof, and no
-  inference is presented as authority.
+  labeled conflict, not a silent pass. Explicit recorded event evidence
+  requires both origin and destination plus event ID and event time.
+  No runtime event producer exists yet. Bare and destination-only
+  markers are unverified associations, never proof. Pool appearance
+  is not canonical identity, and reserve-based inference remains an
+  unvalidated advisory heuristic.
 
 Units: amounts are stored exactly as the caller observed them (raw
 vault amounts for the armed_watch lane); quote_mint / decimals /
@@ -83,8 +80,6 @@ _MAX_TS_FUTURE_SKEW_S = 300.0    # absurd future ts rejected
 _DRAIN_RATIO = 0.5               # latest <= 50% of trailing median
 _SPIKE_RATIO = 2.0               # latest >= 200% of trailing median
 _MIGRATION_DRAIN_RATIO = 0.05    # old pool latest <=5% of causal peak
-_MARKER_TOLERANCE_S = 600.0      # marker must sit within +-10 min of
-                                 # the transition anchor to bind to it
 _THRESHOLDS_PROVENANCE = "unvalidated_advisory_heuristic"
 
 
@@ -211,6 +206,9 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
                     quote_amount: Any, source: str = "caller",
                     migration_event: Optional[str] = None,
                     migration_to: Optional[str] = None,
+                    migration_from: Optional[str] = None,
+                    migration_event_id: Optional[str] = None,
+                    migration_event_ts: Optional[float] = None,
                     quote_mint: Optional[str] = None,
                     decimals: Optional[int] = None,
                     slot: Optional[int] = None,
@@ -229,11 +227,10 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
     whole record - half-grounded context is worse than none.
 
     migration_event: optional caller-supplied marker (e.g.
-    "pumpswap_graduation"). A marker proves a transition only when it
-    also names the target pool via migration_to, or when exactly ONE
-    transition for this mint sits within the marker tolerance - a
-    bare marker near several transitions is ambiguous and binds none
-    (unknown, never guessed)."""
+    "pumpswap_graduation"). Explicit recorded evidence requires
+    migration_from, migration_to, migration_event_id and event time.
+    Proximity and destination-only markers are unverified associations.
+    No runtime producer or independent event verification is implied."""
     if not isinstance(pool, str) or not pool:
         _meta_bump("snapshots_rejected_invalid", home=home)
         return False
@@ -247,6 +244,16 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
         _meta_bump("snapshots_rejected_invalid", home=home)
         return False
     if quote_mint is not None and not isinstance(quote_mint, str):
+        _meta_bump("snapshots_rejected_invalid", home=home)
+        return False
+    for identity in (migration_from, migration_to, migration_event_id):
+        if identity is not None and (not isinstance(identity, str)
+                                     or not identity.strip()):
+            _meta_bump("snapshots_rejected_invalid", home=home)
+            return False
+    if migration_event_ts is not None and (
+            not _is_num(migration_event_ts)
+            or not 0 < migration_event_ts <= ts):
         _meta_bump("snapshots_rejected_invalid", home=home)
         return False
     for opt in (decimals, slot):
@@ -266,7 +273,13 @@ def record_snapshot(pool: Any, mint: Any, ts: Any, base_amount: Any,
     if migration_event:
         rec["migration_event"] = str(migration_event)[:64]
     if migration_to:
-        rec["migration_to"] = str(migration_to)[:64]
+        rec["migration_to"] = migration_to
+    if migration_from:
+        rec["migration_from"] = migration_from
+    if migration_event_id:
+        rec["migration_event_id"] = migration_event_id
+    if migration_event_ts is not None:
+        rec["migration_event_ts"] = migration_event_ts
     if quote_mint:
         rec["quote_mint"] = quote_mint
     if decimals is not None:
@@ -408,13 +421,18 @@ def _retention(home: Optional[str] = None,
     dropped_samples = dropped_samples or 0
     dropped_unreadable = dropped_unreadable or 0
     torn = torn or 0
+    resets = resets or 0
+    # A past reset is PERSISTENT uncertainty: the counter history was
+    # damaged and repaired, so partial never flips back to clean.
     return {"unreadable_this_read": unreadable_this_read,
             "samples_dropped_by_cap_total": dropped_samples,
             "compaction_dropped_unreadable_total": dropped_unreadable,
             "torn_tail_repairs_total": torn,
-            "meta_corrupt": corrupt,
+            "meta_values_reset_total": resets,
+            "meta_corrupt": corrupt or resets > 0,
             "partial": bool(dropped_samples or dropped_unreadable
-                            or torn or unreadable_this_read or corrupt)}
+                            or torn or unreadable_this_read
+                            or corrupt or resets)}
 
 
 def pool_history(pool: str, home: Optional[str] = None) -> Dict[str, Any]:
@@ -508,31 +526,28 @@ def detect_abnormal(pool: str, home: Optional[str] = None,
 
 
 def _explicit_transitions(pairs, by_pool, first_ts):
-    """Indices of transitions proven by a migration marker.
+    """Recorded bound events only, never proximity as proof.
 
-    A marker with migration_to binds the ONE transition whose target
-    pool it names (and only when it sits on one of the two pools
-    involved, within the tolerance of the anchor). A marker WITHOUT
-    target identity binds only when exactly one transition for this
-    mint is within tolerance of its ts on its own pool - near two
-    transitions it is ambiguous and binds neither."""
-    explicit = set()
+    No runtime marker producer exists yet. A caller must supply event
+    identity, event time, and BOTH origin and destination. This is
+    recorded caller evidence, not independent on-chain verification.
+    Bare/destination-only markers remain unverified associations.
+    """
+    explicit, association = set(), set()
     for i, (old, new) in enumerate(pairs):
-        anchor = first_ts[new]
         for r in by_pool[old] + by_pool[new]:
-            if (r.get("migration_event")
+            if not r.get("migration_event"):
+                continue
+            event_ts = r.get("migration_event_ts")
+            if (r.get("migration_from") == old
                     and r.get("migration_to") == new
-                    and abs(r["ts"] - anchor) <= _MARKER_TOLERANCE_S):
+                    and isinstance(r.get("migration_event_id"), str)
+                    and r["migration_event_id"].strip()
+                    and _is_num(event_ts) and 0 < event_ts <= r["ts"]):
                 explicit.add(i)
-    markers = [(p, r) for p, recs in by_pool.items() for r in recs
-               if r.get("migration_event") and not r.get("migration_to")]
-    for pool, r in markers:
-        cand = [i for i, (old, new) in enumerate(pairs)
-                if pool in (old, new)
-                and abs(r["ts"] - first_ts[new]) <= _MARKER_TOLERANCE_S]
-        if len(cand) == 1:
-            explicit.add(cand[0])
-    return explicit
+            else:
+                association.add(i)
+    return explicit, association
 
 
 def detect_migration(mint: str, home: Optional[str] = None,
@@ -562,12 +577,14 @@ def detect_migration(mint: str, home: Optional[str] = None,
     first_ts = {p: recs[0]["ts"] for p, recs in by_pool.items()}
     pools_by_appearance = sorted(by_pool, key=lambda p: first_ts[p])
     pairs = list(zip(pools_by_appearance, pools_by_appearance[1:]))
-    explicit_idx = _explicit_transitions(pairs, by_pool, first_ts)
+    explicit_idx, assoc_idx = _explicit_transitions(
+        pairs, by_pool, first_ts)
     transitions = []
     for idx, (old, new) in enumerate(pairs):
         old_recs, new_recs = by_pool[old], by_pool[new]
         anchor = first_ts[new]
         explicit = idx in explicit_idx
+        associated = idx in assoc_idx and not explicit
         # Causal baseline: pre-transition samples only. No baseline
         # means no inference at all - unknown, not guessed.
         baseline = [r for r in old_recs if r["ts"] < anchor]
@@ -583,11 +600,16 @@ def detect_migration(mint: str, home: Optional[str] = None,
             conflict = not old_drained
             prov = ("explicit" if explicit
                     else "inferred_from_reserves" if old_drained
+                    else "marker_association_unverified" if associated
                     else "unrecorded")
         elif explicit:
             old_drained = None
             conflict = bool(old_after)
             prov = "explicit"
+        elif associated:
+            old_drained = None
+            conflict = bool(old_after)
+            prov = "marker_association_unverified"
         else:
             old_drained = None
             conflict = bool(old_after)

@@ -115,7 +115,7 @@ class ReserveMonitorTest(unittest.TestCase):
         tr = out["transitions"][0]
         self.assertEqual(tr["from_pool"], POOL_A)
         self.assertEqual(tr["to_pool"], POOL_B)
-        self.assertEqual(tr["provenance"], "explicit")
+        self.assertEqual(tr["provenance"], "marker_association_unverified")
         self.assertFalse(tr["conflict_both_active"])
 
     def test_marker_never_launders_a_later_transition(self):
@@ -132,7 +132,7 @@ class ReserveMonitorTest(unittest.TestCase):
         out = rm.detect_migration(MINT, home=self.home)
         trs = {(t["from_pool"], t["to_pool"]): t
                for t in out["transitions"]}
-        self.assertEqual(trs[(POOL_A, POOL_B)]["provenance"], "explicit")
+        self.assertEqual(trs[(POOL_A, POOL_B)]["provenance"], "marker_association_unverified")
         later = trs[(POOL_B, POOL_C)]
         self.assertNotEqual(later["provenance"], "explicit")
         self.assertTrue(later["conflict_both_active"])
@@ -281,6 +281,8 @@ class ReserveMonitorTest(unittest.TestCase):
         self.assertTrue(rm.record_snapshot(
             POOL_B, MINT, self.t0 + 950.0, 10.0, 1.0,
             migration_event="graduation", migration_to=POOL_C,
+            migration_from=POOL_B, migration_event_id="fixture-event-1",
+            migration_event_ts=self.t0 + 940.0,
             home=self.home))
         out = rm.detect_migration(MINT, home=self.home)
         trs = {(t["from_pool"], t["to_pool"]): t
@@ -289,6 +291,13 @@ class ReserveMonitorTest(unittest.TestCase):
                          "explicit")
         self.assertNotEqual(trs[(POOL_A, POOL_B)]["provenance"],
                             "explicit")
+
+    def test_destination_only_marker_is_not_explicit(self):
+        self._snap(2, pool=POOL_A)
+        self._snap(1, pool=POOL_B, start=self.t0 + 500,
+                   migration_event="graduation", migration_to=POOL_B)
+        tr = rm.detect_migration(MINT, home=self.home)["transitions"][0]
+        self.assertEqual(tr["provenance"], "marker_association_unverified")
 
     def test_corrupt_sidecar_isolated_never_crashes_reads(self):
         self._snap(3)
@@ -307,8 +316,12 @@ class ReserveMonitorTest(unittest.TestCase):
         # A later write resets the corrupt value, never propagates.
         rm._meta_bump("snapshots_recorded", home=self.home)
         meta = rm._meta_read(self.home)
-        self.assertIsInstance(meta.get("samples_dropped_by_cap"),
-                              int)
+        self.assertIsInstance(meta.get("samples_dropped_by_cap"), int)
+        for result in (rm.pool_history(POOL_A, home=self.home),
+                       rm.detect_abnormal(POOL_A, home=self.home),
+                       rm.detect_migration(MINT, home=self.home)):
+            self.assertTrue(result["retention"]["partial"])
+            self.assertGreater(result["retention"]["meta_values_reset_total"], 0)
 
     def test_torn_repair_marks_retention_partial(self):
         self._snap(2)
@@ -540,6 +553,48 @@ class ArmedWatchWiringTest(unittest.TestCase):
         w._subs[11] = (MINT, "base", POOL_A, gen1)
         w._handle(None, self._push_msg(11, 4242))
         self.assertEqual(w._amounts[MINT]["base"], 4242)
+
+    def test_reconcile_rejects_identity_changed_inside_resolver(self):
+        from unittest.mock import patch
+        from daemon.launch_scanner import armed_watch as aw
+        w = aw.ArmedWatcher(lambda *a: None, sol_usd_fn=lambda: 100)
+        va = {"base_vault": "ba", "quote_vault": "qa",
+              "base_amount": 10, "quote_amount": 20, "quote_virtual": 0,
+              "quote_effective": 20}
+        vb = dict(va, base_vault="bb", quote_vault="qb",
+                  base_amount=30, quote_amount=40, quote_effective=40)
+        with patch.object(aw._res, "resolve_vaults", return_value=va), \
+                patch.object(aw._res, "mint_decimals", return_value=6):
+            w.set_positions({MINT: {"pair": POOL_A}})
+        def change_during_read(*args):
+            with patch.object(aw._res, "resolve_vaults", return_value=vb), \
+                    patch.object(aw._res, "mint_decimals", return_value=6):
+                w.set_positions({MINT: {"pair": POOL_B}})
+            return va
+        with patch.object(aw._res, "resolve_vaults", side_effect=change_during_read):
+            w._reconcile(10)
+        self.assertEqual(w._amounts[MINT]["quote"], 40)
+        self.assertEqual(w._monitor_amounts[MINT]["quote"], 40)
+        self.assertGreater(w._stale_sub_drops, 0)
+        w._subs[23] = (MINT, "base", POOL_B, w._generation)
+        w._handle(None, self._push_msg(23, 300))
+        latest = rm.pool_history(POOL_B, home=self.tmp)["samples"][-1]
+        self.assertEqual(latest["quote_amount"], 40)
+
+    def test_failed_reconcile_does_not_refresh_capture_times(self):
+        from unittest.mock import patch
+        from daemon.launch_scanner import armed_watch as aw
+        w = aw.ArmedWatcher(lambda *a: None)
+        w._want[MINT] = {"pool": POOL_A, "base_vault": "ba",
+                          "quote_vault": "qa", "decimals": 6}
+        old = {"base": 1, "quote": 2, "ts": 100,
+               "base_ts": 99, "quote_ts": 100}
+        w._amounts[MINT] = dict(old)
+        w._monitor_amounts[MINT] = dict(old)
+        with patch.object(aw._res, "resolve_vaults", return_value=None):
+            w._reconcile(10)
+        self.assertEqual(w._monitor_amounts[MINT], old)
+        self.assertEqual(w._amounts[MINT], old)
 
     def test_monitor_failure_never_breaks_watch_loop(self):
         from unittest.mock import patch

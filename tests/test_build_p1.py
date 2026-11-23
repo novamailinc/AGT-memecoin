@@ -187,7 +187,8 @@ w = AW.ArmedWatcher(on_price=lambda m, p, t: seen.append((m, p)),
                     sol_usd_fn=lambda now=None: 100.0)
 w._want = {MINT: {"pool": "POOL", "decimals": 6,
                   "base_vault": bv, "quote_vault": qv}}
-w._subs = {4242: (MINT, "base"), 4243: (MINT, "quote")}
+w._subs = {4242: (MINT, "base", "POOL", w._generation),
+           4243: (MINT, "quote", "POOL", w._generation)}
 w._amounts = {MINT: {"base": 100_000_000_000, "quote": 0, "ts": 0.0}}
 
 

@@ -196,6 +196,7 @@ class ArmedWatcher:
         self._subs = {}        # subid -> (mint, role, pool, generation)
         self._pending = {}     # request id -> (mint, role, pool, gen)
         self._amounts = {}     # mint -> {"base": int, "quote": int}
+        self._monitor_amounts = {}  # isolated measurement capture state
         self._generation = 0   # armed-identity generation; a
                                # notification captured under an older
                                # generation is discarded, never
@@ -308,9 +309,11 @@ class ArmedWatcher:
                             or w_new.get("quote_vault")
                             != w_old.get("quote_vault")):
                         self._amounts.pop(m, None)
+                        self._monitor_amounts.pop(m, None)
                 self._dirty.set()
             for m, a in fresh_amounts.items():
                 self._amounts[m] = a
+                self._monitor_amounts[m] = dict(a)
 
     # -- internals ------------------------------------------------------
 
@@ -560,7 +563,8 @@ class ArmedWatcher:
                 if not key:
                     return
                 mint, role, pool, gen = key
-                if gen != self._generation:
+                if (gen != self._generation
+                        or pool != (self._want.get(mint) or {}).get("pool")):
                     # Delayed notification from an older armed
                     # identity: discarded, never stored against the
                     # new pool or paired with a newer other side.
@@ -573,7 +577,10 @@ class ArmedWatcher:
                 amt[role] = ta["amount"]
                 amt[role + "_ts"] = now
                 amt["ts"] = now
-                amt_snap = dict(amt)
+                capture = self._monitor_amounts.setdefault(mint, {})
+                capture[role] = ta["amount"]
+                capture[role + "_ts"] = now
+                amt_snap = dict(capture)
                 dec = (self._want.get(mint) or {}).get("decimals")
                 base, quote = amt.get("base"), amt.get("quote")
             _record_push_snapshot(
@@ -607,20 +614,37 @@ class ArmedWatcher:
         moved = []
         with self._lock:
             want = dict(self._want)
+            gen = self._generation
         for mint, w in want.items():
             try:
                 v = _res.resolve_vaults(w["pool"], mint)
                 if not v:
                     continue
-                _record_reserve_snapshot(w["pool"], mint, v,
-                                         decimals=w.get("decimals"))
                 with self._lock:
+                    # The resolve ran outside the lock: a position
+                    # change during it makes the result OLD-identity
+                    # data. Re-check generation AND pool/vault
+                    # identity before publishing anything from it -
+                    # never seed old-pool amounts against the new
+                    # armed set.
+                    cur = self._want.get(mint)
+                    if (self._generation != gen or not cur
+                            or cur.get("pool") != w.get("pool")
+                            or cur.get("base_vault")
+                            != w.get("base_vault")
+                            or cur.get("quote_vault")
+                            != w.get("quote_vault")):
+                        self._stale_sub_drops += 1
+                        continue
                     now_rec = time.time()
                     self._amounts[mint] = {
                         "base": v["base_amount"],
                         "quote": v["quote_amount"], "ts": now_rec,
                         "base_ts": now_rec, "quote_ts": now_rec}
+                    self._monitor_amounts[mint] = dict(self._amounts[mint])
                     old = float(self._last_px.get(mint) or 0)
+                _record_reserve_snapshot(w["pool"], mint, v,
+                                         decimals=w.get("decimals"))
                 px = _res.amounts_price(v["base_amount"],
                                         v["quote_effective"],
                                         w["decimals"],
@@ -628,6 +652,9 @@ class ArmedWatcher:
                                         quote_mint=v.get("quote_mint"))
                 if px:
                     with self._lock:
+                        if self._generation != gen or self._want.get(mint) != w:
+                            self._stale_sub_drops += 1
+                            continue
                         self._last_px[mint] = px
                     try:
                         self._on_price(mint, px, time.time())

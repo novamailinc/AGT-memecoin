@@ -245,10 +245,18 @@ def log_decision(lane, mint, entry_ts, features, symbol=None,
                     if rec.get("status") == "settled":
                         return False
                     merged = dict(rec.get("features") or {})
+                    fts = dict(rec.get("feature_ts") or {})
+                    now = time.time()
                     for k, v in feats.items():
                         if merged.get(k) is None and v is not None:
                             merged[k] = v
+                            # First-recorded time for this value;
+                            # never overwritten once set (values
+                            # are immutable once recorded).
+                            fts.setdefault(k, now)
                     rec["features"] = merged
+                    if fts:
+                        rec["feature_ts"] = fts
                     if symbol and not rec.get("symbol"):
                         rec["symbol"] = symbol
                     if lessons_in_context:
@@ -256,15 +264,18 @@ def log_decision(lane, mint, entry_ts, features, symbol=None,
                             lessons_in_context)[:8]
                     _write_all(lane, recs, home)
                     return True
+            now = time.time()
             recs.append({
                 "kind": "decision", "lane": lane, "mint": mint,
                 "symbol": symbol or "",
                 "status": "pending",
                 "entry_ts": _num(entry_ts),
                 "features": feats,
+                "feature_ts": {k: now for k, v in feats.items()
+                               if v is not None},
                 "lessons_in_context": list(
                     lessons_in_context or [])[:8],
-                "logged_ts": time.time(),
+                "logged_ts": now,
             })
             _write_all(lane, recs, home)
             return True
@@ -340,20 +351,24 @@ def settle_from_close(lane, close_rec, home=None):
                 if _key(r) == _key(rec) and \
                         r.get("status") == "settled":
                     return False
+            now = time.time()
+            feats = extract_features(rec.get("entry_features") or {},
+                                     rec)
             recs.append({
                 "kind": "decision", "lane": lane, "mint": mint,
                 "symbol": str(rec.get("symbol") or ""),
                 "status": "settled",
                 "entry_ts": _num(rec.get("entry_ts")),
-                "features": extract_features(
-                    rec.get("entry_features") or {}, rec),
+                "features": feats,
+                "feature_ts": {k: now for k, v in feats.items()
+                               if v is not None},
                 "lessons_in_context": [],
-                "logged_ts": time.time(),
+                "logged_ts": now,
                 "pnl_usd": _num(rec.get("pnl_usd")),
                 "realized_mult": _num(rec.get("realized_mult")),
                 "close_reason": str(rec.get("closed_reason") or ""),
                 "close_ts": _num(rec.get("close_ts")),
-                "settled_ts": time.time(),
+                "settled_ts": now,
                 "exit_price_kind": str(
                     rec.get("exit_price_kind") or "unknown"),
                 "source": "close",
@@ -445,6 +460,12 @@ def _band(value, edges, labels):
         if value <= edge:
             return label
     return labels[-1]
+
+
+# Feature keys consumed by lesson banding (_band_of). Knowledge-time
+# replay tracks first-recorded timestamps for these values.
+_BAND_FEATURE_KEYS = ("grad_age_s", "deployer_launches_24h", "ttg_s",
+                      "curve_trades", "copycat_others_24h")
 
 
 def _band_of(dimension, features):
@@ -684,27 +705,40 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
     settled_ts (ledger-rebuilt or legacy records) have unknown
     first-knowledge time: they are EXCLUDED and counted in
     unknown_availability_excluded, never silently treated as
-    known. Records recorded after their close (late backfill)
-    are included when recorded by as_of and counted in
-    late_backfill_included. knowledge_replay_limits labels the
-    remaining gap: feature values were stamped at entry/merge
-    time without per-field timestamps and post-hoc file edits
-    are unversioned, so this is an append-time replay of the
-    known-availability subset, not a verified leak-free
-    reconstruction of model inputs at as_of.
+    known. Records recorded after their close (any settled_ts >
+    close_ts, no lateness threshold) are included when recorded by
+    as_of and counted in recorded_after_close_included. Feature
+    availability is tracked per banded-dimension value
+    (_BAND_FEATURE_KEYS): feature_ts[k] is the time value k was
+    FIRST recorded (log_decision stamps it at append and at each
+    merge fill; merge fills only None values, so recorded values
+    are immutable and the first-recorded time is exact). A
+    visible record whose banded features were all recorded by
+    as_of replays exactly what the record held at as_of; a record
+    with any banded feature recorded after as_of is excluded and
+    counted in feature_recorded_after_as_of, and a record lacking
+    feature_ts (legacy) is excluded and counted in
+    feature_availability_unknown. knowledge_replay_limits labels
+    the remaining gap: post-hoc file edits are unversioned, so
+    this is an append-time replay of the known-availability
+    subset, not a verified leak-free reconstruction guarded
+    against file tampering.
 
-    Both modes: only settled records are eligible (pending
-    records are skipped before any counting, so the counts below
-    describe the eligible set only). Timestamps are coerced with
-    the module's numeric coercion (numeric strings accepted).
-    Records that are not dicts or lack a finite close_ts are
-    excluded and counted in malformed_excluded; a record whose
-    settled_ts precedes its close_ts (recorded before the outcome
-    happened) is inconsistent: excluded in knowledge_time mode,
-    counted in inconsistent_time_excluded in both modes. Any
-    nonzero exclusion sets partial_history=True: the payload is
-    not the full recorded history. Non-finite or missing as_of,
-    and unknown modes, are rejected (labeled, never silently full
+    Both modes: only records with status "settled" are eligible
+    (pending records are skipped before any counting, so the
+    counts below describe the eligible set only; a record with a
+    close_ts but no/unknown status is NOT assumed pending - it is
+    excluded and counted in status_unknown_excluded). Timestamps
+    are coerced with the module's numeric coercion (numeric
+    strings accepted). Records that are not dicts or lack a
+    finite close_ts are excluded and counted in
+    malformed_excluded; a record whose settled_ts precedes its
+    close_ts (recorded before the outcome happened) is
+    inconsistent: excluded in knowledge_time mode, counted in
+    inconsistent_time_excluded in both modes. Any nonzero
+    exclusion sets partial_history=True: the payload is not the
+    full recorded history. Non-finite or missing as_of, and
+    unknown modes, are rejected (labeled, never silently full
     history); an as_of in the future is labeled explicitly.
     Never raises."""
     try:
@@ -720,15 +754,24 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
         gen = generated_at or time.time()
         visible = []
         unknown_availability = 0
-        late_backfill = 0
+        recorded_after_close = 0
         inconsistent_time = 0
         malformed = 0
+        status_unknown = 0
+        feature_after = 0
+        feature_unknown = 0
         for r in (decisions or []):
             if not isinstance(r, dict):
                 malformed += 1
                 continue
-            if r.get("status") != "settled":
-                continue  # pending records are not eligible
+            status = r.get("status")
+            if status != "settled":
+                if status not in ("pending", "settled") \
+                        and _num(r.get("close_ts")) is not None:
+                    # Settled-looking record of unknown status:
+                    # counted honestly, never assumed pending.
+                    status_unknown += 1
+                continue  # only settled records are eligible
             ct = _num(r.get("close_ts"))
             if ct is None or not math.isfinite(ct):
                 malformed += 1
@@ -750,9 +793,23 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
             if inconsistent:
                 inconsistent_time += 1
                 continue
+            fts = r.get("feature_ts")
+            fts = fts if isinstance(fts, dict) else {}
+            fvals = r.get("features")
+            fvals = fvals if isinstance(fvals, dict) else {}
+            used = [k for k in _BAND_FEATURE_KEYS
+                    if _num(fvals.get(k)) is not None]
+            f_ts = {k: _num(fts.get(k)) for k in used}
+            if any(v is None or not math.isfinite(v)
+                   for v in f_ts.values()):
+                feature_unknown += 1
+                continue
+            if any(v > cutoff for v in f_ts.values()):
+                feature_after += 1
+                continue
             visible.append(r)
             if st > ct:
-                late_backfill += 1
+                recorded_after_close += 1
         payload = generate_lessons(lane, visible,
                                    generated_at=generated_at)
         payload["as_of"] = cutoff
@@ -764,18 +821,29 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
             else "append_recorded_time_known_availability_subset")
         payload["malformed_excluded"] = malformed
         payload["inconsistent_time_excluded"] = inconsistent_time
+        payload["status_unknown_excluded"] = status_unknown
         payload["partial_history"] = bool(
-            malformed or unknown_availability)
+            malformed or inconsistent_time or status_unknown
+            or unknown_availability or feature_after
+            or feature_unknown)
         if mode == "knowledge_time":
             payload["unknown_availability_excluded"] = \
                 unknown_availability
-            payload["late_backfill_included"] = late_backfill
+            payload["recorded_after_close_included"] = \
+                recorded_after_close
+            payload["feature_recorded_after_as_of_excluded"] = \
+                feature_after
+            payload["feature_availability_unknown_excluded"] = \
+                feature_unknown
             payload["knowledge_replay_limits"] = (
                 "append-time replay of the known-availability "
-                "subset only; feature values carry no per-field "
-                "timestamps and post-hoc file edits are "
-                "unversioned, so this is not a verified leak-free "
-                "reconstruction of model inputs at as_of")
+                "subset only: banded-feature first-recorded "
+                "timestamps are tracked for records logged via "
+                "log_decision (values immutable once recorded), "
+                "legacy records without them are excluded, and "
+                "post-hoc file edits are unversioned, so this is "
+                "not a verified leak-free reconstruction guarded "
+                "against file tampering")
         return payload
     except Exception:
         return {"lane": lane, "generated_at": generated_at or 0,

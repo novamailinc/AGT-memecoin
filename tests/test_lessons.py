@@ -596,9 +596,10 @@ check("point-in-time: future as_of labeled explicitly",
 # Knowledge-time mode (4.4): cutoff on settled_ts (when the outcome
 # was RECORDED), not close_ts (when it happened).
 kt = [dict(hq[0], close_ts=BASE + 100, settled_ts=BASE + 100,
-           pnl_usd=10.0),
+           pnl_usd=10.0, feature_ts={"grad_age_s": BASE + 100}),
       dict(hq[0], mint="MINT-KT2", close_ts=BASE + 120,
-           settled_ts=BASE + 400, pnl_usd=-4.0),  # late backfill
+           settled_ts=BASE + 400, pnl_usd=-4.0,
+           feature_ts={"grad_age_s": BASE + 400}),  # late backfill
       dict(hq[0], mint="MINT-KT3", close_ts=BASE + 130,
            pnl_usd=7.0)]  # no settled_ts: unknown availability
 kres = L.generate_lessons_as_of("grad_select", kt, BASE + 150,
@@ -618,7 +619,7 @@ kres2 = L.generate_lessons_as_of("grad_select", kt, BASE + 500,
 check("knowledge-time: late backfill included once recorded, "
       "labeled separately",
       kres2.get("n_settled") == 2
-      and kres2.get("late_backfill_included") == 1
+      and kres2.get("recorded_after_close_included") == 1
       and kres2.get("unknown_availability_excluded") == 1)
 check("knowledge-time: replay limits labeled, not claimed leak-free",
       "leak-free" in str(kres2.get("knowledge_replay_limits"))
@@ -657,13 +658,65 @@ check("outcome-event: malformed honestly excluded and counted",
       and oeinc.get("partial_history") is True
       and oeinc.get("inconsistent_time_excluded") == 1
       and oeinc.get("n_settled") == 1)
-check("late_backfill counts eligible settled only, never pending",
-      kinc.get("late_backfill_included") == 0)
+check("recorded_after_close counts eligible settled only, "
+      "never pending",
+      kinc.get("recorded_after_close_included") == 0)
 clean = L.generate_lessons_as_of("grad_select", hq2, BASE + 500)
 check("clean history: no exclusions, partial_history False",
       clean.get("malformed_excluded") == 0
       and clean.get("inconsistent_time_excluded") == 0
+      and clean.get("status_unknown_excluded") == 0
       and clean.get("partial_history") is False)
+check("inconsistent_time also marks partial_history",
+      oeinc.get("partial_history") is True
+      and oeinc.get("inconsistent_time_excluded") == 1)
+
+# Status-unknown honesty and per-feature availability (4.4).
+kt3 = [dict(hq[0], status="unknown", close_ts=BASE + 100,
+            settled_ts=BASE + 100, pnl_usd=3.0),
+       dict(hq[0], mint="MINT-KTF", close_ts=BASE + 100,
+            settled_ts=BASE + 100, pnl_usd=5.0,
+            feature_ts={"grad_age_s": BASE + 300}),  # filled late
+       dict(hq[0], mint="MINT-KTU", close_ts=BASE + 100,
+            settled_ts=BASE + 100, pnl_usd=6.0)]  # no feature_ts
+kst = L.generate_lessons_as_of("grad_select", kt3, BASE + 200,
+                               mode="knowledge_time")
+check("knowledge-time: close_ts record of unknown status counted, "
+      "never assumed pending",
+      kst.get("status_unknown_excluded") == 1)
+check("knowledge-time: feature filled after as_of excluded, "
+      "feature_ts missing excluded",
+      kst.get("n_settled") == 0
+      and kst.get("feature_recorded_after_as_of_excluded") == 1
+      and kst.get("feature_availability_unknown_excluded") == 1
+      and kst.get("partial_history") is True)
+kst2 = L.generate_lessons_as_of("grad_select", kt3, BASE + 400,
+                                mode="knowledge_time")
+check("knowledge-time: feature recorded before as_of replays",
+      kst2.get("n_settled") == 1
+      and kst2.get("feature_recorded_after_as_of_excluded") == 0)
+
+# log_decision stamps feature first-recorded times; merge fills
+# stamp the fill time and never overwrite recorded values.
+_fts_home = tempfile.mkdtemp(prefix="lessons-fts-")
+check("feature_ts: initial log stamps non-None features",
+      L.log_decision("grad_select", "FTS1", 1000.0,
+                     {"grad_age_s": None, "mcap": 60000.0},
+                     home=_fts_home) is True)
+_fr = L.load_decisions("grad_select", home=_fts_home)[0]
+check("feature_ts: None values unstamped, recorded values stamped",
+      "grad_age_s" not in (_fr.get("feature_ts") or {})
+      and (_fr.get("feature_ts") or {}).get("mcap") is not None)
+check("feature_ts: merge fill stamps the fill, keeps old values",
+      L.log_decision("grad_select", "FTS1", 1000.0,
+                     {"grad_age_s": 12.0, "mcap": 99999.0},
+                     home=_fts_home) is True)
+_fr2 = L.load_decisions("grad_select", home=_fts_home)[0]
+check("feature_ts: fill stamped, original value/ts untouched",
+      (_fr2.get("feature_ts") or {}).get("grad_age_s") is not None
+      and _fr2["features"]["grad_age_s"] == 12.0
+      and _fr2["features"]["mcap"] == 60000.0
+      and _fr2["feature_ts"]["mcap"] == _fr["feature_ts"]["mcap"])
 
 print()
 if fails:

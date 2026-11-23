@@ -66,18 +66,25 @@ Items marked FIXED name the landing commit.
   as_of rejected, future as_of labeled. mode="knowledge_time" filters on
   settled_ts (the append time stamped by the settle paths): records closed
   before the cutoff but recorded after it are excluded, records recorded after
-  their close are counted in late_backfill_included, records recorded before
-  their close are excluded as inconsistent_time_excluded (counted in both
-  modes), and records lacking a finite settled_ts (ledger-rebuilt/legacy) are
-  excluded and counted in unknown_availability_excluded - never silently
-  treated as known. Non-dict or close_ts-less records are excluded and counted
-  in malformed_excluded (both modes); any exclusion sets partial_history=True.
+  their close (any settled_ts > close_ts, no lateness threshold) are counted
+  in recorded_after_close_included, records recorded before their close are
+  excluded as inconsistent_time_excluded (counted in both modes), and records
+  lacking a finite settled_ts (ledger-rebuilt/legacy) are excluded and counted
+  in unknown_availability_excluded - never silently treated as known.
+  Settled-looking records of unknown status are counted in
+  status_unknown_excluded, never assumed pending. Non-dict or close_ts-less
+  records are counted in malformed_excluded (both modes); any exclusion sets
+  partial_history=True. Per-feature availability: log_decision stamps
+  feature_ts[k] at first record (append and merge fills; merge fills only
+  None values, so recorded values are immutable and first-recorded times are
+  exact); in knowledge_time mode a record with a banded feature recorded
+  after as_of is excluded (feature_recorded_after_as_of_excluded) and one
+  lacking feature_ts is excluded (feature_availability_unknown_excluded).
   Numeric-string values follow the same numeric coercion as generate_lessons.
-  knowledge_replay_limits labels the remaining gap: feature values carry no
-  per-field timestamps and post-hoc file edits are unversioned, so this is an
-  append-time replay of the known-availability subset, NOT a verified
-  leak-free reconstruction of model inputs at as_of (immutable per-field
-  versions remain UNBUILT). Unknown modes rejected (tests in test_lessons.py).
+  knowledge_replay_limits labels the remaining gap: post-hoc file edits are
+  unversioned, so this is an append-time replay of the known-availability
+  subset, NOT a verified leak-free reconstruction guarded against file
+  tampering. Unknown modes rejected (tests in test_lessons.py).
 - 4.5 Operational memory: IMPLEMENTED — acquisition/provider_health.py
   (ok/degraded/down/unconfigured, latency/error/429 surfacing, public-fallback-only
   alert), health_monitor.py, event_recovery.py, helius_ratelimit.py,

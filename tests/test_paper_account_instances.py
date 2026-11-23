@@ -171,3 +171,22 @@ Path(sys.argv[1]+'/'+sys.argv[2]).write_text(json.dumps(result))
         snap = pa.snapshot()
         assert snap['cash']==3. and snap['cost_exposure']==7.
         assert snap['lanes']['scanner']['open_count']==1
+
+    @pytest.mark.parametrize('replay', [False, True])
+    def test_instance_write_down_exact_operation_shape(self, account, replay):
+        a = pa.try_debit_instance('scanner','M',1.,100.,'a')[2]
+        b = pa.try_debit_instance('scanner','M',1.,100.,'b')[2]
+        if replay:
+            with patch.object(pa,'_save_locked',side_effect=OSError('stop')):
+                with pytest.raises(OSError):
+                    pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone')
+            assert pa.snapshot()['degraded'] is None
+        else:
+            assert pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone')[0]
+        assert pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone')[0]
+        assert not pa.write_down('scanner','M','wd',pos_id=a,qty=75.,reason='gone')[0]
+        assert not pa.write_down('scanner','M','wd',pos_id=b,qty=25.,reason='gone')[0]
+        assert not pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='other')[0]
+        assert not pa.write_down('scanner','M','a',pos_id=a,qty=25.,reason='gone')[0]
+        snap = pa.snapshot()
+        assert snap['cost_exposure']==1.75 and snap['unresolved_cost']==.25

@@ -836,7 +836,10 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             if op_id:
                 ops[op_id] = {"event": "write_down", "lane": lane,
                               "mint": mint,
-                              "pos_id": ev.get("pos_id")}
+                              "pos_id": ev.get("pos_id"),
+                              **({"instance": True, "qty": ev.get("qty"),
+                                  "reason": ev.get("reason")}
+                                 if ev.get("instance") is True else {})}
             replayed += 1
         # The seq advances only for entries actually processed: on
         # a divergence return above it stays BEHIND the offending
@@ -1408,6 +1411,17 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, "ledger unreadable"
         prior = led["ops"].get(op_id)
         if prior is not None:
+            # Instance operations are exact. A different event or target can
+            # never ACK an unapplied disposal. Legacy behavior stays isolated.
+            st = _lane(led, lane)
+            target = st["open"].get(_position_key(st, mint, pos_id))
+            instance = (prior.get("instance") is True or
+                        (isinstance(target, dict) and target.get("instance") is True))
+            if instance:
+                expected = {"event": "write_down", "lane": lane, "mint": mint,
+                            "pos_id": pos_id, "qty": qty, "reason": reason}
+                if any(prior.get(k) != v for k, v in expected.items()):
+                    return False, "op_id instance write_down parameter conflict"
             return True, "already applied"
         if degraded is not None:
             _journal({"event": "write_down_intent", "lane": lane,
@@ -1436,11 +1450,14 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, "%s (journaled, not applied)" % why
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "write_down", "lane": lane,
-                             "mint": mint, "pos_id": pid}
+                             "mint": mint, "pos_id": pid,
+                             **({"instance": True, "qty": qty, "reason": reason}
+                                if pos.get("instance") is True else {})}
         _journal({"event": "write_down",
                   "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "pos_id": pid, "reason": reason,
+                  **({"instance": True} if pos.get("instance") is True else {}),
                   "qty": qty,
                   "register_qty": led["unresolved"][pid]["qty"],
                   "register_basis": led["unresolved"][pid]["basis"],

@@ -143,11 +143,17 @@ class Pacer:
 
 calls = []
 fail_primary = [False]
+fail_detail = [False]
 def transport(url, body, method, host, timeout):
     req = json.loads(body)
     calls.append((host, req["method"]))
     if fail_primary[0] and "alchemy" in host:
         return None, "fail", 0.001
+    if req['method']=='getSignaturesForAddress':
+        wallet=req['params'][0]
+        return [{'signature':'sig:'+wallet},{'signature':'old:'+wallet}], 'ok', 0.001
+    if fail_detail[0]:
+        return None,'fail',0.001
     wallet = req["params"][0].split(":", 1)[1]
     tx = {"blockTime": int(time.time()),
           "transaction": {"signatures": [req["params"][0]],
@@ -163,17 +169,26 @@ pairs = [("https://fixture.g.alchemy.com/v2/not-a-key", "alchemy-fixture"),
 with patch.object(R, "rpc_url_pairs", return_value=pairs), \
         patch.object(R, "_pacer", return_value=Pacer()), \
         patch.object(R, "_rpc_attempt", side_effect=transport):
+    from daemon.launch_scanner.wallet_intake import WalletIntake
+    intake=WalletIntake(os.environ['FOREX_AGENT_HOME'])
     for wallet in ("WalA", "WalB", "WalC"):
+        intake.stage(wallet,None,'old:'+wallet,[])
         fail_primary[0] = wallet == "WalB"
-        buys = sw.get_buy_details(wallet, "sig:" + wallet, "unused-fixture")
-        check("actual transaction parser yields buy for " + wallet,
-              len(buys) == 1 and buys[0]["mint"] == MINT)
-        for buy in buys:
-            sw.handle_sighting(wallet, buy, REGISTRY, seen)
+        if wallet=='WalA':
+            fail_detail[0]=True
+            sw.poll_wallet(wallet,'unused-fixture',REGISTRY,seen,intake)
+            check('real poll persists unavailable detail before cursor advance',
+                  intake.wallet(wallet)['pending']==['sig:'+wallet]
+                  and intake.wallet(wallet)['cursor']=='sig:'+wallet)
+            fail_detail[0]=False
+            intake=WalletIntake(os.environ['FOREX_AGENT_HOME'])
+        sw.poll_wallet(wallet,'unused-fixture',REGISTRY,seen,intake)
+        check('actual poll acknowledges parsed and persisted sighting for '+wallet,
+              intake.wallet(wallet)['pending']==[])
     check("primary failure traversed actual Helius fallback tier",
           any("helius" in host for host, _ in calls))
-    check("all acquisition requests used transaction method",
-          all(method == "getTransaction" for _, method in calls))
+    check("actual poll used signature discovery and transaction detail methods",
+          {method for _,method in calls}=={'getSignaturesForAddress','getTransaction'})
     fail_primary[0] = False
     with patch.object(R, "_rpc_attempt", return_value=(None, "null", 0.001)):
         check("definitive primary null yields no fabricated wallet buy",

@@ -42,7 +42,9 @@ Original source: user's WhatsApp message `wamid.HBgNMjM0NzA0NDcxOTI1MRUCABIYFDNB
 
 `tests/test_realpath_e2e.py` now starts with a provider-shaped transaction response at the actual HTTP-attempt seam, not a preconstructed buy:
 
-1. Actual `smart-watcher.get_buy_details` calls its actual `rpc` wrapper.
+1. Actual `smart-watcher.poll_wallet` discovers fixture signatures and atomically
+   stages its durable intake. A detail outage survives a reconstructed intake;
+   next ordinary cycle recovers through real `get_buy_details`.
 2. Wrapper delegates to shared `reserves.rpc`; paced primary/fallback selection executes. HTTP attempts and pacing are fixtures, no actual requests.
 3. Real transaction balance parser produces wallet buys; real wallet grouping/convergence produces the signal bus record.
 4. Actual watcher intake consumes the bus into the shared $10 simulated account. Duplicate intake and negative safety are tested.
@@ -121,3 +123,13 @@ between downstream effects and acknowledgement can replay. This does not prove
 exactly-once sell/notification/execution effects, abrupt AGT crash recovery,
 provider completeness or a qualified strategy. Existing sell attribution and
 convergence-policy approximations are not repaired by acquisition persistence.
+
+
+## Remaining durability boundaries
+
+Bus, convergence, seen and intake are separate commits, not one transaction.
+Crashes can replay downstream effects. Fixed temporary paths and unlocked
+read-modify-write in shared bus/convergence writers lack demonstrated
+cross-process serialization; sell grading effects are not idempotent by
+transaction signature. Passing poll recovery is not proof of exactly-once
+signal/notification/sell execution or full acquisition coverage.

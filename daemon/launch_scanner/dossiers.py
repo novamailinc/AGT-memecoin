@@ -269,6 +269,26 @@ def _classify_curve_samples(samples):
     return "multi_sample_curve_sequence"
 
 
+def _migrated_evidence(d):
+    """Three-valued migration provenance: True only on an explicit
+    flag or a validated migrated_ts stamp (the only field the
+    production observer writes); False only on an explicit recorded
+    negative; anything absent, zero or corrupt is unrecorded
+    (None) - never invented evidence either way."""
+    m = d.get("migrated")
+    if m is True:
+        return True
+    if m is False:
+        return False
+    ts = d.get("migrated_ts")
+    if isinstance(ts, bool):
+        return None
+    try:
+        return True if float(ts or 0) > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _archive_dossier(d, now):
     """Append one compact long-term record for an expiring dossier
     to the persistent archive. Returns True when the record is
@@ -295,12 +315,9 @@ def _archive_dossier(d, now):
             if isinstance(report, dict) else None,
             "initial_buy_sol": d.get("initial_buy_sol"),
             "market_cap_sol": d.get("market_cap_sol"),
-            "migrated": (True if d.get("migrated") is True else
-                (False if d.get("migrated") is False else None)),
+            "migrated": _migrated_evidence(d),
             "reserve_samples": len(d.get("curve_samples")
                 if "curve_samples" in d else (d.get("reserve_samples") or [])),
-            "migrated": (True if d.get("migrated") is True else
-                (False if d.get("migrated") is False else None)),
             "curve_kind": _classify_curve_samples(d.get("curve_samples")
                 if "curve_samples" in d else (d.get("reserve_samples") or [])),
             "reserve_acquisition": d.get("reserve_acquisition") or {
@@ -710,6 +727,10 @@ def _maybe_compact_archive(now):
                         dropped += 1
                         continue
                     rtype = rec.get("record_type", "launch")
+                    if rtype == "compaction_anchor":
+                        # Superseded bookkeeping, replaced by the
+                        # new anchor below: not a lost record.
+                        continue
                     if rtype == "outcome":
                         try:
                             age = now - float(
@@ -757,10 +778,22 @@ def _maybe_compact_archive(now):
                             if k in ("v", "record_type", "deployer",
                                      "year"):
                                 continue
+                            if k == "partial":
+                                # Provenance flag, not a counter:
+                                # propagate, never sum, never count
+                                # as a dropped record.
+                                if v is True:
+                                    lru["partial"] = True
+                                continue
                             try:
-                                lru[k] = lru.get(k, 0) + int(v or 0)
+                                if isinstance(v, bool) or v is None:
+                                    raise ValueError("unmergeable")
+                                iv = int(v)
                             except Exception:
-                                pass
+                                dropped += 1
+                                lru["partial"] = True
+                                continue
+                            lru[k] = lru.get(k, 0) + iv
                     elif rtype == "launch" and rec.get("mint"):
                         launches[rec["mint"]] = rec  # newest wins
                     else:

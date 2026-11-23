@@ -752,20 +752,21 @@ def test_launch_rollup_preserves_curve_and_migration_kind():
         dossiers.ARCHIVE_MAX_BYTES = 100
         dossiers.LAUNCH_RAW_S = 100
         try:
-            for i, (mint, n, migrated) in enumerate((
-                    ("MINT-U", 0, False), ("MINT-S", 1, False),
-                    ("MINT-M", 2, True))):
+            # Mixed evidence: legacy explicit False, production
+            # migrated_ts stamp, and no migration fields at all.
+            for i, (mint, n, extra) in enumerate((
+                    ("MINT-U", 0, {}),
+                    ("MINT-S", 1, {"migrated": False}),
+                    ("MINT-M", 2, {"migrated_ts": now - 80000}))):
                 samples = [{"ts": now - 90000 + j, "v_sol": j + 1,
                             "v_token": 10 + j} for j in range(n)]
                 c.write_dossier(mint, now - 90000 - i,
                                 deployer="DEP-CURVE",
                                 safety={"report": {"unknown": False,
                                                    "source": "x"}},
-                                curve_samples=samples,
-                                migrated=migrated)
-            dossiers._last_sweep = 0.0
-            dossiers._sweep(now)
-            dossiers._maybe_compact_archive(now + 1)
+                                curve_samples=samples, **extra)
+            dossiers._sweep(now - 200)  # records age beyond LAUNCH_RAW_S
+            dossiers._maybe_compact_archive(now)
             rollups = [r for r in dossiers.launch_archive(limit=1000)
                        if r.get("record_type") == "launch_rollup"]
             check("rollup: launch kinds preserve unknown/preliminary/sequence",
@@ -790,24 +791,28 @@ def test_launch_rollup_merge_preserves_new_counters():
         dossiers.ARCHIVE_MAX_BYTES = 100
         dossiers.LAUNCH_RAW_S = 100
         try:
+            # Mixed evidence across the four records: production
+            # migrated_ts stamp, legacy explicit False, production
+            # initial migrated_ts=0.0 (unrecorded), and no fields.
+            extras = ({"migrated_ts": now - 90000 + 10},
+                      {"migrated": False},
+                      {"migrated_ts": 0.0},
+                      {})
             for i in range(4):
-                migrated = True if i == 0 else (False if i == 1 else None)
                 fields = {"curve_samples": [{"v_sol": 1.0,
                                              "v_token": 1.0}]}
-                if migrated is not None:
-                    fields["migrated"] = migrated
+                fields.update(extras[i])
                 c.write_dossier("MINT-MERGE-%d" % i,
                                 born_ts=now - 90000 - i,
                                 deployer="DEP-MERGE",
                                 safety={"report": {"unknown": False,
                                                    "source": "x"}},
                                 **fields)
-            dossiers._last_sweep = 0.0
-            dossiers._sweep(now)
-            dossiers._maybe_compact_archive(now + 1)
+            dossiers._sweep(now - 200)  # records age beyond LAUNCH_RAW_S
+            dossiers._maybe_compact_archive(now)
             first = [r for r in dossiers.launch_archive(limit=1000)
                      if r.get("record_type") == "launch_rollup"]
-            dossiers._maybe_compact_archive(now + 2)
+            dossiers._maybe_compact_archive(now + 1)
             second = [r for r in dossiers.launch_archive(limit=1000)
                       if r.get("record_type") == "launch_rollup"]
             check("rollup: second compaction preserves every launch counter",
@@ -1194,36 +1199,106 @@ def test_fixture_failure_paths_not_hidden():
             dossiers._res = real_res
 
 
+def test_observe_migrations_drives_archive_migrated_true():
+    with _Ctx() as c:
+        now = time.time()
+        # Young dossier (pre-expiry) so observe_migrations can read it.
+        c.write_dossier("MINT-OBS", now - 3600, deployer="DEP-OBS",
+                        safety={"ts": now - 3600,
+                                "report": {"unknown": False,
+                                           "source": "x"}},
+                        migrated_ts=0.0)
+        dossiers.observe_migrations(
+            [{"source": "pumpportal-migration", "mint": "MINT-OBS"}],
+            now=now - 1800)
+        # Age the dossier past expiry so the sweep archives it.
+        p = os.path.join(dossiers.DOSSIER_DIR, "MINT-OBS.json")
+        with open(p) as f:
+            d = json.load(f)
+        d["born_ts"] = now - 25 * 3600
+        with open(p, "w") as f:
+            json.dump(d, f)
+        dossiers._sweep(now)
+        recs = dossiers.launch_archive(mint="MINT-OBS")
+        check("archive: observe_migrations stamps migrated=True",
+              len(recs) == 1 and recs[0].get("migrated") is True)
+
+
+def test_initial_zero_migrated_ts_archives_unrecorded():
+    with _Ctx() as c:
+        now = time.time()
+        # Production build initialises migrated_ts=0.0 and never
+        # writes a migrated flag: that is unrecorded, not a
+        # recorded negative.
+        c.write_dossier("MINT-NOMIG", now - 25 * 3600,
+                        deployer="DEP-NOMIG",
+                        safety={"ts": now - 25 * 3600,
+                                "report": {"unknown": False,
+                                           "source": "x"}},
+                        migrated_ts=0.0)
+        dossiers._sweep(now)
+        recs = dossiers.launch_archive(mint="MINT-NOMIG")
+        check("archive: initial migrated_ts=0 stays unrecorded",
+              len(recs) == 1 and recs[0].get("migrated") is None)
+
+
+def test_launch_rollup_partial_when_corrupt_counter():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        dossiers.ARCHIVE_MAX_BYTES = 1
+        try:
+            os.makedirs(os.path.dirname(dossiers.ARCHIVE_FILE),
+                        exist_ok=True)
+            with open(dossiers.ARCHIVE_FILE, "w") as f:
+                f.write(json.dumps({
+                    "v": 1, "record_type": "launch_rollup",
+                    "deployer": "DEP-X", "year": "2026",
+                    "launches": 2, "migrated": None}) + "\n")
+            dossiers._maybe_compact_archive(now)
+            rows = [r for r in dossiers.launch_archive(limit=1000)
+                    if r.get("record_type") == "launch_rollup"]
+            check("rollup: corrupt counter is partial, not silently summed",
+                  len(rows) == 1 and rows[0].get("partial") is True
+                  and rows[0].get("migrated", 0) == 0)
+            dossiers._maybe_compact_archive(now + 1)
+            rows = [r for r in dossiers.launch_archive(limit=1000)
+                    if r.get("record_type") == "launch_rollup"]
+            check("rollup: partial flag survives a second compaction",
+                  len(rows) == 1 and rows[0].get("partial") is True)
+            anchors = [r for r in dossiers.launch_archive(limit=1000)
+                       if r.get("record_type") == "compaction_anchor"]
+            check("rollup: superseded anchor is not counted as dropped",
+                  anchors
+                  and anchors[-1].get("dropped_records") == 0)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+
+
+_main_called = set()
+
+
 def main():
-    test_fixture_failure_paths_not_hidden()
-    test_registry_refresh_stamps_only_after_success()
-    test_constructed_fixture_intake_drives_memory_consumption()
-    test_sweep_refreshes_registry_on_cadence()
-    test_end_to_end_memory_consumed_after_restart()
-    test_exit_price_kind_labels()
-    test_deployer_history_current_price_only()
-    test_outcome_rollup_preserves_deployer_linkage()
-    test_launch_rollup_after_raw_window()
-    test_max_kept_launches_hard_cap()
-    test_missing_archive_with_existing_history_is_unavailable()
-    test_torn_tail_marks_history_partial()
-    test_compaction_never_discards_concurrent_append()
-    test_cross_process_appends_never_interleave()
-    test_rollup_records_survive_compaction_and_merge()
-    test_eviction_suppressed_when_archive_write_fails()
-    test_archive_status_distinguishes_empty_from_unavailable()
-    test_outcome_linkage_via_verdict_ledger_close()
-    test_compaction_bounds_size_and_keeps_resolved_state()
-    test_concurrent_appends_never_interleave()
-    test_expired_dossier_is_archived_before_eviction()
-    test_fresh_dossier_not_archived_or_evicted()
-    test_unknown_safety_archived_as_unknown()
-    test_deployer_filter_and_order()
-    test_archive_never_raises_on_corrupt_state()
-    test_schema_version_written_and_enforced()
-    test_launch_memory_conflict_resolution()
-    test_launch_memory_staleness_labels()
-    test_intel_fields_consume_archive()
+    # Run every test_* exactly once, in sorted order, so the direct
+    # script entry point covers the same set pytest collects.
+    for name in sorted(n for n in globals()
+                       if n.startswith("test_")
+                       and callable(globals()[n])):
+        _main_called.add(name)
+        try:
+            globals()[name]()
+        except AssertionError:
+            pass  # already recorded in FAILS by check()
+        except Exception as e:
+            print("FAIL %s raised %r" % (name, e))
+            FAILS.append("%s raised %r" % (name, e))
+    registered = {n for n in globals()
+                  if n.startswith("test_") and callable(globals()[n])}
+    try:
+        check("registration: every test function ran in main",
+              _main_called == registered)
+    except AssertionError:
+        pass
     print()
     if FAILS:
         print("FAILURES:", FAILS)

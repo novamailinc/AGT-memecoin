@@ -31,7 +31,7 @@ Original source: user's WhatsApp message `wamid.HBgNMjM0NzA0NDcxOTI1MRUCABIYFDNB
 | 19 AGT runtime | Prior installer/startup/restart component evidence | Current actual AGT install, reboot, persistent operation, restore and backup proof absent |
 | 20 Architectural completion | Concrete production seams progressively repaired | Separate routers/intelligence/advisory modules remain incompletely integrated |
 | 21 Testing/proof | Unit, script and limited realpath integration batteries | A build or mock result is not whole runtime, historical qualification or live demo proof |
-| 22 Graduation | No named requested state-machine implementation found in tree search | Formal condition-bound states and no-auto-mainnet transition need implementation/acceptance |
+| 22 Graduation | Explicit fail-closed state/evidence registry and CLI added, original names/checklist | Bookkeeping only: measured artifact evaluator, runtime admission, verified authority and qualification evidence remain missing |
 | 23 Emergency | Kill switch/global halt and recovery components tested | Full source/provider/restart fault matrix across running system incomplete |
 | 24 Deliverables | Prior partial status reports and component audit | Final evidence-backed architecture/loss/historical/demo/AGT/security reports incomplete |
 | 25 Restrictions | Current work offline, simulated only | Preserve no live activation/spend/silent safety weakening |

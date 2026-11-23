@@ -27,6 +27,16 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 SHADOW_FILE = os.path.join(STATE_DIR, "state.json.bak")
 LOCK_FILE = os.path.join(STATE_DIR, "state.lock")
 
+# Best-effort at import: create STATE_DIR when possible so the
+# long-standing contract holds (callers and tests may touch STATE_FILE/
+# LOCK_FILE paths directly after import). Failure is DEFERRED, not
+# fatal: unwritable-home environments still import, and the first real
+# state access raises through _ensure_state_dir -> gates fail closed.
+try:
+    os.makedirs(STATE_DIR, exist_ok=True)
+except Exception:
+    pass
+
 
 def _ensure_state_dir() -> None:
     """Create STATE_DIR on FIRST USE, never at import.

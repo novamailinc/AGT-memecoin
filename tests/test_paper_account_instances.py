@@ -190,3 +190,16 @@ Path(sys.argv[1]+'/'+sys.argv[2]).write_text(json.dumps(result))
         assert not pa.write_down('scanner','M','a',pos_id=a,qty=25.,reason='gone')[0]
         snap = pa.snapshot()
         assert snap['cost_exposure']==1.75 and snap['unresolved_cost']==.25
+
+    @pytest.mark.parametrize('instance', [False, True])
+    def test_terminal_unresolved_new_operation_does_not_crash(self, account, instance):
+        debit = pa.try_debit_instance if instance else pa.try_debit
+        pid = debit('scanner','M',1.,100.,'a')[2]
+        assert pa.write_down('scanner','M','wd1',pos_id=pid,reason='gone')[0]
+        assert pa.write_down('scanner','M','wd2',pos_id=pid,reason='gone')[0]
+        assert pa.write_down('scanner','M','wd2',pos_id=pid,reason='gone')[0]
+        if instance:
+            assert not pa.write_down('scanner','M','wd2',pos_id=pid,qty=50.,reason='gone')[0]
+        snap = pa.snapshot()
+        assert snap['degraded'] is None and snap['unresolved_cost']==1.
+        assert snap['cash']==9. and snap['cost_exposure']==0.

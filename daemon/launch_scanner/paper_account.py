@@ -1364,6 +1364,7 @@ def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
             if have_qty > 0 else 0.0
         final = False
     entry = reg.setdefault(pid, {"lane": lane, "mint": mint,
+                                 **({"instance": True} if pos.get("instance") is True else {}),
                                  "qty": 0.0, "basis": 0.0,
                                  "entry_qty": pos.get("entry_qty"),
                                  "entry_cost": pos.get("entry_cost"),
@@ -1441,6 +1442,11 @@ def write_down(lane: str, mint: str, op_id: str,
                       "mint": mint, "op_id": op_id,
                       "pos_id": pos_id, "reason": reason, "ts": ts})
             return False, "no open position (journaled)"
+        unresolved = (led.get("unresolved") or {}).get(pid) or {}
+        instance = (isinstance(pos, dict) and pos.get("instance") is True
+                    or unresolved.get("instance") is True)
+        if unresolved and (unresolved.get("lane") != lane or unresolved.get("mint") != mint):
+            return False, "unresolved instance ownership conflict"
         ok, why = _apply_write_down(led, lane, mint, pid, reason,
                                     ts, qty=qty)
         if not ok:
@@ -1452,12 +1458,12 @@ def write_down(lane: str, mint: str, op_id: str,
         led["ops"][op_id] = {"event": "write_down", "lane": lane,
                              "mint": mint, "pos_id": pid,
                              **({"instance": True, "qty": qty, "reason": reason}
-                                if pos.get("instance") is True else {})}
+                                if instance else {})}
         _journal({"event": "write_down",
                   "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "pos_id": pid, "reason": reason,
-                  **({"instance": True} if pos.get("instance") is True else {}),
+                  **({"instance": True} if instance else {}),
                   "qty": qty,
                   "register_qty": led["unresolved"][pid]["qty"],
                   "register_basis": led["unresolved"][pid]["basis"],

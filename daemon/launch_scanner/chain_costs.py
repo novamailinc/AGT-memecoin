@@ -261,6 +261,51 @@ def venue_fee_pct(chain, venue=None, mcap_sol=None, mcap_lamports=None,
         return 0.0
 
 
+# DexScreener dex labels that map to modeled pump venues (exact match;
+# graduation.py documents "pump" as the bonding curve and "pumpswap" as
+# the AMM - "pumpswap" merely contains the substring "pump"). Any other
+# label is an unmodeled venue.
+DEX_VENUE_SOLANA = {
+    "pump": "pumpfun_curve",
+    "pump.fun": "pumpfun_curve",
+    "pumpfun": "pumpfun_curve",
+    "pumpswap": "pumpswap",
+}
+
+
+def lane_dex_venue(chain, dex):
+    """(venue, reason) for a scanner lane's fee model.
+
+    venue: the venue string to pass to tx_cost_usd / cost_gate; "" when
+    the chain models its own trading fee without a venue kwarg
+    (hyperliquid's taker fee); None when the context is UNKNOWN and the
+    caller must REFUSE the entry rather than invent a fee.
+
+    Grounding: the dex label comes from the lane's own fresh tape
+    (DexScreener dexId). Lanes do not pass market cap or quote mint:
+    they carry USD mcap, not quote-lamport mcap, and no in-lane SOL/USD
+    conversion exists, so the fee module's unknown-mcap path selects the
+    highest tier and its unknown-quote path defaults to the SOL category
+    - each the maximum fee, the conservative direction for a cost model.
+    Never raises."""
+    try:
+        c = (chain or "").lower()
+        if c == "hyperliquid":
+            return "", ""
+        if c != "solana":
+            return None, ("venue fee unmodeled for chain '%s' (only "
+                          "solana pump venues and the hyperliquid taker "
+                          "fee are modeled)" % (c or "?"))
+        v = DEX_VENUE_SOLANA.get(str(dex or "").strip().lower())
+        if v is None:
+            return None, ("venue fee unmodeled for dex '%s' (only the "
+                          "pump.fun curve and PumpSwap are modeled)"
+                          % (str(dex or "?")[:32]))
+        return v, ""
+    except Exception:
+        return None, "venue classification failed (refusing)"
+
+
 def venue_fee_usd(chain, traded_usd=1.0, venue=None, mcap_sol=None,
                   mcap_lamports=None, quote_mint=None):
     """Venue fee in USD for ONE swap of traded_usd. Never raises."""

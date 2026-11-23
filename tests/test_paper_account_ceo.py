@@ -67,7 +67,8 @@ class FakeKS:
 
 FAKE_KS = FakeKS()
 _RUNNER_TAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
-                "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40}
+                "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
+                "dex": "pump"}
 
 
 def _patch_all(price=0.01):

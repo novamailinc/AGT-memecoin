@@ -77,7 +77,8 @@ class FakeKS:
 
 
 _RUNNER_TAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
-                "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40}
+                "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
+                "dex": "pump"}
 
 
 def _patch_all(price=0.01, patch_quote=True):
@@ -130,8 +131,8 @@ pos = M.open_positions().get("MINT1")
 check("mirror: position recorded", pos is not None)
 check("mirror: entry is adverse vs quoted (fills)",
       pos["entry_price"] >= 0.01)
-check("mirror: gas deducted from notional",
-      abs(pos["tokens"] * pos["entry_price"] - (1.0 - 0.001)) < 1e-6)
+check("mirror: gas + pump venue fee deducted from notional",
+      abs(pos["tokens"] * pos["entry_price"] - (1.0 - 0.0135)) < 1e-6)
 check("mirror: lane = degen_mirror", pos["lane"] == "degen_mirror")
 check("mirror: entry snapshot kept",
       pos["entry_snapshot"]["score"] == 70.0
@@ -168,11 +169,12 @@ check("mirror: gated entries open nothing",
       len(M.open_positions()) == 0)
 ok, why = _open(mint="RUNNER1")
 check("mirror: runner-grade tape opens", ok)
-# Gate is Solana-only: a Base card never consults the tape.
+# Gate is Solana-only: a Base card never consults the tape — and the
+# venue model refuses base rather than inventing a fee.
 with patch.object(M, "_fresh_tape", return_value=None) as mt:
     ok, why = _open(chain="base", mint="BASE1", price=0.02)
-check("mirror: runner gate does not apply to base",
-      ok and mt.call_count == 0)
+check("mirror: runner gate does not apply to base (refused unmodeled)",
+      not ok and "unmodeled" in why and mt.call_count == 0)
 # Consecutive confirmation (2026-10-21): the tape must pass on TWO
 # consecutive fresh reads — a degraded or dark second read blocks.
 with patch.object(M, "_fresh_tape",
@@ -210,11 +212,11 @@ _unpatch(ps)
 # chain routing
 ps = _patch_all()
 ok, why = _open(chain="base", mint="MINTB", price=0.02)
-check("mirror: base opens (base_mirror lane)",
-      ok and M.open_positions()["MINTB"]["lane"] == "base_mirror")
-posb = M.open_positions()["MINTB"]
-check("mirror: base gas deducted ($0.03)",
-      abs(posb["tokens"] * posb["entry_price"] - 0.97) < 1e-6)
+# Fee integration (2026-11-22): venue fees are modeled only for solana
+# pump venues and hyperliquid's taker fee; any other chain REFUSES the
+# entry rather than booking zero/invented venue fees.
+check("mirror: base REFUSED (venue fee unmodeled)",
+      not ok and "unmodeled" in why and "MINTB" not in M.open_positions())
 ok, why = _open(chain="ethereum", mint="MINTE")
 check("mirror: ethereum COST-BLOCKED (gas > edge room)",
       not ok and "COST-BLOCKED" in why)
@@ -398,22 +400,17 @@ with M._ledger_lock():
     del d3["positions"]["LOCKTEST"]
     M._write(d3)
 
-# hard stop on Base charges ONE tx gas ($0.03), not 3x ($0.09)
+# Fee integration (2026-11-22): base entries REFUSE (venue fee
+# unmodeled for non-solana/non-hyperliquid chains) — the hard-stop
+# multi-leg scenario is now exercised on solana below, and base
+# entries never open.
 ps = _patch_all(price=0.01)
 ok, why = M.mirror_card(chain="base", source="t", mint="MINTB2",
                         symbol="B", score=60, tier="pick",
                         liquidity=50000.0)
-assert ok, why
-entry = M.open_positions()["MINTB2"]["entry_price"]
-closes = M.poll_exits(price_fn=_prices([entry * 0.4]))
-assert closes != []
-realized = sum(v["realized_usd"] for v in closes[0]["legs"].values())
-# gross ≈ 0.384; single gas -> ~0.354; triple gas would be ~0.294
-check("audit: hard stop charges single tx gas (not 3x)",
-      0.33 < realized < 0.38)
-check("audit: hard-stop legs share one exit reason",
-      all(v["exit_reason"] == "hard_stop_-50pct"
-          for v in closes[0]["legs"].values()))
+check("audit: base entry refused (venue fee unmodeled)",
+      not ok and "unmodeled" in why
+      and "MINTB2" not in M.open_positions())
 _unpatch(ps)
 
 # ---------------- peak_mult on closes (2026-10-20) ----------------

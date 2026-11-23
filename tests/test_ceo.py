@@ -74,7 +74,7 @@ class FakeKS:
 FAKE_KS = FakeKS()
 
 
-_RUNNER_TAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+_RUNNER_TAPE = {"dex": "pump", "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
                 "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40}
 
 
@@ -159,8 +159,8 @@ check("ceo: position recorded with legs + features",
       pos is not None and "entry_features" in pos
       and pos["entry_features"]["chain"] == "solana"
       and set(pos["legs"].keys()) == {"a", "b", "c"})
-check("ceo: solana gas deducted from notional ($0.001)",
-      abs(pos["tokens"] * pos["entry_price"] - 0.999) < 1e-6)
+check("ceo: solana gas+venue fee deducted from notional ($0.0135)",
+      abs(pos["tokens"] * pos["entry_price"] - 0.9865) < 1e-6)
 check("ceo: entry is adverse vs quoted (honest fill)",
       pos["entry_price"] >= 0.01)
 
@@ -176,10 +176,11 @@ check("ceo: cost-blocked ETH opens nothing",
       "MINTE" not in C.open_positions())
 
 ok, why = C.consider_card(_sig(chain="base", mint="MINTB"))
-posb = C.open_positions().get("MINTB")
-check("ceo: base opens, $0.03 gas from notional",
-      ok and abs(posb["tokens"] * posb["entry_price"] - 0.97) < 1e-6)
-check("ceo: cash after two entries = $98.00", C.account_cash() == 98.00)
+check("ceo: base refused (venue fee unmodeled for chain)",
+      not ok and "unmodeled" in why)
+check("ceo: base refusal debits nothing", "MINTB" not in C.open_positions())
+check("ceo: cash after solana entry + refused base = $99.00",
+      C.account_cash() == 99.00)
 
 ok, why = C.consider_card(_sig(chain="hyperliquid", mint="HLCOIN",
                                extra={"spot_index": 7, "mark_px": 2.0}))
@@ -237,10 +238,12 @@ check("ceo: gated entries debit nothing", C.account_cash() == 100.00)
 # A KIMCHI-grade tape (graduated, deep liq, rising) opens.
 ok, why = C.consider_card(_sig(mint="RUNNER1"))
 check("ceo: runner-grade tape opens", ok)
-# The gate is Solana-only: a Base card never consults the tape.
+# The gate is Solana-only: a Base card never consults the tape - and
+# with no venue fee model for base the entry is refused (2026-11-22).
 with patch.object(C, "_fresh_tape", return_value=None) as mt:
     ok, why = C.consider_card(_sig(chain="base", mint="BASE1"))
-check("ceo: runner gate does not apply to base", ok and mt.call_count == 0)
+check("ceo: base refused without consulting tape",
+      not ok and "unmodeled" in why and mt.call_count == 0)
 # Consecutive confirmation (2026-10-21): the tape must pass on TWO
 # consecutive fresh reads — a degraded or dark second read blocks.
 with patch.object(C, "_fresh_tape",

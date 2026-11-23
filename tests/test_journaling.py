@@ -96,6 +96,7 @@ C.BUS_PATH = os.path.join(TMPD, "signal_bus.jsonl")
 TAPE = {"usd_liquidity": 120_000.0, "usd_market_cap": 640_000.0,
         "chg_m5": 12.0, "buys_m5": 137, "sells_m5": 52,
         "vol_m5": 9_876.0, "price_usd": 0.01,
+        "dex": "pump",
         "tape_source": "dexscreener"}
 
 ps = []
@@ -187,6 +188,7 @@ QUOTE = {"px": 0.01}
 MTAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
          "chg_m5": 10.0, "buys_m5": 88, "sells_m5": 31,
          "vol_m5": 4_321.0, "price_usd": 0.01,
+         "dex": "pump",
          "tape_source": "dexscreener"}
 
 ps = []
@@ -293,6 +295,7 @@ with open(os.path.join(DOSSDIR, DMINT + ".json"), "w") as f:
 
 GTAPE = {"usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
          "chg_m5": 3.0, "price_usd": 0.00007,
+         "dex": "pump",
          "tape_source": "dexscreener"}
 
 ps = []
@@ -382,6 +385,7 @@ eng._ks = FakeKS()
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
 eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
+                                "dex": "pump",
                                 "tape_source": "test"}
 eng.ensure_ledger()
 RMINT = "RawDos111111111111111111111111111111111pump"

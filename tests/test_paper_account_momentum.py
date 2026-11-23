@@ -42,7 +42,7 @@ def check(name, cond):
         FAILS.append(name)
 
 
-GOOD_TAPE = {"usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
+GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "price_usd": 0.001,
              "tape_source": "test"}
 QUOTES = {}

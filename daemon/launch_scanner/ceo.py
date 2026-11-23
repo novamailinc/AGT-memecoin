@@ -861,6 +861,17 @@ def _hl_all_marks():
 
 # ---- entry ---------------------------------------------------------------
 
+def _exit_fee_venue(pos):
+    """Venue for the exit fee. The entry-stamped venue wins; a legacy
+    position without one is charged the conservative pump maximum tier
+    on solana (estimates may hurt, never help). None = the chain's own
+    model (hyperliquid taker fee) or no venue kwarg."""
+    v = pos.get("fee_venue")
+    if v is None and (pos.get("chain") or "").lower() == "solana":
+        return "pump"
+    return v or None
+
+
 def _veto_ok(chain, mint):
     """Re-verify hard vetoes at entry (same semantics as mirror.py):
     fail-open on exception (vetoes only on positive evidence),
@@ -971,8 +982,30 @@ def _consider_card(sig):
     if not ok:
         return _skip(mint, "veto at entry: %s" % why)
 
+    # Venue fee grounding (2026-11-22 fee integration): solana entries
+    # classify the venue from the runner gate's OWN confirmed tape
+    # (_LAST_GATE_TAPE - no extra fetch, and the gate already verified
+    # it fresh); hyperliquid uses its own taker-fee model; any other
+    # chain or an unmodeled dex REFUSES the entry rather than silently
+    # booking zero venue fees. Market cap / quote mint are not threaded
+    # (no quote-lamport mcap in-lane), so the fee module charges its
+    # maximum tier.
+    if (chain or "").lower() == "solana":
+        fee_venue, venue_why = _costs.lane_dex_venue(
+            chain, (_LAST_GATE_TAPE or {}).get("dex"))
+    else:
+        fee_venue, venue_why = _costs.lane_dex_venue(chain, None)
+    if fee_venue is None:
+        return _skip(mint, venue_why)
+    blocked, why = _costs.cost_gate(chain, NOTIONAL_USD,
+                                    venue=fee_venue or None)
+    if blocked:
+        logger.warning("ceo %s: %s", mint, why)
+        return False, why
+
     liquidity = float(sig.get("liquidity") or 0)
-    gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD)
+    gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD,
+                                venue=fee_venue or None)
     eff_notional = NOTIONAL_USD - gas_in
     if eff_notional <= 0:
         return _skip(mint, "costs exceed notional")
@@ -1013,6 +1046,7 @@ def _consider_card(sig):
         },
         "realized_usd": 0.0,
         "status": "open",
+        "fee_venue": fee_venue,
         "spot_index": spot_index, "pair": extra.get("pair", ""),
         "entry_snapshot": {
             "score": round(float(sig.get("score") or 0), 1),
@@ -1238,12 +1272,13 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     _kind = _pkind(reason, pkind)
     # A write-down is NOT a sale (design v4 Stage B): no fee is
     # booked on units nobody bought.
+    _fv = _exit_fee_venue(pos)
     gas_out = (0.0 if _kind == "write_down_zero"
-               else _costs.tx_cost_usd(chain, gross))
+               else _costs.tx_cost_usd(chain, gross, venue=_fv))
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
-               exit_price_kind=_kind)
+               exit_price_kind=_kind, fee_venue=_fv or "none")
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     if _kind == "write_down_zero":
         _pa_write_down(pos, reason)
@@ -1276,8 +1311,9 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     _kind = _pkind(reason, pkind)
     # A write-down is NOT a sale (design v4 Stage B): no fee is
     # booked on units nobody bought.
+    _fv = _exit_fee_venue(pos)
     gas_out = (0.0 if _kind == "write_down_zero"
-               else _costs.tx_cost_usd(chain, gross))
+               else _costs.tx_cost_usd(chain, gross, venue=_fv))
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]
@@ -1285,7 +1321,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
             if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason,
-                   exit_price_kind=_kind)
+                   exit_price_kind=_kind, fee_venue=_fv or "none")
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     if _kind == "write_down_zero":
         _pa_write_down(pos, reason)

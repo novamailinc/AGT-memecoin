@@ -586,9 +586,27 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
     if not ok:
         return False, "veto at entry: %s" % why
 
+    # Venue fee grounding (2026-11-22 fee integration): solana entries
+    # classify the venue from the fresh tape's dex label; hyperliquid
+    # uses its own taker-fee model; any other chain or an unmodeled dex
+    # REFUSES the entry rather than silently booking zero venue fees.
+    # (mirror stays deliberately unwired; this keeps its cost model
+    # consistent with the live lanes.)
+    if (chain or "").lower() == "solana":
+        # Classify from the runner gate's own confirmed read (the same
+        # _LAST_GATE_TAPE the journaling stamp uses) — NO extra fetch:
+        # the consecutive-confirmation gate is the lane's fresh tape.
+        fee_venue, venue_why = _costs.lane_dex_venue(
+            chain, (_LAST_GATE_TAPE or {}).get("dex"))
+    else:
+        fee_venue, venue_why = _costs.lane_dex_venue(chain, None)
+    if fee_venue is None:
+        return False, venue_why
+
     # Honest entry: adverse fill vs quoted (fills.py) on the $1 notional
     # minus the chain's per-tx cost.
-    gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD)
+    gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD,
+                                venue=fee_venue or None)
     eff_notional = NOTIONAL_USD - gas_in
     if eff_notional <= 0:
         return False, "costs exceed notional"
@@ -627,6 +645,7 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
         },
         "realized_usd": 0.0,
         "status": "open",
+        "fee_venue": fee_venue,
         "spot_index": spot_index, "pair": extra.get("pair", ""),
         "entry_snapshot": {
             "score": round(float(score or 0), 1), "tier": (tier or "")[:32],
@@ -691,6 +710,17 @@ def _pkind(reason, pkind=None):
     return _pk.classify_reason(
         reason, getattr(_f2, "F2_REASON", None) if _f2 else None)
 
+def _exit_fee_venue(pos):
+    """Venue for the exit fee. The entry-stamped venue wins; a legacy
+    position without one is charged the conservative pump maximum tier
+    on solana (estimates may hurt, never help). None = the chain's own
+    model (hyperliquid taker fee) or no venue kwarg."""
+    v = pos.get("fee_venue")
+    if v is None and (pos.get("chain") or "").lower() == "solana":
+        return "pump"
+    return v or None
+
+
 def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     chain = pos["chain"]
@@ -706,11 +736,13 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     except Exception:
         filled_exit = exit_price
     gross = leg_tokens * filled_exit
-    gas_out = _costs.tx_cost_usd(chain, gross)
+    _fv = _exit_fee_venue(pos)
+    gas_out = _costs.tx_cost_usd(chain, gross, venue=_fv)
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
-               exit_price_kind=_pkind(reason, pkind))
+               exit_price_kind=_pkind(reason, pkind),
+               fee_venue=_fv or "none")
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     return net
 
@@ -737,7 +769,8 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     except Exception:
         filled_exit = exit_price
     gross = total_tokens * filled_exit
-    gas_out = _costs.tx_cost_usd(chain, gross)  # ONE tx for the combined exit
+    _fv = _exit_fee_venue(pos)
+    gas_out = _costs.tx_cost_usd(chain, gross, venue=_fv)  # ONE tx for the combined exit
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]

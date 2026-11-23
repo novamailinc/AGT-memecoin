@@ -54,3 +54,20 @@ class TestNativeSharedRisk:
         rate[0]=200.
         assert a.account_info().equity==.05
         assert a.shared_account_snapshot()['cash']==10.
+
+    def test_existing_unbound_baseline_not_silently_reset(self, account, tmp_path):
+        class Store:
+            def __init__(self): self.state={'day':'existing','start_of_day_equity':10.,'recent_outcomes':[False]}
+            def get_risk_state(self): return dict(self.state)
+            def set_risk_state(self,patch): self.state.update(patch)
+        store=Store(); before=dict(store.state)
+        a=_adapter(str(tmp_path),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+                    fx_observer=lambda:{'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},
+                    shared_mark_observer=lambda:{})
+        a.connect({})
+        signal=Signal(symbol='BONK',timeframe='M1',direction='BUY',entry_price=.000001,
+              stop_loss=.000000999,take_profit=.000002,ema_fast=0.,ema_slow=0.,rsi_value=0.,
+              atr_value=0.,candle_time=datetime.now(timezone.utc),trigger='fixture')
+        result=RiskManager(RiskConfig(),store=store).check(signal,a)
+        assert not result.allowed and 'identity unbound' in result.reason
+        assert store.state==before

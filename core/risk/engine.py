@@ -219,6 +219,20 @@ class RiskManager:
             return RiskCheckResult(False, "Signal has no stop loss — rejected by policy",
                                    reason_code=INVALID_ORDER)
 
+        identity_fn = getattr(adapter, "risk_state_identity", None)
+        identity = identity_fn() if identity_fn else None
+        if identity is not None:
+            prior_state = self._get_state()
+            recorded = prior_state.get("risk_account_identity")
+            if recorded is None and any(k in prior_state for k in
+                                        (self._DAY_KEY, self._EQUITY_KEY, self._OUTCOMES_KEY)):
+                return RiskCheckResult(False, "Risk baseline identity unbound; explicit reconciliation required",
+                                       reason_code=RISK_LIMIT_EXCEEDED)
+            if recorded is not None and recorded != identity:
+                return RiskCheckResult(False, "Risk baseline account identity conflict",
+                                       reason_code=RISK_LIMIT_EXCEEDED)
+            if recorded is None:
+                self._set_state({"risk_account_identity":identity})
         account = adapter.account_info()
         equity = account.equity
         start_equity = self._roll_day_if_needed(equity)

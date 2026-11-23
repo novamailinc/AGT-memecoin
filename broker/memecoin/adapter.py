@@ -869,6 +869,15 @@ class MemecoinAdapter(BrokerAdapter):
             server="memecoin-paper" if self._mode == "paper" else "memecoin-live",
         )
 
+    def risk_state_identity(self):
+        if self._shared_account is None:
+            return None
+        with self._state_lock():
+            self._refresh_locked()
+            binding = json.loads((self._data_dir / "shared_binding.json").read_text())
+            return {"book_id":binding["book_id"], "account_id":binding["account_id"],
+                    "currency":"SOL", "mode":"shared-usd-sol-sizing-v1"}
+
     def shared_account_snapshot(self):
         """USD reporting only. Never feed native SOL risk sizing."""
         self._ensure()

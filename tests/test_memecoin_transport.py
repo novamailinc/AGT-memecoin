@@ -113,3 +113,13 @@ def test_curl_bad_json_falls_back_to_urllib(monkeypatch):
     monkeypatch.setattr(tmod.urllib.request, "urlopen",
                         lambda req, timeout=None: _Resp())
     assert tmod._http_get_json("https://example.invalid/x") == {"via": "urllib"}
+
+
+def test_quote_asset_pair_cannot_price_requested_base(monkeypatch):
+    market=tmod.MemecoinMarketData({'SOL':'wanted'})
+    monkeypatch.setattr(tmod,'_http_get_json',lambda url:{'pairs':[
+        {'chainId':'solana','baseToken':{'address':'other'},'quoteToken':{'address':'wanted'},
+         'priceUsd':'999','liquidity':{'usd':999999}},
+        {'chainId':'solana','baseToken':{'address':'wanted'},'priceUsd':'100',
+         'liquidity':{'usd':100}}]})
+    assert market.get_quote('SOL')['price_usd']==100.

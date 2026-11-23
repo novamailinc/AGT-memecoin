@@ -125,7 +125,8 @@ class MemecoinMarketData:
         if not data:
             return None
         pairs = [p for p in (data.get("pairs") or [])
-                 if str(p.get("chainId", "")).lower() == "solana"]
+                 if str(p.get("chainId", "")).lower() == "solana"
+                 and (p.get("baseToken") or {}).get("address") == mint]
         if not pairs:
             return None
         pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0),

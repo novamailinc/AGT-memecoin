@@ -847,6 +847,7 @@ def _poll_exits(price_fn):
     if any(p["chain"] == "hyperliquid" for p in snapshot.values()):
         hl_marks = _hl_all_marks()  # one HL context fetch per cycle
     quotes = {}
+    refusals = {}
     liqs = {}
     for mint, pos in snapshot.items():
         try:
@@ -882,6 +883,8 @@ def _poll_exits(price_fn):
                     dict(pos, mint=mint))
                 if rpx > 0:
                     px = rpx
+                elif _rsrc:
+                    refusals[mint] = _rsrc
             except Exception:
                 pass
         quotes[mint] = px
@@ -895,6 +898,21 @@ def _poll_exits(price_fn):
             try:
                 px = quotes.get(mint, 0)
                 if px <= 0:
+                    # Reserves refusal provenance (2026-11-22): the
+                    # refusal DETAIL is journalled so a schema-gate
+                    # refusal is distinguishable from ordinary
+                    # darkness in the close record.
+                    _ref = refusals.get(mint)
+                    if _ref:
+                        _jq = pos.setdefault("quote_journal", [])
+                        _jq.append({"ts": now, "px": 0,
+                                    "src": "reserves_refused",
+                                    "detail": _ref})
+                        del _jq[:-40]
+                        # Dark positions `continue` below without the
+                        # normal per-position write — persist the
+                        # provenance now (lock held).
+                        _write(d)
                     # F2 (2026-10-23): an ARMED position dark across
                     # every source for a sustained stretch exits at
                     # its last real observed price, stamped — instead

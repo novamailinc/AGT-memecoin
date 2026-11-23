@@ -119,6 +119,36 @@ check("amounts_price math", px is not None and abs(px - 0.005) < 1e-9)
 check("amounts_price: empty base -> None",
       R.amounts_price(0, 5, 6) is None)
 
+# ---- effective quote reserves (fee-adjustment doc, 2026-11-22) ----
+# pool account: 301 bytes, vaults at the IDL offsets, signed virtual
+# quote reserves @245.
+pool2 = bytearray(301)
+pool2[43:75] = R.b58decode(MINT)          # base_mint @43 (IDL)
+pool2[75:107] = R.b58decode(R.WSOL)       # quote_mint @75 (IDL)
+pool2[139:171] = R.b58decode(qv)          # pool_BASE_token_account (IDL)
+pool2[171:203] = R.b58decode(bv)          # pool_QUOTE_token_account (IDL)
+pool2[245:261] = (-2_000_000_000).to_bytes(16, "little", signed=True)
+vq = R.parse_virtual_quote_reserves(bytes(pool2))
+check("virtual quote reserves parsed signed", vq == -2_000_000_000)
+check("short pool: virtual = 0 (pre-v2)",
+      R.parse_virtual_quote_reserves(bytes(pool2[:245])) == 0)
+check("no pool data: virtual None",
+      R.parse_virtual_quote_reserves(None) is None)
+# vault holds 5 SOL but 2 SOL are un-swept fees -> effective 3 SOL
+va2 = R._vault_amounts(accts, bv, qv, R.WSOL, vq)
+check("effective quote = vault + signed virtual",
+      va2["quote_amount"] == 5_000_000_000
+      and va2["quote_virtual"] == -2_000_000_000
+      and va2["quote_effective"] == 3_000_000_000)
+# fees exceed the vault: not priceable -> refuse
+va3 = R._vault_amounts(accts, bv, qv, R.WSOL, -6_000_000_000)
+check("non-positive effective quote refused", va3 is None)
+with patch.object(R, "sol_usd_price", return_value=100.0):
+    px_eff = R.amounts_price(100_000_000_000,
+                             va2["quote_effective"], 6)
+check("amounts_price on effective quote (3 SOL x $100 / 100k)",
+      px_eff is not None and abs(px_eff - 0.003) < 1e-9)
+
 # bonding curve parse + PDA
 curve = bytearray(166)  # current quote-aware schema (>= 115)
 curve[:8] = bytes.fromhex("17b7f83760d8ac60")

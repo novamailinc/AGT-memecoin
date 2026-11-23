@@ -107,6 +107,14 @@ WSOL = _solana_ids.WSOL_MINT
 # Verified PumpSwap pool offsets (see module docstring).
 POOL_QUOTE_VAULT_OFF = 139
 POOL_BASE_VAULT_OFF = 171
+# Signed virtual quote reserves (pump_amm IDL): boost_reserves
+# - protocol_fees - creator_fees. The EXECUTABLE quote side is
+# the vault amount PLUS this (official doc:
+# docs/VIRTUAL_QUOTE_RESERVES_FEE_ADJUSTMENT.md): v2 trades keep
+# fees inside the quote vault and boosts add reserves, so the
+# raw vault amount is not the real liquidity. Absent on pools
+# shorter than 261 bytes (pre-v2: virtual = 0).
+POOL_VIRTUAL_QUOTE_OFF = 245
 
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -870,6 +878,24 @@ def parse_pumpswap_vaults(data):
         return None, None
 
 
+def parse_virtual_quote_reserves(data):
+    """Pool::virtual_quote_reserves (signed i128 @245) from pool
+    account bytes; 0 when the account predates the field (< 261
+    bytes); None on parse failure. Per the official fee-adjustment
+    doc the effective quote reserves = quote vault amount + this
+    value (it carries the sign)."""
+    try:
+        if not data:
+            return None
+        if len(data) < POOL_VIRTUAL_QUOTE_OFF + 16:
+            return 0
+        return int.from_bytes(
+            data[POOL_VIRTUAL_QUOTE_OFF:POOL_VIRTUAL_QUOTE_OFF + 16],
+            "little", signed=True)
+    except Exception:
+        return None
+
+
 def match_vaults(accounts, mint):
     """accounts: {pubkey: (owner, data)}. Returns (base_vault,
     quote_vault, quote_mint): base holds `mint`, quote is the OTHER
@@ -931,29 +957,39 @@ def resolve_vaults(pool, mint, exempt=False):
     owner, data = get_account(pool, exempt=exempt)
     if owner != PUMPSWAP_PROGRAM or not data:
         return None
+    vq = parse_virtual_quote_reserves(data)
+    if vq is None:
+        return None
     q_off, b_off = parse_pumpswap_vaults(data)
     if q_off and b_off:
         accts = get_accounts([q_off, b_off], exempt=exempt)
         b, q, qm = match_vaults(accts, mint)
         if b and q:
-            return _vault_amounts(accts, b, q, qm)
+            return _vault_amounts(accts, b, q, qm, vq)
     b, q = scan_pool_vaults(pool, mint, exempt=exempt)
     if b and q:
         accts = get_accounts([b, q], exempt=exempt)
         _b, _q, qm = match_vaults(accts, mint)
-        return _vault_amounts(accts, b, q, qm)
+        return _vault_amounts(accts, b, q, qm, vq)
     return None
 
 
-def _vault_amounts(accts, base_v, quote_v, quote_mint=None):
+def _vault_amounts(accts, base_v, quote_v, quote_mint=None,
+                   quote_virtual=0):
     out = {"base_vault": base_v, "quote_vault": quote_v,
-           "quote_mint": quote_mint}
+           "quote_mint": quote_mint, "quote_virtual": quote_virtual}
     for key, pk in (("base_amount", base_v), ("quote_amount", quote_v)):
         got = (accts or {}).get(pk)
         ta = parse_token_account(got[1]) if got else None
         if ta is None:
             return None
         out[key] = ta["amount"]
+    # Effective quote reserves (official fee-adjustment formula):
+    # vault amount + signed virtual. Non-positive means the pool
+    # state is not priceable from these reads — refuse.
+    out["quote_effective"] = out["quote_amount"] + quote_virtual
+    if out["quote_effective"] <= 0:
+        return None
     return out
 
 
@@ -998,14 +1034,15 @@ def pool_price_usd(pool, mint, exempt=False):
         if not v:
             return 0.0, "vaults unresolved"
         dec = mint_decimals(mint, exempt=exempt)
-        px = amounts_price(v["base_amount"], v["quote_amount"], dec,
-                           quote_mint=v.get("quote_mint"))
+        px = amounts_price(v["base_amount"], v["quote_effective"],
+                           dec, quote_mint=v.get("quote_mint"))
         if not px:
             return 0.0, "amounts unusable (quote asset %s)" % \
                 str(v.get("quote_mint") or "WSOL")[:8]
-        return px, "pumpswap reserves %s/%s quote=%s" % (
+        return px, "pumpswap reserves %s/%s quote=%s eff=%+d" % (
             v["base_vault"][:8], v["quote_vault"][:8],
-            str(v.get("quote_mint") or "WSOL")[:8])
+            str(v.get("quote_mint") or "WSOL")[:8],
+            v["quote_virtual"])
     except Exception as e:
         return 0.0, "reserves error: %s" % e
 

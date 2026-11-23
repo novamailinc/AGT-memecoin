@@ -207,7 +207,13 @@ class ArmedWatcher:
                         continue
                     vaults = {"base_vault": v["base_vault"],
                               "quote_vault": v["quote_vault"],
-                              "quote_mint": v.get("quote_mint")}
+                              "quote_mint": v.get("quote_mint"),
+                              # signed virtual quote reserves at resolve
+                              # time; pushed vault amounts stay RAW, so
+                              # adding this can drift across fee sweeps
+                              # — the exit probe (price_for_position)
+                              # re-reads the pool for the exact value.
+                              "quote_virtual": v.get("quote_virtual", 0)}
                     self._vault_cache[pool] = vaults
                     try:
                         pos["pool_vaults"] = vaults
@@ -481,8 +487,11 @@ class ArmedWatcher:
             quote_mint_px = ((self._vault_cache.get(
                 (self._want.get(mint) or {}).get("pool") or "")
                 or {}).get("quote_mint"))
+            _cv = (self._vault_cache.get(
+                (self._want.get(mint) or {}).get("pool") or "") or {})
             px = _res.amounts_price(
-                base, quote, dec, sol_usd=self._sol_usd_fn(),
+                base, (quote or 0) + (_cv.get("quote_virtual") or 0),
+                dec, sol_usd=self._sol_usd_fn(),
                 quote_mint=quote_mint_px) if base and quote else None
             if px:
                 with self._lock:
@@ -512,7 +521,7 @@ class ArmedWatcher:
                         "quote": v["quote_amount"], "ts": time.time()}
                     old = float(self._last_px.get(mint) or 0)
                 px = _res.amounts_price(v["base_amount"],
-                                        v["quote_amount"],
+                                        v["quote_effective"],
                                         w["decimals"],
                                         sol_usd=self._sol_usd_fn(),
                                         quote_mint=v.get("quote_mint"))

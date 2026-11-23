@@ -321,6 +321,43 @@ with W._ledger_lock():
     del d["positions"][F13]   # test hygiene: retire the control
     W._write(d)
 
+# ---------------- reserves refusal provenance (2026-11-22) --------
+class _RefusingReserves:
+    @staticmethod
+    def price_for_position(pos):
+        return 0.0, ("curve: implausible curve price 3.4e-04 USD "
+                     "(band 1e-09..0.1); decode not trusted")
+
+
+F14 = M(14)
+opened, why, final = W.consider_fire(fire(F14), time.time())
+ep14 = W._read()["positions"][F14]["entry_price"]
+W.poll_exits(price_fn=lambda c, m, s: ep14 * 2.1)  # bank leg A, arm
+_real_res = W._reserves
+_real_qp = W.quote_price
+_real_ft = W._fresh_tape
+W._reserves = _RefusingReserves
+W.quote_price = lambda chain, mint: 0.0
+W._fresh_tape = lambda chain, mint: None
+try:
+    W._poll_exits(None)           # dark cycle: probe fires, refuses
+finally:
+    W._reserves = _real_res
+    W.quote_price = _real_qp
+    W._fresh_tape = _real_ft
+pos14 = W._read()["positions"].get(F14) or {}
+ref14 = [e for e in (pos14.get("quote_journal") or [])
+         if e.get("src") == "reserves_refused"]
+check("reserves refusal journalled with its reason",
+      len(ref14) == 1 and "implausible" in (ref14[0].get("detail") or "")
+      and ref14[0].get("px") == 0)
+check("one dark cycle is NOT an F2 close (position still open)",
+      F14 in W._read()["positions"])
+with W._ledger_lock():
+    d = W._read()
+    del d["positions"][F14]   # test hygiene
+    W._write(d)
+
 # verdict-ledger chain carries the closes so far
 chain_path = os.path.join(_tmp, "verdict_ledger", "events.jsonl")
 n_chain = 0

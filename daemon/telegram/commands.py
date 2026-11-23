@@ -112,8 +112,8 @@ HELP_TEXT = (
     "/status — bot & daemon health\n"
     "/signals [n] — latest signals\n"
     "/signal <id> — signal detail\n"
-    "/positions — open paper positions\n"
-    "/account — balance / equity\n"
+    "/positions [demo|forex] — open positions (both books when omitted)\n"
+    "/account [demo|forex] — balances (demo = simulated, both when omitted)\n"
     "/perf [days] — performance\n"
     "/degenstats — degen runner P/L scoreboard\n"
     "/history [symbol] [n] — trade history\n"
@@ -656,34 +656,111 @@ def _cmd_signal(ctx, chat_id, user_id, update_id, args):
         else str(sig), None)
 
 
-def _cmd_positions(ctx, chat_id, user_id, update_id, args):
+def _demo_snapshot():
+    """Shared memecoin demo paper account snapshot, or None when no
+    readable ledger exists. Never raises into a handler."""
     try:
-        res = ctx.tools.forex_get_positions()
-    except Exception as exc:
-        ctx.send(chat_id, "⚠️ positions read failed: %s" % exc, None)
+        from daemon.launch_scanner import paper_account as pa  # noqa: PLC0415
+        return pa.snapshot()
+    except Exception:
+        return None
+
+
+def _demo_positions_lines(snap):
+    lines = []
+    n = 0
+    for lane, st in sorted((snap.get("lanes") or {}).items()):
+        for p in st.get("positions", []):
+            n += 1
+            lines.append("• %s %s qty %s basis %s" % (
+                p.get("pos_id") or "%s/%s" % (lane, p.get("mint")),
+                (p.get("mint") or "")[:12], p.get("qty"),
+                _fmt_money(p.get("basis"))))
+    return n, lines
+
+
+def _cmd_positions(ctx, chat_id, user_id, update_id, args):
+    """/positions [demo|forex] — explicit account selection; with no
+    argument BOTH books are shown, each labeled. The demo book is the
+    shared memecoin simulated account; the forex book is the legacy
+    facade. Neither silently replaces the other."""
+    sel = (args[0].lower() if args else "")
+    if sel not in ("", "demo", "forex"):
+        ctx.send(chat_id, "Usage: /positions [demo|forex]", None)
         return
-    positions = res.get("positions", []) if isinstance(res, dict) else []
-    if not positions:
-        ctx.send(chat_id, "No open positions.", None)
-        return
-    lines = ["📊 Open positions (%d):" % len(positions)]
-    for p in positions:
-        lines.append("• #%s %s %s %s @ %s  P/L %s" % (
-            p.get("ticket"), p.get("direction"), p.get("volume"),
-            p.get("symbol"), p.get("open_price"), _fmt_money(p.get("profit"))))
-    ctx.send(chat_id, "\n".join(lines), None)
+    sections = []
+    if sel in ("", "demo"):
+        snap = _demo_snapshot()
+        if snap is None:
+            sections.append("🧪 Demo positions (simulated): no demo "
+                            "account ledger found.")
+        else:
+            n, lines = _demo_positions_lines(snap)
+            header = "🧪 Demo positions (SIMULATED, %d open):" % n
+            sections.append("\n".join([header] + (lines or ["(none)"])))
+    if sel in ("", "forex"):
+        try:
+            res = ctx.tools.forex_get_positions()
+            positions = res.get("positions", []) if isinstance(res, dict) else []
+        except Exception as exc:
+            sections.append("📊 Forex positions: read failed: %s" % exc)
+        else:
+            lines = ["📊 Forex positions (%d):" % len(positions)]
+            for p in positions:
+                lines.append("• #%s %s %s %s @ %s  P/L %s" % (
+                    p.get("ticket"), p.get("direction"), p.get("volume"),
+                    p.get("symbol"), p.get("open_price"),
+                    _fmt_money(p.get("profit"))))
+            if not positions:
+                lines.append("(none)")
+            sections.append("\n".join(lines))
+    ctx.send(chat_id, "\n\n".join(sections), None)
 
 
 def _cmd_account(ctx, chat_id, user_id, update_id, args):
-    try:
-        res = ctx.tools.forex_get_account()
-    except Exception as exc:
-        ctx.send(chat_id, "⚠️ account read failed: %s" % exc, None)
+    """/account [demo|forex] — explicit account selection; with no
+    argument BOTH books are shown, each labeled. The demo book is the
+    shared memecoin simulated account (never real funds); the forex
+    book is the legacy facade. Neither silently replaces the other."""
+    sel = (args[0].lower() if args else "")
+    if sel not in ("", "demo", "forex"):
+        ctx.send(chat_id, "Usage: /account [demo|forex]", None)
         return
-    acct = res.get("account", res) if isinstance(res, dict) else {}
-    ctx.send(chat_id, "💰 Account\nBalance: %s\nEquity: %s\nMargin: %s" % (
-        _fmt_money(acct.get("balance")), _fmt_money(acct.get("equity")),
-        _fmt_money(acct.get("margin"))), None)
+    sections = []
+    if sel in ("", "demo"):
+        snap = _demo_snapshot()
+        if snap is None:
+            sections.append("🧪 Demo account (simulated): no demo "
+                            "account ledger found.")
+        else:
+            lines = ["🧪 Demo account (SIMULATED capital, never real funds):",
+                     "Cash: %s" % _fmt_money(snap.get("cash")),
+                     "Cost exposure (open, at basis): %s"
+                     % _fmt_money(snap.get("cost_exposure")),
+                     "Book value: %s" % _fmt_money(snap.get("book_value")),
+                     "Realized P/L: %s" % _fmt_money(snap.get("realized_pnl"))]
+            if snap.get("marks_status") == "ok":
+                lines.append("Marked equity: %s"
+                             % _fmt_money(snap.get("marked_equity")))
+            else:
+                lines.append("Marked equity: unavailable (%s)"
+                             % (snap.get("marks_status") or "no marks"))
+            if snap.get("degraded"):
+                lines.append("⚠️ ledger degraded: %s" % snap["degraded"])
+            sections.append("\n".join(lines))
+    if sel in ("", "forex"):
+        try:
+            res = ctx.tools.forex_get_account()
+        except Exception as exc:
+            sections.append("📊 Forex account: read failed: %s" % exc)
+        else:
+            acct = res.get("account", res) if isinstance(res, dict) else {}
+            sections.append(
+                "📊 Forex account (paper facade)\nBalance: %s\nEquity: %s\nMargin: %s" % (
+                    _fmt_money(acct.get("balance")),
+                    _fmt_money(acct.get("equity")),
+                    _fmt_money(acct.get("margin"))))
+    ctx.send(chat_id, "\n\n".join(sections), None)
 
 
 def _cmd_perf(ctx, chat_id, user_id, update_id, args):

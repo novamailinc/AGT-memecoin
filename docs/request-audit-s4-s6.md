@@ -66,9 +66,13 @@ Items marked FIXED name the landing commit.
   as_of rejected, future as_of labeled. mode="knowledge_time" filters on
   settled_ts (the append time stamped by the settle paths): records closed
   before the cutoff but recorded after it are excluded, records recorded after
-  their close are counted in late_backfill_included, and records lacking a
-  finite settled_ts (ledger-rebuilt/legacy) are excluded and counted in
-  unknown_availability_excluded - never silently treated as known.
+  their close are counted in late_backfill_included, records recorded before
+  their close are excluded as inconsistent_time_excluded (counted in both
+  modes), and records lacking a finite settled_ts (ledger-rebuilt/legacy) are
+  excluded and counted in unknown_availability_excluded - never silently
+  treated as known. Non-dict or close_ts-less records are excluded and counted
+  in malformed_excluded (both modes); any exclusion sets partial_history=True.
+  Numeric-string values follow the same numeric coercion as generate_lessons.
   knowledge_replay_limits labels the remaining gap: feature values carry no
   per-field timestamps and post-hoc file edits are unversioned, so this is an
   append-time replay of the known-availability subset, NOT a verified

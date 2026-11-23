@@ -693,9 +693,20 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
     known-availability subset, not a verified leak-free
     reconstruction of model inputs at as_of.
 
-    Non-finite or missing as_of, and unknown modes, are rejected
-    (labeled, never silently full history); an as_of in the
-    future is labeled explicitly. Never raises."""
+    Both modes: only settled records are eligible (pending
+    records are skipped before any counting, so the counts below
+    describe the eligible set only). Timestamps are coerced with
+    the module's numeric coercion (numeric strings accepted).
+    Records that are not dicts or lack a finite close_ts are
+    excluded and counted in malformed_excluded; a record whose
+    settled_ts precedes its close_ts (recorded before the outcome
+    happened) is inconsistent: excluded in knowledge_time mode,
+    counted in inconsistent_time_excluded in both modes. Any
+    nonzero exclusion sets partial_history=True: the payload is
+    not the full recorded history. Non-finite or missing as_of,
+    and unknown modes, are rejected (labeled, never silently full
+    history); an as_of in the future is labeled explicitly.
+    Never raises."""
     try:
         cutoff = _num(as_of_ts)
         if cutoff is None or not math.isfinite(cutoff):
@@ -710,21 +721,34 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
         visible = []
         unknown_availability = 0
         late_backfill = 0
+        inconsistent_time = 0
+        malformed = 0
         for r in (decisions or []):
             if not isinstance(r, dict):
+                malformed += 1
                 continue
+            if r.get("status") != "settled":
+                continue  # pending records are not eligible
             ct = _num(r.get("close_ts"))
             if ct is None or not math.isfinite(ct):
+                malformed += 1
                 continue
+            st = _num(r.get("settled_ts"))
+            inconsistent = (
+                st is not None and math.isfinite(st) and st < ct)
             if mode == "outcome_event":
                 if ct <= cutoff:
                     visible.append(r)
+                    if inconsistent:
+                        inconsistent_time += 1
                 continue
-            st = _num(r.get("settled_ts"))
             if st is None or not math.isfinite(st):
                 unknown_availability += 1
                 continue
             if st > cutoff:
+                continue
+            if inconsistent:
+                inconsistent_time += 1
                 continue
             visible.append(r)
             if st > ct:
@@ -738,6 +762,10 @@ def generate_lessons_as_of(lane, decisions, as_of_ts,
             "outcome_event_time_only_not_knowledge_time"
             if mode == "outcome_event"
             else "append_recorded_time_known_availability_subset")
+        payload["malformed_excluded"] = malformed
+        payload["inconsistent_time_excluded"] = inconsistent_time
+        payload["partial_history"] = bool(
+            malformed or unknown_availability)
         if mode == "knowledge_time":
             payload["unknown_availability_excluded"] = \
                 unknown_availability

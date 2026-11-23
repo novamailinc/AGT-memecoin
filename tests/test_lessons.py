@@ -634,6 +634,37 @@ check("knowledge-time: default mode stays outcome-event",
       and defkt.get("n_settled") == 3
       and "unknown_availability_excluded" not in defkt)
 
+# Time consistency and malformed handling (validator findings).
+kt2 = [dict(hq[0], close_ts=BASE + 5000, settled_ts=BASE + 100,
+            pnl_usd=10.0),  # recorded before the outcome: inconsistent
+       dict(hq[0], mint="MINT-KTM", close_ts=None, pnl_usd=5.0),
+       "not-a-record",
+       dict(hq[0], mint="MINT-KTP", status="pending",
+            close_ts=BASE + 100, settled_ts=BASE + 400)]
+kinc = L.generate_lessons_as_of("grad_select", kt2, BASE + 1000,
+                                mode="knowledge_time")
+check("knowledge-time: recorded-before-close excluded as "
+      "inconsistent_time",
+      kinc.get("n_settled") == 0
+      and kinc.get("inconsistent_time_excluded") == 1)
+check("knowledge-time: malformed excluded and counted, "
+      "partial_history labeled",
+      kinc.get("malformed_excluded") == 2
+      and kinc.get("partial_history") is True)
+oeinc = L.generate_lessons_as_of("grad_select", kt2, BASE + 9000)
+check("outcome-event: malformed honestly excluded and counted",
+      oeinc.get("malformed_excluded") == 2
+      and oeinc.get("partial_history") is True
+      and oeinc.get("inconsistent_time_excluded") == 1
+      and oeinc.get("n_settled") == 1)
+check("late_backfill counts eligible settled only, never pending",
+      kinc.get("late_backfill_included") == 0)
+clean = L.generate_lessons_as_of("grad_select", hq2, BASE + 500)
+check("clean history: no exclusions, partial_history False",
+      clean.get("malformed_excluded") == 0
+      and clean.get("inconsistent_time_excluded") == 0
+      and clean.get("partial_history") is False)
+
 print()
 if fails:
     print("FAILURES: %d" % len(fails))

@@ -193,3 +193,47 @@ if FAILS:
     print("FAILURES:", FAILS)
     sys.exit(1)
 print("ALL PAPER-ACCOUNT WIRING TESTS PASSED")
+
+
+# ---- grad write-down: unquotable close settles via the register --
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+importlib.reload(PA)
+ps, _mv, _ms = _fresh()
+opened, why, _f = G.consider_candidate(_cand(mint="WD111pump"))
+check("wd fixture: entry opened", opened)
+snap0 = PA.snapshot()
+cash0, pnl0 = snap0["cash"], snap0["realized_pnl"]
+# Drive the lane's real close path the way poll_time_exits does
+# for a 24h-unquotable position (directly, to keep the test
+# deterministic).
+with G._ledger_lock():
+    d = G._read()
+    pos = d["positions"]["WD111pump"]
+    G._close_remaining(pos, 0.0, "time_stop_24h_unquotable",
+                       pkind="write_down_zero")
+    rec_wd = G._finalize(d, "WD111pump", pos,
+                         "time_stop_24h_unquotable")
+    G._write(d)
+wd = [rec_wd] if rec_wd else []
+check("grad unquotable close fires", len(wd) == 1)
+if wd:
+    check("grad close reason is the unquotable variant",
+          wd[0]["closed_reason"].endswith("unquotable"))
+    check("grad write-down close labeled write_down_zero",
+          wd[0].get("exit_price_kind") == "write_down_zero")
+    check("grad write-down books no fee on a non-sale",
+          float(wd[0]["realized_usd"]) == 0.0)
+snap1 = PA.snapshot()
+check("grad write-down moved no cash",
+      abs(snap1["cash"] - cash0) < 1e-9)
+check("grad write-down booked no realized loss in the account",
+      abs(snap1["realized_pnl"] - pnl0) < 1e-9)
+un = [u for u in snap1.get("unresolved") or []
+      if u["mint"] == "WD111pump"]
+check("grad written-down units held in the unresolved register "
+      "with original cost",
+      len(un) == 1 and float(un[0]["basis"]) > 0
+      and un[0]["status"] == "held_unresolved")
+check("grad write-down left no open account position",
+      not snap1["lanes"].get("grad", {}).get("positions"))
+_unpatch(ps)

@@ -326,6 +326,80 @@ def write_down_register():
 
 write_down_register()
 
+def partial_write_down_conservation():
+    """Original-cost/unit conservation across MULTIPLE partial
+    write-downs, idempotent retry and replay (parent 2026-11-22):
+    partials plus the remaining position always recompose the
+    original cost and units exactly; the impairment stays a risk
+    loss and never releases usable capital."""
+    home = tempfile.mkdtemp()
+    pa = fresh(home)
+    ok, _, pid = pa.try_debit("watcher", "P", 2.0, qty=100.0,
+                              op_id="watcher:buy:P:1")
+    check("p entry ok", ok)
+    spend0 = pa.snapshot()["cash_spendable"]
+    ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:1",
+                          pos_id=pid, reason="r1", qty=30.0)
+    check("partial wd 1 ok", ok)
+    snap = pa.snapshot()
+    check("partial wd 1 register (30 units, 0.60 cost)",
+          len(snap["unresolved"]) == 1
+          and abs(float(snap["unresolved"][0]["qty"]) - 30.0) < 1e-6
+          and abs(float(snap["unresolved"][0]["basis"]) - 0.6)
+          < 1e-6)
+    check("partial wd 1 leaves remainder open (70 units, 1.40)",
+          abs(snap["cost_exposure"] - 1.4) < 1e-6)
+    ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:1",
+                          pos_id=pid, reason="r1", qty=30.0)
+    check("partial wd retry idempotent", ok)
+    snap = pa.snapshot()
+    check("retry moved nothing twice",
+          abs(float(snap["unresolved"][0]["qty"]) - 30.0) < 1e-6
+          and abs(snap["cost_exposure"] - 1.4) < 1e-6)
+    ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:2",
+                          pos_id=pid, reason="r2", qty=50.0)
+    check("partial wd 2 ok", ok)
+    ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:3",
+                          pos_id=pid, reason="r3")  # remainder
+    check("final wd ok", ok)
+    snap = pa.snapshot()
+    check("CONSERVATION: register holds ALL original units",
+          abs(float(snap["unresolved"][0]["qty"]) - 100.0) < 1e-6)
+    check("CONSERVATION: register holds ALL original cost",
+          abs(float(snap["unresolved"][0]["basis"]) - 2.0) < 1e-6)
+    check("no position remains open",
+          abs(snap["cost_exposure"]) < 1e-9)
+    check("impairment never released usable capital",
+          abs(snap["cash_spendable"] - spend0) < 1e-9
+          and abs(snap["cash_estimated"]) < 1e-9)
+    # replay after restart conserves exactly
+    import daemon.launch_scanner.paper_account as pa2
+    pa2 = importlib.reload(pa2)
+    snap = pa2.snapshot()
+    check("replay conserves units and cost",
+          abs(float(snap["unresolved"][0]["qty"]) - 100.0) < 1e-6
+          and abs(float(snap["unresolved"][0]["basis"]) - 2.0)
+          < 1e-6
+          and abs(snap["cash_spendable"] - spend0) < 1e-9)
+
+
+partial_write_down_conservation()
+
+
+def mirror_exclusion_explicit():
+    """mirror is deliberately UNWIRED from the shared account
+    (design decision pending review). Keep that exclusion
+    structural and explicit: the module must not reference the
+    account at all."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "daemon", "launch_scanner", "mirror.py")
+    srcm = open(p).read()
+    check("mirror exclusion explicit: no account references",
+          "paper_account" not in srcm and "pa_pos_id" not in srcm)
+
+
+mirror_exclusion_explicit()
+
 print()
 if FAILS:
     print("FAILURES:", FAILS)

@@ -1350,11 +1350,16 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     except Exception:
         filled_exit = exit_price
     gross = leg_tokens * filled_exit
-    gas_out = _costs.tx_cost_usd(pos["chain"], gross, venue=VENUE)
+    _kind = _pkind(reason, pkind)
+    # A write-down is NOT a sale (design v4 Stage B): no fee is
+    # booked on units nobody bought.
+    gas_out = (0.0 if _kind == "write_down_zero"
+               else _costs.tx_cost_usd(pos["chain"], gross,
+                                       venue=VENUE))
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
-               exit_price_kind=_pkind(reason, pkind))
+               exit_price_kind=_kind)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     return net
 
@@ -1418,13 +1423,18 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
         except Exception:
             filled_exit = exit_price
         gross = remaining * filled_exit
-        gas_out = _costs.tx_cost_usd(pos["chain"], gross, venue=VENUE)
+        _kind = _pkind(reason, pkind)
+        # A write-down is NOT a sale (design v4 Stage B): no fee is
+        # booked on units nobody bought.
+        gas_out = (0.0 if _kind == "write_down_zero"
+                   else _costs.tx_cost_usd(pos["chain"], gross,
+                                           venue=VENUE))
         net = gross - gas_out
         tw["remainder"] = {"tokens": round(remaining, 6),
                            "exit_price": filled_exit,
                            "realized_usd": round(net, 6),
                            "exit_reason": reason,
-                           "exit_price_kind": _pkind(reason, pkind)}
+                           "exit_price_kind": _kind}
         if _pk is not None:
             _pks = set(tw.get("price_kinds") or [])
             _pks.add(tw["remainder"]["exit_price_kind"])
@@ -1445,8 +1455,12 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     except Exception:
         filled_exit = exit_price
     gross = total_tokens * filled_exit
-    gas_out = _costs.tx_cost_usd(pos["chain"], gross,
-                                 venue=VENUE)  # ONE tx total
+    _kind = _pkind(reason, pkind)
+    # A write-down is NOT a sale (design v4 Stage B): no fee is
+    # booked on units nobody bought.
+    gas_out = (0.0 if _kind == "write_down_zero"
+               else _costs.tx_cost_usd(pos["chain"], gross,
+                                       venue=VENUE))  # ONE tx total
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]
@@ -1454,7 +1468,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
             if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason,
-                   exit_price_kind=_pkind(reason, pkind))
+                   exit_price_kind=_kind)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     return net
 
@@ -1556,11 +1570,19 @@ def _finalize(d, mint, pos, closed_reason):
         # unlike the ladder lanes' per-tranche settles).
         _op = "%s:close:%s:%s" % (LANE, mint,
                                   pos.get("pa_pos_id") or "legacy")
-        _ok, _why = _pa.credit(LANE, mint, realized, _op,
-                               pos_id=pos.get("pa_pos_id"),
-                               price_kind=_close_kind)
+        if _close_kind == "write_down_zero":
+            # Pure write-down: no sale happened, so the units +
+            # original cost move to the unresolved register
+            # (design v4 Stage B), never a zero/negative credit.
+            _ok, _why = _pa.write_down(
+                LANE, mint, _op, pos_id=pos.get("pa_pos_id"),
+                reason=closed_reason)
+        else:
+            _ok, _why = _pa.credit(LANE, mint, realized, _op,
+                                   pos_id=pos.get("pa_pos_id"),
+                                   price_kind=_close_kind)
         if not _ok:
-            logger.warning("grad: shared paper account credit "
+            logger.warning("grad: shared paper account settle "
                            "for %s failed: %s (journaled)", mint, _why)
     # Minimum fundable stake is the COLD stake (base x 0.5): the
     # lane can still enter while the bankroll covers it, so the

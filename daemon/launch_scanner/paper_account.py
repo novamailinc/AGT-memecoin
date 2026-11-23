@@ -648,7 +648,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         elif kind == "write_down" and lane and mint:
             ok, why = _apply_write_down(
                 led, lane, mint, ev.get("pos_id"),
-                ev.get("reason"), ev.get("ts"))
+                ev.get("reason"), ev.get("ts"), qty=ev.get("qty"))
             if not ok:
                 return led, ("replay cannot apply write_down "
                              "%s/%s: %s" % (lane, mint, why))
@@ -714,7 +714,7 @@ def _derive_buckets_locked(led: Dict[str, Any],
         elif ev["event"] == "write_down":
             ok, why = _apply_write_down(
                 gen, lane, mint, ev.get("pos_id"),
-                ev.get("reason"), ev.get("ts"))
+                ev.get("reason"), ev.get("ts"), qty=ev.get("qty"))
             if not ok:
                 return led, ("cash-split migration: write_down "
                              "%s: %s; manual reconciliation "
@@ -1096,37 +1096,69 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
 
 def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
                       pid: str, reason: Optional[str],
-                      ts: Optional[float]) -> Tuple[bool, str]:
-    """Move an open position to the unresolved register (write-down
-    of unquotable units). No cash moves, no fee, no realized P/L is
-    recognized: a write-down is not a sale. Caller holds the lock.
-    Idempotent per pos_id: a replay or retry of an applied
-    write-down is a no-op."""
+                      ts: Optional[float],
+                      qty: Optional[float] = None
+                      ) -> Tuple[bool, str]:
+    """Move open-position units to the unresolved register
+    (write-down of unquotable units). No cash moves, no fee, no
+    realized P/L is recognized: a write-down is not a sale. Caller
+    holds the lock. A full write-down (qty=None) is idempotent per
+    pos_id: a replay or retry of an applied write-down is a no-op.
+    Partial write-downs (qty given) move that many units with
+    average-cost basis; CONSERVATION: moved qty + basis accumulate
+    in the register entry so partials plus the remaining position
+    always recompose the original cost and units exactly."""
     reg = led.setdefault("unresolved", {})
-    if pid in reg:
-        return True, "already unresolved"
     st = _lane(led, lane)
+    if (qty is None and pid in reg
+            and st["open"].get(mint, {}).get("pos_id") != pid):
+        return True, "already unresolved"
     pos = st["open"].get(mint)
     if pos is None:
+        if pid in reg:
+            return True, "already unresolved"
         return False, "no open position"
     if pos.get("pos_id") != pid:
         return False, ("pos_id mismatch (open is %s)"
                        % pos.get("pos_id"))
-    reg[pid] = {"lane": lane, "mint": mint,
-                "qty": pos.get("qty"),
-                "basis": pos.get("basis"),
-                "entry_qty": pos.get("entry_qty"),
-                "entry_cost": pos.get("entry_cost"),
-                "reason": reason, "ts": ts or time.time(),
-                "status": "held_unresolved"}
-    st["open"].pop(mint)
+    have_qty = _pos_qty(pos)
+    basis = _pos_basis(pos)
+    if qty is None or have_qty is None \
+            or qty >= have_qty - _EPS:
+        move_qty, alloc, final = have_qty, basis, True
+    else:
+        if not _valid_amount(qty) or qty <= 0:
+            return False, "bad qty"
+        move_qty = qty
+        alloc = round(basis * qty / have_qty, 6) \
+            if have_qty > 0 else 0.0
+        final = False
+    entry = reg.setdefault(pid, {"lane": lane, "mint": mint,
+                                 "qty": 0.0, "basis": 0.0,
+                                 "entry_qty": pos.get("entry_qty"),
+                                 "entry_cost": pos.get("entry_cost"),
+                                 "reason": reason,
+                                 "ts": ts or time.time(),
+                                 "status": "held_unresolved"})
+    entry["qty"] = round(float(entry.get("qty") or 0.0)
+                         + (move_qty or 0.0), 8)
+    entry["basis"] = round(float(entry.get("basis") or 0.0)
+                           + alloc, 6)
+    entry["reason"] = reason
+    entry["ts"] = ts or entry["ts"]
+    if final:
+        st["open"].pop(mint)
+    else:
+        pos["qty"] = round(have_qty - move_qty, 8)
+        pos["basis"] = round(basis - alloc, 6)
     return True, "ok"
 
 
 def write_down(lane: str, mint: str, op_id: str,
                ts: Optional[float] = None,
                pos_id: Optional[str] = None,
-               reason: Optional[str] = None
+               reason: Optional[str] = None,
+               qty: Optional[float] = None
                ) -> Tuple[bool, str]:
     """Write a position down to zero carrying value: units and their
     original cost move to the unresolved register as
@@ -1164,7 +1196,8 @@ def write_down(lane: str, mint: str, op_id: str,
             pid = pos.get("pos_id")
         if pid is None:
             return False, "no open position"
-        ok, why = _apply_write_down(led, lane, mint, pid, reason, ts)
+        ok, why = _apply_write_down(led, lane, mint, pid, reason,
+                                    ts, qty=qty)
         if not ok:
             _journal({"event": "write_down_refused", "lane": lane,
                       "mint": mint, "op_id": op_id, "pos_id": pid,
@@ -1177,8 +1210,9 @@ def write_down(lane: str, mint: str, op_id: str,
                   "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "pos_id": pid, "reason": reason,
-                  "qty": led["unresolved"][pid]["qty"],
-                  "basis": led["unresolved"][pid]["basis"],
+                  "qty": qty,
+                  "register_qty": led["unresolved"][pid]["qty"],
+                  "register_basis": led["unresolved"][pid]["basis"],
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"

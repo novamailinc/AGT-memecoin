@@ -56,16 +56,19 @@ Items marked FIXED name the landing commit.
   tails repaired under lock before append and counted), per-outcome bounded
   timestamps (outcome_ts) alongside the bounded launch_ts, and segments with
   stable ids (deployer + registry first_seen): a re-appearing deployer's later
-  segment never erases an earlier one - reads and compaction MERGE segments per
-  deployer, summing counters only over verifiable values (corrupt counters mark
-  the row partial) and linking segment ids; duplicate appends dedupe by segment
-  id; live risk counters are never rehydrated from the archive. Compaction past
-  the byte cap merges as above (bounded in practice by cardinality, no
-  enforceable-constant claim); dropped corrupt lines, compaction failures and
-  torn-tail repairs persist in a sidecar meta file surfaced by
-  deployer_archive() (missing file = unknown_missing, absence cannot prove zero
-  history). Archived counters/timestamps are labeled recorded values, not
-  verified skill; advisory memory only, no gate/entry/exit reads it (tests in
+  segment never erases an earlier one - reads and compaction keep PER-SEGMENT
+  detail per segment id (the dedup identity compaction cannot erase) and upsert
+  by id, so a retried eviction with updated counters replaces the stale value,
+  never double-counts; totals sum only over verifiable counters (corrupt
+  counters mark the row partial); segment detail grows with distinct evictions
+  (bounded in practice by activity, no enforceable-constant or lifetime-dedup
+  claim); live risk counters are never rehydrated from the archive. Compaction
+  past the byte cap rewrites one row per deployer as above; dropped corrupt or
+  unidentifiable lines, compaction failures and torn-tail repairs persist in a
+  sidecar meta file surfaced by deployer_archive() (missing file =
+  unknown_missing, absence cannot prove zero history). Archived
+  counters/timestamps are labeled recorded values, not verified skill;
+  advisory memory only, no gate/entry/exit reads it (tests in
   test_deployers.py).
 - 4.3 Trading memory: IMPLEMENTED — recorder.py, tap_journal.py, decision_journal.py
   (daemon/intelligence/signals/), verdict_ledger.py, exit_provenance.py, paper_account

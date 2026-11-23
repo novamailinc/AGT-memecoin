@@ -56,13 +56,17 @@ though the live entry is gone. Memory semantics (code-defined):
 - segments, not snapshots: each eviction archives one SEGMENT with a
   stable ``segment_id`` (deployer + its registry first_seen). A
   re-appearing deployer's later segment never erases an earlier one:
-  reads and compaction MERGE segments per deployer, summing counters
-  only over verifiable values (any corrupt/missing counter marks the
-  row partial, never silently summed) and linking segment ids.
-  Duplicate appends of the same segment (eviction retried after a
-  registry-save failure) are deduped by segment id. Live risk
-  counters are NEVER rehydrated from the archive: a re-appearing
-  deployer's live entry starts fresh;
+  reads and compaction keep a PER-SEGMENT entry per segment id (the
+  dedup identity compaction cannot erase) and upsert by id - a
+  retried eviction with updated counters REPLACES that id's older
+  contribution, never double-counts and never silently keeps the
+  stale value. Totals sum only over verifiable values (any
+  corrupt/missing counter marks the row partial, never silently
+  summed). Segment detail grows with distinct evictions per
+  deployer, bounded in practice by activity, NOT by an enforceable
+  constant (no lifetime-dedup claim beyond the persisted ids).
+  Live risk counters are NEVER rehydrated from the archive: a
+  re-appearing deployer's live entry starts fresh;
 - availability: a missing archive file is UNKNOWN (absence cannot
   prove zero history), reported as ``unknown_missing``; unreadable
   lines are counted in ``archive_status``; compaction-dropped
@@ -116,7 +120,6 @@ _ARCHIVE_LOCK_FILE = _HOME / "launch_scanner" / "deployer_archive.lock"
 _ARCHIVE_META_FILE = _HOME / "launch_scanner" / "deployer_archive_meta.json"
 _ARCHIVE_SCHEMA_V = 1
 _ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
-_MAX_SEGMENT_IDS = 50        # bounded linked-segment list per deployer
 _CACHE_KEY = "deployer_cache"
 _SEEN_KEY = "deployer_fasttrack_seen"
 _MAX_REGISTRY = 2000
@@ -468,67 +471,104 @@ def _meta_write(meta: Dict[str, Any]) -> None:
         pass
 
 
-def _min_ts(a, b):
-    vals = [v for v in (a, b) if isinstance(v, (int, float))]
-    return min(vals) if vals else None
 
 
-def _max_ts(a, b):
-    vals = [v for v in (a, b) if isinstance(v, (int, float))]
-    return max(vals) if vals else None
+_SEG_FIELDS = ("archived_ts", "first_seen", "last_seen",
+               "launches_seen", "hits_2x", "rugs", "dead",
+               "launch_ts", "outcome_ts", "evicted_reason",
+               "memory_provenance", "partial")
+_COUNTER_FIELDS = ("launches_seen", "hits_2x", "rugs", "dead")
 
 
-def _merge_segments(cur: Optional[Dict[str, Any]],
-                    rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge two archive segments for one deployer. Counters sum
-    only over verifiable int values; any corrupt/missing counter
-    marks the merged row partial, never silently summed. Segment
-    ids accumulate (bounded) so history stays linked."""
-    if cur is None:
-        r = dict(rec)
-        sid = r.get("segment_id")
-        r["segment_ids"] = [sid] if sid else list(
-            r.get("segment_ids") or [])
-        r["segments_merged"] = int(r.get("segments_merged") or 1)
-        return r
-    out = dict(cur)
-    partial = bool(cur.get("partial")) or bool(rec.get("partial"))
-    for k in ("launches_seen", "hits_2x", "rugs", "dead"):
-        a, b = cur.get(k), rec.get(k)
-        if isinstance(a, int) and isinstance(b, int):
-            out[k] = a + b
-        else:
-            out[k] = a if isinstance(a, int) else (
-                b if isinstance(b, int) else 0)
-            partial = True
-    out["partial"] = partial
-    out["first_seen"] = _min_ts(cur.get("first_seen"),
-                                rec.get("first_seen"))
-    out["last_seen"] = _max_ts(cur.get("last_seen"),
-                               rec.get("last_seen"))
-    out["archived_ts"] = _max_ts(cur.get("archived_ts"),
-                                 rec.get("archived_ts"))
-    ids = list(cur.get("segment_ids") or [])
+def _seg_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: rec.get(k) for k in _SEG_FIELDS if k in rec}
+
+
+def _upsert_segment(state: Dict[str, Any], sid: str,
+                    seg: Dict[str, Any]) -> None:
+    """Newer archived_ts for the same segment id REPLACES the older
+    contribution (a retried eviction updates, never double-counts,
+    never silently keeps the stale value)."""
+    old = state.get(sid)
+    if old is None or float(seg.get("archived_ts") or 0) >= float(
+            old.get("archived_ts") or 0):
+        state[sid] = seg
+
+
+def _fold_record(state: Dict[str, Any], rec: Dict[str, Any]) -> bool:
+    """Fold one file record (raw segment or compacted merged row)
+    into per-deployer {segment_id: segment} state. Returns False
+    for an unidentifiable record (counted by the caller)."""
+    segs = rec.get("segments")
+    if isinstance(segs, dict) and segs:
+        for sid, seg in segs.items():
+            if isinstance(seg, dict):
+                _upsert_segment(state, sid, _seg_from_record(seg))
+        return True
     sid = rec.get("segment_id")
-    if sid and sid not in ids:
-        ids.append(sid)
-    out["segment_ids"] = ids[-_MAX_SEGMENT_IDS:]
-    out["segments_merged"] = int(cur.get("segments_merged") or 1) + 1
+    if not sid:
+        return False
+    _upsert_segment(state, sid, _seg_from_record(rec))
+    return True
+
+
+def _row_from_segments(deployer: str,
+                       segs: Dict[str, Any]) -> Dict[str, Any]:
+    """Display/compaction row for one deployer: per-segment detail
+    preserved (dedup identity), totals summed only over verifiable
+    int counters (any corrupt/missing counter marks the row
+    partial, never silently summed)."""
+    row = {"v": _ARCHIVE_SCHEMA_V, "record_type": "deployer_archive",
+           "deployer": deployer, "segments": segs,
+           "segment_ids": sorted(segs), "segments_merged": len(segs),
+           "memory_provenance":
+               "recorded_counters_and_bounded_timestamps"
+               "_not_verified_skill"}
+    partial = False
+    for k in _COUNTER_FIELDS:
+        total = 0
+        for seg in segs.values():
+            v = seg.get(k)
+            if isinstance(v, int):
+                total += v
+            else:
+                partial = True
+        row[k] = total
+    if any(seg.get("partial") for seg in segs.values()):
+        partial = True
+    row["partial"] = partial
+    first = [s.get("first_seen") for s in segs.values()]
+    last = [s.get("last_seen") for s in segs.values()]
+    arch = [s.get("archived_ts") for s in segs.values()]
+    row["first_seen"] = min(
+        [v for v in first if isinstance(v, (int, float))],
+        default=None)
+    row["last_seen"] = max(
+        [v for v in last if isinstance(v, (int, float))],
+        default=None)
+    row["archived_ts"] = max(
+        [v for v in arch if isinstance(v, (int, float))],
+        default=None)
+    row["evicted_reason"] = "registry_cap"
     for k, cap in (("launch_ts", _MAX_LAUNCH_TS),
                    ("outcome_ts", _MAX_OUTCOME_TS)):
-        vals = list(cur.get(k) or []) + list(rec.get(k) or [])
-        out[k] = vals[-cap:]
-    out["merged"] = True
-    return out
+        vals = []
+        for sid in sorted(segs):
+            vals.extend(segs[sid].get(k) or [])
+        row[k] = vals[-cap:]
+    row["merged"] = len(segs) > 1
+    return row
 
 
 def _archive_append(rec: Dict[str, Any]) -> bool:
     """Append one archive segment under an exclusive lock. Repairs a
     torn tail first (crash mid-append must not glue the next record
-    onto a partial line; the repair is counted), dedupes by stable
-    segment id (a retried eviction must not double-count history),
-    then compacts opportunistically past the byte cap. Returns True
-    only when the segment is durable. Never raises."""
+    onto a partial line; the repair is counted), then compacts
+    opportunistically past the byte cap. Duplicate segment ids are
+    NOT skipped here: a retried eviction may carry UPDATED counters,
+    and dedup is by per-id upsert (newer archived_ts replaces) at
+    read and compaction time, where the identity cannot be erased.
+    Returns True only when the segment is durable. Never raises."""
     try:
         _ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
         with _archive_lock():
@@ -550,23 +590,6 @@ def _archive_append(rec: Dict[str, Any]) -> bool:
                                     or 0) + 1
             except Exception:
                 pass
-            sid = rec.get("segment_id")
-            if sid and os.path.exists(_ARCHIVE_FILE):
-                try:
-                    with open(_ARCHIVE_FILE) as f:
-                        for line in f:
-                            try:
-                                old = json.loads(line)
-                            except Exception:
-                                continue
-                            if not isinstance(old, dict):
-                                continue
-                            if old.get("segment_id") == sid or sid in \
-                                    (old.get("segment_ids") or []):
-                                _meta_write(meta)
-                                return True  # already durable
-                except Exception:
-                    pass
             with open(_ARCHIVE_FILE, "a") as out:
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
@@ -579,21 +602,22 @@ def _archive_append(rec: Dict[str, Any]) -> bool:
 
 
 def _maybe_compact_archive(meta: Dict[str, Any]) -> None:
-    """Past the byte cap, MERGE segments per deployer (never
-    latest-wins: earlier history is summed verifiably or marked
-    partial, and segment ids stay linked). Dropped corrupt lines and
-    compaction failures are counted in the meta file - a compacted
-    file never looks complete when evidence was dropped. Enforceable
-    invariant: one merged record per distinct deployer after every
-    compaction; total size is bounded in practice by deployer
-    cardinality and activity, NOT by an enforceable constant. Called
-    with the archive lock held; meta is written by the caller.
-    Never raises."""
+    """Past the byte cap, rewrite the archive as one row per
+    deployer carrying PER-SEGMENT detail (the dedup identity
+    compaction cannot erase): same-id records upsert by newer
+    archived_ts, distinct ids are all preserved. Dropped corrupt or
+    unidentifiable lines and compaction failures are counted in the
+    meta file - a compacted file never looks complete when evidence
+    was dropped. Enforceable invariant: one row per distinct
+    deployer after every compaction; total size is bounded in
+    practice by deployer/segment cardinality and activity, NOT by
+    an enforceable constant. Called with the archive lock held;
+    meta is written by the caller. Never raises."""
     try:
         if not os.path.exists(_ARCHIVE_FILE) \
                 or os.path.getsize(_ARCHIVE_FILE) <= _ARCHIVE_MAX_BYTES:
             return
-        merged = {}
+        states = {}
         dropped = 0
         with open(_ARCHIVE_FILE) as f:
             for line in f:
@@ -611,14 +635,17 @@ def _maybe_compact_archive(meta: Dict[str, Any]) -> None:
                 if not dep:
                     dropped += 1
                     continue
-                merged[dep] = _merge_segments(merged.get(dep), rec)
+                if not _fold_record(states.setdefault(dep, {}), rec):
+                    dropped += 1
         if dropped:
             meta["dropped_unreadable_total"] = int(
                 meta.get("dropped_unreadable_total") or 0) + dropped
         tmp = str(_ARCHIVE_FILE) + ".tmp"
         with open(tmp, "w") as out:
-            for rec in merged.values():
-                out.write(json.dumps(rec) + "\n")
+            for dep, state in states.items():
+                if state:
+                    out.write(json.dumps(
+                        _row_from_segments(dep, state)) + "\n")
             out.flush()
             os.fsync(out.fileno())
         os.replace(tmp, _ARCHIVE_FILE)
@@ -636,10 +663,12 @@ def _archive_deployer(deployer: str, entry: Optional[Dict[str, Any]],
                       now: float) -> bool:
     """Archive one evicted registry entry as a segment with a stable
     id (deployer + its registry first_seen, so a retried eviction
-    dedupes and a re-appearing deployer's new entry forms a NEW
-    segment instead of erasing the old one). The archived counters
-    and timestamps are RECORDED values, labeled as such - not
-    verified skill. Never raises; returns True only when durable."""
+    UPSERTS - newer archived_ts replaces that id's older
+    contribution at read/compaction time - and a re-appearing
+    deployer's new entry forms a NEW segment instead of erasing the
+    old one). The archived counters and timestamps are RECORDED
+    values, labeled as such - not verified skill. Never raises;
+    returns True only when durable."""
     try:
         e = entry if isinstance(entry, dict) else {}
         first_seen = e.get("first_seen")
@@ -671,15 +700,16 @@ def _archive_deployer(deployer: str, entry: Optional[Dict[str, Any]],
 
 def deployer_archive(deployer: Optional[str] = None,
                      limit: int = 100) -> Dict[str, Any]:
-    """Merged archived history per deployer (segments summed
-    verifiably, linked by segment_ids, partial when any counter was
-    corrupt), newest first. A missing archive file is UNKNOWN
-    (absence cannot prove zero history), reported as
-    ``unknown_missing``; unreadable lines, compaction-dropped
-    corrupt lines, compaction failures and torn-tail repairs are
-    counted in ``archive_status``, never a clean empty history.
-    Returns {"records": [...], "archive_status": {...}}; never
-    raises."""
+    """Archived history per deployer, newest first: per-segment
+    detail upserted by segment id (a retried eviction replaces its
+    older contribution, never double-counts), totals summed only
+    over verifiable counters (partial when any was corrupt). A
+    missing archive file is UNKNOWN (absence cannot prove zero
+    history), reported as ``unknown_missing``; unreadable lines,
+    compaction-dropped corrupt lines, compaction failures and
+    torn-tail repairs are counted in ``archive_status``, never a
+    clean empty history. Returns {"records": [...],
+    "archive_status": {...}}; never raises."""
     status = {"available": False, "unreadable_lines": 0,
               "reason": "unknown_missing"}
     try:
@@ -697,7 +727,7 @@ def deployer_archive(deployer: Optional[str] = None,
             return {"records": [], "archive_status": status}
         status["available"] = True
         status["reason"] = "ok"
-        merged = {}
+        states = {}
         with open(_ARCHIVE_FILE) as f:
             for line in f:
                 try:
@@ -714,10 +744,12 @@ def deployer_archive(deployer: Optional[str] = None,
                     continue
                 if deployer is not None and dep != deployer:
                     continue
-                merged[dep] = _merge_segments(merged.get(dep), rec)
-        recs = sorted(merged.values(),
-                      key=lambda r: float(r.get("archived_ts") or 0),
-                      reverse=True)[:int(limit or 100)]
+                _fold_record(states.setdefault(dep, {}), rec)
+        recs = sorted(
+            (_row_from_segments(dep, st)
+             for dep, st in states.items() if st),
+            key=lambda r: float(r.get("archived_ts") or 0),
+            reverse=True)[:int(limit or 100)]
         return {"records": recs, "archive_status": status}
     except Exception:
         status["reason"] = "unreadable"

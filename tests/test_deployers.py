@@ -379,18 +379,61 @@ class DeployerArchiveTest(unittest.TestCase):
         # Live counters were never rehydrated from the archive.
         self.assertNotIn(DEP1, deployers.load_registry())
 
-    def test_duplicate_segment_deduped(self):
+    def test_duplicate_segment_upserts_never_double_counts(self):
         entry = {"first_seen": 100.0, "last_seen": 200.0,
                  "launches_seen": 3, "hits_2x": 1, "rugs": 0, "dead": 0}
         self.assertTrue(deployers._archive_deployer(DEP1, entry, 300.0))
-        # Eviction retried after a registry-save failure: same segment.
+        # Eviction retried after a registry-save failure: same segment
+        # id, SAME counters - must not double-count.
         self.assertTrue(deployers._archive_deployer(DEP1, entry, 301.0))
-        with open(self.arc) as f:
-            lines = [l for l in f.read().splitlines() if l.strip()]
-        self.assertEqual(len(lines), 1)
         out = deployers.deployer_archive(DEP1)
         self.assertEqual(out["records"][0]["launches_seen"], 3)
         self.assertEqual(out["records"][0]["segments_merged"], 1)
+
+    def test_same_id_counter_update_replaces_stale_value(self):
+        # Eviction archives launches=3, registry save fails, 6 more
+        # launches accrue, retry archives the SAME segment id with
+        # launches=9: the updated value replaces, never keeps 3 or
+        # sums to 12.
+        e3 = {"first_seen": 100.0, "launches_seen": 3,
+              "hits_2x": 1, "rugs": 0, "dead": 0}
+        e9 = dict(e3, launches_seen=9)
+        self.assertTrue(deployers._archive_deployer(DEP1, e3, 300.0))
+        self.assertTrue(deployers._archive_deployer(DEP1, e9, 301.0))
+        out = deployers.deployer_archive(DEP1)
+        self.assertEqual(out["records"][0]["launches_seen"], 9)
+        self.assertEqual(out["records"][0]["segments_merged"], 1)
+        # And after compaction the identity still cannot be erased.
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            deployers._archive_deployer(
+                DEP2, {"first_seen": 1.0, "launches_seen": 1}, 302.0)
+        out2 = deployers.deployer_archive(DEP1)
+        self.assertEqual(out2["records"][0]["launches_seen"], 9)
+        self.assertEqual(out2["records"][0]["segments_merged"], 1)
+
+    def test_many_segments_survive_repeated_compactions(self):
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            for i in range(60):
+                deployers._archive_deployer(
+                    DEP1, {"first_seen": float(i), "launches_seen": 1,
+                           "hits_2x": 0, "rugs": 0, "dead": 0},
+                    100.0 + i)
+            deployers._archive_deployer(
+                DEP2, {"first_seen": 1.0, "launches_seen": 1}, 500.0)
+        out = deployers.deployer_archive(DEP1)
+        rec = out["records"][0]
+        self.assertEqual(rec["launches_seen"], 60)
+        self.assertEqual(rec["segments_merged"], 60)
+        self.assertEqual(len(rec["segment_ids"]), 60)
+        # A retry of an OLD segment id after many compactions still
+        # upserts that id, never adds a phantom 61st segment.
+        deployers._archive_deployer(
+            DEP1, {"first_seen": 0.0, "launches_seen": 5,
+                   "hits_2x": 0, "rugs": 0, "dead": 0}, 600.0)
+        out2 = deployers.deployer_archive(DEP1)
+        rec2 = out2["records"][0]
+        self.assertEqual(rec2["segments_merged"], 60)
+        self.assertEqual(rec2["launches_seen"], 64)
 
     def test_torn_tail_repaired_under_lock_before_append(self):
         self.arc.write_text(
@@ -483,8 +526,9 @@ class DeployerArchiveTest(unittest.TestCase):
     def test_archive_unreadable_counted_not_clean_empty(self):
         self.arc.write_text(
             json.dumps({"v": 1, "record_type": "deployer_archive",
-                        "deployer": DEP1, "archived_ts": 5,
-                        "launches_seen": 4}) + "\nnot-json\n")
+                        "segment_id": "x:1", "deployer": DEP1,
+                        "archived_ts": 5, "launches_seen": 4})
+            + "\nnot-json\n")
         out = deployers.deployer_archive()
         self.assertEqual(len(out["records"]), 1)
         self.assertEqual(out["archive_status"]["unreadable_lines"], 1)

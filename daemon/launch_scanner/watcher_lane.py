@@ -138,6 +138,57 @@ MAX_SEEN_KEYS = 2000
 
 BANKROLL_START = 100.00
 NOTIONAL_USD = 1.00       # the user's $1/shot rule
+
+
+def _paper_account():
+    """The shared cross-lane paper account (2026-11-22), or None
+    when disabled. Same opt-in and fail-open-import semantics as
+    grad/ceo: PAPER_ACCOUNT_ENABLED=1 makes the shared account the
+    authoritative capital gate for entries and the settlement
+    target for exits; default OFF preserves historical behavior.
+    watcher_v2 loads THIS file as an isolated module instance with
+    its own LANE override, so everything below keys on the LANE
+    global and inherits cleanly."""
+    if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1":
+        return None
+    try:
+        # Absolute with sibling fallback: engine-loaded variants
+        # exec this file OUTSIDE the package.
+        try:
+            from daemon.launch_scanner import paper_account
+        except ImportError:
+            import paper_account
+        return paper_account
+    except Exception:
+        logger.exception("watcher: paper account unavailable; "
+                         "shared gate disabled for this call")
+        return None
+
+
+def _pa_settle(pos, qty, gross, fee, suffix):
+    """Credit the shared account for one settlement tranche, when
+    this position was opened through it. Same contract as ceo's:
+    net proceeds land in shared cash immediately, average-cost
+    basis allocation shrinks the position, the op_id (pinned
+    position instance + tranche suffix) makes uncertain-response
+    retries safe, positions without a pa_pos_id (opened with the
+    flag off) are skipped so a stale close can never settle a
+    later instance, and failures are journaled by the account
+    module, never blocking the lane's own settle."""
+    pa_pos_id = pos.get("pa_pos_id")
+    if not pa_pos_id:
+        return
+    _pa = _paper_account()
+    if _pa is None:
+        return
+    mint = pos["mint"]
+    _op = "%s:%s:%s:%s" % (LANE, suffix, mint, pa_pos_id)
+    _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
+                           qty=qty, fee=fee)
+    if not _ok:
+        logger.warning("watcher: shared paper account credit for %s "
+                       "(%s) failed: %s (journaled)", mint, suffix,
+                       _why)
 MAX_OPEN = 50              # bankroll binds first by design (see header)
 LANE = "watcher"
 DEFAULT_CHAIN = "solana"
@@ -785,6 +836,25 @@ def _consider_fire(sig, now):
         if len(d["positions"]) >= MAX_OPEN:
             return _skip(mint, "max open positions (%d) (race)"
                          % MAX_OPEN, False)
+        # Shared cross-lane paper account (2026-11-22): when enabled
+        # it is the AUTHORITATIVE capital gate — the entry happens
+        # only if the shared cash covers the stake. Lock order is
+        # lane-ledger -> account (the account never calls back),
+        # same as grad/ceo; the debit lands immediately before the
+        # position insert, which cannot fail. Fail-closed and
+        # transient: cash freed by a close re-enables entries. The
+        # op_id keys on mint + entry ts (this lane dedupes-ever, so
+        # an entry instance is unique) under the LANE override, so
+        # watcher_v2's instance gets its own op space.
+        _pa = _paper_account()
+        if _pa is not None:
+            _op = "%s:entry:%s:%d" % (LANE, mint,
+                                      int(pos["entry_ts"] * 1000))
+            _ok, _why, _pid = _pa.try_debit(LANE, mint, NOTIONAL_USD,
+                                            tokens, _op)
+            if not _ok:
+                return _skip(mint, "paper account: " + _why, False)
+            pos["pa_pos_id"] = _pid
         d["bankroll"] = round(float(d["bankroll"]) - NOTIONAL_USD, 6)
         d["positions"][mint] = pos
         _write(d)
@@ -919,6 +989,7 @@ def _close_leg(pos, leg_key, exit_price, reason):
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+    _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key)
     return net
 
 
@@ -948,6 +1019,8 @@ def _close_remaining(pos, exit_price, reason):
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+    _pa_settle(pos, total_tokens, gross, gas_out,
+               "remaining:%s" % "".join(open_legs))
     return net
 
 

@@ -251,6 +251,46 @@ check("measured features only (buys/age/safety/groups)",
       and (ev.get("components") or {}).get("convergence_groups") == 2)
 check("detection resolved the mint (seen)", MINT in seen)
 
+# --- 1b. second actual wallet source observes the SAME lifecycle mint ---
+# This joins its durable grade/state handoff to the lifecycle evidence below.
+# It does NOT pretend scanner fasttrack routes to watcher-lane trade entry.
+from daemon.launch_scanner import smartmoney as SM, smartgrade as SG, LaunchScanner
+from storage import Store
+from daemon.common import get_daemon_state
+from types import SimpleNamespace
+scanner_state={'seen':{},'degen_positions':{}}
+scanner=LaunchScanner.__new__(LaunchScanner)
+scanner_store=Store(os.path.join(TMPD,'scanner-source.db'))
+scanner_cfg=SimpleNamespace(degen=SimpleNamespace(smart_fasttrack_enabled=False))
+scanner_detail_failed=[True]
+def scanner_rpc(method,params):
+    if method=='getSignaturesForAddress':return [{'signature':'scanner:WalA'}]
+    if scanner_detail_failed[0]:return None
+    return {'blockTime':int(time.time()),'transaction':{'signatures':['scanner:WalA'],
+        'message':{'accountKeys':[{'pubkey':'WalA'},{'pubkey':'scanner-token-account'}]}},
+        'meta':{'err':None,'preBalances':[2000000000],'postBalances':[600000000],
+        'preTokenBalances':[],'postTokenBalances':[{'accountIndex':1,'owner':'WalA',
+        'mint':MINT,'uiTokenAmount':{'uiAmount':1000}}]}}
+try:
+    with patch.object(SM,'api_key',return_value='fixture'),patch.object(SM,'load_registry',return_value={'WalA':{}}),patch.object(SM,'_rpc',side_effect=scanner_rpc),patch.object(SM.time,'sleep'):
+        check('second source outage returns no fabricated same-mint activity',SM.poll_wallets(scanner_state,poll_seconds=0)=={})
+        check('second source outage keeps actual signature pending',SM._intake().wallet('WalA')['pending']==['scanner:WalA'])
+        scanner_detail_failed[0]=False
+        fresh=SM.poll_wallets(scanner_state,poll_seconds=0)
+        check('second source validated evidence resolves same lifecycle mint',fresh=={MINT:['WalA']})
+        with patch.object(SG,'save_grades',return_value=False):
+            try:scanner._handoff_smart_wallet_activity(scanner_cfg,scanner_store,scanner_state,fresh)
+            except OSError:pass
+            else:check('second source grade failure propagates',False)
+        check('second source grade failure retains actual signature',SM._intake().wallet('WalA')['pending']==['scanner:WalA'])
+        fresh=SM.poll_wallets(scanner_state,poll_seconds=0)
+        scanner._handoff_smart_wallet_activity(scanner_cfg,scanner_store,scanner_state,fresh)
+        scanner_state=get_daemon_state(scanner_store,'launch_scanner')
+        check('second source successful grade handoff durably accepts signature',SM._intake().wallet('WalA')['pending']==[])
+        check('second source next cycle does not replay graded lifecycle mint',SM.poll_wallets(scanner_state,poll_seconds=0)=={})
+        check('same-mint grade observation survives durable scanner reload',scanner_state['smart_activity']=={MINT:['WalA']} and any(b['mint']==MINT for b in SG.load_grades()['WalA']['buys']))
+finally:scanner_store.close()
+
 # --- 2. duplicate detection: same mint re-sighted, no 2nd record -----
 for w in ("WalA", "WalB", "WalC"):
     sw.handle_sighting(w, {"mint": MINT, "block_ts": time.time(),

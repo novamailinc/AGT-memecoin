@@ -744,6 +744,43 @@ def test_max_kept_launches_hard_cap():
             dossiers.MAX_KEPT_LAUNCHES = real_max
 
 
+def test_launch_rollup_preserves_curve_and_migration_kind():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_lraw = dossiers.LAUNCH_RAW_S
+        dossiers.ARCHIVE_MAX_BYTES = 100
+        dossiers.LAUNCH_RAW_S = 100
+        try:
+            for i, (mint, n, migrated) in enumerate((
+                    ("MINT-U", 0, False), ("MINT-S", 1, False),
+                    ("MINT-M", 2, True))):
+                samples = [{"ts": now - 90000 + j, "v_sol": j + 1,
+                            "v_token": 10 + j} for j in range(n)]
+                c.write_dossier(mint, now - 90000 - i,
+                                deployer="DEP-CURVE",
+                                safety={"report": {"unknown": False,
+                                                   "source": "x"}},
+                                curve_samples=samples,
+                                migrated=migrated)
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now)
+            dossiers._maybe_compact_archive(now + 1)
+            rollups = [r for r in dossiers.launch_archive(limit=1000)
+                       if r.get("record_type") == "launch_rollup"]
+            check("rollup: launch kinds preserve unknown/preliminary/sequence",
+                  len(rollups) == 1
+                  and rollups[0].get("launches") == 3
+                  and rollups[0].get("migrated") == 1
+                  and rollups[0].get("not_migrated_observed") == 2
+                  and rollups[0].get("curve_kind_unknown_curve") == 1
+                  and rollups[0].get("curve_kind_single_preliminary_snapshot") == 1
+                  and rollups[0].get("curve_kind_multi_sample_curve_sequence") == 1)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.LAUNCH_RAW_S = real_lraw
+
+
 def test_end_to_end_memory_consumed_after_restart():
     """Full consumer chain in one flow: birth -> dossier -> close
     outcome via the verdict-ledger funnel -> TTL eviction archives

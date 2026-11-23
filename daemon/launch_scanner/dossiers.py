@@ -252,6 +252,23 @@ def _archive_append(rec):
         return False
 
 
+def _classify_curve_samples(samples):
+    """Durable launch curve kind. The current birth reserve sample is
+    only a preliminary bonding-curve snapshot, so at dossier expiry
+    one sample cannot establish sustained growth. Two or more reserve
+    samples give a bounded sequence without inventing pump/dump labels.
+    Missing acquisition is unknown, never a clean stable curve."""
+    try:
+        n = len(samples or [])
+    except Exception:
+        return "unknown_curve"
+    if n <= 0:
+        return "unknown_curve"
+    if n == 1:
+        return "single_preliminary_snapshot"
+    return "multi_sample_curve_sequence"
+
+
 def _archive_dossier(d, now):
     """Append one compact long-term record for an expiring dossier
     to the persistent archive. Returns True when the record is
@@ -280,6 +297,9 @@ def _archive_dossier(d, now):
             "market_cap_sol": d.get("market_cap_sol"),
             "migrated": bool(d.get("migrated")),
             "reserve_samples": len(d.get("curve_samples")
+                if "curve_samples" in d else (d.get("reserve_samples") or [])),
+            "migrated": bool(d.get("migrated")),
+            "curve_kind": _classify_curve_samples(d.get("curve_samples")
                 if "curve_samples" in d else (d.get("reserve_samples") or [])),
             "reserve_acquisition": d.get("reserve_acquisition") or {
                 "status": "unknown", "reason": "legacy_unrecorded"},
@@ -619,6 +639,16 @@ def _rollup_add_launch(row, rec):
         row["conclusive"] += 1
     elif sv == "unknown":
         row["unknown"] += 1
+    if bool(rec.get("migrated")):
+        row["migrated"] = row.get("migrated", 0) + 1
+    else:
+        row["not_migrated_observed"] = row.get(
+            "not_migrated_observed", 0) + 1
+    kind = rec.get("curve_kind")
+    if not kind:
+        kind = "unknown_curve"  # no curve/reserve evidence recorded
+    row["curve_kind_" + str(kind)] = row.get(
+        "curve_kind_" + str(kind), 0) + 1
 
 
 def _maybe_compact_archive(now):

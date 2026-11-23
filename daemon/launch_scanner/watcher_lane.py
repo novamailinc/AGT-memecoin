@@ -579,8 +579,10 @@ def ensure_ledger():
             return _read()
         d = _blank()
         _write(d)
-        logger.warning("watcher ledger created: bankroll $%.2f, "
-                       "verdict pre-registered at %d closes",
+        logger.warning("watcher ledger created: NOTIONAL verdict "
+                       "counter $%.2f (unfunded bookkeeping; real cash "
+                       "authority is the shared paper account), verdict "
+                       "pre-registered at %d closes",
                        d["bankroll"], VERDICT_SAMPLE_CLOSES)
         return d
 
@@ -926,7 +928,7 @@ def _consider_fire(sig, now):
     with _ledger_lock():
         d = _read()
         if float(d["bankroll"]) < NOTIONAL_USD:
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
             return _skip(mint, "already open", True)
@@ -1094,7 +1096,7 @@ def _consider_fire(sig, now):
             if d["state"] != "bankroll_exhausted":
                 d["state"] = "bankroll_exhausted"
                 _write(d)
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
             return _skip(mint, "already open (race)", True)
@@ -1137,7 +1139,8 @@ def _consider_fire(sig, now):
         d["positions"][mint] = pos
         _write(d)
     logger.warning("watcher OPEN %s %s @ %s ($1, %d groups, liq $%.0f, "
-                   "mcap $%.0f, lag %.1fs, cash now $%.2f)",
+                   "mcap $%.0f, lag %.1fs, NOTIONAL counter now $%.2f "
+                   "[unfunded; real cash is the shared paper account])",
                    symbol, mint[:12], filled, n_groups, liquidity,
                    mcap, (now - fire_ts) if fire_ts else -1,
                    account_cash())

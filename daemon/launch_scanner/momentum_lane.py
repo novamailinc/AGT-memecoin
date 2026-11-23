@@ -904,7 +904,7 @@ def _consider_candidate(cand, now):
     with _ledger_lock():
         d = _read()
         if float(d["bankroll"]) < NOTIONAL_USD:
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
             return _skip(mint, "already open", True)
@@ -1058,7 +1058,7 @@ def _consider_candidate(cand, now):
             if d["state"] != "bankroll_exhausted":
                 d["state"] = "bankroll_exhausted"
                 _write(d)
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
             return _skip(mint, "already open (race)", True)

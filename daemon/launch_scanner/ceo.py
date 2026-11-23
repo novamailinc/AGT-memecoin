@@ -952,7 +952,7 @@ def _consider_card(sig):
             if state != "bankroll_exhausted":
                 d["state"] = "bankroll_exhausted"
                 _write(d)  # lock held here; the flip is final, like losses
-            return _skip(mint, "bankroll exhausted (cash $%.2f)" % cash)
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)" % cash)
         if mint in d["positions"]:
             return _skip(mint, "already open")
         for c in d["closes"]:
@@ -1005,7 +1005,13 @@ def _consider_card(sig):
         logger.warning("ceo %s: %s", mint, why)
         return False, why
 
-    liquidity = float(sig.get("liquidity") or 0)
+    # The fill and the slippage gate use the lane's OWN gate-verified
+    # tape liquidity, never the card's claim: a claimed value can be
+    # absent (fail-open) or inflated (diluted gate). The runner gate
+    # already refused no-tape candidates, so the verified figure
+    # exists on every path that reaches here (2026-11-23).
+    gate_liq = float((_LAST_GATE_TAPE or {}).get("usd_liquidity") or 0)
+    liquidity = gate_liq or float(sig.get("liquidity") or 0)
     gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD,
                                 venue=fee_venue or None)
     eff_notional = NOTIONAL_USD - gas_in
@@ -1095,7 +1101,7 @@ def _consider_card(sig):
                     d["state"] != "bankroll_exhausted":
                 d["state"] = "bankroll_exhausted"
                 _write(d)
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]))
         if mint in d["positions"]:
             return _skip(mint, "already open (race)")

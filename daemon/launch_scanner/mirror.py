@@ -613,6 +613,13 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
     if eff_notional <= 0:
         return False, "costs exceed notional"
 
+    # The fill and the slippage gate use the lane's OWN gate-verified
+    # tape liquidity, never the card's claim (2026-11-23, same fix as
+    # ceo): a claimed value can be absent or inflated. The
+    # consecutive-confirmation gate already refused no-tape cards.
+    gate_liq = float((_LAST_GATE_TAPE or {}).get("usd_liquidity") or 0)
+    liquidity = gate_liq or float(liquidity or 0)
+
     # Declared slippage cap (fills.MAX_SLIPPAGE_PCT, tighten-only via
     # AGT_RISK_MAX_SLIPPAGE_PCT): a fill the model can only price at
     # the cap is not an honest entry. Retryable - liquidity can

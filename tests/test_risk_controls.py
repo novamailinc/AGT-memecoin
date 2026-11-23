@@ -85,6 +85,24 @@ for lane in ("grad", "watcher_lane", "ceo", "momentum_lane", "mirror"):
     check("%s does not duplicate paper_account entry gates" % lane,
           "_risk.check_entry(" not in src)
 
+# ---------- verified-tape liquidity beats card claims at the fill ----
+# ceo/mirror fed the slippage gate and honest_entry the CARD's claimed
+# liquidity; a claim can be absent (fail-open) or inflated (diluted
+# gate). Both lanes now compute the fill liquidity from their own
+# gate-verified tape (_LAST_GATE_TAPE) BEFORE the gate call, falling
+# back to the claim only when the verified figure is absent
+# (2026-11-23, integrator fix on the merged patch).
+for lane in ("ceo", "mirror"):
+    src = open(os.path.join(REPO, "daemon", "launch_scanner",
+                            lane + ".py")).read()
+    i_gate = src.find('gate_liq = float((_LAST_GATE_TAPE or {})'
+                      '.get("usd_liquidity")')
+    check("%s fill prefers gate-verified tape liquidity" % lane,
+          i_gate >= 0)
+    if i_gate >= 0:
+        check("%s verified liquidity precedes the slippage call" % lane,
+              src.find("_risk.check_slippage(", i_gate) > i_gate)
+
 print()
 if fails:
     print("FAILURES:", fails)

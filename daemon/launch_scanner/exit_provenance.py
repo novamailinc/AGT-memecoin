@@ -95,12 +95,31 @@ def verdict_visibility(closes):
     never be READ as qualified performance. Any change to the
     registered evaluation itself is an owner decision, not a
     technical default."""
+    # Quantified contamination visibility (2026-11-23): the registered
+    # expectancy ingests stale-estimated closes BY FROZEN DESIGN. This
+    # figure puts the qualified number NEXT to it - expectancy over
+    # current-price closes only - so the gap is measured, not hidden.
+    # It never feeds HALT, excludes nothing from the registered sample,
+    # and re-registers nothing; changing the registered evaluation
+    # itself stays an owner decision.
+    qualified = [float((c or {}).get("pnl_usd") or 0) for c in closes
+                 if (c or {}).get("exit_price_kind") == CURRENT]
     return {
         "price_kind_breakdown": sample_breakdown(closes),
         "qualification_status": QUALIFICATION_STATUS,
         "fill_model_validated": FILL_MODEL_VALIDATED,
         "expectancy_presentation":
             "reproducibility_only_not_qualified_performance",
+        "qualified_expectancy_visibility": {
+            "current_price_closes": len(qualified),
+            "expectancy_current_only": (
+                round(sum(qualified) / len(qualified), 6)
+                if qualified else None),
+            "note": ("visibility only - the registered verdict math "
+                     "is UNCHANGED (all closes, frozen); this figure "
+                     "never feeds HALT, excludes nothing from the "
+                     "registered sample, re-registers nothing"),
+        },
     }
 
 

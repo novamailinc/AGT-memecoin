@@ -698,7 +698,9 @@ def ensure_ledger():
             return _read()
         d = _blank()
         _write(d)
-        logger.warning("grad ledger created: bankroll $%.2f, verdict "
+        logger.warning("grad ledger created: NOTIONAL verdict "
+                       "counter $%.2f (unfunded bookkeeping; real cash "
+                       "authority is the shared paper account), verdict "
                        "pre-registered at %d closes",
                        d["bankroll"], VERDICT_SAMPLE_CLOSES)
         return d
@@ -1029,7 +1031,7 @@ def _consider_candidate(cand, now):
             _max_open = MAX_OPEN
             _sit_out = None
         if float(d["bankroll"]) < _stake:
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
             return _skip(mint, "already open", True)
@@ -1245,7 +1247,7 @@ def _consider_candidate(cand, now):
             if d["state"] != "bankroll_exhausted":
                 d["state"] = "bankroll_exhausted"
                 _write(d)
-            return _skip(mint, "bankroll exhausted (cash $%.2f)"
+            return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
             return _skip(mint, "already open (race)", True)
@@ -1325,7 +1327,8 @@ def _consider_candidate(cand, now):
     except Exception:
         pass
     logger.warning("grad OPEN %s %s @ %s ($1, pool age %.0fs, liq $%.0f, "
-                   "mcap $%.0f, cash now $%.2f)",
+                   "mcap $%.0f, NOTIONAL counter now $%.2f [unfunded; "
+                   "real cash is the shared paper account])",
                    symbol, mint[:12], filled, age, liquidity, mcap,
                    account_cash())
     # P4: entry event (fires for both grad and grad_raw engine

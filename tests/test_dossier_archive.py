@@ -1242,6 +1242,131 @@ def test_initial_zero_migrated_ts_archives_unrecorded():
               len(recs) == 1 and recs[0].get("migrated") is None)
 
 
+def test_migration_conflict_labeled_not_silent_false():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_lraw = dossiers.LAUNCH_RAW_S
+        dossiers.ARCHIVE_MAX_BYTES = 100
+        dossiers.LAUNCH_RAW_S = 100
+        try:
+            # Legacy explicit negative, then a real migration event
+            # stamps the dossier through the production observer.
+            c.write_dossier("MINT-CONF", now - 3600,
+                            deployer="DEP-CONF",
+                            safety={"ts": now - 3600,
+                                    "report": {"unknown": False,
+                                               "source": "x"}},
+                            migrated=False)
+            dossiers.observe_migrations(
+                [{"source": "pumpportal-migration",
+                  "mint": "MINT-CONF"}], now=now - 1800)
+            p = os.path.join(dossiers.DOSSIER_DIR, "MINT-CONF.json")
+            with open(p) as f:
+                d = json.load(f)
+            d["born_ts"] = now - 25 * 3600
+            with open(p, "w") as f:
+                json.dump(d, f)
+            dossiers._sweep(now - 200)
+            recs = [r for r in dossiers.launch_archive(
+                        mint="MINT-CONF", limit=1000)
+                    if r.get("record_type") == "launch"]
+            check("conflict: explicit negative + valid stamp is "
+                  "labeled, never silently False",
+                  len(recs) == 1
+                  and recs[0].get("migrated") is None
+                  and recs[0].get("migration_conflict") is True)
+            dossiers._maybe_compact_archive(now)
+            rows = [r for r in dossiers.launch_archive(limit=1000)
+                    if r.get("record_type") == "launch_rollup"]
+            check("conflict: rollup counts conflicts separately",
+                  len(rows) == 1
+                  and rows[0].get("migration_conflict") == 1
+                  and rows[0].get("not_migrated_recorded", 0) == 0
+                  and rows[0].get("migration_unrecorded", 0) == 0)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.LAUNCH_RAW_S = real_lraw
+
+
+def test_migration_stamp_plausibility():
+    with _Ctx() as c:
+        now = time.time()
+        for mint, ts in (("MINT-INF", float("inf")),
+                         ("MINT-FUT", now + 10 ** 6)):
+            c.write_dossier(mint, now - 25 * 3600,
+                            deployer="DEP-PLAUS",
+                            safety={"ts": now - 25 * 3600,
+                                    "report": {"unknown": False,
+                                               "source": "x"}},
+                            migrated_ts=ts)
+        dossiers._sweep(now)
+        recs = {r.get("mint"): r
+                for r in dossiers.launch_archive(limit=1000)
+                if r.get("record_type") == "launch"}
+        check("plausibility: non-finite stamp is unrecorded",
+              recs.get("MINT-INF", {}).get("migrated") is None)
+        check("plausibility: future-dated stamp is unrecorded",
+              recs.get("MINT-FUT", {}).get("migrated") is None)
+
+
+def test_rollup_merge_rejects_invalid_counters():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        dossiers.ARCHIVE_MAX_BYTES = 1
+        try:
+            os.makedirs(os.path.dirname(dossiers.ARCHIVE_FILE),
+                        exist_ok=True)
+            with open(dossiers.ARCHIVE_FILE, "w") as f:
+                f.write(json.dumps({
+                    "v": 1, "record_type": "launch_rollup",
+                    "deployer": "DEP-NEG", "year": "2026",
+                    "launches": -3, "conclusive": 2,
+                    "unknown": 0}) + "\n")
+                f.write(json.dumps({
+                    "v": 1, "record_type": "launch_rollup",
+                    "deployer": "DEP-NEG", "year": "2026",
+                    "launches": 2, "conclusive": 2.5,
+                    "unknown": 0}) + "\n")
+            dossiers._maybe_compact_archive(now)
+            rows = [r for r in dossiers.launch_archive(limit=1000)
+                    if r.get("record_type") == "launch_rollup"]
+            check("rollup: negative/fractional counters are partial, "
+                  "never silently summed",
+                  len(rows) == 1
+                  and rows[0].get("partial") is True
+                  and rows[0].get("launches") == 2
+                  and rows[0].get("conclusive") == 2)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+
+
+def test_intel_fields_surfaces_rollup_partial():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        dossiers.ARCHIVE_MAX_BYTES = 1
+        try:
+            os.makedirs(os.path.dirname(dossiers.ARCHIVE_FILE),
+                        exist_ok=True)
+            with open(dossiers.ARCHIVE_FILE, "w") as f:
+                f.write(json.dumps({
+                    "v": 1, "record_type": "launch_rollup",
+                    "deployer": "DEP-X", "year": "2026",
+                    "launches": 2, "migrated": None}) + "\n")
+            dossiers._maybe_compact_archive(now)
+            intel = dossiers._intel_fields("DEP-X")
+            hist = (intel or {}).get("deployer_history") or {}
+            check("intel: corrupt rollup fold surfaces as partial "
+                  "history to the consumer",
+                  hist.get("partial") is True
+                  and hist.get("partial_rollups") == 1
+                  and hist.get("archived_launches") == 2)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+
+
 def test_launch_rollup_partial_when_corrupt_counter():
     with _Ctx() as c:
         now = time.time()

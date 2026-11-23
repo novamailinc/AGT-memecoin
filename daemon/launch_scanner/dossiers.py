@@ -269,24 +269,31 @@ def _classify_curve_samples(samples):
     return "multi_sample_curve_sequence"
 
 
-def _migrated_evidence(d):
-    """Three-valued migration provenance: True only on an explicit
-    flag or a validated migrated_ts stamp (the only field the
-    production observer writes); False only on an explicit recorded
-    negative; anything absent, zero or corrupt is unrecorded
-    (None) - never invented evidence either way."""
+def _migrated_evidence(d, now=None):
+    """Migration provenance as (value, conflict), never invented
+    either way. A stamp is VALID only when finite, positive and
+    not after the record's own archive time - the only field the
+    production observer writes. True: an explicit flag, or a valid
+    stamp. False: an explicit recorded negative with NO valid
+    stamp contradicting it. An explicit negative contradicted by a
+    valid stamp is a CONFLICT: (None, True) - labeled unrecorded,
+    never a silently trusted False. Absent, zero, non-finite or
+    future-dated evidence: (None, False), unrecorded."""
     m = d.get("migrated")
-    if m is True:
-        return True
-    if m is False:
-        return False
+    stamped = False
     ts = d.get("migrated_ts")
-    if isinstance(ts, bool):
-        return None
-    try:
-        return True if float(ts or 0) > 0 else None
-    except (TypeError, ValueError):
-        return None
+    if not isinstance(ts, bool):
+        try:
+            t = float(ts or 0)
+            stamped = 0 < t != float("inf") \
+                and (now is None or t <= now)
+        except (TypeError, ValueError):
+            stamped = False
+    if m is True:
+        return True, False
+    if m is False:
+        return (None, True) if stamped else (False, False)
+    return (True, False) if stamped else (None, False)
 
 
 def _archive_dossier(d, now):
@@ -315,7 +322,7 @@ def _archive_dossier(d, now):
             if isinstance(report, dict) else None,
             "initial_buy_sol": d.get("initial_buy_sol"),
             "market_cap_sol": d.get("market_cap_sol"),
-            "migrated": _migrated_evidence(d),
+            "migrated": _migrated_evidence(d, now)[0],
             "reserve_samples": len(d.get("curve_samples")
                 if "curve_samples" in d else (d.get("reserve_samples") or [])),
             "curve_kind": _classify_curve_samples(d.get("curve_samples")
@@ -323,6 +330,10 @@ def _archive_dossier(d, now):
             "reserve_acquisition": d.get("reserve_acquisition") or {
                 "status": "unknown", "reason": "legacy_unrecorded"},
         }
+        if _migrated_evidence(d, now)[1]:
+            # Explicit negative contradicted by a valid stamp:
+            # labeled as a conflict, never silently False.
+            rec["migration_conflict"] = True
         return _archive_append(rec)
     except Exception:
         return False
@@ -663,6 +674,11 @@ def _rollup_add_launch(row, rec):
     elif rec.get("migrated") is False:
         row["not_migrated_recorded"] = row.get(
             "not_migrated_recorded", 0) + 1
+    elif rec.get("migration_conflict") is True:
+        # Contradictory evidence is its own count, never lumped
+        # into recorded negatives or clean unrecorded.
+        row["migration_conflict"] = row.get(
+            "migration_conflict", 0) + 1
     else:
         row["migration_unrecorded"] = row.get(
             "migration_unrecorded", 0) + 1
@@ -789,6 +805,14 @@ def _maybe_compact_archive(now):
                                 if isinstance(v, bool) or v is None:
                                     raise ValueError("unmergeable")
                                 iv = int(v)
+                                # Only true non-negative integer
+                                # counters merge: negatives,
+                                # fractions, non-numerics and
+                                # non-finite values would violate
+                                # the totals silently - mark
+                                # partial instead.
+                                if iv != v or iv < 0:
+                                    raise ValueError("unmergeable")
                             except Exception:
                                 dropped += 1
                                 lru["partial"] = True
@@ -1000,10 +1024,16 @@ def _intel_fields(deployer):
                             != "current_price_simulated_fill"),
                         "outcomes_provenance": "simulated",
                         "outcomes_qualified": False,
-                        # Partial memory (skipped torn lines) or
-                        # rolled-up older history: labeled, never
-                        # shown as a complete clean record.
-                        "partial": st.get("unreadable_lines", 0) > 0,
+                        # Partial memory (skipped torn lines or a
+                        # corrupt-counter rollup fold) or rolled-up
+                        # older history: labeled, never shown as a
+                        # complete clean record.
+                        "partial": st.get("unreadable_lines", 0) > 0
+                        or any(r.get("partial") is True
+                               for r in launch_rollups),
+                        "partial_rollups": sum(
+                            1 for r in launch_rollups
+                            if r.get("partial") is True),
                     }
             # unavailable -> field omitted: unknown history is
             # never shown as zero history.

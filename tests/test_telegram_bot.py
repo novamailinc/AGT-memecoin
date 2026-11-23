@@ -296,6 +296,32 @@ class CommandTests(unittest.TestCase):
         tg_commands.handle_message(ctx, CHAT, USER, 2, "/status")
         self.assertTrue(any("Status" in text for _, text, _ in client.sent))
 
+    def test_status_mode_never_ambiguous(self):
+        # Section 16: the control room must always show an unambiguous
+        # operating mode, and mainnet is always reported DISABLED (this
+        # tree has no signing path and Telegram can never enable one).
+        client, ctx, sec, published, audit = self._paired()
+        tmp = tempfile.mkdtemp()
+        try:
+            with patch.dict(os.environ, {"FOREX_AGENT_HOME": tmp}):
+                client.sent.clear()
+                tg_commands.handle_message(ctx, CHAT, USER, 2, "/status")
+                text = "\n".join(t for _, t, _ in client.sent)
+                self.assertIn("Mode: HISTORICAL/OFFLINE", text)
+                self.assertIn("Mainnet: DISABLED", text)
+                os.makedirs(os.path.join(tmp, "paper_account"))
+                with open(os.path.join(tmp, "paper_account",
+                                       "ledger.json"), "w") as f:
+                    f.write("{}")
+                client.sent.clear()
+                tg_commands.handle_message(ctx, CHAT, USER, 3, "/status")
+                text = "\n".join(t for _, t, _ in client.sent)
+                self.assertIn("Mode: LIVE-MARKET DEMO", text)
+                self.assertIn("simulated capital", text)
+                self.assertIn("Mainnet: DISABLED", text)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_skipped_shows_blocked_runners(self):
         import daemon.common as common
         client, ctx, sec, published, audit = self._paired()

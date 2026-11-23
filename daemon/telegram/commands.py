@@ -514,13 +514,32 @@ def _cmd_help(ctx, chat_id, user_id, update_id, args):
     ctx.send(chat_id, HELP_TEXT, None)
 
 
+def _trading_mode_line():
+    """Request section 16: the control room must NEVER make the operating
+    mode ambiguous. This tree has no mainnet signing path at all and
+    Telegram can never enable one (the hard refusal in security.py), so
+    mainnet is reported DISABLED, not merely off. Live-market demo
+    activity is detected from the shared paper-account ledger under
+    FOREX_AGENT_HOME, which every demo lane writes through
+    paper_account; with no ledger the bot is in historical/offline work
+    only."""
+    home = os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser(
+        "~/.forex-agent")
+    ledger = os.path.join(home, "paper_account", "ledger.json")
+    if os.path.exists(ledger):
+        return ("Mode: LIVE-MARKET DEMO (simulated capital; no real "
+                "transactions) | Mainnet: DISABLED")
+    return ("Mode: HISTORICAL/OFFLINE (no live-market demo activity) | "
+            "Mainnet: DISABLED")
+
+
 def _cmd_status(ctx, chat_id, user_id, update_id, args):
     try:
         health = ctx.tools.forex_get_health()
     except Exception as exc:
         ctx.send(chat_id, "⚠️ health read failed: %s" % exc, None)
         return
-    lines = ["🟢 Status"]
+    lines = ["🟢 Status", _trading_mode_line()]
     for key in ("mode", "kill_switch", "daemons", "queue", "storage"):
         if key in health:
             lines.append("%s: %s" % (key, health[key]))

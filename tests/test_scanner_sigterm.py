@@ -71,19 +71,30 @@ def _counting_consider(calls):
 
 cfg = SimpleNamespace(degen=SimpleNamespace(degen_lane_enabled=False))
 
+import tempfile
+from unittest.mock import patch
+from storage import Store
+from daemon.launch_scanner.logstream import LogStream
+_scratch=tempfile.TemporaryDirectory()
+_store=Store(os.path.join(_scratch.name,'state.db'))
 s3 = LaunchScanner()
-s3._logstream = FakeFeed([{"mint": "M1", "ts": 1.0},
-                          {"mint": "M2", "ts": 2.0},
-                          {"mint": "M3", "ts": 3.0}])
+s3._logstream=LogStream(intake_home=_scratch.name)
+for i in range(1,4):
+    sig='sig'+str(i)
+    s3._logstream._intake.receive(sig);s3._logstream._intake.resolve(sig,'M'+str(i))
 calls = []
 s3._consider = _counting_consider(calls)
 s3._stop = True
-s3._drain_logstream(cfg, None, {})
-check("drain logstream: stop set -> 0 considers", calls == [], str(calls))
-s3._stop = False
-s3._drain_logstream(cfg, None, {})
+with patch('daemon.launch_scanner.get_store',return_value=_store):
+    s3._drain_logstream(cfg, None, {})
+    check("drain logstream: stop set -> 0 considers", calls == [], str(calls))
+    check("drain logstream: stop retains all 3",len(s3._logstream.drain())==3)
+    s3._stop = False
+    s3._drain_logstream(cfg, None, {})
 check("drain logstream: no stop -> all 3 considered",
       calls == ["M1", "M2", "M3"], str(calls))
+check("drain logstream: durable acceptance consumes all 3",s3._logstream.drain()==[])
+_store.close();_scratch.cleanup()
 
 s4 = LaunchScanner()
 s4._pumpportal = FakeFeed([{"mint": "P1", "source": "pumpportal-new"},

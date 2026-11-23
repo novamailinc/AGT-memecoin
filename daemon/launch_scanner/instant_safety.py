@@ -438,6 +438,7 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
             flags.append(msg)
 
     ext_names: List[str] = []
+    transfer_fee_detail: Dict[str, Any] = {}
     extensions = info.get("extensions")
     if extensions is None:
         pass  # classic SPL mint: no extensions key at all
@@ -485,6 +486,37 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
                             "default (defaultAccountState=frozen)")
                 elif name == "transferFeeConfig":
                     bps = _transfer_fee_bps(state)
+                    # Exact fee math is possible from mint data
+                    # alone (UiTransferFee: epoch, maximumFee in
+                    # RAW BASE UNITS, transferFeeBasisPoints):
+                    # fee(x) = min(x * bps / 10000, maximumFee).
+                    # The cap is token-denominated, so no price
+                    # context is needed; expose the inputs so a
+                    # consumer can compute the exact fee for any
+                    # transfer amount.
+                    def _maxfee():
+                        vals = []
+                        for k in ("newerTransferFee",
+                                  "olderTransferFee"):
+                            sub = state.get(k)
+                            if isinstance(sub, dict) \
+                                    and sub.get("maximumFee") \
+                                    is not None:
+                                try:
+                                    vals.append(
+                                        int(sub["maximumFee"]))
+                                except (TypeError, ValueError):
+                                    pass
+                        return max(vals) if vals else None
+                    mf = _maxfee()
+                    if bps is not None:
+                        transfer_fee_detail["bps"] = bps
+                    if mf is not None:
+                        transfer_fee_detail["maximum_fee_raw"] = mf
+                        if bps:
+                            transfer_fee_detail[
+                                "cap_binds_above_raw"] = int(
+                                    mf * 10000 // bps)
                     if bps is not None:
                         if bps > 1000:
                             fails.append(
@@ -640,6 +672,7 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
         "topHolders": [{"pct": round(p, 2)} for p in user_pcts],
         "instant": {
             "token2022_extensions": ext_names,
+            "transfer_fee": transfer_fee_detail or None,
             "mint_authority": (str(mint_auth) if mint_auth else None),
             "freeze_authority": (str(freeze_auth)
                                  if freeze_auth else None),

@@ -57,7 +57,8 @@ BASE = 1794000000.0  # fixed close_ts base so resolved_at is exact
 
 
 def _dec(mint, entry_ts, close_ts, pnl, age=None, dep=None,
-         ttg=None, trades=None, copycat=None):
+         ttg=None, trades=None, copycat=None,
+         kind="current_price_simulated_fill"):
     return {
         "kind": "decision", "lane": "grad_select", "mint": mint,
         "symbol": "T", "status": "settled", "entry_ts": entry_ts,
@@ -70,6 +71,7 @@ def _dec(mint, entry_ts, close_ts, pnl, age=None, dep=None,
         "lessons_in_context": [], "pnl_usd": pnl,
         "realized_mult": 1.0 + pnl / 25.0,
         "close_reason": "time_stop_24h", "close_ts": close_ts,
+        "exit_price_kind": kind,
     }
 
 
@@ -509,3 +511,36 @@ if fails:
         print("  FAIL " + f)
     sys.exit(1)
 print("ALL LESSONS TESTS PASSED")
+# ============ 4.6 learning hygiene: incomplete records excluded ============
+hq = [_dec("QWin%d" % i, BASE - 500 + i, BASE + 500 + i, 10.0, age=10.0)
+      for i in range(3)]
+hx = [_dec("Stale%d" % i, BASE - 400 + i, BASE + 600 + i, -50.0,
+           age=10.0, kind="stale_price_estimate") for i in range(2)]
+hx.append(_dec("WD0", BASE - 300, BASE + 700, -25.0, age=10.0,
+               kind="write_down_zero"))
+hx.append(_dec("Legacy", BASE - 200, BASE + 800, 99.0, age=10.0,
+               kind="unknown"))
+hp = L.generate_lessons("grad_select", hq + hx, generated_at=BASE + 900)
+hid = {l["id"]: l for l in hp["lessons"]}
+ho = hid.get("grad_select:overall:all")
+hf = hid.get("grad_select:entry_speed:fast (age<=30s)")
+check("hygiene: only current-price outcomes enter lesson numbers",
+      ho is not None and ho["closes"] == 3 and ho["wins"] == 3
+      and ho["net_pnl_usd"] == 30.0)
+check("hygiene: exclusion is reported per lesson and per payload",
+      ho["excluded_unqualified"] == 4
+      and hf["excluded_unqualified"] == 4
+      and hp["n_settled"] == 7 and hp["n_qualified"] == 3
+      and hp["n_excluded_unqualified"] == 4
+      and hp["learning_price_kind"] == "current_price_simulated_fill")
+check("hygiene: all-unqualified lane yields no lessons, counts honest",
+      L.generate_lessons("grad_select", hx,
+                         generated_at=BASE + 901)["lessons"] == []
+      and L.generate_lessons(
+          "grad_select", hx,
+          generated_at=BASE + 901)["n_excluded_unqualified"] == 4)
+check("hygiene: missing label fails closed (excluded, not learned)",
+      L.generate_lessons(
+          "grad_select",
+          [{k: v for k, v in hq[0].items() if k != "exit_price_kind"}],
+          generated_at=BASE + 902)["n_qualified"] == 0)

@@ -1029,14 +1029,20 @@ def _build_inner(item):
             # Lever 3 (2026-11-16): curve_price_usd's return value
             # was discarded — it re-fetched this same curve account
             # (plus a mint-decimals fetch) for nothing. The single
-            # get_account below serves the sample.
-            _o, data = _res.get_account(
-                _res.derive_curve_pda(mint) or "")
-            c = _res.parse_bonding_curve(data)
-            if c:
-                d["curve_samples"].append(
-                    {"ts": now, "v_sol": c["v_sol"],
-                     "v_token": c["v_token"]})
+            # get_account below serves the sample. A reserve/RPC
+            # failure must NOT abort the build: the dossier is
+            # still written, with no fabricated samples
+            # (2026-11-23, fixture failure-path finding).
+            try:
+                _o, data = _res.get_account(
+                    _res.derive_curve_pda(mint) or "")
+                c = _res.parse_bonding_curve(data)
+                if c:
+                    d["curve_samples"].append(
+                        {"ts": now, "v_sol": c["v_sol"],
+                         "v_token": c["v_token"]})
+            except Exception:
+                pass
         _write(mint, d)
         rep = None
         if _safety is not None:

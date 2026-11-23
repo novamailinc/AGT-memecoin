@@ -154,6 +154,25 @@ rep = run("mutable fee authority", make_rpc(
 check("low current fee still flags authority-mutable schedule",
       rep["passed"] and not rep["fails"]
       and any("authority-mutable" in f for f in rep["flags"]))
+rep = run("fee math inputs exposed", make_rpc(
+    holders=ONE_HOLDER,
+    extensions=[ext("transferFeeConfig", {
+        "newerTransferFee": {"epoch": 900,
+                             "transferFeeBasisPoints": 500,
+                             "maximumFee": 1000000},
+        "olderTransferFee": {"epoch": 800,
+                             "transferFeeBasisPoints": 100,
+                             "maximumFee": 50}})]))
+_fd = rep["instant"].get("transfer_fee") or {}
+check("fee detail: exact per-amount inputs exposed (raw units)",
+      rep["passed"]
+      and _fd.get("bps") == 500
+      and _fd.get("maximum_fee_raw") == 1000000
+      and _fd.get("cap_binds_above_raw") == 20000000)
+rep = run("no fee extension", make_rpc(holders=ONE_HOLDER,
+                                       extensions=None))
+check("no fee extension: transfer_fee detail is absent",
+      rep["instant"].get("transfer_fee") is None)
 rep = run("unknown future extension", make_rpc(
     holders=ONE_HOLDER,
     extensions=[ext("quantumTransfer", {})]))

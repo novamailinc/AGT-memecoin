@@ -29,7 +29,7 @@ def check(name, cond):
         FAILS.append(name)
 
 
-def fresh(home, enabled=None, providers=None):
+def fresh(home, enabled=None, providers=None, mode=None):
     os.environ["FOREX_AGENT_HOME"] = home
     os.environ["PAPER_ACCOUNT_START"] = "10.0"
     os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED", None)
@@ -41,6 +41,10 @@ def fresh(home, enabled=None, providers=None):
         os.environ.pop("PROVIDER_HEALTH_GATE_PROVIDERS", None)
     else:
         os.environ["PROVIDER_HEALTH_GATE_PROVIDERS"] = providers
+    if mode is None:
+        os.environ.pop("PROVIDER_HEALTH_GATE_MODE", None)
+    else:
+        os.environ["PROVIDER_HEALTH_GATE_MODE"] = mode
     import daemon.launch_scanner.paper_account as pa
     return importlib.reload(pa)
 
@@ -150,6 +154,75 @@ write_health(home, {"alchemy": "ok", "helius": "down"})
 pa = fresh(home, enabled=True, providers="alchemy")
 ok, why, pid = debit(pa)
 check("unlisted provider health does not gate", ok and pid)
+
+# ---------------- all_down mode: fallback-chain semantics ------------
+# The core distinction: a primary outage absorbed by a healthy
+# fallback is NOT missing reliable data.
+home = tempfile.mkdtemp(prefix="phgate-ad-fallback-")
+write_health(home, {"alchemy": "down", "helius": "ok"})
+pa = fresh(home, enabled=True, providers="alchemy, helius",
+           mode="all_down")
+ok, why, pid = debit(pa)
+check("all_down: primary down + healthy fallback allows entry",
+      ok and pid)
+
+home = tempfile.mkdtemp(prefix="phgate-ad-all-")
+write_health(home, {"alchemy": "down", "helius": "down"})
+pa = fresh(home, enabled=True, providers="alchemy, helius",
+           mode="all_down")
+ok, why, pid = debit(pa)
+check("all_down: every provider dark refuses with states",
+      not ok and "no named provider known-ok" in why
+      and "alchemy=down" in why and "helius=down" in why)
+
+home = tempfile.mkdtemp(prefix="phgate-ad-norec-")
+write_health(home, {"alchemy": "ok"})
+pa = fresh(home, enabled=True, providers="alchemy, helius",
+           mode="all_down")
+ok, why, pid = debit(pa)
+check("all_down: known-ok primary covers a no-record fallback",
+      ok and pid)
+
+home = tempfile.mkdtemp(prefix="phgate-ad-none-")
+write_health(home, {"alchemy": "down"})
+pa = fresh(home, enabled=True, providers="alchemy, helius",
+           mode="all_down")
+ok, why, pid = debit(pa)
+check("all_down: down + unknown-record refuses (unknown != ok)",
+      not ok and "helius=no-record" in why)
+
+home = tempfile.mkdtemp(prefix="phgate-ad-stale-")
+write_health(home, {"alchemy": "ok", "helius": "ok"}, age_s=3600)
+pa = fresh(home, enabled=True, providers="alchemy, helius",
+           mode="all_down")
+ok, why, pid = debit(pa)
+check("all_down: stale record still fails closed (freshness kept)",
+      not ok and "stale" in why)
+
+home = tempfile.mkdtemp(prefix="phgate-ad-corrupt-")
+with open(os.path.join(home, "acquisition_provider_health.json"),
+          "w") as fh:
+    fh.write("{not json")
+pa = fresh(home, enabled=True, providers="alchemy", mode="all_down")
+ok, why, pid = debit(pa)
+check("all_down: unreadable record fails closed",
+      not ok and "no durable provider-health record" in why)
+
+home = tempfile.mkdtemp(prefix="phgate-badmode-")
+write_health(home, {"alchemy": "ok"})
+pa = fresh(home, enabled=True, providers="alchemy", mode="weird")
+ok, why, pid = debit(pa)
+check("unknown mode fails closed as incomplete configuration",
+      not ok and "unknown PROVIDER_HEALTH_GATE_MODE" in why)
+
+# Default mode keeps the original any-down semantics: primary down
+# refuses even with a healthy fallback. Documents the distinction.
+home = tempfile.mkdtemp(prefix="phgate-anydown-")
+write_health(home, {"alchemy": "down", "helius": "ok"})
+pa = fresh(home, enabled=True, providers="alchemy, helius")
+ok, why, pid = debit(pa)
+check("default any_down: primary down refuses despite fallback",
+      not ok and "alchemy down" in why)
 
 # ---------------- exits never pass through the gate ------------------
 home = tempfile.mkdtemp(prefix="phgate-exit-")

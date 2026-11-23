@@ -301,6 +301,17 @@ def provider_health_gate_enabled() -> bool:
     return os.environ.get("PROVIDER_HEALTH_GATE_ENABLED") == "1"
 
 
+def provider_health_gate_mode() -> str:
+    """Gate semantics (default "any_down", the original behavior):
+    any named provider not-ok blocks the entry. "all_down"
+    (2026-11-23, section 4.5 faithful to the fallback chain): the
+    entry is refused only when NO named provider is known-ok -
+    a primary outage absorbed by a healthy fallback is not
+    missing reliable data. Unknown mode strings fail closed
+    (treated as incomplete configuration)."""
+    return os.environ.get("PROVIDER_HEALTH_GATE_MODE") or "any_down"
+
+
 def _provider_health_refusal() -> Optional[str]:
     """None when the entry may proceed; the refusal reason otherwise.
     Only consulted when provider_health_gate_enabled()."""
@@ -326,6 +337,24 @@ def _provider_health_refusal() -> Optional[str]:
         return ("gate: durable provider-health record is stale (age "
                 "%ss); entry blocked fail-closed" % view.get("age_s"))
     statuses = view.get("providers") or {}
+    mode = provider_health_gate_mode()
+    if mode == "all_down":
+        # Refuse only when NO named provider is known-ok. A
+        # missing record is not ok: unknown health cannot be the
+        # reliable source the entry relies on.
+        states = {n: statuses.get(n) for n in names}
+        if any(st == "ok" for st in states.values()):
+            return None
+        return ("gate: no named provider known-ok (%s); market "
+                "information not reliable, entry blocked "
+                "fail-closed" % ", ".join(
+                    "%s=%s" % (n, st if st is not None
+                               else "no-record")
+                    for n, st in states.items()))
+    if mode != "any_down":
+        return ("gate: unknown PROVIDER_HEALTH_GATE_MODE %r; entry "
+                "blocked fail-closed (incomplete configuration)"
+                % mode)
     for name in names:
         st = statuses.get(name)
         if st is None:

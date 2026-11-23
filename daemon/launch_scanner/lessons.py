@@ -279,10 +279,11 @@ def settle_decision(lane, mint, entry_ts, pnl_usd, realized_mult,
     (mint, entry_ts) is a no-op returning False. Returns True
     only when a record was settled by this call. Never raises.
 
-    exit_price_kind is additive Stage-C visibility (2026-11-22):
-    the outcome's price provenance is recorded with the settled
-    decision so a lesson built on stale/write-down/unknown-priced
-    outcomes is visibly unqualified. It never gates anything."""
+    exit_price_kind is recorded with the settled decision (Stage-C
+    visibility, 2026-11-22) and gates LEARNING only: generate_lessons
+    excludes non-current-price outcomes from lesson statistics (4.6:
+    never learn from incomplete trade records). It never gates an
+    exit or changes a settlement amount."""
     try:
         mint = str(mint or "")
         if not mint or lane not in LANES:
@@ -504,6 +505,20 @@ def _lesson_text(dimension, band, closes, wins, net_pnl):
         dimension, band, _fmt_money(net_pnl), closes, wins)
 
 
+def _qualified_for_learning(rec):
+    """4.6 hygiene: a settled decision feeds lesson statistics only
+    when its outcome was priced from a current observed quote
+    (exit_provenance.CURRENT). Stale estimates, zero write-downs and
+    unclassified/legacy records are incomplete trade records and are
+    EXCLUDED from learning; their count is reported, never learned
+    from. Anything unreadable or unlabeled fails closed (excluded)."""
+    try:
+        return str(rec.get("exit_price_kind") or "") == \
+            "current_price_simulated_fill"
+    except Exception:
+        return False
+
+
 def _summarize(rows):
     closes = len(rows)
     wins = sum(1 for r in rows
@@ -522,22 +537,33 @@ def generate_lessons(lane, decisions, generated_at=None):
     lesson. Text is templated from the numbers only — no LLM, no
     model prose. Every lesson carries ``resolved_at``: the
     close_ts of the newest settled decision it is based on.
-    Returns a payload dict ready for :func:`write_lessons`.
-    Never raises."""
+    4.6 hygiene: lesson statistics learn ONLY from outcomes priced
+    from a current observed quote (exit_price_kind
+    "current_price_simulated_fill"); stale estimates, write-downs and
+    unclassified records are incomplete trade records and are
+    excluded from the numbers, with their count reported per lesson
+    and per payload. Returns a payload dict ready for
+    :func:`write_lessons`. Never raises."""
     try:
         settled = [r for r in (decisions or [])
                    if isinstance(r, dict)
                    and r.get("status") == "settled"
                    and _num(r.get("close_ts")) is not None]
         gen = generated_at or time.time()
+        qualified = [r for r in settled if _qualified_for_learning(r)]
+        excluded = [r for r in settled if not _qualified_for_learning(r)]
         lessons = []
         dims = ("entry_speed", "deployer", "curve_speed",
                 "curve_trades", "copycat")
         for dim in dims:
             groups = {}
-            for r in settled:
+            for r in qualified:
                 band = _band_of(dim, r.get("features") or {})
                 groups.setdefault(band, []).append(r)
+            xgroups = {}
+            for r in excluded:
+                band = _band_of(dim, r.get("features") or {})
+                xgroups.setdefault(band, []).append(r)
             for band in sorted(groups):
                 rows = groups[band]
                 closes, wins, net, resolved = _summarize(rows)
@@ -550,10 +576,11 @@ def generate_lessons(lane, decisions, generated_at=None):
                     "net_pnl_usd": net,
                     "win_rate": round(
                         wins / closes, 4) if closes else 0.0,
+                    "excluded_unqualified": len(xgroups.get(band, [])),
                     "resolved_at": resolved,
                     "generated_at": gen,
                 })
-        closes, wins, net, resolved = _summarize(settled)
+        closes, wins, net, resolved = _summarize(qualified)
         if closes:
             lessons.append({
                 "id": "%s:overall:all" % lane,
@@ -562,6 +589,7 @@ def generate_lessons(lane, decisions, generated_at=None):
                                      net),
                 "closes": closes, "wins": wins, "net_pnl_usd": net,
                 "win_rate": round(wins / closes, 4) if closes else 0.0,
+                "excluded_unqualified": len(excluded),
                 "resolved_at": resolved, "generated_at": gen,
             })
         # Stage-C visibility (owner-approved 2026-11-22): the
@@ -585,7 +613,10 @@ def generate_lessons(lane, decisions, generated_at=None):
         return {
             "lane": lane, "generated_at": gen,
             "resolved_at": resolved if closes else None,
-            "n_settled": closes,
+            "n_settled": len(settled),
+            "n_qualified": len(qualified),
+            "n_excluded_unqualified": len(excluded),
+            "learning_price_kind": "current_price_simulated_fill",
             "lessons": lessons,
             "visibility": _vis,
         }

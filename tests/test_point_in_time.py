@@ -196,7 +196,8 @@ def _dec(mint, entry_ts, close_ts, pnl):
                          "liquidity": 5000.0},
             "lessons_in_context": [], "pnl_usd": pnl,
             "realized_mult": 1.0 + pnl / 25.0,
-            "close_reason": "time_stop_24h", "close_ts": close_ts}
+            "close_reason": "time_stop_24h", "close_ts": close_ts,
+            "exit_price_kind": "current_price_simulated_fill"}
 
 
 _gen_at = 1795000000.0
@@ -214,6 +215,16 @@ check("lessons: every generated lesson carries resolved_at",
       len(_payload["lessons"]) > 0
       and all(les.get("resolved_at") is not None
               for les in _payload["lessons"]))
+_mixed = L.generate_lessons(
+    "grad_select",
+    [_dec("Q", 1000.0, 2000.0, 10.0),
+     {**_dec("S", 1100.0, 5000.0, -5.0),
+      "exit_price_kind": "stale_price_estimate"}],
+    generated_at=_gen_at)
+check("lessons: resolved_at tracks newest QUALIFIED close only",
+      _mixed["resolved_at"] == 2000.0
+      and _mixed["n_qualified"] == 1
+      and _mixed["n_excluded_unqualified"] == 1)
 check("lessons: no lesson claims a resolution after the newest close",
       all(les["resolved_at"] <= 3000.0 for les in _payload["lessons"]))
 check("lessons: overall lesson resolved_at == newest settled close_ts",

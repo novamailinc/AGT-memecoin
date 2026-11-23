@@ -862,14 +862,17 @@ def test_sweep_refreshes_registry_on_cadence():
             dossiers.REGISTRY_REFRESH_S = real_s
 
 
-def test_build_path_replay_drives_memory_consumption():
-    """Runtime-wiring proof with recorded responses injected at
-    the provider seams (the instant_safety fake-RPC pattern):
-    observe_births -> background _build -> dossier carries the
-    recorded safety precompute -> TTL eviction archives ->
-    registry joins dead_mints through the archive -> the NEXT
-    birth by the same deployer consumes the durable record AT
-    BUILD TIME through the same real code path."""
+def test_constructed_fixture_intake_drives_memory_consumption():
+    """Intake-wiring proof with CONSTRUCTED fixtures (not captured
+    provider responses): the safety seam is replaced wholesale by
+    a constant verdict, reserves are skipped entirely (_res =
+    None), and the birth items and dead-mint ledger are built by
+    hand. What is REAL: observe_births -> background _build ->
+    dossier carries the injected safety precompute -> TTL
+    eviction archives -> registry joins dead_mints through the
+    archive -> the NEXT birth by the same deployer consumes the
+    durable record AT BUILD TIME through the same code path.
+    This closes INTAKE WIRING only; it is not provider replay."""
     from daemon.launch_scanner import rugger_registry as rr
 
     class _FakeSafety:
@@ -996,9 +999,122 @@ def test_registry_refresh_stamps_only_after_success():
             dossiers._last_registry_refresh = real_last
 
 
+def test_fixture_failure_paths_not_hidden():
+    """Failure-hiding gaps: provider-SHAPED (still constructed)
+    safety verdicts incl. unknown, reserve acquisition success
+    AND failure, duplicate births."""
+    from daemon.launch_scanner import rugger_registry as rr
+
+    class _ShapedSafety:
+        @staticmethod
+        def check_token(chain, mint, timeout=10):
+            if mint == "MINT-F2":
+                return {"unknown": True, "score": 0,
+                        "source": "rugcheck"}
+            return {"unknown": False, "passed": False,
+                    "score": 20, "source": "rugcheck",
+                    "risks": [{"name": "fake"}]}
+
+    class _ReservesOk:
+        @staticmethod
+        def derive_curve_pda(mint):
+            return "CURVE-PDA"
+
+        @staticmethod
+        def get_account(addr):
+            return ("owner", b"curve-bytes")
+
+        @staticmethod
+        def parse_bonding_curve(data):
+            return {"v_sol": 30.0, "v_token": 1000.0}
+
+    class _ReservesDown:
+        @staticmethod
+        def derive_curve_pda(mint):
+            return "CURVE-PDA"
+
+        @staticmethod
+        def get_account(addr):
+            raise RuntimeError("rpc down")
+
+        @staticmethod
+        def parse_bonding_curve(data):
+            return None
+
+    def _birth(m, dep="DEP-F", born=None):
+        return {"source": "pumpportal-new", "mint": m,
+                "symbol": m[-2:], "created_ts": born or time.time(),
+                "extra": {"trader": dep, "initial_buy_sol": 1.0,
+                          "market_cap_sol": 30.0,
+                          "bonding_curve": "BC"}}
+
+    def _wait_dossier(m):
+        for _ in range(200):
+            d = dossiers.read_dossier(m)
+            if d:
+                return d
+            time.sleep(0.05)
+        return None
+
+    with _Ctx() as c:
+        real_safety = dossiers._safety
+        real_res = dossiers._res
+        try:
+            dossiers._safety = _ShapedSafety
+            # 1. Reserve acquisition succeeds: curve sample lands.
+            dossiers._res = _ReservesOk
+            dossiers.observe_births([_birth("MINT-F1")])
+            d1 = _wait_dossier("MINT-F1")
+            check("fixture: reserve sample recorded on success",
+                  bool((d1 or {}).get("curve_samples")))
+            # 2. Reserve acquisition FAILS: build still completes,
+            # no fabricated samples.
+            dossiers._res = _ReservesDown
+            dossiers.observe_births([_birth("MINT-F2")])
+            d2 = _wait_dossier("MINT-F2")
+            check("fixture: reserve failure does not break build",
+                  d2 is not None
+                  and d2.get("curve_samples") == [])
+            check("fixture: unknown safety stays unknown",
+                  ((d2 or {}).get("safety") or {})
+                  .get("report", {}).get("unknown") is True)
+            # 3. Duplicate birth: not re-queued.
+            q = dossiers.observe_births([_birth("MINT-F1")])
+            check("fixture: duplicate birth not re-queued", q == 0)
+            # 4. Malformed item: no mint, skipped, never raises.
+            q = dossiers.observe_births(
+                [{"source": "pumpportal-new", "extra": {}}, None])
+            check("fixture: malformed items skipped", q == 0)
+            # 5. Eviction archives conclusive AND unknown verdicts
+            # with the recorded reserve-sample counts.
+            past = time.time() - 90000
+            for m, d in (("MINT-F1", d1), ("MINT-F2", d2)):
+                d["born_ts"] = past
+                with open(os.path.join(dossiers.DOSSIER_DIR,
+                                       m + ".json"), "w") as f:
+                    json.dump(d, f)
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(time.time())
+            arch = {r["mint"]: r for r in dossiers.launch_archive(
+                limit=100)
+                if r.get("record_type", "launch") == "launch"
+                and str(r.get("mint") or "").startswith("MINT-F")}
+            check("fixture: archive keeps sample count + verdicts",
+                  (arch.get("MINT-F1") or {}).get("reserve_samples")
+                  == 1
+                  and (arch.get("MINT-F1") or {}).get(
+                      "safety_verdict") == "conclusive"
+                  and (arch.get("MINT-F2") or {}).get(
+                      "safety_verdict") == "unknown")
+        finally:
+            dossiers._safety = real_safety
+            dossiers._res = real_res
+
+
 def main():
+    test_fixture_failure_paths_not_hidden()
     test_registry_refresh_stamps_only_after_success()
-    test_build_path_replay_drives_memory_consumption()
+    test_constructed_fixture_intake_drives_memory_consumption()
     test_sweep_refreshes_registry_on_cadence()
     test_end_to_end_memory_consumed_after_restart()
     test_exit_price_kind_labels()

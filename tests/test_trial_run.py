@@ -13,9 +13,11 @@ Plain script - run directly (scripts/run_script_tests.py).
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -164,17 +166,55 @@ with tempfile.TemporaryDirectory() as td:
             pass
     check("wall: child and grandchild processes are dead", dead)
 
-# 7. One-shot: a second run against the same state dir refuses.
+# 7. One-shot: a rerun against the same state dir idles WITHOUT
+#    network or exit (an auto-restarting supervisor spins harmlessly)
+#    and records the refusal in trial_outcome.
 with tempfile.TemporaryDirectory() as td:
     env = dict(os.environ)
     env["FOREX_AGENT_HOME"] = td
     a = [sys.executable, TRIAL, "--seconds", "5", "--",
          sys.executable, "-c", "print('ok')"]
     subprocess.run(a, env=env, capture_output=True, text=True, timeout=60)
-    p2 = subprocess.run(a, env=env, capture_output=True, text=True,
-                        timeout=60)
-    check("one-shot: rerun against same state dir refuses",
-          p2.returncode == 3 and "already consumed" in p2.stderr)
+    p2 = subprocess.Popen(a, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    time.sleep(3)
+    alive = p2.poll() is None  # idling, not exited
+    p2.kill()
+    p2.wait()
+    with open(os.path.join(td, "trial_outcome")) as f:
+        outcome_log = f.read()
+    check("one-shot: rerun idles without exit and logs refusal",
+          alive and "already-consumed" in outcome_log)
+
+# 9. WS-style handshake 429 (raw socket status line) trips the trial.
+try:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    ws_port = srv.getsockname()[1]
+
+    def _serve_429():
+        conn, _ = srv.accept()
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
+        conn.close()
+
+    threading.Thread(target=_serve_429, daemon=True).start()
+    rc, out, so, se, _ = run_trial(
+        ["--seconds", "30", "--max-requests", "100", "--",
+         sys.executable, "-c",
+         "import socket, time\n"
+         "s = socket.create_connection(('127.0.0.1', %d), timeout=5)\n"
+         "s.sendall(b'GET / HTTP/1.1\\r\\n\\r\\n')\n"
+         "s.recv(4096)\n"
+         "time.sleep(60)" % ws_port])
+    check("ws handshake 429: outcome reports the trip", "trip" in out)
+finally:
+    try:
+        srv.close()
+    except Exception:
+        pass
 
 # 8. Redirects count per connect: a 302 chain produces two counted
 #    connections, so redirect loops cannot bypass the ceiling.

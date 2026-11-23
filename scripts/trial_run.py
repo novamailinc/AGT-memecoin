@@ -119,8 +119,10 @@ def urlopen_trial(url, *a, **kw):
 urllib.request.urlopen = urlopen_trial
 
 # Socket-level counting covers urllib, websocket-client, and any other
-# Python TCP client: every outbound connect counts once. Redirects and
-# retries reconnect, so they count too. Fail closed on any shim error.
+# Python TCP client: every outbound connect counts once. urllib opens
+# a fresh connection per request (no keep-alive reuse), so connects ==
+# requests on these paths; redirects and retries reconnect and count.
+# Fail closed on any shim error.
 import socket as _socket
 
 _real_connect = _socket.socket.connect
@@ -135,6 +137,24 @@ def _connect_trial(self, address):
 
 
 _socket.socket.connect = _connect_trial
+
+# 429 detection for raw-socket HTTP handshakes (the logstream WSClient
+# reads its own status line, bypassing urllib). The handshake response
+# is the first bytes on a fresh connection and starts with "HTTP/";
+# upgraded WS frames never do, so this cannot trip on stream data.
+_real_recv = _socket.socket.recv
+
+
+def _recv_trial(self, bufsize, flags=0):
+    data = _real_recv(self, bufsize, flags)
+    if data[:5] == b"HTTP/":
+        line = data.split(b"\r\n", 1)[0]
+        if b" 429" in line:
+            open(_TRIP, "a").close()
+    return data
+
+
+_socket.socket.recv = _recv_trial
 '''
 
 
@@ -161,10 +181,20 @@ def main(argv):
     trip_file = os.path.join(home, "trial_trip")
     consumed = os.path.join(home, "trial_consumed")
     if os.path.exists(consumed):
-        print("trial_run: refusing - trial already consumed for %s "
-              "(wipe the state dir for an explicitly new trial)" % home,
-              file=sys.stderr)
-        return 3
+        # One-shot: a trial already ran against this state dir. Idle
+        # WITHOUT network or exit so an auto-restarting supervisor
+        # spins harmlessly instead of re-running the trial. An
+        # explicitly new trial needs a fresh state dir.
+        msg = ("trial_run: outcome=already-consumed idling (no network); "
+               "wipe %s for an explicitly new trial" % home)
+        print(msg, file=sys.stderr)
+        try:
+            with open(os.path.join(home, "trial_outcome"), "a") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+        while True:
+            time.sleep(3600)
     with open(consumed, "w") as f:
         f.write(str(time.time()))
     for p in (count_file, trip_file, count_file + ".lock"):
@@ -222,8 +252,14 @@ def main(argv):
             total = f.read().strip()
     except FileNotFoundError:
         total = "0"
-    print("trial_run: outcome=%s wall=%ds requests=%s/%s child_rc=%s"
-          % (outcome, seconds, total, max_req, child.returncode))
+    line = ("trial_run: outcome=%s wall=%ds requests=%s/%s child_rc=%s"
+            % (outcome, seconds, total, max_req, child.returncode))
+    print(line)
+    try:
+        with open(os.path.join(home, "trial_outcome"), "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
     return 0
 
 

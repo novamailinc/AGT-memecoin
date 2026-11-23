@@ -271,3 +271,10 @@ time rather than making an old launch fresh. Existing ignition-window pruning
 and signal processing remain downstream, unchanged and not made crash-atomic by
 this handoff. Spark is not activated by these changes or fixtures. Existing
 load_seen, daily-cap and final signal bookkeeping remain separate audit work.
+
+Spark's actual main now holds the same reentrant whole-lifecycle thread/flock
+across load, collect/accept, process, prune and final watchlist save, preventing a
+concurrent accepted mint from being overwritten by a stale final snapshot. Lock
+spans network work and competing runs wait. Threaded actual-main and separate-
+process stale-save probes preserve later acceptance. Expiration, independent
+signal/seen/cap stores and stop-without-join remain distinct limits.

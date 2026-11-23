@@ -150,12 +150,37 @@ def save_watchlist(wl):
         if os.path.exists(name):os.unlink(name)
 
 
+import contextlib
+import threading
+_WATCHLIST_MUTEX=threading.RLock()
+_WATCHLIST_DEPTH=threading.local()
+
+
+@contextlib.contextmanager
+def watchlist_cycle_lock():
+    """Serialize the entire read/process/prune/write lifecycle.
+
+    Reentrant for collect's acceptance inside main. Lock spans network work;
+    a second Spark process waits rather than overwriting accepted state.
+    """
+    import fcntl
+    with _WATCHLIST_MUTEX:
+        if getattr(_WATCHLIST_DEPTH,'active',False):
+            yield
+            return
+        os.makedirs(os.path.dirname(WATCHLIST_FILE),exist_ok=True)
+        with open(WATCHLIST_FILE+'.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            _WATCHLIST_DEPTH.active=True
+            try:yield
+            finally:
+                _WATCHLIST_DEPTH.active=False
+                fcntl.flock(lock,fcntl.LOCK_UN)
+
+
 def accept_push_watchlist(ls,items):
     """Only this consumer's durable watchlist acceptance authorizes its ACK."""
-    import fcntl
-    os.makedirs(os.path.dirname(WATCHLIST_FILE),exist_ok=True)
-    with open(WATCHLIST_FILE+'.lock','a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
+    with watchlist_cycle_lock():
         watchlist=load_watchlist()
         for item in items:
             watchlist.setdefault(item['mint'],{'ts':item['ts'],'sig':item['signature']})
@@ -309,6 +334,11 @@ def build_watchlist_token(mint, age_sec):
 
 
 def main():
+    with watchlist_cycle_lock():
+        return _main_locked()
+
+
+def _main_locked():
     if not _HAS_SPARK:
         log.warning("spark module not available, skipping")
         return

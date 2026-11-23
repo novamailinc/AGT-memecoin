@@ -58,3 +58,51 @@ class TestSparkStreamContract(unittest.TestCase):
         scanner._intake.receive('sig');scanner._intake.resolve('sig','M')
         spark.accept_push_watchlist(self.ls,self.ls.drain())
         self.assertEqual(len(scanner.drain()),1)
+
+    def test_actual_main_holds_lifecycle_lock_through_process_prune_save(self):
+        import threading
+        entered=threading.Event();release=threading.Event();accepted=threading.Event()
+        self.ls._intake.resolve('sig','M')
+        def blocked_pools():
+            entered.set();self.assertTrue(release.wait(10));return []
+        def run_cycle():spark.main()
+        def accept_other():
+            self.ls._intake.receive('other');self.ls._intake.resolve('other','NEW')
+            spark.accept_push_watchlist(self.ls,[i for i in self.ls.drain() if i['signature']=='other'])
+            accepted.set()
+        with patch.object(spark,'_HAS_SPARK',True),patch.object(spark.killswitch,'gate',return_value=True),patch.object(spark,'collect_push_mints',return_value=[]),patch.object(spark,'get_new_pools',side_effect=blocked_pools),patch.object(spark,'load_seen',return_value=set()),patch.object(spark,'save_seen'):
+            cycle=threading.Thread(target=run_cycle);cycle.start()
+            self.assertTrue(entered.wait(10))
+            writer=threading.Thread(target=accept_other);writer.start()
+            self.assertFalse(accepted.wait(.1))
+            release.set();cycle.join(10);writer.join(10)
+            self.assertFalse(cycle.is_alive());self.assertFalse(writer.is_alive())
+        self.assertTrue(accepted.is_set())
+        self.assertIn('NEW',spark.load_watchlist())
+
+    def test_process_cycle_lock_blocks_accept_until_stale_save_finishes(self):
+        from threading import Timer
+        marker=self.home/'holding';release=self.home/'release'
+        code="""
+import importlib.machinery,importlib.util,os,time
+from pathlib import Path
+l=importlib.machinery.SourceFileLoader('spark_process',str(Path.cwd()/'scripts/spark-feed'));sp=importlib.util.spec_from_loader(l.name,l);s=importlib.util.module_from_spec(sp);l.exec_module(s)
+s.WATCHLIST_FILE=str(Path(os.environ['STREAM_HOME'])/'spark_watchlist.json')
+with s.watchlist_cycle_lock():
+    old=s.load_watchlist();Path(os.environ['STREAM_MARKER']).touch()
+    deadline=time.time()+10
+    while not Path(os.environ['STREAM_RELEASE']).exists():
+        assert time.time()<deadline
+        time.sleep(.01)
+    s.save_watchlist(old)
+"""
+        child=subprocess.Popen([sys.executable,'-c',code],cwd=ROOT,env=dict(os.environ,STREAM_HOME=self.tmp.name,STREAM_MARKER=str(marker),STREAM_RELEASE=str(release)),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        import time
+        deadline=time.time()+10
+        while not marker.exists():
+            self.assertLess(time.time(),deadline);time.sleep(.01)
+        timer=Timer(.2,release.touch);timer.start()
+        try:spark.accept_push_watchlist(self.ls,self.ls.drain())
+        finally:timer.join();out,err=child.communicate(timeout=15)
+        self.assertEqual(child.returncode,0,out+err)
+        self.assertIn('M',spark.load_watchlist())

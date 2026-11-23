@@ -124,18 +124,43 @@ def save_seen(s):
 
 
 def load_watchlist():
-    """Mints detected via push stream, waiting to enter ignition window."""
+    """Existing corrupt/unavailable state must never become a fresh baseline."""
     try:
-        return json.load(open(WATCHLIST_FILE))
-    except Exception:
-        return {}
+        with open(WATCHLIST_FILE) as source:data=json.load(source)
+    except FileNotFoundError:return {}
+    if not isinstance(data,dict) or any(not isinstance(m,str) or not isinstance(r,dict) for m,r in data.items()):
+        raise ValueError('spark watchlist unavailable')
+    return data
 
 
 def save_watchlist(wl):
+    import tempfile
+    directory=os.path.dirname(WATCHLIST_FILE)
+    os.makedirs(directory,exist_ok=True)
+    fd,name=tempfile.mkstemp(dir=directory,prefix='.spark-watchlist-')
     try:
-        json.dump(wl, open(WATCHLIST_FILE, "w"))
-    except Exception:
-        pass
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w') as out:
+            json.dump(wl,out,allow_nan=False);out.flush();os.fsync(out.fileno())
+        os.replace(name,WATCHLIST_FILE)
+        dfd=os.open(directory,os.O_RDONLY)
+        try:os.fsync(dfd)
+        finally:os.close(dfd)
+    finally:
+        if os.path.exists(name):os.unlink(name)
+
+
+def accept_push_watchlist(ls,items):
+    """Only this consumer's durable watchlist acceptance authorizes its ACK."""
+    import fcntl
+    os.makedirs(os.path.dirname(WATCHLIST_FILE),exist_ok=True)
+    with open(WATCHLIST_FILE+'.lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        watchlist=load_watchlist()
+        for item in items:
+            watchlist.setdefault(item['mint'],{'ts':item['ts'],'sig':item['signature']})
+        save_watchlist(watchlist)
+        ls.acknowledge([item['signature'] for item in items])
 
 
 def collect_push_mints():
@@ -146,6 +171,7 @@ def collect_push_mints():
     """
     if not _HAS_LOGSTREAM:
         return []
+    ls=None
     try:
         # Authenticated Helius RPCs win when the key files exist — the
         # public endpoints 403 getTransaction (jsonParsed), which silently
@@ -157,17 +183,21 @@ def collect_push_mints():
         for hurl in reversed(_helius_rpc_urls()):
             if hurl not in urls:
                 urls.insert(0, hurl)
-        ls = LogStream(http_rpcs=urls)
+        ls = LogStream(http_rpcs=urls,intake_home=HOME,
+                       intake_filename='spark_logstream_intake.json')
         ls.start()
         time.sleep(LISTEN_SEC)
         mints = ls.drain()
         ls.stop()
+        accept_push_watchlist(ls,mints)
         log.info(f"push stream: {len(mints)} new mints in {LISTEN_SEC}s "
                  f"(healthy={ls.healthy})")
         return mints
     except Exception as e:
         log.warning(f"push stream FAIL: {e}")
         return []
+    finally:
+        if ls is not None:ls.stop()
 
 
 def get_new_pools():

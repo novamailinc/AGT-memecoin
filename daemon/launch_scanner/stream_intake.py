@@ -14,8 +14,8 @@ import time
 
 
 class StreamIntake:
-    def __init__(self,home):
-        self.path=Path(home)/'launch_scanner'/'logstream_intake.json'
+    def __init__(self,home,filename='logstream_intake.json'):
+        self.path=Path(home)/'launch_scanner'/filename
 
     @contextlib.contextmanager
     def _locked(self):

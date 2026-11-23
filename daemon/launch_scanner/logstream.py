@@ -351,7 +351,7 @@ class LogStream:
     def __init__(self, ws_url: str = WS_URL, http_rpc: Optional[str] = None,
                  programs: Tuple[str, ...] = (PUMP_PROGRAM,),
                  http_rpcs: Optional[List[str]] = None,
-                 intake_home=None):
+                 intake_home=None,intake_filename='logstream_intake.json'):
         self._ws_url = ws_url
         if http_rpcs:
             urls = [u for u in http_rpcs if u]
@@ -371,8 +371,11 @@ class LogStream:
         self._lock = threading.Lock()
         self._healthy = False
         from pathlib import Path
-        from .stream_intake import StreamIntake
-        self._intake=StreamIntake(intake_home or os.environ.get('FOREX_AGENT_HOME',Path.home()/'.forex-agent'))
+        try:
+            from .stream_intake import StreamIntake
+        except ImportError:
+            from stream_intake import StreamIntake
+        self._intake=StreamIntake(intake_home or os.environ.get('FOREX_AGENT_HOME',Path.home()/'.forex-agent'),filename=intake_filename)
         self._last_retry_ts=0.0
         # RPC politeness / failure accounting (worker thread only).
         self._last_rpc_ts = 0.0

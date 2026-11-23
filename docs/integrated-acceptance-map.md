@@ -256,3 +256,18 @@ instruction ownership proof, whole-bot crash safety or source completeness is
 claimed. Valid successful no-mint and definitive failed fetched details currently
 remain pending too, so diagnostic backlog can grow. Websocket receipt still has a
 small receive-to-stage crash gap; messages not durably received are not recovered.
+
+
+## LogStream consumer compatibility and Spark watchlist handoff
+
+Constructor/caller search finds scanner and scripts/spark-feed instantiate
+LogStream. smart-watcher uses WSClient helpers; armed_watch and PumpPortal also use
+WSClient, not LogStream.drain. Package and top-level module import paths are tested.
+Spark uses a separate spark_logstream_intake journal: scanner ACK cannot consume
+Spark work. Actual Spark collector atomically fsyncs its watchlist before ACK,
+preserving full signature and original receipt time. Watchlist save/corruption
+failure leaves delivery pending; replay after ACK failure preserves the first
+time rather than making an old launch fresh. Existing ignition-window pruning
+and signal processing remain downstream, unchanged and not made crash-atomic by
+this handoff. Spark is not activated by these changes or fixtures. Existing
+load_seen, daily-cap and final signal bookkeeping remain separate audit work.

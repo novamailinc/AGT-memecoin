@@ -350,7 +350,7 @@ ref14 = [e for e in (pos14.get("quote_journal") or [])
          if e.get("src") == "reserves_refused"]
 check("reserves refusal journalled with its reason",
       len(ref14) == 1 and "implausible" in (ref14[0].get("detail") or "")
-      and ref14[0].get("px") == 0)
+      and ref14[0].get("px") is None)
 check("one dark cycle is NOT an F2 close (position still open)",
       F14 in W._read()["positions"])
 with W._ledger_lock():

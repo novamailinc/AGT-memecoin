@@ -1265,7 +1265,7 @@ def _poll_exits(price_fn):
                     _ref = refusals.get(mint)
                     if _ref:
                         _jq = pos.setdefault("quote_journal", [])
-                        _jq.append({"ts": now, "px": 0,
+                        _jq.append({"ts": now, "px": None,
                                     "src": "reserves_refused",
                                     "detail": _ref})
                         del _jq[:-40]

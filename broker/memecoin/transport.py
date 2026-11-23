@@ -162,6 +162,7 @@ class MemecoinMarketData:
             "source": "dexscreener:token-top-solana-pair",
             "price_usd": price_usd,
             "price_sol": price_sol,
+            "price_sol_quote_mint": (pair.get("quoteToken") or {}).get("address"),
             "pair": pair.get("pairAddress"),
             "ts": datetime.now(timezone.utc),
         }

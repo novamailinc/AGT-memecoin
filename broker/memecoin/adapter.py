@@ -326,6 +326,8 @@ class MemecoinAdapter(BrokerAdapter):
                     fill["tokens"], fill["volume_sol"], fx,
                     "native-entry:" + self._shared_book_id + ":" + identity)
             else:
+                fill["price_evidence"] = (getattr(self,"_shared_last_exit_price",None)
+                    if fill.get("price_sol") else {"kind":"explicit_zero","reason":fill.get("close_reason")})
                 intent["shared_exits"] = []
                 for index, allocation in enumerate(fill["allocations"]):
                     pos = intent["before"]["positions"][str(allocation["ticket"])]
@@ -689,13 +691,32 @@ class MemecoinAdapter(BrokerAdapter):
 
     def _shared_price_sol(self, symbol):
         self._verify_position_mints(symbol)
-        fx = self._observe_entry_fx()
         quote = self._market.get_quote(symbol)
-        usd = quote.get("price_usd") if isinstance(quote,dict) else None
+        if not isinstance(quote,dict):
+            raise BrokerError(BROKER_UNAVAILABLE,"shared native token price unavailable")
+        native = quote.get("price_sol")
+        observed = quote.get("ts")
+        if isinstance(observed,datetime):
+            observed=observed.timestamp()
+        if (quote.get("mint")==self._market.mint_for(symbol)
+                and quote.get("price_sol_quote_mint")==SOL_MINT
+                and isinstance(native,(int,float)) and not isinstance(native,bool)
+                and math.isfinite(native) and native>0
+                and isinstance(observed,(int,float)) and not isinstance(observed,bool)
+                and 0<=time.time()-observed<=_SOL_PRICE_TTL
+                and isinstance(quote.get("source"),str) and quote["source"]):
+            self._shared_last_exit_price = {"kind":"native_SOL_pair", "price_sol":native,
+                "mint":quote["mint"],"source":quote["source"],"observed_at":observed}
+            return float(native)
+        fx = self._observe_entry_fx()
+        usd = quote.get("price_usd")
         if (isinstance(usd,bool) or not isinstance(usd,(int,float))
                 or not math.isfinite(usd) or usd <= 0):
             raise BrokerError(BROKER_UNAVAILABLE,"shared native token price unavailable")
-        return usd/fx["usd_per_sol"]
+        price=usd/fx["usd_per_sol"]
+        self._shared_last_exit_price={"kind":"USD_ratio", "price_sol":price,
+                                     "mint":self._market.mint_for(symbol),"fx":fx}
+        return price
 
     def _price_sol(self, symbol: str) -> float:
         """Token price in SOL, via USD legs. Raises BROKER_UNAVAILABLE

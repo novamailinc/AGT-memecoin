@@ -153,3 +153,20 @@ class TestNativeSharedRisk:
         assert pa.snapshot()['pending_sol'][0]['proceeds_sol']==pytest.approx(.02)
         a.settle_pending_usd({'usd_per_sol':200.,'observed_at':time.time(),'source':'fixture'})
         assert pa.snapshot()['cash']==10.
+
+    def test_native_pair_exit_survives_missing_usd_fx_without_fabricated_release(self, account, tmp_path):
+        from broker.memecoin.adapter import SOL_MINT
+        a=_adapter(str(tmp_path),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+             fx_observer=lambda:{'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'})
+        a.connect({});a.submit_order(_req('BONK','BUY',.02,'a'))
+        mint=a._market.mint_for('BONK')
+        a._market.get_quote=lambda symbol:{'mint':mint,'price_sol':.000001,
+             'price_sol_quote_mint':SOL_MINT,'ts':time.time(),'source':'fixture:native-pair'}
+        a._fx_observer=lambda: (_ for _ in ()).throw(BrokerError('BROKER_UNAVAILABLE','FX missing'))
+        assert a.close_position(1)==.000001
+        snapshot=pa.snapshot()
+        assert not a._positions and snapshot['cash']==8.
+        assert snapshot['pending_sol'][0]['proceeds_sol']==pytest.approx(.02)
+        assert snapshot['pending_sol_basis']==2.
+        with pytest.raises(BrokerError):
+            a.account_info()

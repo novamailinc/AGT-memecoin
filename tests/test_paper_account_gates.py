@@ -73,7 +73,8 @@ ok, why, _ = pa.try_debit("grad", "A", 5.0, 5.0, "g-off-1")
 check("gates OFF by default: entry without marks succeeds", ok)
 
 # ---- empty account: equity is exactly cash, no marks needed ---------
-H = tempfile.mkdtemp(prefix="gates-empty-")
+H_EMPTY = tempfile.mkdtemp(prefix="gates-empty-")
+H = H_EMPTY
 pa = fresh(H, max_daily=None, max_dd=None, max_exp=None)
 ok, why, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-e0")
 check("gates ON, NO limits configured anywhere: entry refused "
@@ -85,6 +86,7 @@ check("gates ON with limits, empty account: first entry allowed "
       "without marks", ok)
 
 # ---- owner_config limits (no env): the owner-approved path -----------
+_saved_home = os.environ.get("FOREX_AGENT_HOME")
 H = tempfile.mkdtemp(prefix="gates-ownercfg-")
 os.environ["FOREX_AGENT_HOME"] = H
 import json as _json, os as _os
@@ -104,8 +106,62 @@ m = {"grad": {"A": mark(4.0, 5.0, pos_id=pid_oc)}}  # equity 9, loss 1
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-oc2", marks=m)
 check("owner_config tightened daily-loss limit: refused",
       not ok and "daily loss" in why)
+os.environ["FOREX_AGENT_HOME"] = _saved_home
+
+# ---- precedence: env may tighten, never loosen, owner limits ---------
+_saved_home = os.environ.get("FOREX_AGENT_HOME")
+H = tempfile.mkdtemp(prefix="gates-prec-")
+os.environ["FOREX_AGENT_HOME"] = H
+with open(os.path.join(H, "owner_config.json"), "w") as _fh:
+    _json.dump({"max_daily_loss_usd": 0.50, "max_drawdown_pct": 50.0,
+                "max_exposure_pct": 60.0}, _fh)
+# Env LOOSER than owner (5.0 > 0.5): owner wins, the $1 loss refuses.
+pa = fresh(H, max_daily=5.00, max_dd=None, max_exp=None)
+_, _, pid_p = pa.try_debit("grad", "A", 2.0, 2.0, "g-p1")
+m = {"grad": {"A": mark(1.0, 2.0, pos_id=pid_p)}}  # daily loss 1.00
+ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-p2", marks=m)
+check("env looser than owner: owner limit wins (refused)",
+      not ok and "daily loss" in why)
+# Env TIGHTER than owner (0.25 < 0.5): env wins, refused again.
+pa = fresh(H, max_daily=0.25, max_dd=None, max_exp=None)
+ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-p3", marks=m)
+check("env tighter than owner: env limit wins (refused)",
+      not ok and "daily loss" in why)
+# Owner limit raised above the loss: env-tighter still applies.
+with open(os.path.join(H, "owner_config.json"), "w") as _fh:
+    _json.dump({"max_daily_loss_usd": 5.0, "max_drawdown_pct": 50.0,
+                "max_exposure_pct": 60.0}, _fh)
+pa = fresh(H, max_daily=0.25, max_dd=None, max_exp=None)
+ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-p4", marks=m)
+check("env tighter than a raised owner limit: still refused",
+      not ok and "daily loss" in why)
+pa = fresh(H, max_daily=5.00, max_dd=None, max_exp=None)
+ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-p5", marks=m)
+check("env and owner both above the loss: allowed", ok)
+os.environ["FOREX_AGENT_HOME"] = _saved_home
+
+# ---- invalid owner_config value: dropped, gate fails closed ----------
+_saved_home = os.environ.get("FOREX_AGENT_HOME")
+H = tempfile.mkdtemp(prefix="gates-badcfg-")
+os.environ["FOREX_AGENT_HOME"] = H
+with open(os.path.join(H, "owner_config.json"), "w") as _fh:
+    _json.dump({"max_daily_loss_usd": "not-a-number",
+                "max_drawdown_pct": 50.0, "max_exposure_pct": 60.0}, _fh)
+pa = fresh(H, max_daily=None, max_dd=None, max_exp=None)
+ok, why, _ = pa.try_debit("grad", "A", 1.0, 1.0, "g-b1")
+check("invalid owner limit value: entry refused fail-closed",
+      not ok and "no owner-approved limit" in why)
+os.environ["FOREX_AGENT_HOME"] = _saved_home
+# Restore the env threshold vars the owner-config blocks popped; the
+# blocks below run against env-configured limits again.
+os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "100"
+os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "100"
+os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "100"
 
 # ---- open position: marks become mandatory ---------------------------
+# Re-bind the module to the gates-empty home: the owner-config blocks
+# above reloaded it against other homes.
+pa = fresh(H_EMPTY)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-e2")
 check("open position + no marks: entry refused (fail-closed)",
       not ok and "marks not trustworthy" in why)

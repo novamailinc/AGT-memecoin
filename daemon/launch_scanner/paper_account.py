@@ -197,19 +197,32 @@ def _owner_threshold(owner_key: str) -> Optional[float]:
         return None
 
 
+def _resolve_threshold(env_name: str, owner_key: str) -> Optional[float]:
+    """Effective gate limit. TIGHTEN-ONLY: an env override (runtime/
+    fixture config, NOT authenticated owner approval) may tighten the
+    owner-approved limit but never loosen it; with both present the
+    LOWER value wins. With only one, that one applies. With neither,
+    None - the gate fails closed."""
+    env_v = _env_f(env_name, None)
+    owner_v = _owner_threshold(owner_key)
+    if env_v is not None and owner_v is not None:
+        return min(env_v, owner_v)
+    return env_v if env_v is not None else owner_v
+
+
 def max_daily_loss_usd() -> Optional[float]:
-    v = _env_f("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", None)
-    return v if v is not None else _owner_threshold("max_daily_loss_usd")
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD",
+                              "max_daily_loss_usd")
 
 
 def max_drawdown_pct() -> Optional[float]:
-    v = _env_f("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT", None)
-    return v if v is not None else _owner_threshold("max_drawdown_pct")
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT",
+                              "max_drawdown_pct")
 
 
 def max_exposure_pct() -> Optional[float]:
-    v = _env_f("PAPER_ACCOUNT_MAX_EXPOSURE_PCT", None)
-    return v if v is not None else _owner_threshold("max_exposure_pct")
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_EXPOSURE_PCT",
+                              "max_exposure_pct")
 
 
 def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],

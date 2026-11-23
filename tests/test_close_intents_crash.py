@@ -120,11 +120,12 @@ def account_apply(op):
                          pos_id=op.get("pos_id"), qty=op.get("qty"),
                          reason=op.get("reason") or "recovered")
 
-def lane_has_close(mint, pos_id):
+def lane_has_close(intent):
     if not os.path.exists(LANE_LEDGER):
         return False
     d = json.load(open(LANE_LEDGER))
-    return any(c.get("pos_id") == pos_id for c in d["closes"])
+    return any(c.get("pos_id") == intent.get("pos_id")
+               for c in d["closes"])
 
 def lane_apply(intent):
     info = intent["close_info"]

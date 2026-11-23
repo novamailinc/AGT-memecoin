@@ -342,15 +342,19 @@ def _recover_close_intents():
                 LANE, op.get("mint"), op.get("amount"),
                 op.get("op_id"), pos_id=op.get("pos_id"),
                 qty=op.get("qty"), price_kind=op.get("price_kind"))
-        if not ok and _pa.op_outcome(op.get("op_id")) == "orphan":
-            return True, "orphan (converged)"
+        if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
+                and not _pa.pos_ever_existed(
+                    pos_id=op.get("pos_id"), lane=LANE,
+                    mint=op.get("mint")):
+            return True, "orphan (converged, epoch-proven)"
         return ok, why
 
-    def lane_has_close(mint, pos_id):
+    def lane_has_close(intent):
+        pos_id = intent.get("pos_id")
         for rec in _read().get("closes", []):
             if pos_id and rec.get("pa_pos_id") == pos_id:
                 return True
-            if not pos_id and rec.get("mint") == mint:
+            if not pos_id and rec.get("mint") == intent.get("mint"):
                 return True
         return False
 
@@ -635,15 +639,30 @@ def _write(d):
                 os.close(dfd)
         except OSError:
             pass
-        # Stage C: a successful persist makes every close whose
+        # Stage C: a successful persist makes a close whose
         # account side already settled durable on the lane side -
-        # the last boundary of the cross-ledger intent.
+        # the last boundary of the cross-ledger intent. Flush ONLY
+        # intents whose close record THIS persist actually carries:
+        # an unrelated write (an entry, a watchlist update) must
+        # not mark a close it does not contain.
         if _PENDING_CLOSE_INTENTS:
             _ciw = _close_intents()
             if _ciw is not None:
-                for _iid in _PENDING_CLOSE_INTENTS:
-                    _ciw.mark_lane_applied(LANE, _iid)
-            _PENDING_CLOSE_INTENTS.clear()
+                _closed_pids = {r.get("pa_pos_id")
+                                for r in d.get("closes", [])
+                                if r.get("pa_pos_id")}
+                _closed_mints = {r.get("mint")
+                                 for r in d.get("closes", [])}
+                _keep = []
+                for _iid, _pid, _mint in _PENDING_CLOSE_INTENTS:
+                    if (_pid and _pid in _closed_pids) or (
+                            not _pid and _mint in _closed_mints):
+                        _ciw.mark_lane_applied(LANE, _iid)
+                    else:
+                        _keep.append((_iid, _pid, _mint))
+                _PENDING_CLOSE_INTENTS[:] = _keep
+            else:
+                _PENDING_CLOSE_INTENTS.clear()
         return True
     except Exception:
         return False
@@ -1233,6 +1252,12 @@ def _consider_candidate(cand, now):
         # cash freed by another lane's close re-enables entries.
         _pa = _paper_account()
         if _pa is not None:
+            # Stage C: reconcile pending close intents BEFORE any
+            # entry/gate/capital decision - a restart must not
+            # permit new entries while a prior close's account
+            # settle is unconfirmed (parent review 2026-11-22).
+            # Once-per-process, guarded.
+            _recover_close_intents()
             # Stable op_id from the pool's durable identity (mint +
             # pool-creation ts, falling back to entry ts), so a
             # retry of an uncertain debit response — even across a
@@ -1702,14 +1727,27 @@ def _finalize(d, mint, pos, closed_reason):
                 _sold_qty += _lq
                 _sold_kinds.append(_lv.get("exit_price_kind"))
     # Legacy/minimal positions without per-leg fracs cannot split
-    # units: fall back to aggregate routing. An aggregate
-    # write-down still books as a write-down, never a sale.
+    # units. CONSERVATION RULE (parent review 2026-11-22): when
+    # ANY done leg is a write-down and units cannot be attributed,
+    # the WHOLE position goes to the unresolved register - units
+    # and full original cost are conserved there, no sale is
+    # invented for unquotable units, and no cash is claimed while
+    # the sold/units split is unknown (the register's later
+    # resolution recognizes proceeds with evidence; until then the
+    # account under-credits versus the lane, the direction that
+    # can only hurt, never help). With NO write-down leg every
+    # unit was priced and sold, so the aggregate credit conserves
+    # exactly: all units settled, realized proceeds credited,
+    # quarantined by the aggregate kind.
     _agg_wd = False
     if not _split_complete:
+        _saw_wd = any(
+            v.get("exit_price_kind") == _WD
+            for v in pos["legs"].values() if v.get("done"))
         _sold_qty = 0.0
         _wd_qty = 0.0
         _sold_kinds = []
-        _agg_wd = (_close_kind == _WD)
+        _agg_wd = _saw_wd or (_close_kind == _WD)
     _sold_kind = (_pk.aggregate(_sold_kinds)
                   if (_pk is not None and _sold_kinds) else None)
     _pa = _paper_account()
@@ -1770,11 +1808,16 @@ def _finalize(d, mint, pos, closed_reason):
                     pos_id=_pos_id, qty=_sop.get("qty"),
                     price_kind=_sop.get("price_kind"))
             if not _ok:
-                # A deliberate orphan (the account never held these
-                # units - a position predating the flag) is a
-                # CONVERGED outcome, journaled by the account:
-                # treat it as applied, never a freeze.
-                if _pa.op_outcome(_sop["op_id"]) == "orphan":
+                # Orphan tolerance needs POSITIVE evidence of a
+                # pre-account epoch: the account's journal shows
+                # the unreasoned absent-position orphan AND no
+                # debit/settle for this position ever. A missing
+                # open position alone proves nothing (a stale
+                # restore also removes debited positions) - those
+                # stay open for recovery and freeze loud.
+                if _pa.op_outcome(_sop["op_id"]) == "orphan" \
+                        and not _pa.pos_ever_existed(
+                            pos_id=_pos_id, lane=LANE, mint=mint):
                     _ok, _why = True, ""
                     continue
                 break
@@ -1783,7 +1826,7 @@ def _finalize(d, mint, pos, closed_reason):
             # the ledger persist lands.
             if _ci is not None and _iid is not None:
                 _ci.mark_account_applied(LANE, _iid)
-                _PENDING_CLOSE_INTENTS.append(_iid)
+                _PENDING_CLOSE_INTENTS.append((_iid, _pos_id, mint))
         else:
             # The intent stays open: recovery re-applies the
             # account side at the next start (the lane close below
@@ -1816,6 +1859,10 @@ def _finalize(d, mint, pos, closed_reason):
         "entry_notional_usd": entry_notional,
         "pnl_usd": pnl,
         "closed_reason": closed_reason,
+        # Stage C: the account position this close settles, so the
+        # intent journal's lane-write flush and recovery can match
+        # lane closes to account ops without re-deriving anything.
+        "pa_pos_id": pos.get("pa_pos_id"),
         "legs": {k: {"done": v["done"],
                      "exit_price": v.get("exit_price", 0),
                      "realized_usd": v.get("realized_usd", 0),

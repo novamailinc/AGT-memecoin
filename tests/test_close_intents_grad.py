@@ -167,13 +167,15 @@ check("recovery: cash unchanged", PA.snapshot()["cash"]
       == cash_before)
 
 # ---- orphan close: converged, never frozen -------------------------
+# A TRUE pre-account-epoch position: entered with the flag OFF (never
+# debited), closed with the flag ON. The account's journal holds no
+# debit for it, so the orphan outcome is provably converged.
 ps, _mv, _ms = _fresh()
+os.environ.pop("PAPER_ACCOUNT_ENABLED", None)
 opened, _w, _f = G.consider_candidate(_cand(mint="ORPH11pump"))
-check("fixture: orphan-candidate entry opened", opened)
-with PA._lock():
-    led, healthy, _deg = PA._load_locked()
-    led["lanes"]["grad"]["open"].pop("ORPH11pump", None)
-    PA._save_locked(led)
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+check("fixture: orphan-candidate entry opened (pre-account epoch)",
+      opened)
 _close_open("ORPH11pump", mult=1.5)
 evs2 = [e for e in _events() if e.get("mint") == "ORPH11pump"
         or e.get("intent_id", "").startswith("grad:ORPH11pump")]
@@ -210,6 +212,139 @@ check("write-down: settle op is a write_down",
       evs3[0]["settle_ops"][0]["kind"] == "write_down")
 check("write-down: unresolved register holds the units",
       PA.snapshot()["unresolved_cost"] > 0)
+_unpatch(ps)
+
+# ---- orphan tolerance requires epoch proof ------------------------
+# A DEBITED position that vanishes from the account without a settle
+# (stale-restore shape) must NOT converge: the journal holds its
+# debit, so the close settles nowhere and recovery freezes loud.
+ps, _mv, _ms = _fresh()
+opened, _w, _f = G.consider_candidate(_cand(mint="GHOST1pump"))
+check("fixture: ghost entry opened and debited", opened)
+with PA._lock():
+    led, healthy, _deg = PA._load_locked()
+    ghost_pid = led["lanes"]["grad"]["open"]["GHOST1pump"]["pos_id"]
+    led["lanes"]["grad"]["open"].pop("GHOST1pump", None)
+    PA._save_locked(led)
+cash_before_ghost = PA.snapshot()["cash"]
+_close_open("GHOST1pump", mult=1.5)
+evs4 = [e for e in _events()
+        if e.get("intent_id", "").startswith("grad:GHOST1pump")]
+check("ghost: intent opened but account side NEVER applied",
+      [e["ev"] for e in evs4] == ["intent"])
+check("ghost: no cash invented by the refused settle",
+      PA.snapshot()["cash"] == cash_before_ghost)
+G._RECOVERY_DONE = False
+G._recover_close_intents()
+evs4b = [e for e in _events()
+         if e.get("intent_id", "").startswith("grad:GHOST1pump")]
+check("ghost: recovery freezes the divergence (debit in history)",
+      evs4b[-1]["ev"] == "frozen")
+check("ghost: still no double settlement",
+      PA.snapshot()["cash"] == cash_before_ghost)
+_unpatch(ps)
+
+# ---- recovery runs BEFORE a post-restart entry ---------------------
+# Simulate a kill after account_applied but before the lane write:
+# _finalize with a FAILING _write (the kill lands at the persist).
+# The next process's FIRST ENTRY must reconcile the pending intent
+# before debiting.
+ps, _mv, _ms = _fresh()
+opened, _w, _f = G.consider_candidate(_cand(mint="PEND11pump"))
+check("fixture: pending-close entry opened", opened)
+_orig_write = G._write
+G._write = lambda d: False   # the persist never lands
+with G._ledger_lock():
+    d = G._read()
+    pos = d["positions"]["PEND11pump"]
+    px = pos["entry_price"] * 2.0
+    for leg in ("a", "b", "c"):
+        G._close_leg(pos, leg, px, "test")
+    G._finalize(d, "PEND11pump", pos, "test")
+G._write = _orig_write
+# On disk the position is still open and no close is recorded.
+disk = G._load()
+check("fixture: kill left the position open on disk",
+      "PEND11pump" in disk["positions"]
+      and not disk["closes"])
+pend = CI.pending("grad")
+check("fixture: intent pending with account side applied",
+      len(pend) == 1 and pend[0]["account_applied"]
+      and not pend[0]["lane_applied"])
+cash_after_close = PA.snapshot()["cash"]
+G._RECOVERY_DONE = False   # the restart
+opened_b, why_b, _f = G.consider_candidate(_cand(mint="NEXT11pump"))
+check("entry: new entry permitted after reconciliation", opened_b)
+check("entry: recovery left the open position to its natural "
+      "re-close (still pending, both ledgers consistent)",
+      len(CI.pending("grad")) == 1)
+check("entry: account not re-credited during reconciliation",
+      abs(PA.snapshot()["cash"] - (cash_after_close - 1.0)) < 1e-9)
+# The natural re-close settles the intent with the SAME op_id: no
+# double settlement across the restart.
+with G._ledger_lock():
+    d = G._read()
+    pos = d["positions"]["PEND11pump"]
+    px = pos["entry_price"] * 2.0
+    for leg in ("a", "b", "c"):
+        G._close_leg(pos, leg, px, "test")
+    G._finalize(d, "PEND11pump", pos, "test")
+check("re-close: intent converged, no pending", [p for p in
+      CI.pending("grad")
+      if p["intent_id"].startswith("grad:PEND11pump")] == [])
+check("re-close: stable op_id deduped (no double credit)",
+      abs(PA.snapshot()["cash"] - (cash_after_close - 1.0)) < 1e-9)
+_unpatch(ps)
+
+# ---- incomplete split + write-down leg: conservation ---------------
+# Legacy position WITHOUT per-leg fracs, one priced leg and one
+# write-down leg: units cannot be attributed, so the WHOLE position
+# must go to the unresolved register - no sale invented for the
+# unquotable units, no cash claimed while the split is unknown.
+ps, _mv, _ms = _fresh()
+opened, _w, _f = G.consider_candidate(_cand(mint="LEGWD1pump"))
+check("fixture: legacy-mixed entry opened", opened)
+with PA._lock():
+    _led, _h, _dg = PA._load_locked()
+    acct_qty = _led["lanes"]["grad"]["open"]["LEGWD1pump"]["qty"]
+with G._ledger_lock():
+    d = G._read()
+    pos = d["positions"]["LEGWD1pump"]
+    for k, v in pos["legs"].items():
+        v.pop("frac", None)   # pre-frac legacy shape
+    pos["legs"]["a"].update({"done": True, "exit_price": 0.00014,
+                            "realized_usd": 1.0,
+                            "exit_reason": "t",
+                            "exit_price_kind":
+                            "current_price_simulated_fill"})
+    pos["legs"]["b"].update({"done": True, "exit_price": 0.0,
+                            "realized_usd": 0.0,
+                            "exit_reason": "unquotable",
+                            "exit_price_kind": "write_down_zero"})
+    pos["legs"]["c"].update({"done": True, "exit_price": 0.0,
+                            "realized_usd": 0.0,
+                            "exit_reason": "unquotable",
+                            "exit_price_kind": "write_down_zero"})
+    pos["realized_usd"] = 1.0
+    cash_pre = PA.snapshot()["cash"]
+    G._finalize(d, "LEGWD1pump", pos, "legacy_mixed")
+    G._write(d)
+snap = PA.snapshot()
+check("legacy-mixed: whole position to the unresolved register",
+      snap["unresolved_cost"] > 0 and snap["unresolved"])
+reg_entry = [v for v in snap["unresolved"]
+             if v.get("mint") == "LEGWD1pump"]
+check("legacy-mixed: register conserves ALL account units "
+      "(none sold)",
+      reg_entry and abs(float(reg_entry[0].get("entry_qty") or 0)
+                        - acct_qty) < 1e-9)
+check("legacy-mixed: register conserves the FULL original cost",
+      reg_entry and abs(float(reg_entry[0].get("basis") or 0)
+                        - 1.0) < 1e-9
+      and abs(float(reg_entry[0].get("entry_cost") or 0)
+              - 1.0) < 1e-9)
+check("legacy-mixed: no sale cash claimed while split unknown",
+      PA.snapshot()["cash"] == cash_pre)
 _unpatch(ps)
 
 print()

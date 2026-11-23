@@ -216,8 +216,10 @@ def recover_lane(
 
     account_apply(settle_op) re-applies one account operation and
     must be idempotent (the account dedupes by op_id; a duplicate
-    is a successful apply). lane_has_close(mint, pos_id) reports
-    whether the lane ledger already holds the close.
+    is a successful apply). lane_has_close(intent) reports
+    whether the lane ledger already reflects this intent's close
+    (per-position for whole-close lanes, per-leg for tranche
+    lanes - the intent payload carries the markers).
     lane_apply(intent) is tri-state: True = the lane ledger now
     holds the close (re-booked from the durable payload); None =
     leave the intent pending without freezing (the lane's natural
@@ -266,8 +268,7 @@ def recover_lane(
                                "intent_id": iid})
                 st["account_applied"] = True
         if why is None and not st["lane_applied"]:
-            if lane_has_close(intent.get("mint"),
-                              intent.get("pos_id")):
+            if lane_has_close(intent):
                 _append(path, {"ev": "lane_applied",
                                "intent_id": iid})
                 st["lane_applied"] = True

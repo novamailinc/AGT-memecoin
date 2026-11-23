@@ -1245,10 +1245,46 @@ def op_outcome(op_id: str) -> str:
         kind = ev.get("event")
         if kind in ("credit", "write_down", "debit"):
             outcome = "applied"
-        elif kind in ("credit_orphan", "write_down_orphan") \
-                and outcome != "applied":
+        elif kind == "write_down_orphan" and outcome != "applied":
+            # Only one variant exists: the position is absent.
             outcome = "orphan"
+        elif kind == "credit_orphan" and outcome != "applied":
+            # credit_orphan without a reason is the absent-position
+            # variant; a reasoned one (pos_id mismatch, apply
+            # refusal) names a REAL inconsistency and must stay
+            # unknown so recovery freezes it.
+            if not ev.get("reason"):
+                outcome = "orphan"
+            else:
+                outcome = "unknown"
     return outcome
+
+
+def pos_ever_existed(pos_id: Optional[str] = None,
+                     lane: Optional[str] = None,
+                     mint: Optional[str] = None) -> bool:
+    """True when the journal holds ANY debit/credit/write_down for
+    this pos_id (or, when pos_id is None, for this lane+mint).
+
+    Orphan tolerance needs POSITIVE evidence the position belongs
+    to a pre-account epoch: a missing open position alone proves
+    nothing - a stale-backup restore also removes positions that
+    WERE debited, and converging those would silently lose the
+    debit. The journal is the account's own history; a debit in
+    it means the position lived here and its absence is
+    divergence, not an orphan."""
+    entries, status, _ = _journal_read()
+    if status == "torn":
+        return True   # unreadable history: assume it existed
+    for ev in entries:
+        if ev.get("event") not in ("debit", "credit", "write_down"):
+            continue
+        if pos_id is not None and ev.get("pos_id") == pos_id:
+            return True
+        if pos_id is None and lane is not None \
+                and ev.get("lane") == lane and ev.get("mint") == mint:
+            return True
+    return False
 
 
 def _mark_value(mark: Any, now: float, ttl: float,

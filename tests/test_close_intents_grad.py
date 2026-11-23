@@ -242,7 +242,13 @@ check("ghost: recovery freezes the divergence (debit in history)",
       evs4b[-1]["ev"] == "frozen")
 check("ghost: still no double settlement",
       PA.snapshot()["cash"] == cash_before_ghost)
+# A frozen intent BLOCKS entries, not merely logs.
+opened_blk, why_blk, _f = G.consider_candidate(
+    _cand(mint="BLOCKED1pump"))
+check("frozen: entry refused while divergence is frozen",
+      not opened_blk and "frozen" in why_blk)
 _unpatch(ps)
+G._ENTRY_BLOCKED = False   # section isolation
 
 # ---- recovery runs BEFORE a post-restart entry ---------------------
 # Simulate a kill after account_applied but before the lane write:
@@ -250,6 +256,7 @@ _unpatch(ps)
 # The next process's FIRST ENTRY must reconcile the pending intent
 # before debiting.
 ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False
 opened, _w, _f = G.consider_candidate(_cand(mint="PEND11pump"))
 check("fixture: pending-close entry opened", opened)
 _orig_write = G._write
@@ -302,6 +309,7 @@ _unpatch(ps)
 # must go to the unresolved register - no sale invented for the
 # unquotable units, no cash claimed while the split is unknown.
 ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False
 opened, _w, _f = G.consider_candidate(_cand(mint="LEGWD1pump"))
 check("fixture: legacy-mixed entry opened", opened)
 with PA._lock():
@@ -345,6 +353,29 @@ check("legacy-mixed: register conserves the FULL original cost",
               - 1.0) < 1e-9)
 check("legacy-mixed: no sale cash claimed while split unknown",
       PA.snapshot()["cash"] == cash_pre)
+_unpatch(ps)
+
+# ---- torn intent journal: unknown history freezes ------------------
+# A corrupt journal proves nothing: recovery cannot classify any
+# incomplete intent, so every one of them freezes and entries block.
+ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False
+opened, _w, _f = G.consider_candidate(_cand(mint="TORN11pump"))
+check("fixture: torn-journal entry opened", opened)
+_close_open("TORN11pump", mult=1.5)
+# Corrupt the journal MID-FILE (not the tail): no automatic repair
+# can justify itself.
+_jpath = CI.journal_path("grad")
+_lines = open(_jpath).read().splitlines(True)
+with open(_jpath, "w") as _f2:
+    _f2.writelines(_lines[:1] + ["{not json\n"] + _lines[1:])
+G._RECOVERY_DONE = False
+G._ENTRY_BLOCKED = False
+opened_t, why_t, _f = G.consider_candidate(_cand(mint="AFTERT1pump"))
+check("torn: recovery cannot prove state -> entry BLOCKED",
+      not opened_t and "frozen" in why_t)
+check("torn: op_outcome unknown on truncated/corrupt history",
+      PA.op_outcome("grad:close:TORN11pump:nonexistent") == "unknown")
 _unpatch(ps)
 
 print()

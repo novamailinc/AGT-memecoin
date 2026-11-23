@@ -1236,7 +1236,9 @@ def op_outcome(op_id: str) -> str:
     The cross-ledger close-intent recovery uses this to distinguish
     a benign orphan from a settle failure it must freeze."""
     entries, status, _ = _journal_read()
-    if status == "torn":
+    # Truncated OR corrupt history is UNKNOWN, never proof: the
+    # lost record could be this op's debit or settle.
+    if status is not None:
         return "unknown"
     outcome = "unknown"
     for ev in entries:
@@ -1274,8 +1276,11 @@ def pos_ever_existed(pos_id: Optional[str] = None,
     it means the position lived here and its absence is
     divergence, not an orphan."""
     entries, status, _ = _journal_read()
-    if status == "torn":
-        return True   # unreadable history: assume it existed
+    # Absence proves never-debited ONLY on a complete, clean
+    # journal; truncated/corrupt history is unknown - assume the
+    # position existed (fail closed).
+    if status is not None:
+        return True
     for ev in entries:
         if ev.get("event") not in ("debit", "credit", "write_down"):
             continue

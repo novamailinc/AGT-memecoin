@@ -311,6 +311,11 @@ def _close_intents():
 # successful persist, recovery re-drives whatever survives a kill.
 _PENDING_CLOSE_INTENTS = []
 _RECOVERY_DONE = False
+# A FROZEN intent blocks every entry (parent review 2026-11-22):
+# contradictory lane/account capital must not fund new risk. Set
+# by recovery, cleared never (a freeze is terminal until operator
+# resolution).
+_ENTRY_BLOCKED = False
 
 
 def _recover_close_intents():
@@ -320,13 +325,13 @@ def _recover_close_intents():
     durable payload only when the position is no longer open (an
     open position re-closes naturally on the next poll and the
     intent stays pending until then)."""
-    global _RECOVERY_DONE
+    global _RECOVERY_DONE, _ENTRY_BLOCKED
     if _RECOVERY_DONE:
-        return
+        return _ENTRY_BLOCKED
     _RECOVERY_DONE = True
     _ci = _close_intents()
     if _ci is None:
-        return
+        return False
 
     def account_apply(op):
         _pa = _paper_account()
@@ -382,9 +387,11 @@ def _recover_close_intents():
     frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
                               lane_apply)
     if frozen:
+        _ENTRY_BLOCKED = True
         logger.error("grad: %d close intent(s) FROZEN - ledgers "
-                     "diverge, operator review required: %s",
-                     len(frozen), ",".join(frozen))
+                     "diverge, ENTRIES BLOCKED until operator "
+                     "resolution: %s", len(frozen), ",".join(frozen))
+    return _ENTRY_BLOCKED
 CHAIN = "solana"
 # Venue for cost accounting (P3 fee audit, 2026-10-23): graduation
 # trades execute on pump.fun venues — the bonding curve at 1.25% per
@@ -1255,9 +1262,13 @@ def _consider_candidate(cand, now):
             # Stage C: reconcile pending close intents BEFORE any
             # entry/gate/capital decision - a restart must not
             # permit new entries while a prior close's account
-            # settle is unconfirmed (parent review 2026-11-22).
-            # Once-per-process, guarded.
+            # settle is unconfirmed, and a FROZEN intent blocks
+            # the entry outright (parent review 2026-11-22).
             _recover_close_intents()
+            if _ENTRY_BLOCKED:
+                return (False,
+                        "close-intent divergence frozen: entries "
+                        "blocked until operator resolution", False)
             # Stable op_id from the pool's durable identity (mint +
             # pool-creation ts, falling back to entry ts), so a
             # retry of an uncertain debit response — even across a

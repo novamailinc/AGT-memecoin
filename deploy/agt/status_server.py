@@ -382,11 +382,69 @@ def read_pnl(home):
                              if missing else "")))
 
 
+def read_global_halt():
+    """The global human halt latch (Telegram /halt), read EXACTLY
+    where the production writer and the lane enforcement read it:
+    storage.store's DEFAULT_DB_PATH ($FOREX_AGENT_STORAGE else
+    <repo>/storage/local.db, resolved at import time). The per-lane
+    killswitch state.json alone never shows this latch, which let
+    the dashboard report ok while every lane was halted
+    (2026-11-23, independent validator). Mirrors the lane-side
+    fail-closed rule: an unreadable existing latch counts as
+    ENGAGED (a stop command we cannot read is treated as given).
+    The DB is opened only when the file already exists; this
+    reader never creates the production database as a side
+    effect."""
+    try:
+        from storage.store import Store, DEFAULT_DB_PATH
+    except ImportError:
+        # deploy/agt/status_server.py -> repo root is THREE levels up.
+        _repo = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        if _repo not in sys.path:
+            sys.path.insert(0, _repo)
+        from storage.store import Store, DEFAULT_DB_PATH
+    path = str(DEFAULT_DB_PATH)
+    if not os.path.exists(path):
+        return {"engaged": False, "source": None, "ts": None,
+                "path": path,
+                "note": "no latch database yet - no /halt ever "
+                        "written"}, None
+    try:
+        st = Store(path)
+        try:
+            rec = st.get_kill_switch()
+        finally:
+            close = getattr(st, "close", None)
+            if callable(close):
+                close()
+        rec["path"] = path
+        return rec, None
+    except Exception as exc:
+        return {"engaged": True, "path": path,
+                "unreadable": str(exc)[:200]}, (
+            "fail-closed: latch DB exists but is unreadable; lane "
+            "enforcement treats every lane as halted")
+
+
 def read_killswitch(home):
+    # The global /halt latch is read FIRST and reported regardless of
+    # the per-lane file: a missing state.json must never hide an
+    # engaged global halt (2026-11-23 fleet verification).
+    gh, gh_err = read_global_halt()
     path = os.path.join(home, "killswitch", "state.json")
     data, err = _read_json(path)
     if err:
-        return _section("unavailable", path, reason=err)
+        payload = {
+            "lanes": {},
+            "halted_lanes": [],
+            "global_halt": gh,
+            "effective_halt": (
+                "ALL lanes: global human halt (/halt) engaged - new "
+                "entries refused everywhere, exits still settle"
+                if gh.get("engaged") else None)}
+        return _section("unavailable", path, payload,
+                        reason="; ".join(x for x in (err, gh_err) if x))
     _index, entries, void_err = _void_index()
     lanes = {}
     for lane, v in (data.get("lanes") or {}).items():
@@ -424,12 +482,20 @@ def read_killswitch(home):
             "window_wins": sum(1 for t in kept
                                if (t.get("pnl") or 0) > 0)}
     events = (data.get("events") or [])[-10:]
-    return _section("ok", path, {
+    payload = {
         "lanes": lanes,
         "halted_lanes": [k for k, v in lanes.items()
                          if v["halted"]],
+        "global_halt": gh,
+        "effective_halt": (
+            "ALL lanes: global human halt (/halt) engaged - new "
+            "entries refused everywhere, exits still settle"
+            if gh.get("engaged") else None),
         "void_list_error": void_err,
-        "recent_events": events})
+        "recent_events": events}
+    if gh_err:
+        return _section("unavailable", path, payload, reason=gh_err)
+    return _section("ok", path, payload)
 
 
 def read_risk(home):
@@ -646,6 +712,12 @@ def _html(status):
         if name == "killswitch" and sec.get("data"):
             halted = sec["data"].get("halted_lanes") or []
             extra = " — halted: %s" % (", ".join(halted) or "none")
+            gh = sec["data"].get("global_halt") or {}
+            if gh.get("engaged"):
+                extra += (" — GLOBAL HALT (/halt) ENGAGED: every "
+                          "lane halted")
+            if gh.get("unreadable"):
+                extra += " — latch UNREADABLE (fail-closed = halted)"
         if name == "open_positions" and sec.get("data"):
             extra = " — %s open" % sec["data"].get("total_open")
         return ("<tr><td>%s</td><td>%s</td><td>%s%s</td></tr>"
@@ -690,6 +762,12 @@ class Handler(BaseHTTPRequestHandler):
             checks = {k: v.get("status")
                       for k, v in status.items()
                       if isinstance(v, dict) and "status" in v}
+            # Truthful effective state (2026-11-23): under an engaged
+            # global /halt the killswitch check must not read "ok".
+            ks_data = (status.get("killswitch") or {}).get("data")
+            if ks_data and (ks_data.get("global_halt") or {}).get(
+                    "engaged"):
+                checks["killswitch"] = "halted"
             self._send(200, json.dumps(
                 {"status": status["_health"], "checks": checks}),
                 "application/json")

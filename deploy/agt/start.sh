@@ -43,6 +43,23 @@ log() { printf '%s start.sh: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 preflight() {
     mkdir -p "$FOREX_AGENT_HOME/log" "$FOREX_AGENT_HOME/run"
     log "repo=$REPO home=$FOREX_AGENT_HOME port=$PORT"
+    # One durable storage path for EVERY process in the deployment
+    # (2026-11-23 wiring fix, found by the independent validator):
+    # storage.store's built-in default is repo-relative
+    # (<repo>/storage/local.db) while db_init and the dashboard use
+    # $FOREX_AGENT_HOME/storage/local.db, so without this export the
+    # /halt latch, daemon Store writes and the initialized database
+    # were three different files. Derived here, before any Python
+    # child starts; an explicit operator override still wins.
+    export FOREX_AGENT_STORAGE="${FOREX_AGENT_STORAGE:-$FOREX_AGENT_HOME/storage/local.db}"
+    # Shared paper account (the owner-authorized $10 shared demo
+    # account): without this, the grad/ceo/watcher/momentum lanes run
+    # on private notional counters instead of the shared account.
+    # Enable only: the ledger is created once at first use and is
+    # NEVER reset by startup (paper_account refuses to overwrite an
+    # existing ledger). Gate activation and thresholds stay
+    # owner-owned - PAPER_ACCOUNT_GATES_ENABLED is untouched.
+    export PAPER_ACCOUNT_ENABLED="${PAPER_ACCOUNT_ENABLED:-1}"
     "$AGT_PY" "$REPO/deploy/agt/credentials.py" --preflight || return 1
     # Deployment version record (Phase 13 finalize): the dashboard
     # reports exactly which commit is running. git may be absent in

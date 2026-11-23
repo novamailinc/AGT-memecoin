@@ -1,0 +1,76 @@
+{
+ "capture_route": "https://solana-rpc.publicnode.com (PublicNode free tier; ToS authorize automated access incl. agents; usage limits enforced via HTTP 429)",
+ "capture_method": "JSON-RPC getAccountInfo, encoding base64; each address read exactly once; HTTP 200, no throttling observed",
+ "derivation": {
+  "fee_program": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+  "fee_config_seeds": [
+   "fee_config",
+   "<owning_program_id>"
+  ],
+  "fee_config_idl_evidence": "pump_fees IDL get_fees/initialize_fee_config account pda seeds: const 'fee_config' + account config_program_id; FeeConfig discriminator [143,52,146,187,219,123,76,155]",
+  "pump_amm_buy_const_evidence": "pump_amm IDL buy instruction fee_config pda embeds const bytes decoding to pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA, confirming owning-program seed semantics",
+  "global_config_seeds": [
+   "global_config"
+  ],
+  "global_config_idl_evidence": "pump_amm IDL admin_update_token_incentives global_config pda seeds: const 'global_config'; GlobalConfig discriminator [149,8,156,202,160,252,176,217]"
+ },
+ "accounts": {
+  "FC_PUMP": {
+   "address": "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+   "captured_utc": "2026-11-23T04:21:32Z",
+   "http_status": 200,
+   "owner": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+   "lamports": 37292293,
+   "data_len": 4097,
+   "discriminator": [
+    143,
+    52,
+    146,
+    187,
+    219,
+    123,
+    76,
+    155
+   ],
+   "file": "fc_pump.bin"
+  },
+  "FC_PAMM": {
+   "address": "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx",
+   "captured_utc": "2026-11-23T04:21:33Z",
+   "http_status": 200,
+   "owner": "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+   "lamports": 33103977,
+   "data_len": 4097,
+   "discriminator": [
+    143,
+    52,
+    146,
+    187,
+    219,
+    123,
+    76,
+    155
+   ],
+   "file": "fc_pamm.bin"
+  },
+  "GC_PAMM": {
+   "address": "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw",
+   "captured_utc": "2026-11-23T04:21:34Z",
+   "http_status": 200,
+   "owner": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+   "lamports": 9272823,
+   "data_len": 949,
+   "discriminator": [
+    149,
+    8,
+    156,
+    202,
+    160,
+    252,
+    176,
+    217
+   ],
+   "file": "gc_pamm.bin"
+  }
+ }
+}

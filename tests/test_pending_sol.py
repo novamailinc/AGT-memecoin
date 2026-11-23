@@ -76,3 +76,28 @@ class TestPendingSOL:
         fx={'usd_per_sol':100.,'observed_at':0.,'source':'fixture'}
         assert not pending.settle(pa,'scanner','M',pid,'pending',fx,.5,'early')[0]
         assert snap['cash']==8.
+
+    @pytest.mark.parametrize('observation',['future','stale','bad-source'])
+    def test_new_settlement_requires_actual_current_observation(self, account, observation):
+        pid=pa.try_debit_instance('scanner','M',2.,100.,'entry')[2]
+        assert reserve(pid)[0]
+        before=Path(pa.LEDGER_PATH).read_bytes()
+        journal=Path(pa.JOURNAL_PATH).read_bytes()
+        fx={'usd_per_sol':999.,'observed_at':time.time(),'source':'fixture'}
+        if observation=='future': fx['observed_at']+=86400
+        if observation=='stale': fx['observed_at']-=600
+        if observation=='bad-source': fx['source']=123
+        assert not pending.settle(pa,'scanner','M',pid,'pending',fx,19.98,'settle')[0]
+        assert Path(pa.LEDGER_PATH).read_bytes()==before
+        assert Path(pa.JOURNAL_PATH).read_bytes()==journal
+
+    def test_admitted_settlement_replay_does_not_reage_fx(self, account):
+        pid=pa.try_debit_instance('scanner','M',2.,100.,'entry')[2]
+        assert reserve(pid)[0]
+        fx={'usd_per_sol':150.,'observed_at':time.time(),'source':'fixture'}
+        with patch.object(pa,'_save_locked',side_effect=OSError('after WAL')):
+            with pytest.raises(OSError):
+                pending.settle(pa,'scanner','M',pid,'pending',fx,3.,'settle')
+        with patch('time.time',return_value=time.time()+86400):
+            assert pa.snapshot()['cash']==11.
+            assert pending.settle(pa,'scanner','M',pid,'pending',fx,3.,'settle')[0]

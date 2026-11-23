@@ -8,6 +8,7 @@ account code never acquires a native lock or calls market data under its lock.
 import copy
 import math
 import time
+from broker.memecoin.shared_capital import validate_fx, CapitalConflict
 
 EVENTS = ('pending_sol', 'settle_sol')
 
@@ -59,7 +60,8 @@ def apply(led, event, pa):
             return 'pending SOL settlement ownership conflict'
         evidence=event['fx']
         if (not isinstance(evidence,dict) or not _number(evidence.get('usd_per_sol'),True)
-                or not _number(evidence.get('observed_at')) or not evidence.get('source')
+                or not _number(evidence.get('observed_at'))
+                or not isinstance(evidence.get('source'),str) or not evidence['source']
                 or evidence['observed_at']<item['sold_at']):
             return 'invalid or pre-sale settlement FX'
         net=round(item['proceeds_sol']*evidence['usd_per_sol'],6)
@@ -93,6 +95,13 @@ def _execute(pa, event):
             if any(old.get(k)!=v for k,v in expected.items()):
                 return False,'pending SOL retry parameter conflict'
             return True,'already applied'
+        # Freshness is checked only for a NEW admission. Replay uses the
+        # pinned observation, never re-ages already accepted evidence.
+        if event['event']=='settle_sol':
+            try:
+                validate_fx(event.get('fx'))
+            except CapitalConflict as exc:
+                return False,str(exc)
         # Validate on a copy before WAL or economic projection.
         planned=copy.deepcopy(led)
         reason=apply(planned,event,pa)

@@ -44,8 +44,9 @@ Items marked FIXED name the landing commit.
   labeled conflict), bounded preliminary curve-history digests (actual retained
   samples with totals), and per-deployer-year rollups with honest counter merges
   (corrupt counters marked partial, never silently summed; partial surfaces in
-  _intel_fields deployer_history). Curve-kind labels remain sample-count
-  categories, not verified curve/pump/regime history.
+  _intel_fields deployer_history). Curve-history digests are retained on raw
+  records only - rollups keep counts, and curve-kind labels remain
+  sample-count categories; no full-curve or verified pattern claim.
 - 4.2 Wallet memory: IMPLEMENTED (measurement posture) — wallet_grader.py
   (statistical gates), funding_clusters.py (union-find funder clustering, explicitly
   non-gating), deployer_tracker.py / deployers.py, smartmoney.py, follower_grader.py.
@@ -78,15 +79,20 @@ Items marked FIXED name the landing commit.
   simulated subset. walk_forward.py is a chronological classifier harness, not a
   general promotion controller. Existing degen-learner mutation is now contained:
   mandatory dry-run, save_weights refuses, scheduler invokes --dry-run explicitly.
-  No runtime LLM dependency added. FIXED (0f7c1da, promotion plumbing):
-  promotion.py - offline evaluation writes durable promotion_decision records
-  (PROMOTE-TO-DEMO / REJECT / NEED-DATA) with source-grounded criteria:
-  chronological expanding-window splits only, all-settled economics, labeled
-  exclusion of non-current-price/non-finite outcomes (never mixed, never
-  qualified performance), and activation fixed "not_authorized"
-  (tests/test_promotion.py). PENDING: wiring candidate generation from the
-  degen-learner dry-run into the evaluation record, fuller record/feature
-  completeness, owner-approved demo validation; no activation authorized.
+  No runtime LLM dependency added. PARTIAL (research plumbing only):
+  promotion.py writes durable research-only promotion_decision records -
+  verdicts NEED-CRITERIA / NEED-DATA / EVALUATED, never a promote
+  recommendation; without source-approved criteria every record is
+  not_eligible. Enforced discipline: chronological splits on settled time
+  only (no archive-time fallback), entry-time-only scorer schema (outcome
+  peeking fails loudly), all-settled economics with excluded outcomes
+  labeled and reported separately (never qualified performance), and the
+  unresolved requirements (capital protection, selection noise, fresh
+  holdout, overlap, missingness bias, counterfactual coverage) recorded on
+  every decision. Storage: locked fsync'd append under FOREX_AGENT_HOME
+  (tests/test_promotion.py, 10 checks). PENDING and owner-owned: approved
+  promotion criteria, candidate wiring from the degen-learner dry-run,
+  demo validation; NO activation authorized.
 
 ## 6. Advanced market intelligence
 

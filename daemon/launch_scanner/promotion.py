@@ -1,47 +1,63 @@
 #!/usr/bin/env python3
-"""Controlled-learning promotion plumbing (request section 4.6).
+"""Controlled-learning promotion RESEARCH plumbing (section 4.6).
 
-Offline evaluation -> durable promotion-decision record. There is
-NO activation path: degen-learner save_weights refuses automatic
-promotion, and this module only writes an advisory decision
-artifact for an owner-approved demo-validation step, which itself
-stays unauthorized. Criteria are source-grounded and code-defined:
+This module prepares offline evaluation evidence only. It is NOT a
+promotion controller and it CANNOT approve anything:
 
-- Chronological splits ONLY (expanding window; the newest fold is
-  the out-of-sample validation the scorer never saw) - the same
-  discipline as walk_forward.py.
+- There is no source-approved promotion criteria in the system, so
+  every durable record is explicitly research-only and NOT ELIGIBLE
+  for promotion. Preparation (computing labeled evidence) may
+  proceed; a validated recommendation may not.
+- Verdicts are descriptive only: NEED-CRITERIA (no approved
+  criteria supplied), NEED-DATA (criteria supplied but the settled
+  sample is too small under it), or EVALUATED (labeled evidence
+  computed). No verdict implies promotion-worthiness.
+- No activation path exists: degen-learner save_weights refuses
+  automatic promotion, and nothing here writes runtime weights.
+
+Discipline that IS enforced (mirrors walk_forward.py and the
+lessons hygiene rules):
+
+- Chronological splits ONLY, on SETTLED time (the outcome event
+  time). Records with no valid settled_ts are excluded - archive
+  bookkeeping time is never substituted for event meaning.
+- Scorers receive an ENTRY-TIME-ONLY view (entry_ts, features).
+  Outcome fields are stripped, so a scorer that peeks at outcomes
+  fails loudly instead of silently "winning". Note: an arbitrary
+  callable cannot be proven leak-free - the harness enforces input
+  schema and chronology, not feature hygiene.
 - Economics are computed on ALL SETTLED recorded outcomes a scorer
-  takes. Records whose exit provenance is not a current-price
-  simulated fill, or whose core outcome (realized multiple or
-  settle time) is non-finite/missing, are EXCLUDED and counted
-  separately - never mixed into the included subset and never
-  presented as qualified performance, because selective
-  missingness can bias the included simulated subset.
-- A candidate PROMOTES-TO-DEMO only with enough settled samples
-  and a strictly better out-of-sample result than the incumbent;
-  otherwise REJECT or NEED-DATA. Promotion-to-demo is still not
-  runtime activation.
+  takes. Non-current-price provenance and non-finite/missing core
+  outcomes are EXCLUDED, counted, and their economics reported
+  SEPARATELY - never mixed, never presented as qualified
+  performance (selective missingness can bias the included
+  subset).
 
-Scorers are callables over settled entry records; callers must
-define them over entry-time features only. This harness enforces
-chronological and economic discipline, not feature hygiene.
+Unresolved requirements (owner-owned, not waived by this module):
+capital protection, selection noise control, fresh holdout, outcome
+overlap, missingness bias, counterfactual coverage.
 """
 
+import contextlib
+import fcntl
 import json
 import math
 import os
 import time
 
-CRITERIA_VERSION = 1
-DEFAULT_CRITERIA = {
-    "criteria_version": CRITERIA_VERSION,
-    "min_settled": 30,          # minimum usable settled outcomes
-    "min_val": 10,              # minimum out-of-sample fold size
-    "val_frac": 0.25,           # newest fold fraction
-    "min_oos_improvement": 0.0,  # strictly greater mean mult OOS
-}
-
 CURRENT_PRICE = "current_price_simulated_fill"
+
+RESEARCH_LIMITS = [
+    "capital_protection_not_modeled",
+    "selection_noise_uncontrolled",
+    "fresh_holdout_not_enforced",
+    "outcome_overlap_unhandled",
+    "missingness_bias_possible",
+    "counterfactual_coverage_unknown",
+    "callable_leakage_unprovable",
+]
+
+NOT_ELIGIBLE = "not_eligible_no_source_approved_criteria"
 
 
 def _num(v):
@@ -56,42 +72,56 @@ def _num(v):
 
 def _settled(records):
     """Split recorded outcomes into usable settled records and
-    labeled exclusions. Never raises."""
+    labeled exclusions. Settled records keep an entry-time view
+    separate from the outcome, so scorers never see outcomes.
+    Never raises."""
     settled, excluded = [], []
     for rec in records or []:
         try:
-            mult = _num((rec or {}).get("realized_mult"))
-            ts = _num((rec or {}).get("settled_ts")
-                      or (rec or {}).get("ts")
-                      or (rec or {}).get("archived_ts"))
-            if mult is None or ts is None:
-                excluded.append({"reason": "nonfinite_or_missing_core"})
-                continue
-            if str((rec or {}).get("exit_price_kind") or "unknown") \
-                    != CURRENT_PRICE:
+            rec = rec or {}
+            mult = _num(rec.get("realized_mult"))
+            if mult is None:
                 excluded.append({
-                    "reason": "not_current_price",
-                    "exit_price_kind": str(
-                        (rec or {}).get("exit_price_kind")
-                        or "unknown")})
+                    "reason": "nonfinite_or_missing_outcome"})
                 continue
-            settled.append({"ts": ts, "realized_mult": mult})
+            ts = _num(rec.get("settled_ts"))
+            if ts is None:
+                # Archive bookkeeping time is NOT event time: no
+                # archived_ts fallback.
+                excluded.append({
+                    "reason": "missing_or_invalid_settled_ts",
+                    "realized_mult": mult})
+                continue
+            kind = str(rec.get("exit_price_kind") or "unknown")
+            if kind != CURRENT_PRICE:
+                excluded.append({"reason": "not_current_price",
+                                 "exit_price_kind": kind,
+                                 "realized_mult": mult})
+                continue
+            settled.append({
+                "entry": {"entry_ts": _num(rec.get("entry_ts")),
+                          "features": rec.get("features")},
+                "settled_ts": ts,
+                "realized_mult": mult,
+            })
         except Exception:
             excluded.append({"reason": "unreadable"})
     return settled, excluded
 
 
-def _chronological_split(records, val_frac):
-    """Expanding-window split: train on the oldest, validate on the
-    newest fold. Chronological ONLY, never shuffled."""
-    order = sorted(records, key=lambda r: r["ts"])
+def _chronological_split(settled, val_frac):
+    """Expanding-window split on SETTLED time: the newest fold is
+    the out-of-sample validation. Chronological ONLY."""
+    order = sorted(settled, key=lambda r: r["settled_ts"])
     cut = int(len(order) * (1.0 - val_frac))
     return order[:cut], order[cut:]
 
 
-def _economics(records, score_fn):
-    """All-settled economics over the records a scorer takes."""
-    taken = [r for r in records if score_fn(r)]
+def _economics(settled, score_fn):
+    """All-settled economics over the records a scorer takes.
+    Scorer exceptions propagate: a broken scorer fails the
+    evaluation loudly, never silently promotes."""
+    taken = [r for r in settled if score_fn(r["entry"])]
     n = len(taken)
     if not n:
         return {"taken": 0, "win_rate": None, "mean_mult": None}
@@ -102,63 +132,131 @@ def _economics(records, score_fn):
                 sum(r["realized_mult"] for r in taken) / n, 6)}
 
 
+def _excluded_economics(excluded):
+    """Labeled economics of the excluded records, reported
+    separately - excluded outcomes are evidence of missingness,
+    never mixed into the included subset."""
+    mults = [e["realized_mult"] for e in excluded or []
+             if _num((e or {}).get("realized_mult")) is not None]
+    out = {"n": len(excluded or []),
+           "provenance": "excluded_mixed_or_unknown"}
+    if mults:
+        out["mean_mult"] = round(sum(mults) / len(mults), 6)
+    return out
+
+
 def evaluate_promotion(candidate_id, records, score_incumbent,
                        score_candidate, criteria=None, now=None):
-    """One promotion-decision record. Advisory evidence only;
-    activation is never part of the decision."""
-    criteria = dict(DEFAULT_CRITERIA, **(criteria or {}))
+    """One durable research-only evaluation record. No verdict in
+    this record implies promotion-worthiness; without
+    source-approved criteria the candidate is NOT ELIGIBLE, and
+    preparation (labeled evidence) is all this produces."""
     now = time.time() if now is None else now
+    criteria_approved = bool((criteria or {}).get("approved"))
     settled, excluded = _settled(records)
-    train, val = _chronological_split(settled, criteria["val_frac"])
     dec = {
         "v": 1,
         "record_type": "promotion_decision",
         "candidate_id": str(candidate_id or "unknown"),
-        "criteria": criteria,
         "created_ts": now,
+        "criteria": criteria,
+        "criteria_approved": criteria_approved,
+        "promotion_eligibility": (
+            "eligible_per_supplied_criteria" if criteria_approved
+            else NOT_ELIGIBLE),
+        "research_only": True,
+        "research_limits": list(RESEARCH_LIMITS),
+        "activation": "not_authorized",
         "n_records": len(records or []),
         "n_settled": len(settled),
         "n_excluded": len(excluded),
         "excluded_reasons": sorted(
             {e["reason"] for e in excluded}),
+        "excluded_economics": _excluded_economics(excluded),
         "provenance": "simulated_current_price_only",
         "qualified_performance": False,
-        "activation": "not_authorized",
-        "train_incumbent": _economics(train, score_incumbent),
-        "val_incumbent": _economics(val, score_incumbent),
-        "val_candidate": _economics(val, score_candidate),
     }
-    if len(settled) < criteria["min_settled"] \
-            or len(val) < criteria["min_val"]:
+    if not criteria_approved:
+        dec["verdict"] = "NEED-CRITERIA"
+        dec["descriptive_only"] = True
+        dec["all_settled_incumbent"] = _economics(
+            settled, score_incumbent)
+        dec["all_settled_candidate"] = _economics(
+            settled, score_candidate)
+        return dec
+    val_frac = _num(criteria.get("val_frac"))
+    min_settled = _num(criteria.get("min_settled"))
+    min_val = _num(criteria.get("min_val"))
+    if val_frac is None or min_settled is None or min_val is None:
+        dec["verdict"] = "NEED-CRITERIA"
+        dec["reason"] = "approved_criteria_missing_split_fields"
+        return dec
+    train, val = _chronological_split(settled, val_frac)
+    dec["train_incumbent"] = _economics(train, score_incumbent)
+    dec["val_incumbent"] = _economics(val, score_incumbent)
+    dec["val_candidate"] = _economics(val, score_candidate)
+    if len(settled) < min_settled or len(val) < min_val:
         dec["verdict"] = "NEED-DATA"
         return dec
-    inc = dec["val_incumbent"]
-    cand = dec["val_candidate"]
-    if not cand["taken"] or cand["mean_mult"] is None:
-        dec["verdict"] = "REJECT"
-        dec["reason"] = "candidate_takes_nothing_oos"
-    elif inc["mean_mult"] is None or cand["mean_mult"] > \
-            inc["mean_mult"] + criteria["min_oos_improvement"]:
-        dec["verdict"] = "PROMOTE-TO-DEMO"
-    else:
-        dec["verdict"] = "REJECT"
-        dec["reason"] = "no_oos_improvement"
+    dec["verdict"] = "EVALUATED"
     return dec
 
 
+def _home(home=None):
+    if home:
+        return str(home)
+    return os.environ.get(
+        "FOREX_AGENT_HOME",
+        os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+
 def _path(home=None):
-    home = home or os.environ.get("HOME") or os.path.expanduser("~")
-    return os.path.join(home, "memory", "promotion_decisions.jsonl")
+    return os.path.join(_home(home), "promotion", "decisions.jsonl")
+
+
+def _lock_path(home=None):
+    return _path(home) + ".lock"
+
+
+@contextlib.contextmanager
+def _write_lock(home=None):
+    """Exclusive cross-process lock (the verdict_ledger lock
+    pattern). Never raises: on lock failure the writer proceeds
+    WITHOUT the lock - the reader tolerates a torn line and the
+    alternative is losing the record entirely."""
+    fd = None
+    try:
+        fd = os.open(_lock_path(home), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            except Exception:
+                pass
 
 
 def append_decision(decision, home=None):
-    """Durable append of one decision record. Returns True when the
-    record landed; never raises."""
+    """One locked, fsync'd append to the durable decision log.
+    Returns True only when the record is durably written.
+    Never raises."""
     try:
-        p = _path(home)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "a") as f:
-            f.write(json.dumps(decision, sort_keys=True) + "\n")
+        os.makedirs(os.path.dirname(_path(home)), exist_ok=True)
+        with _write_lock(home):
+            with open(_path(home), "a") as f:
+                f.write(json.dumps(decision, sort_keys=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         return True
     except Exception:
         return False

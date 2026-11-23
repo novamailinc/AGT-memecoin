@@ -550,6 +550,12 @@ class BacktestEngine:
         return {
             "split_index": k,
             "holdout_fraction": frac,
+            # Each segment is its OWN portfolio: capital resets at the
+            # boundary, no open position or P&L carries over, and the
+            # two reports must never be concatenated as one portfolio.
+            "portfolio_note": ("independent segments: capital resets at "
+                               "the split; no position or capital "
+                               "carryover; not one portfolio"),
             "dev": dev_engine.run(ordered[:k]),
             "eval": eval_engine.run(ordered[k:]),
         }
@@ -730,9 +736,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--slippage-bps", type=float, default=None)
     ap.add_argument("--impact-bps", type=float, default=None)
     ap.add_argument("--venue", default=None,
-                    help="named venue fee schedule (pumpfun-curve=125bps, "
-                         "pumpswap-standard=30bps); alternative to "
-                         "--fee-bps")
+                    help="named venue fee scenario (pumpfun-curve=125bps; "
+                         "pumpswap-canonical-max=125bps / "
+                         "pumpswap-canonical-min=30bps / "
+                         "pumpswap-noncanonical=30bps, as of 2026-11 "
+                         "captures); alternative to --fee-bps")
     ap.add_argument("--holdout", type=float, default=None,
                     help="chronological dev/eval split: the LATER "
                          "fraction (e.g. 0.3) is the evaluation holdout")
@@ -757,8 +765,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     costs: Optional[Dict[str, Any]] = None
     if args.with_costs:
         # The venue fee is NEVER silently assumed: --fee-bps explicitly,
-        # or a named venue with a published schedule.
-        venue_fees = {"pumpfun-curve": 125.0, "pumpswap-standard": 30.0}
+        # or a named venue SCENARIO. PumpSwap has no single rate: its
+        # canonical tiers run 125 -> 30 bps by market cap, non-canonical
+        # pools charge 0.30%, and unknown mcap/quote resolves to the max
+        # tier (fee schedule verified from captures+IDLs, as of
+        # 2026-11 - a snapshot, never a live-current claim). The named
+        # scenarios below pick a tier explicitly; anything else needs
+        # --fee-bps.
+        venue_fees = {"pumpfun-curve": 125.0,
+                      "pumpswap-canonical-max": 125.0,
+                      "pumpswap-canonical-min": 30.0,
+                      "pumpswap-noncanonical": 30.0}
         if args.fee_bps is not None:
             fee_bps = args.fee_bps
         elif args.venue in venue_fees:
@@ -778,6 +795,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             exit_rules=exit_rules, costs=costs)
     if args.holdout is not None:
         split = engine.run_with_holdout(histories, args.holdout)
+        print("SEGMENTS: %s" % split["portfolio_note"])
         print("=== DEV segment (%d histories) ===" % split["split_index"])
         _print_report(split["dev"])
         print("=== EVAL holdout (later %d histories; final evaluation "

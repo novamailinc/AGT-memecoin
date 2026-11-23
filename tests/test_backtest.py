@@ -312,6 +312,7 @@ class BacktestEngineTest(unittest.TestCase):
         self.assertEqual(split["split_index"], 7)
         self.assertEqual(split["dev"]["n_histories"], 7)
         self.assertEqual(split["eval"]["n_histories"], 3)
+        self.assertIn("capital resets", split["portfolio_note"])
 
     def test_holdout_eval_independent_of_dev(self):
         # Boundary-leakage guard: eval outcomes must be identical whether
@@ -356,6 +357,7 @@ class BacktestEngineTest(unittest.TestCase):
             self.assertIn("failed executions:", out)
             self.assertIn("DEV segment", out)
             self.assertIn("EVAL holdout", out)
+            self.assertIn("capital resets", out)
 
     def test_cli_costs_without_fee_refused(self):
         with tempfile.TemporaryDirectory() as d:

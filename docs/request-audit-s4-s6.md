@@ -89,10 +89,15 @@ Items marked FIXED name the landing commit.
   labeled and reported separately (never qualified performance), and the
   unresolved requirements (capital protection, selection noise, fresh
   holdout, overlap, missingness bias, counterfactual coverage) recorded on
-  every decision. Storage: locked fsync'd append under FOREX_AGENT_HOME
-  (tests/test_promotion.py, 10 checks). PENDING and owner-owned: approved
-  promotion criteria, candidate wiring from the degen-learner dry-run,
-  demo validation; NO activation authorized.
+  every decision. Eligibility is never caller-conferred: records stay
+  not_eligible_research_only regardless of flags. Entry schema hygiene
+  enforced (finite entry_ts, dict features, entry not after settle).
+  Storage: fail-closed locked append with torn-tail repair, file fsync
+  (directory fsync best-effort, the stated limit), reader counts
+  unreadable lines (tests/test_promotion.py, 13 checks incl. negative
+  probes). PENDING and owner-owned: approved promotion criteria,
+  candidate wiring from the degen-learner dry-run, demo validation;
+  NO activation authorized.
 
 ## 6. Advanced market intelligence
 

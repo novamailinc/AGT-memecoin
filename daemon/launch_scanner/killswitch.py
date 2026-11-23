@@ -39,7 +39,7 @@ except Exception:
 
 
 def _ensure_state_dir() -> None:
-    """Create STATE_DIR on FIRST USE, never at import.
+    """Create the parent directory of every state path on FIRST USE.
 
     Import-time makedirs made `import killswitch` fail outright in any
     environment where the home path was unwritable (e.g. a test sandbox
@@ -48,8 +48,17 @@ def _ensure_state_dir() -> None:
     a state dir that cannot be created raises here, _load/_lock
     propagate, and is_halted/gate fail closed on the error - identical
     to today's outcome, without the import-time side effect.
+
+    Callers and tests repoint the path constants independently (e.g.
+    STATE_FILE and LOCK_FILE in different directories), so create the
+    dirname of each path constant, not just STATE_DIR: with the default
+    layout all three dirnames ARE STATE_DIR, so this also restores the
+    import-time contract's guarantee for the default case.
     """
-    os.makedirs(STATE_DIR, exist_ok=True)
+    for path in (STATE_FILE, SHADOW_FILE, LOCK_FILE):
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
 # Config per lane: (window_trades, min_trades_before_kill, halt_on_negative)
 CFG = {
@@ -215,7 +224,20 @@ def _load() -> Dict:
         with open(STATE_FILE) as f:
             return json.load(f)
     except FileNotFoundError:
-        # Genuine first boot: nothing to lose.
+        # Genuine first boot: nothing to lose. But a MISSING state
+        # file in an UNWRITABLE state directory is not a first boot
+        # we can safely treat as one — the halt ledger may be
+        # unreachable (permissions, read-only mount) rather than
+        # absent, and silently resuming on a blank state would
+        # evaporate every halt exactly like the torn-file case
+        # below. Probe writability via the lock file: a genuine
+        # first boot can always create it; if we cannot, fail
+        # closed. (Found by tests/test_killswitch_paths.py.)
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(fd)
+        except Exception as e:
+            raise _StateError("killswitch state dir unwritable: %s" % (e,))
         return {"lanes": {}, "events": []}
     except Exception as e:
         # Corrupt/torn file: NEVER invent a blank state over real

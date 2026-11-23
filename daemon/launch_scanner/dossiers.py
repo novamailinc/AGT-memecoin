@@ -82,23 +82,46 @@ ARCHIVE_FILE = os.path.join(HOME, "memory", "launch_archive.jsonl")
 # - durability: a dossier is only evicted after its archive write
 #   SUCCEEDS; writers append under an exclusive flock so
 #   concurrent daemons never interleave a line;
-# - retention: launch records collapse to one per mint under
-#   compaction, but OUTCOME history is kept raw for a year and
-#   then rolled into per-lane-per-year summary records
-#   (outcome_rollup), so neither file size nor scan cost grows
-#   without bound. While the retained set fits under
-#   ARCHIVE_MAX_BYTES the cap bounds the file outright; past
-#   that, compaction rewrites to the bounded kept set. Retrieval
-#   is a full scan of that bounded file; a real index is a
-#   future slice if volume outgrows scanning;
-# - outcome provenance: today's closes come from SIMULATED paper
-#   lanes. Every outcome record carries provenance; rollups
-#   count them as simulated wins/losses, never as verified
-#   real-money results.
+# - retention, with an ENFORCEABLE invariant (no blanket
+#   "bounded" claim): after every compaction the file holds at
+#   most (a) one anchor, (b) MAX_KEPT_LAUNCHES per-mint launch
+#   records (a hard cap - older ones are first aggregated into
+#   per-deployer-per-year launch_rollup records so deployer
+#   linkage survives), (c) raw outcome records younger than
+#   OUTCOME_RAW_S (older ones aggregate into per-
+#   (lane, year, deployer) outcome_rollup records, so the
+#   mint->deployer linkage resolvable at rollup time is kept),
+#   (d) rollup rows, which grow only with distinct
+#   (deployer, year) and (lane, year, deployer) pairs. Retrieval
+#   is a full scan of exactly that file; a real index is a
+#   future slice if rollup cardinality itself outgrows scanning.
+# - outcome provenance, two axes: every outcome is a SIMULATED
+#   paper-lane result (never verified real money), AND each
+#   carries exit_price_kind classifying the close price as a
+#   current-price simulated fill, a stale-price estimate, a
+#   zero write-down, or unknown (exit_provenance labels).
+#   Win/loss counting uses ONLY current-price simulated fills;
+#   stale/write-down/unknown outcomes are counted separately as
+#   the unqualified samples they are.
 ARCHIVE_SCHEMA_V = 1
 ARCHIVE_STALE_S = 30 * 86400
 ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
 OUTCOME_RAW_S = 365 * 86400  # raw outcomes kept a year, then rolled up
+LAUNCH_RAW_S = 365 * 86400   # per-mint launches kept a year, then rolled up
+MAX_KEPT_LAUNCHES = 20000    # hard cap on per-mint launch records
+
+
+def _classify_exit_price_kind(closed_reason):
+    """exit_provenance label for a close reason; "unknown" on any
+    doubt. Never raises."""
+    try:
+        try:
+            from daemon.launch_scanner import exit_provenance as _pk
+        except Exception:
+            import exit_provenance as _pk  # type: ignore
+        return _pk.classify_reason(closed_reason)
+    except Exception:
+        return "unknown"
 
 
 def _archive_lock_path():
@@ -286,6 +309,11 @@ def record_outcome(mint, lane, ts=None, pnl_usd=None,
             # can mistake it for a verified real-money outcome.
             "provenance": "simulated",
             "qualified": False,
+            # And WITHIN simulated: whether the close price was a
+            # current observed quote or a stale/estimated/write-
+            # down figure (the qualification blocker axis).
+            "exit_price_kind": _classify_exit_price_kind(
+                closed_reason),
         }
         return _archive_append(rec)
     except Exception:
@@ -500,19 +528,83 @@ def _sweep(now):
         pass
 
 
+_KIND_KEYS = ("current_price_simulated_fill",
+              "stale_price_estimate", "write_down_zero", "unknown")
+
+
+def _outcome_rollup_row(lane, year, deployer):
+    row = {"v": ARCHIVE_SCHEMA_V, "record_type": "outcome_rollup",
+           "lane": lane, "year": year, "deployer": deployer or None,
+           "count": 0, "wins": 0, "losses": 0,
+           "provenance": "simulated", "qualified": False}
+    for k in _KIND_KEYS:
+        row["kind_" + k] = 0
+    return row
+
+
+def _rollup_add_outcome(row, rec):
+    """Fold one raw outcome into a rollup row. Win/loss counting
+    uses ONLY current-price simulated fills; stale/write-down/
+    unknown kinds are counted as the unqualified samples they
+    are, never as wins or losses."""
+    row["count"] += 1
+    kind = rec.get("exit_price_kind")
+    if kind not in _KIND_KEYS:
+        kind = "unknown"  # legacy record with no label
+    row["kind_" + kind] = row.get("kind_" + kind, 0) + 1
+    if kind == "current_price_simulated_fill":
+        m = rec.get("realized_mult")
+        if isinstance(m, (int, float)):
+            if m > 1.0:
+                row["wins"] += 1
+            else:
+                row["losses"] += 1
+
+
+def _launch_rollup_row(deployer, year):
+    return {"v": ARCHIVE_SCHEMA_V, "record_type": "launch_rollup",
+            "deployer": deployer or None, "year": year,
+            "launches": 0, "conclusive": 0, "unknown": 0}
+
+
+def _rollup_add_launch(row, rec):
+    row["launches"] += 1
+    sv = rec.get("safety_verdict")
+    if sv == "conclusive":
+        row["conclusive"] += 1
+    elif sv == "unknown":
+        row["unknown"] += 1
+
+
 def _maybe_compact_archive(now):
-    """Bounded retention: past ARCHIVE_MAX_BYTES, rewrite the
-    archive keeping the latest launch record per mint, outcomes
-    younger than OUTCOME_RAW_S raw, older outcomes aggregated
-    into per-lane-per-year outcome_rollup records, and a
-    compaction anchor naming what was dropped. The WHOLE
+    """Retention with an enforceable invariant. Compaction runs
+    when the file passes ARCHIVE_MAX_BYTES OR the per-mint
+    launch records pass MAX_KEPT_LAUNCHES; afterwards the file
+    holds only: one anchor, <= MAX_KEPT_LAUNCHES newest per-mint
+    launches (older and >LAUNCH_RAW_S ones folded into
+    per-deployer-per-year launch_rollup rows so the mint->deployer
+    linkage survives aggregation), raw outcomes younger than
+    OUTCOME_RAW_S (older folded into per-(lane, year, deployer)
+    outcome_rollup rows, deployer resolved from the launch
+    records present in this same pass), and rollup rows whose
+    cardinality grows only with distinct key pairs. The WHOLE
     read+rewrite runs under the write lock, so a concurrent
     append can never be silently discarded by the rename.
     Best-effort; never raises."""
     try:
         if not os.path.exists(ARCHIVE_FILE):
             return
-        if os.path.getsize(ARCHIVE_FILE) <= ARCHIVE_MAX_BYTES:
+        launch_lines = 0
+        try:
+            with open(ARCHIVE_FILE) as f:
+                for line in f:
+                    if '"record_type": "outcome"' not in line \
+                            and '"record_type":"outcome"' not in line:
+                        launch_lines += 1
+        except Exception:
+            launch_lines = 0
+        if os.path.getsize(ARCHIVE_FILE) <= ARCHIVE_MAX_BYTES \
+                and launch_lines <= MAX_KEPT_LAUNCHES:
             return
         tmp = ARCHIVE_FILE + ".compact-tmp"
         # Lock across read AND rename: an append landing between
@@ -521,6 +613,7 @@ def _maybe_compact_archive(now):
         # takes, so appends queue behind the compaction.
         with _archive_write_lock():
             launches, outcomes, rollups = {}, [], {}
+            launch_rollups = {}
             dropped = 0
             with open(ARCHIVE_FILE) as f:
                 for line in f:
@@ -544,47 +637,88 @@ def _maybe_compact_archive(now):
                         except Exception:
                             age = 0.0
                         if age > OUTCOME_RAW_S:
+                            # Resolve the deployer from the launch
+                            # record seen in this same pass so the
+                            # mint->deployer linkage survives the
+                            # rollup; unresolved -> None key,
+                            # labeled by absence, never guessed.
+                            lr = launches.get(
+                                str(rec.get("mint") or "")) or {}
                             year = time.strftime(
                                 "%Y", time.gmtime(float(
                                     rec.get("archived_ts") or 0)))
-                            key = (str(rec.get("lane") or ""), year)
-                            ru = rollups.setdefault(key, {
-                                "v": ARCHIVE_SCHEMA_V,
-                                "record_type": "outcome_rollup",
-                                "lane": key[0], "year": key[1],
-                                "count": 0, "wins": 0, "losses": 0,
-                                "provenance": "simulated",
-                                "qualified": False})
-                            ru["count"] += 1
-                            m = rec.get("realized_mult")
-                            if isinstance(m, (int, float)):
-                                if m > 1.0:
-                                    ru["wins"] += 1
-                                else:
-                                    ru["losses"] += 1
+                            key = (str(rec.get("lane") or ""),
+                                   year,
+                                   str(lr.get("deployer") or ""))
+                            ru = rollups.setdefault(
+                                key, _outcome_rollup_row(*key))
+                            _rollup_add_outcome(ru, rec)
                         else:
                             outcomes.append(rec)
                     elif rtype == "outcome_rollup":
                         key = (str(rec.get("lane") or ""),
-                               str(rec.get("year") or ""))
-                        ru = rollups.setdefault(key, {
-                            "v": ARCHIVE_SCHEMA_V,
-                            "record_type": "outcome_rollup",
-                            "lane": key[0], "year": key[1],
-                            "count": 0, "wins": 0, "losses": 0,
-                            "provenance": "simulated",
-                            "qualified": False})
-                        for k in ("count", "wins", "losses"):
+                               str(rec.get("year") or ""),
+                               str(rec.get("deployer") or ""))
+                        ru = rollups.setdefault(
+                            key, _outcome_rollup_row(*key))
+                        for k in ("count", "wins", "losses") \
+                                + tuple("kind_" + x
+                                        for x in _KIND_KEYS):
                             try:
                                 ru[k] += int(rec.get(k) or 0)
+                            except Exception:
+                                pass
+                    elif rtype == "launch_rollup":
+                        key = (str(rec.get("deployer") or ""),
+                               str(rec.get("year") or ""))
+                        lru = launch_rollups.setdefault(
+                            key, _launch_rollup_row(*key))
+                        for k in ("launches", "conclusive",
+                                  "unknown"):
+                            try:
+                                lru[k] += int(rec.get(k) or 0)
                             except Exception:
                                 pass
                     elif rtype == "launch" and rec.get("mint"):
                         launches[rec["mint"]] = rec  # newest wins
                     else:
                         dropped += 1
-            kept = list(launches.values()) + outcomes \
-                + list(rollups.values())
+            # Launch retention: raw per-mint records older than
+            # LAUNCH_RAW_S fold into per-deployer-per-year
+            # rollups; then the hard cap MAX_KEPT_LAUNCHES folds
+            # the oldest remaining until the cap holds. The
+            # per-mint set is therefore always bounded by a
+            # constant, not by mint cardinality.
+            def _lts(rec):
+                try:
+                    return float(rec.get("archived_ts") or 0)
+                except Exception:
+                    return 0.0
+            kept_launches = {}
+            for mint, rec in launches.items():
+                ts = _lts(rec)
+                if ts and now - ts > LAUNCH_RAW_S:
+                    key = (str(rec.get("deployer") or ""),
+                           time.strftime("%Y", time.gmtime(ts)))
+                    lru = launch_rollups.setdefault(
+                        key, _launch_rollup_row(*key))
+                    _rollup_add_launch(lru, rec)
+                else:
+                    kept_launches[mint] = rec
+            if len(kept_launches) > MAX_KEPT_LAUNCHES:
+                oldest = sorted(kept_launches.values(), key=_lts)
+                for rec in oldest[:len(kept_launches)
+                                  - MAX_KEPT_LAUNCHES]:
+                    ts = _lts(rec)
+                    key = (str(rec.get("deployer") or ""),
+                           time.strftime("%Y", time.gmtime(ts)))
+                    lru = launch_rollups.setdefault(
+                        key, _launch_rollup_row(*key))
+                    _rollup_add_launch(lru, rec)
+                    del kept_launches[rec["mint"]]
+            kept = list(kept_launches.values()) + outcomes \
+                + list(rollups.values()) \
+                + list(launch_rollups.values())
             anchor = {"v": ARCHIVE_SCHEMA_V,
                       "record_type": "compaction_anchor",
                       "archived_ts": now,
@@ -675,36 +809,63 @@ def _intel_fields(deployer):
         try:
             st = archive_status()
             if st.get("available"):
-                launches = [
-                    r for r in launch_archive(deployer=deployer,
-                                              limit=1000)
-                    if r.get("record_type", "launch") == "launch"]
-                if launches:
+                archived = launch_archive(deployer=deployer,
+                                          limit=1000)
+                launches = [r for r in archived
+                            if r.get("record_type", "launch")
+                            == "launch"]
+                launch_rollups = [r for r in archived
+                                  if r.get("record_type")
+                                  == "launch_rollup"]
+                if launches or launch_rollups:
                     mints = {r.get("mint") for r in launches}
                     outcomes = [o for o in outcome_records()
                                 if o.get("mint") in mints]
-                    mults = [o.get("realized_mult") for o in outcomes
+                    # Win/loss counting uses ONLY current-price
+                    # simulated fills; stale/estimated, write-down
+                    # and unlabeled legacy outcomes are counted
+                    # separately as unqualified samples.
+                    cur = [o for o in outcomes
+                           if o.get("exit_price_kind")
+                           == "current_price_simulated_fill"]
+                    mults = [o.get("realized_mult") for o in cur
                              if isinstance(o.get("realized_mult"),
                                            (int, float))]
                     out["deployer_history"] = {
-                        "archived_launches": len(launches),
+                        "archived_launches": len(launches) + sum(
+                            int(r.get("launches") or 0)
+                            for r in launch_rollups),
+                        # Rollup rows folded older launches into
+                        # aggregates: totals include them, and the
+                        # flag says this is not a pure raw record.
+                        "includes_rollup": bool(launch_rollups),
                         "conclusive": sum(
                             1 for r in launches
                             if r.get("safety_verdict")
-                            == "conclusive"),
+                            == "conclusive") + sum(
+                            int(r.get("conclusive") or 0)
+                            for r in launch_rollups),
                         "unknown": sum(
                             1 for r in launches
-                            if r.get("safety_verdict") == "unknown"),
+                            if r.get("safety_verdict") == "unknown")
+                            + sum(int(r.get("unknown") or 0)
+                                  for r in launch_rollups),
                         "outcomes": len(outcomes),
                         # Today's outcomes are SIMULATED paper-lane
                         # results: counted and labeled as such,
                         # never presented as verified real-money
                         # wins/losses. Code-defined: recorded
-                        # realized multiple > 1.0 is a win.
+                        # realized multiple > 1.0 is a win, and
+                        # only a current-price simulated fill
+                        # counts.
                         "simulated_wins": sum(
                             1 for m in mults if m > 1.0),
                         "simulated_losses": sum(
                             1 for m in mults if m <= 1.0),
+                        "outcomes_not_current_price": sum(
+                            1 for o in outcomes
+                            if o.get("exit_price_kind")
+                            != "current_price_simulated_fill"),
                         "outcomes_provenance": "simulated",
                         "outcomes_qualified": False,
                         # Partial memory (skipped torn lines) or

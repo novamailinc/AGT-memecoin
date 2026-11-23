@@ -581,7 +581,174 @@ def test_rollup_records_survive_compaction_and_merge():
             dossiers.OUTCOME_RAW_S = real_raw
 
 
+def test_exit_price_kind_labels():
+    with _Ctx() as c:
+        now = time.time()
+        dossiers.record_outcome("MINT-K1", "grad", ts=now,
+                                realized_mult=2.0,
+                                closed_reason="trail")
+        dossiers.record_outcome("MINT-K2", "grad", ts=now,
+                                realized_mult=1.5,
+                                closed_reason="f2_last_known_price")
+        dossiers.record_outcome("MINT-K3", "grad", ts=now,
+                                realized_mult=0.0,
+                                closed_reason="stop_unquotable")
+        dossiers.record_outcome("MINT-K4", "grad", ts=now,
+                                realized_mult=1.1,
+                                closed_reason=None)
+        k = {o["mint"]: o.get("exit_price_kind")
+             for o in dossiers.outcome_records()}
+        check("kind: current-price fill labeled",
+              k.get("MINT-K1") == "current_price_simulated_fill")
+        check("kind: stale estimate labeled",
+              k.get("MINT-K2") == "stale_price_estimate")
+        check("kind: write-down labeled",
+              k.get("MINT-K3") == "write_down_zero")
+        check("kind: missing reason is unknown, never assumed",
+              k.get("MINT-K4") == "unknown")
+
+
+def test_deployer_history_current_price_only():
+    with _Ctx() as c:
+        now = time.time()
+        c.write_dossier("MINT-DH", born_ts=now - 90000,
+                        deployer="DEP-DH",
+                        safety={"report": {"unknown": False,
+                                           "source": "x"}})
+        dossiers._last_sweep = 0.0
+        dossiers._sweep(now)
+        dossiers.record_outcome("MINT-DH", "grad", ts=now,
+                                realized_mult=2.0,
+                                closed_reason="trail")
+        dossiers.record_outcome("MINT-DH", "grad", ts=now,
+                                realized_mult=3.0,
+                                closed_reason="f2_last_known_price")
+        dossiers.record_outcome("MINT-DH", "grad", ts=now,
+                                realized_mult=0.0,
+                                closed_reason="stop_unquotable")
+        h = dossiers._intel_fields("DEP-DH").get(
+            "deployer_history") or {}
+        check("history: wins/losses count current-price fills only",
+              h.get("simulated_wins") == 1
+              and h.get("simulated_losses") == 0)
+        check("history: non-current-price samples counted apart",
+              h.get("outcomes_not_current_price") == 2
+              and h.get("outcomes") == 3)
+
+
+def test_outcome_rollup_preserves_deployer_linkage():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_raw = dossiers.OUTCOME_RAW_S
+        dossiers.ARCHIVE_MAX_BYTES = 100  # force compaction
+        dossiers.OUTCOME_RAW_S = 100
+        try:
+            c.write_dossier("MINT-LINK", born_ts=now - 90000,
+                            deployer="DEP-LINK",
+                            safety={"report": {"unknown": False,
+                                               "source": "x"}})
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now - 500)
+            dossiers.record_outcome("MINT-LINK", "grad",
+                                    ts=now - 1000,
+                                    realized_mult=2.0,
+                                    closed_reason="trail")
+            dossiers._maybe_compact_archive(now)
+            rollups = [r for r in dossiers.launch_archive(limit=1000)
+                       if r.get("record_type") == "outcome_rollup"]
+            check("rollup: keyed lane+year+deployer, linkage kept",
+                  len(rollups) == 1
+                  and rollups[0].get("deployer") == "DEP-LINK"
+                  and rollups[0].get("lane") == "grad"
+                  and rollups[0].get("count") == 1
+                  and rollups[0].get("wins") == 1
+                  and rollups[0].get(
+                      "kind_current_price_simulated_fill") == 1)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.OUTCOME_RAW_S = real_raw
+
+
+def test_launch_rollup_after_raw_window():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_lraw = dossiers.LAUNCH_RAW_S
+        dossiers.ARCHIVE_MAX_BYTES = 100
+        dossiers.LAUNCH_RAW_S = 100
+        try:
+            c.write_dossier("MINT-OLD-L", born_ts=now - 90000,
+                            deployer="DEP-OLD",
+                            safety={"report": {"unknown": False,
+                                               "source": "x"}})
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now - 1000)  # archived 1000s ago
+            dossiers._maybe_compact_archive(now)
+            raw = [r for r in dossiers.launch_archive(limit=1000)
+                   if r.get("record_type", "launch") == "launch"]
+            lru = [r for r in dossiers.launch_archive(limit=1000)
+                   if r.get("record_type") == "launch_rollup"]
+            check("launch rollup: aged launch folded, raw gone",
+                  len(raw) == 0 and len(lru) == 1
+                  and lru[0].get("deployer") == "DEP-OLD"
+                  and lru[0].get("launches") == 1
+                  and lru[0].get("conclusive") == 1)
+            h = dossiers._intel_fields("DEP-OLD").get(
+                "deployer_history") or {}
+            check("launch rollup: deployer history still visible "
+                  "and labeled as rolled up",
+                  h.get("archived_launches") == 1
+                  and h.get("includes_rollup") is True)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.LAUNCH_RAW_S = real_lraw
+
+
+def test_max_kept_launches_hard_cap():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_max = dossiers.MAX_KEPT_LAUNCHES
+        # Byte cap huge: compaction must trigger on the launch
+        # COUNT alone.
+        dossiers.ARCHIVE_MAX_BYTES = 10 ** 9
+        dossiers.MAX_KEPT_LAUNCHES = 5
+        try:
+            for i in range(12):
+                c.write_dossier("MINT-CAP-%02d" % i,
+                                born_ts=now - 90000 + i,
+                                deployer="DEP-CAP",
+                                safety={"report": {"unknown": False,
+                                                   "source": "x"}})
+                dossiers._last_sweep = 0.0
+                dossiers._sweep(now - 100 + i)
+            dossiers._maybe_compact_archive(now)
+            with open(dossiers.ARCHIVE_FILE) as f:
+                lines = [json.loads(l) for l in f if l.strip()]
+            raw = [l for l in lines
+                   if l.get("record_type", "launch") == "launch"]
+            lru = [l for l in lines
+                   if l.get("record_type") == "launch_rollup"]
+            check("cap: per-mint launches never exceed the hard cap",
+                  len(raw) <= 5)
+            check("cap: overflow folded into deployer-year rollup",
+                  sum(int(r.get("launches") or 0) for r in lru)
+                  == 7)
+            check("cap: nothing lost, raw + rollup == archived",
+                  len(raw) + sum(int(r.get("launches") or 0)
+                                 for r in lru) == 12)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.MAX_KEPT_LAUNCHES = real_max
+
+
 def main():
+    test_exit_price_kind_labels()
+    test_deployer_history_current_price_only()
+    test_outcome_rollup_preserves_deployer_linkage()
+    test_launch_rollup_after_raw_window()
+    test_max_kept_launches_hard_cap()
     test_missing_archive_with_existing_history_is_unavailable()
     test_torn_tail_marks_history_partial()
     test_compaction_never_discards_concurrent_append()

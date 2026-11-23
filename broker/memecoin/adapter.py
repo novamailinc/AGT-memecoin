@@ -122,7 +122,8 @@ class MemecoinAdapter(BrokerAdapter):
                  market_data: Optional[MemecoinMarketData] = None,
                  chains: Optional[List[str]] = None,
                  key_provider=None,
-                 devnet_rpc_url: str = "", shared_account=None, fx_observer=None):
+                 devnet_rpc_url: str = "", shared_account=None, fx_observer=None,
+                 shared_mark_observer=None):
         """
         data_dir: state directory (created if missing).
         mode: "paper" | "live". Live is fail-closed (see module docstring).
@@ -150,6 +151,7 @@ class MemecoinAdapter(BrokerAdapter):
         # No environment switch activates the unfinished bridge.
         self._shared_account = shared_account
         self._fx_observer = fx_observer
+        self._shared_mark_observer = shared_mark_observer
         if shared_account is not None and mode != "paper":
             raise BrokerError(CONFIG_INVALID, "shared capital bridge is paper-only")
         self._paper_start_sol = float(paper_start_sol)
@@ -833,8 +835,25 @@ class MemecoinAdapter(BrokerAdapter):
     def account_info(self) -> AccountInfo:
         self._ensure()
         if self._shared_account is not None:
-            raise BrokerError(BROKER_UNAVAILABLE,
-                              "shared USD account is not a SOL risk-sizing view; integration unqualified")
+            with self._state_lock():
+                self._refresh_locked()
+                from daemon.launch_scanner import account_marks
+                try:
+                    fx = self._observe_entry_fx()
+                    marks = (self._shared_mark_observer or account_marks.collect_marks)()
+                    snap = self._shared_account.snapshot(marks)
+                except Exception as exc:
+                    raise BrokerError(BROKER_UNAVAILABLE, "shared SOL sizing inputs unavailable") from exc
+                equity = snap.get("marked_equity_conservative")
+                if snap.get("degraded") or equity is None:
+                    raise BrokerError(BROKER_UNAVAILABLE, "shared SOL sizing marks unavailable")
+                rate = fx["usd_per_sol"]
+                self._last_shared_sizing_evidence = {"fx":fx, "usd_equity":equity,
+                    "usd_spendable":snap["cash_spendable"], "currency":"SOL"}
+                return AccountInfo(balance=snap["cash_spendable"]/rate,
+                                   equity=equity/rate, currency="SOL", margin=0.,
+                                   free_margin=snap["cash_spendable"]/rate, leverage=1,
+                                   login=0, server="memecoin-shared-paper-sol-sizing")
         # Equity = cash + current market value of open positions. (BUY
         # deducts the cost from cash, so adding only unrealized P/L would
         # double-count the cost basis.)

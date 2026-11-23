@@ -74,7 +74,34 @@ class BacktestEngine:
     """Replay histories through entry/exit rules. Standalone, no scanner."""
 
     def __init__(self, entry_rules: Optional[Dict[str, Any]] = None,
-                 exit_rules: Optional[Dict[str, Any]] = None):
+                 exit_rules: Optional[Dict[str, Any]] = None,
+                 costs: Optional[Dict[str, Any]] = None,
+                 seed: int = 0):
+        # Stage A cost model (request section 12). OFF by default so
+        # historical reports stay comparable; when enabled every
+        # simulated fill is dragged and charged:
+        #   fee_bps            per swap leg (venue fee; pump.fun curve is
+        #                      125 bps flat per the landed fee schedule)
+        #   slippage_bps       assumed slippage per fill
+        #   price_impact_bps   assumed price impact per fill
+        #   fail_prob_entry    probability an entry execution is
+        #                      unavailable (trade never opens)
+        #   fail_prob_exit     probability an exit leg execution fails at
+        #                      that snapshot (leg stays open)
+        #   trade_notional_usd / token_account_cost_usd: fixed per-
+        #                      position cost (ATA rent) in multiple terms
+        # Fills are decided on OBSERVED prices and realized at dragged
+        # prices: buys execute at price*(1+drag), sells at price*(1-drag).
+        costs = dict(costs or {})
+        self.costs_enabled = bool(costs)
+        self.cost_fee_bps = _f(costs.get("fee_bps"))
+        self.cost_slippage_bps = _f(costs.get("slippage_bps"))
+        self.cost_impact_bps = _f(costs.get("price_impact_bps"))
+        self.cost_fail_entry = _f(costs.get("fail_prob_entry"))
+        self.cost_fail_exit = _f(costs.get("fail_prob_exit"))
+        self.cost_notional_usd = _f(costs.get("trade_notional_usd"))
+        self.cost_ata_usd = _f(costs.get("token_account_cost_usd"))
+        self._rng = random.Random(seed)
         entry = dict(_DEFAULT_ENTRY_RULES)
         if entry_rules:
             entry.update(entry_rules)
@@ -132,19 +159,45 @@ class BacktestEngine:
     # -- exit simulation ------------------------------------------------
     def _simulate(self, snaps: List[Dict[str, Any]],
                   entry_idx: int) -> Dict[str, Any]:
-        """Walk post-entry snapshots; TP ladder, trailing stop, time stop."""
+        """Walk post-entry snapshots; TP ladder, trailing stop, time stop.
+
+        With the cost model on, rungs still TRIGGER on observed prices
+        (the strategy sees the market), but every fill REALIZES at a
+        dragged price and pays the per-leg fee; a failed exit leg stays
+        open for the next snapshot."""
         entry_snap = snaps[entry_idx]
         entry_price = _f(entry_snap.get("price_usd"))
         entry_t = _f(entry_snap.get("t"))
         deadline = entry_t + self.time_stop_h * 3600.0
 
-        remainder = 1.0
+        if self.costs_enabled:
+            drag = (self.cost_slippage_bps + self.cost_impact_bps) / 1e4
+            buy_drag = 1.0 + drag
+            sell_drag = max(0.0, 1.0 - drag)
+            fee = self.cost_fee_bps / 1e4
+        else:
+            buy_drag = sell_drag = 1.0
+            fee = 0.0
+        # Entry fill: worse price (buy_drag) and the entry-leg fee comes
+        # out of the position itself.
+        remainder = 1.0 * (1.0 - fee)
         proceeds = 0.0
+        failed_exits = 0
         rung_hit = [False] * len(self.tp_ladder)
         peak = 1.0
         max_dd = 0.0
         exit_reason = "final"
         last_mult = 1.0
+
+        def _try_sell(frac_pos: float, raw_mult: float) -> float:
+            """Execute one exit leg; returns proceeds in entry-multiple
+            terms, 0.0 when the execution fails (leg stays open)."""
+            nonlocal failed_exits
+            if self.costs_enabled and self._rng.random() < self.cost_fail_exit:
+                failed_exits += 1
+                return 0.0
+            realized = raw_mult * sell_drag / buy_drag
+            return frac_pos * realized * (1.0 - fee)
 
         for snap in snaps[entry_idx + 1:]:
             if not isinstance(snap, dict):
@@ -162,9 +215,15 @@ class BacktestEngine:
             for i, (rung_mult, frac) in enumerate(self.tp_ladder):
                 if not rung_hit[i] and mult >= rung_mult:
                     sell = min(frac, remainder)
-                    proceeds += sell * rung_mult
-                    remainder -= sell
-                    rung_hit[i] = True
+                    got = _try_sell(sell, rung_mult)
+                    if got > 0.0:
+                        proceeds += got
+                        remainder -= sell
+                        rung_hit[i] = True
+                    elif not self.costs_enabled:
+                        proceeds += 0.0
+                        remainder -= sell
+                        rung_hit[i] = True
             if remainder <= 1e-12:
                 remainder = 0.0
                 exit_reason = "tp-all"
@@ -173,27 +232,40 @@ class BacktestEngine:
             # Trailing stop on the remainder (armed once peak >= 1.5x).
             if (self.trailing_stop_pct > 0 and peak >= 1.5
                     and mult <= peak * (1.0 - self.trailing_stop_pct / 100.0)):
-                proceeds += remainder * mult
-                remainder = 0.0
-                exit_reason = "trailing"
-                break
+                got = _try_sell(remainder, mult)
+                if got > 0.0 or not self.costs_enabled:
+                    proceeds += got
+                    remainder = 0.0
+                    exit_reason = "trailing"
+                    break
 
             # Time stop: sell the remainder at the deadline snapshot.
             if t >= deadline:
-                proceeds += remainder * mult
-                remainder = 0.0
-                exit_reason = "time-stop"
-                break
+                got = _try_sell(remainder, mult)
+                if got > 0.0 or not self.costs_enabled:
+                    proceeds += got
+                    remainder = 0.0
+                    exit_reason = "time-stop"
+                    break
 
         if remainder > 0:
-            proceeds += remainder * last_mult
-            remainder = 0.0
+            got = _try_sell(remainder, last_mult)
+            if got > 0.0 or not self.costs_enabled:
+                proceeds += got
+                remainder = 0.0
+            else:
+                exit_reason = "exit-failed"
+        # Fixed per-position cost (e.g. token-account rent) in multiple
+        # terms, when a notional was supplied to express it against.
+        if self.costs_enabled and self.cost_notional_usd > 0 and self.cost_ata_usd > 0:
+            proceeds -= self.cost_ata_usd / self.cost_notional_usd
         return {
             "proceeds_mult": proceeds,
             "pnl_mult": proceeds - 1.0,
             "peak_mult": peak,
             "max_drawdown_mult": max_dd,
             "exit_reason": exit_reason,
+            "failed_exit_attempts": failed_exits,
         }
 
     # -- realized paper tally ------------------------------------------
@@ -256,6 +328,10 @@ class BacktestEngine:
             "per_gate_blocked": {},
             "skipped_malformed": 0,
             "trades": [],
+            # Stage A cost-model accounting (0 / absent when disabled).
+            "costs_enabled": self.costs_enabled,
+            "n_failed_entry_executions": 0,
+            "n_failed_exit_executions": 0,
             # Realized paper outcomes (outcome_kind="paper"): what the bot
             # actually did — never re-simulated, tallied as reported.
             "paper": {
@@ -303,7 +379,15 @@ class BacktestEngine:
                 _block("entry-mcap")
                 continue
 
+            if self.costs_enabled and self._rng.random() < self.cost_fail_entry:
+                # Entry execution unavailable (route/liquidity failure):
+                # the trade never opens. Counted, not silently dropped.
+                report["n_failed_entry_executions"] += 1
+                continue
+
             trade = self._simulate(snaps, entry_idx)
+            report["n_failed_exit_executions"] += trade.get(
+                "failed_exit_attempts", 0)
             pnl = trade["pnl_mult"]
             mult = trade["proceeds_mult"]
             report["n_trades"] += 1
@@ -365,6 +449,16 @@ class BacktestEngine:
             for key, agg in bucket.items():
                 t = agg["trades"]
                 agg["win_rate"] = round(agg["wins"] / t, 4) if t else 0.0
+        if self.costs_enabled:
+            report["costs"] = {
+                "fee_bps": self.cost_fee_bps,
+                "slippage_bps": self.cost_slippage_bps,
+                "price_impact_bps": self.cost_impact_bps,
+                "fail_prob_entry": self.cost_fail_entry,
+                "fail_prob_exit": self.cost_fail_exit,
+                "trade_notional_usd": self.cost_notional_usd,
+                "token_account_cost_usd": self.cost_ata_usd,
+            }
         # Finalize realized paper stats.
         paper = report["paper"]
         mults = paper.pop("mults", None) or []
@@ -379,6 +473,37 @@ class BacktestEngine:
                 t = agg["trades"]
                 agg["win_rate"] = round(agg["wins"] / t, 4) if t else 0.0
         return report
+
+    # -- chronological dev/eval separation (Stage A) --------------------
+    def run_with_holdout(self, histories: List[Dict[str, Any]],
+                         holdout_fraction: float = 0.3) -> Dict[str, Any]:
+        """Split histories CHRONOLOGICALLY and report dev and eval runs
+        separately. The LATER segment is the evaluation holdout:
+        strategy development belongs on the dev segment, and the
+        holdout is touched only for final evaluation, so repeatedly
+        tuning against the report never overfits the eval data
+        (request Stage A: separate strategy development from final
+        evaluation data)."""
+        def _first_t(h: Any) -> float:
+            if not isinstance(h, dict):
+                return float("inf")
+            snaps = h.get("snapshots")
+            if isinstance(snaps, list):
+                for s in snaps:
+                    if isinstance(s, dict) and _f(s.get("t")) > 0:
+                        return _f(s.get("t"))
+            return _f(h.get("t0"))
+
+        ordered = sorted(list(histories or []), key=_first_t)
+        n = len(ordered)
+        frac = min(max(_f(holdout_fraction), 0.0), 1.0)
+        k = min(n, max(0, int(round(n * (1.0 - frac)))))
+        return {
+            "split_index": k,
+            "holdout_fraction": frac,
+            "dev": self.run(ordered[:k]),
+            "eval": self.run(ordered[k:]),
+        }
 
 
 def synthetic_history(mint: str = "SYNTH1", symbol: str = "SYN",
@@ -489,6 +614,14 @@ def _print_report(report: Dict[str, Any]) -> None:
         print("blocked — " + " ".join(bits))
     if report["skipped_malformed"]:
         print("skipped malformed: %d" % report["skipped_malformed"])
+    if report.get("costs_enabled"):
+        c = report.get("costs") or {}
+        print("costs: fee %.0fbps slippage %.0fbps impact %.0fbps per leg"
+              % (c.get("fee_bps", 0), c.get("slippage_bps", 0),
+                 c.get("price_impact_bps", 0)))
+        print("failed executions: %d entries, %d exit legs" % (
+            report.get("n_failed_entry_executions", 0),
+            report.get("n_failed_exit_executions", 0)))
     paper = report.get("paper") or {}
     if paper.get("trades"):
         print("--- REAL PAPER OUTCOMES (%d closed positions) ---" % (
@@ -534,6 +667,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="override trailing stop pct (default 30)")
     ap.add_argument("--time-stop-h", type=float, default=None,
                     help="override time stop hours (default 6)")
+    ap.add_argument("--with-costs", action="store_true",
+                    help="Stage A cost model: 125bps venue fee per leg, "
+                         "50bps slippage, 100bps price impact (override "
+                         "with --fee-bps/--slippage-bps/--impact-bps)")
+    ap.add_argument("--fee-bps", type=float, default=None)
+    ap.add_argument("--slippage-bps", type=float, default=None)
+    ap.add_argument("--impact-bps", type=float, default=None)
+    ap.add_argument("--holdout", type=float, default=None,
+                    help="chronological dev/eval split: the LATER "
+                         "fraction (e.g. 0.3) is the evaluation holdout")
     args = ap.parse_args(argv)
 
     entry_rules: Dict[str, Any] = {}
@@ -552,8 +695,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("(expected at %s)" % os.path.expanduser(args.dataset))
         return 0
     histories = _load_dataset(args.dataset)
-    engine = BacktestEngine(entry_rules=entry_rules, exit_rules=exit_rules)
-    _print_report(engine.run(histories))
+    costs: Optional[Dict[str, Any]] = None
+    if args.with_costs:
+        costs = {
+            "fee_bps": 125.0 if args.fee_bps is None else args.fee_bps,
+            "slippage_bps": (50.0 if args.slippage_bps is None
+                             else args.slippage_bps),
+            "price_impact_bps": (100.0 if args.impact_bps is None
+                                 else args.impact_bps),
+        }
+    engine = BacktestEngine(entry_rules=entry_rules,
+                            exit_rules=exit_rules, costs=costs)
+    if args.holdout is not None:
+        split = engine.run_with_holdout(histories, args.holdout)
+        print("=== DEV segment (%d histories) ===" % split["split_index"])
+        _print_report(split["dev"])
+        print("=== EVAL holdout (later %d histories; final evaluation "
+              "only) ===" % (len(histories) - split["split_index"]))
+        _print_report(split["eval"])
+    else:
+        _print_report(engine.run(histories))
     return 0
 
 

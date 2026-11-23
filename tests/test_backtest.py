@@ -208,6 +208,100 @@ class BacktestEngineTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("no data yet", buf.getvalue())
 
+    # -- Stage A cost model -------------------------------------------
+    def test_costs_off_preserves_legacy_math(self):
+        eng = backtest.BacktestEngine(
+            exit_rules={"tp_ladder": [(2.0, 0.5)], "trailing_stop_pct": 30.0,
+                        "time_stop_h": 6.0})
+        r = eng.run([_hist([1.0, 2.0, 1.0])])
+        self.assertFalse(r["costs_enabled"])
+        self.assertNotIn("costs", r)
+        self.assertAlmostEqual(r["trades"][0]["proceeds_mult"], 1.5, places=6)
+
+    def test_costs_drag_and_fees_exact(self):
+        # entry 1.0, rung at 2x sells half, trailing exits the rest at 1.0.
+        # fee 125bps/leg, slippage 50 + impact 100bps -> drag 1.5%.
+        costs = {"fee_bps": 125.0, "slippage_bps": 50.0,
+                 "price_impact_bps": 100.0}
+        eng = backtest.BacktestEngine(
+            exit_rules={"tp_ladder": [(2.0, 0.5)], "trailing_stop_pct": 30.0,
+                        "time_stop_h": 6.0},
+            costs=costs, seed=1)
+        r = eng.run([_hist([1.0, 2.0, 1.0])])
+        self.assertTrue(r["costs_enabled"])
+        fee, drag = 0.0125, 0.015
+        pos = 1.0 * (1 - fee)
+        rung = 0.5 * (2.0 * (1 - drag) / (1 + drag)) * (1 - fee)
+        trail = (pos - 0.5) * (1.0 * (1 - drag) / (1 + drag)) * (1 - fee)
+        self.assertAlmostEqual(r["trades"][0]["proceeds_mult"],
+                               rung + trail, places=4)
+        self.assertLess(r["trades"][0]["proceeds_mult"], 1.5)
+        self.assertIn("costs", r)
+        self.assertEqual(r["costs"]["fee_bps"], 125.0)
+
+    def test_failed_entry_execution_counted_not_traded(self):
+        eng = backtest.BacktestEngine(
+            exit_rules={"tp_ladder": [(2.0, 0.5)]},
+            costs={"fail_prob_entry": 1.0}, seed=1)
+        r = eng.run([_hist([1.0, 2.0, 1.0])])
+        self.assertEqual(r["n_trades"], 0)
+        self.assertEqual(r["n_failed_entry_executions"], 1)
+
+    def test_failed_exit_leaves_position_unsold(self):
+        eng = backtest.BacktestEngine(
+            exit_rules={"tp_ladder": [(2.0, 0.5)], "trailing_stop_pct": 30.0,
+                        "time_stop_h": 6.0},
+            costs={"fail_prob_exit": 1.0}, seed=1)
+        r = eng.run([_hist([1.0, 2.0, 1.0])])
+        trade = r["trades"][0]
+        self.assertEqual(trade["exit_reason"], "exit-failed")
+        self.assertEqual(trade["proceeds_mult"], 0.0)
+        self.assertGreaterEqual(r["n_failed_exit_executions"], 1)
+
+    def test_cost_model_deterministic_per_seed(self):
+        hists = [backtest.synthetic_history(seed=i, n_snaps=30)
+                 for i in range(20)]
+        kw = dict(costs={"fee_bps": 125.0, "fail_prob_entry": 0.3,
+                         "fail_prob_exit": 0.2}, seed=42)
+        r1 = backtest.BacktestEngine(**kw).run(hists)
+        r2 = backtest.BacktestEngine(**kw).run(hists)
+        self.assertEqual(r1["n_trades"], r2["n_trades"])
+        self.assertEqual(r1["n_failed_entry_executions"],
+                         r2["n_failed_entry_executions"])
+        self.assertEqual(r1["trades"], r2["trades"])
+
+    # -- Stage A chronological dev/eval separation ---------------------
+    def test_holdout_split_is_chronological(self):
+        hists = []
+        for i in range(10):
+            h = backtest.synthetic_history(seed=i, n_snaps=20)
+            for s in h["snapshots"]:
+                s["t"] += i * 100000.0  # strictly increasing ages
+            hists.append(h)
+        eng = backtest.BacktestEngine()
+        split = eng.run_with_holdout(hists, 0.3)
+        self.assertEqual(split["split_index"], 7)
+        self.assertEqual(split["dev"]["n_histories"], 7)
+        self.assertEqual(split["eval"]["n_histories"], 3)
+
+    def test_cli_with_costs_and_holdout(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "h.jsonl")
+            for i in range(4):
+                backtest.record_history(
+                    path, backtest.synthetic_history(seed=i, n_snaps=40,
+                                                     drift=0.08, vol=0.02))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = backtest.main([path, "--with-costs",
+                                    "--holdout", "0.25"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("costs: fee 125bps", out)
+            self.assertIn("failed executions:", out)
+            self.assertIn("DEV segment", out)
+            self.assertIn("EVAL holdout", out)
+
     def test_cli_parses_overrides(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "h.jsonl")

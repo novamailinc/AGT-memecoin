@@ -39,7 +39,7 @@ from . import blink as _blink
 from . import filters as _filters
 from . import thesis_watch as _thesis_watch
 from .client import TelegramClient, TelegramError, TelegramFloodError, redact
-from .commands import HandlerContext, handle_callback, handle_message
+from .commands import HandlerContext, handle_callback, handle_message, control_only
 from .security import SecurityContext
 
 logger = logging.getLogger("forex_agent.daemon.telegram")
@@ -112,7 +112,12 @@ class RealTools:
         self._signals, self._trading = t_signals, t_trading
         self._account, self._misc = t_account, t_misc
 
-    def forex_get_health(self): return self._misc.forex_get_health()
+    def forex_get_health(self):
+        if control_only():
+            return {'mode':'development_control_only', 'storage':'local',
+                    'daemons':{'telegram':'running','trading':'not_started'},
+                    'note':'No broker/worker health requests in control-only mode'}
+        return self._misc.forex_get_health()
     def forex_get_signals(self, limit=20): return self._signals.forex_get_signals(limit=limit)
     def forex_get_signal(self, signal_id): return self._signals.forex_get_signal(signal_id)
     def forex_get_positions(self): return self._account.forex_get_positions()
@@ -126,6 +131,13 @@ class RealTools:
     def forex_close_position(self, ticket, request_id=None):
         return self._trading.forex_close_position(ticket, request_id=request_id)
     def forex_kill_switch(self, engage=True, reason=None):
+        if control_only():
+            if not engage:
+                return {'ok':False,'message':'Resume disabled in control-only mode'}
+            store=get_store()
+            store.set_kill_switch(True, 'telegram_control_only')
+            state=store.get_kill_switch()
+            return {'ok':state.get('engaged') is True, **state}
         return self._trading.forex_kill_switch(engage=engage, reason=reason)
 
 
@@ -189,7 +201,7 @@ class TelegramDaemon(Daemon):
         sec = SecurityContext(state)
 
         ctx = HandlerContext(
-            send=self._make_sender(client),
+            send=self._make_sender(client, state),
             delete_message=self._make_deleter(client),
             security=sec,
             tools=self._tools(),
@@ -235,21 +247,22 @@ class TelegramDaemon(Daemon):
         # Runs even when the update pull above failed.
         self._fan_out(ctx, client, sec, state, store)
 
-        # 3. card pulse ---------------------------------------------------
-        # Blink the live-status line on tracked cards (own try/except so a
-        # pulse failure can never break the alert loop above).
-        try:
-            _blink.maybe_poll(state, client)
-        except Exception:
-            logger.exception("blink maybe_poll crashed")
+        if not control_only():
+            # 3. card pulse ---------------------------------------------------
+            # Blink the live-status line on tracked cards (own try/except so a
+            # pulse failure can never break the alert loop above).
+            try:
+                _blink.maybe_poll(state, client)
+            except Exception:
+                logger.exception("blink maybe_poll crashed")
 
-        # 4. lifecycle cards: thesis-break watcher -------------------------
-        # Re-prices watched 🎯 PICKs and fires thesis-break / plan-level
-        # alerts on confirmation. Display-only; own try/except.
-        try:
-            _thesis_watch.maybe_check(state, ctx.publish)
-        except Exception:
-            logger.exception("thesis_watch maybe_check crashed")
+            # 4. lifecycle cards: thesis-break watcher -------------------------
+            # Re-prices watched 🎯 PICKs and fires thesis-break / plan-level
+            # alerts on confirmation. Display-only; own try/except.
+            try:
+                _thesis_watch.maybe_check(state, ctx.publish)
+            except Exception:
+                logger.exception("thesis_watch maybe_check crashed")
 
         # Never persist when the initial read failed: an empty state
         # would wipe pairing/cursor (2026-10-10 outage).
@@ -270,6 +283,9 @@ class TelegramDaemon(Daemon):
                            message_id=msg.get("message_id"))
         elif "callback_query" in update:
             cb = update["callback_query"] or {}
+            if control_only():
+                self._answer(client, cb.get('id'), 'Disabled in control-only mode')
+                return
             msg = cb.get("message") or {}
             chat = msg.get("chat") or {}
             frm = cb.get("from") or {}
@@ -284,11 +300,18 @@ class TelegramDaemon(Daemon):
         except TelegramError as exc:
             logger.warning("answerCallbackQuery failed: %s", exc)
 
-    def _make_sender(self, client: TelegramClient):
+    def _make_sender(self, client: TelegramClient, state=None):
         def _send(chat_id: Any, text: str, reply_markup: Optional[Dict[str, Any]]) -> None:
             try:
-                client.send_message(chat_id, text, reply_markup=reply_markup)
+                result=client.send_message(chat_id, text, reply_markup=reply_markup)
+                if state is not None and control_only():
+                    import time
+                    state['last_command_delivery']={
+                        'chat_id':chat_id,'message_id':(result or {}).get('message_id'),
+                        'accepted_at':time.time(),'status':'telegram_api_accepted_not_read_receipt'}
             except TelegramError as exc:
+                if state is not None and control_only():
+                    state['command_send_failures']=int(state.get('command_send_failures',0))+1
                 logger.warning("telegram send failed: %s", exc)
         return _send
 
@@ -457,6 +480,8 @@ class TelegramDaemon(Daemon):
 
 
 def main_entry(argv=None):
+    if argv and '--control-only' in argv:
+        os.environ['TELEGRAM_CONTROL_ONLY']='1'
     return main(lambda: TelegramDaemon(), argv)
 
 

@@ -127,9 +127,17 @@ def save_convergence(ledger: Dict[str, Any]) -> bool:
     try:
         _LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _LEDGER_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(ledger))
-        os.chmod(tmp, 0o600)
+        with open(tmp, 'w') as f:
+            os.chmod(tmp, 0o600)
+            json.dump(ledger, f)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(_LEDGER_FILE)
+        directory_fd = os.open(_LEDGER_FILE.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         return True
     except OSError as exc:
         logger.warning("could not save convergence ledger: %s", exc)

@@ -161,6 +161,26 @@ HELP_TEXT = (
 # ----------------------------------------------------------------------
 # entry points
 # ----------------------------------------------------------------------
+CONTROL_ONLY_HELP = (
+    'AGT-memecoin control room connected. Owner-only development control mode.\n'
+    'Trading and market-data processes are NOT running. Stage A is unpassed.\n'
+    '/status - actual local runtime and gate state\n'
+    '/account - shared simulated account, if present\n'
+    '/positions - stored simulated positions\n'
+    '/perf - stored demo results, not qualification\n'
+    '/halt - engage the global entry stop\n'
+    '/help - this list\n'
+    'Trade, resume, configuration changes and market research are disabled here. '
+    'This is not an AGT deployment or a live-market demo.'
+)
+
+def control_only():
+    return os.environ.get('TELEGRAM_CONTROL_ONLY') == '1'
+
+def _help_text():
+    return CONTROL_ONLY_HELP if control_only() else HELP_TEXT
+
+
 def handle_message(ctx: HandlerContext, chat_id: Any, user_id: Any,
                    update_id: int, text: str, message_id: Any = None) -> None:
     """Route one incoming message through auth -> rate limit -> handler."""
@@ -183,7 +203,7 @@ def handle_message(ctx: HandlerContext, chat_id: Any, user_id: Any,
             parts = text.split()
             code = parts[1] if len(parts) > 1 else ""
             ok, msg = sec.try_pair(chat_id, user_id, code=code)
-            ctx.send(chat_id, "✅ Paired. This chat is now the control channel.\n\n" + HELP_TEXT
+            ctx.send(chat_id, "✅ Paired. This chat is now the control channel.\n\n" + _help_text()
                      if ok else "⛔ " + msg, None)
         elif first in ("/repair", "repair"):
             # Repair is allowlist-gated inside the handler: the
@@ -221,6 +241,14 @@ def handle_message(ctx: HandlerContext, chat_id: Any, user_id: Any,
     parts = text.split()
     cmd = parts[0].lower().lstrip("/")
     args = parts[1:]
+
+    if control_only():
+        if cmd not in ('start','help','status','account','positions','perf','halt','repair'):
+            ctx.send(chat_id, 'Unavailable in development control-only mode. '
+                     'Trading, resume and market-data commands are disabled. /help', None)
+            return
+        if cmd in ('account','positions','perf'):
+            args=['demo'] + (args[1:] if args and args[0].lower()=='demo' else [])
 
     mutating = cmd in ("trade", "close", "closeall", "resume", "confirm",
                        "halt", "add", "sethelius", "heliuskey", "repair",
@@ -488,7 +516,7 @@ def _cmd_start(ctx, chat_id, user_id, update_id, args):
     code = args[0] if args else ""
     ok, msg = ctx.security.try_pair(chat_id, user_id, code=code)
     ctx.send(chat_id, ("✅ This chat is already the paired control channel." if not ok and ctx.security.is_paired()
-                       else ("✅ Paired. " if ok else "⛔ " + msg) + "\n\n" + HELP_TEXT), None)
+                       else ("✅ Paired. " if ok else "⛔ " + msg) + "\n\n" + _help_text()), None)
 
 
 def _cmd_repair(ctx, chat_id, user_id, update_id, args):
@@ -509,13 +537,13 @@ def _cmd_repair(ctx, chat_id, user_id, update_id, args):
                     "WARNING")
         return
     ok, msg = ctx.security.re_pair(chat_id, user_id)
-    ctx.send(chat_id, ("✅ Repaired. This chat is now the paired control channel.\n\n" + HELP_TEXT
+    ctx.send(chat_id, ("✅ Repaired. This chat is now the paired control channel.\n\n" + _help_text()
                        if ok else "⛔ " + msg), None)
     _audit(ctx, chat_id, user_id, update_id, "repair", msg, ok)
 
 
 def _cmd_help(ctx, chat_id, user_id, update_id, args):
-    ctx.send(chat_id, HELP_TEXT, None)
+    ctx.send(chat_id, _help_text(), None)
 
 
 def _status_mode_lines():
@@ -537,6 +565,10 @@ def _status_mode_lines():
     home = os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser(
         "~/.forex-agent")
     lines = []
+    if control_only():
+        lines.append('Control room: CONNECTED, development control-only mode')
+        lines.append('Trading/market-data processes: NOT started by this control room')
+        lines.append('Stage A: UNPASSED; not a live-market demo or AGT deployment')
 
     # --- mainnet: read the enforced deployment/arm gates --------------
     marker = None
@@ -713,6 +745,10 @@ def _demo_snapshot():
     """Shared memecoin demo paper account snapshot, or None when no
     readable ledger exists. Never raises into a handler."""
     try:
+        if control_only():
+            home=os.environ.get('FOREX_AGENT_HOME') or os.path.expanduser('~/.forex-agent')
+            if not os.path.isfile(os.path.join(home,'paper_account','ledger.json')):
+                return None
         from daemon.launch_scanner import paper_account as pa  # noqa: PLC0415
         return pa.snapshot()
     except Exception:

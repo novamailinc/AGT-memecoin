@@ -422,6 +422,10 @@ def _active_roster():
     daemon in a scratch home without adopting the live fleet).
     Never set it in production: a restricted supervisor would
     leave the rest of the fleet unguarded."""
+    if '--telegram-control-only' in sys.argv:
+        os.environ['TELEGRAM_CONTROL_ONLY']='1'
+        return [Spec('telegram', [sys.executable,'-m','daemon.telegram','--control-only'],
+                     'daemon.telegram')]
     only = os.environ.get("FOREX_SUPERVISOR_ONLY")
     if not only:
         return list(ROSTER)

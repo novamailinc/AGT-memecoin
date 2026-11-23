@@ -1,6 +1,6 @@
 # Pinned integrated acceptance map
 
-Snapshot: candidate immediately after 7b2ef6f, November 23, 2026. This is an engineering acceptance map, not qualification or a completed-bot report.
+Snapshot: integrated candidate with durable wallet intake, November 23, 2026. This is an engineering acceptance map, not qualification or a completed-bot report.
 
 Original source: user's WhatsApp message `wamid.HBgNMjM0NzA0NDcxOTI1MRUCABIYFDNBNjA4MzdENEMxRDFBQzYyQTZGAA==`, November 22, 2026, 14:25 Pacific. The message includes numbered sections 1–26 and a final section 27. Requirements are not sequentially completed milestones.
 
@@ -25,7 +25,7 @@ Original source: user's WhatsApp message `wamid.HBgNMjM0NzA0NDcxOTI1MRUCABIYFDNB
 | 13 Performance/qualification | Some metrics and diagnostics implemented | Frozen verdict contamination and missing qualified sample/period/uncertainty report |
 | 14 Adaptation | Dry-run learner/promotion records | Tested candidate development, holdout comparison, rollback and controlled production promotion not integrated |
 | 15 Portfolio | Shared cash/account gates and position persistence fixture-tested | All-lane exposure/risk acceptance and live execution evidence missing |
-| 16 Telegram | Real handler/account/position and stop/resume component tests | Current live pairing/polling/control-room acceptance not demonstrated |
+| 16 Telegram | Real owner-only development control-only poller connected; supervised process restart demonstrated; local status/account/positions/perf/halt only | Next real owner-command API receipt awaited; no whole connected trading runtime, AGT hosting or reboot proof |
 | 17 Signing security | No real signing exercised in this work | Secure signing/mainnet readiness must be separately demonstrated; no secrets in tests |
 | 18 Jupiter/real execution | Pricing/execution components and fixtures | Actual simulation/submission/confirmation/reconciliation proof not established by fixtures |
 | 19 AGT runtime | Prior installer/startup/restart component evidence | Current actual AGT install, reboot, persistent operation, restore and backup proof absent |
@@ -80,12 +80,42 @@ Proposed correction for review: retain the original registered verdict as an imm
 The wallet-buy acquisition parser now requires meta.err to be explicitly null,
 matching response/request signature, unique in-range account indices and
 explicit owner identity, finite nonnegative native/token amounts and positive
-block time before producing any buys. It validates the whole response before
+block time before producing any buys. It validates the wallet-acquisition evidence before
 returning output, aggregates multiple token accounts for the same mint, and
 records signature/provenance. Aggregate and derived arithmetic must remain finite.
 Block time is finite-positive only, not future-time or freshness qualified. This prevents failed chain transactions and
 malformed later records from becoming partial sighting evidence. Suffix-based
 Pump mint selection and equal split of SOL outflow remain existing approximations.
-The polling cursor still advances before transaction-detail success, so lost
-acquisitions on transient detail failure remain an unresolved production gap.
-No missing execution status is guessed successful.
+No missing execution status is guessed successful. Native arrays are checked
+at the wallet index, not every unrelated balance; non-wallet amounts are not
+validated. Loaded-address account indexing, raw amount/decimal consistency and
+instruction-proven swap attribution remain unsupported.
+
+## Durable wallet acquisition follow-up
+
+The actual main wallet loop now calls `poll_wallet` with a locked atomic/fsynced
+`wallet_intake.json` journal. New signatures are stored in the same snapshot as
+the advanced acquisition cursor. Processing acknowledgement is separate: transport
+error, null, invalid evidence and failed downstream persistence retain pending
+work for the next ordinary cycle. Definitive chain failure and valid no-buy
+responses can acknowledge without fabricating a sighting. One shared typed detail
+fetch feeds buy/sell parsing; the existing six-worker concurrency, shared pacer,
+30-second poll/event loop and inter-wallet pause remain, no extra retry timer.
+
+A normal batch attempts at most the existing page budget (30*4 details); failed
+items rotate durably so a poison item cannot starve later signatures. Pending
+storage is deliberately not hard-capped or evicted, so prolonged outages can grow
+it. Corruption is unavailable, never rebaselined. First-time bootstrap explicitly
+records no pre-start backfill; pageback overflow or an absent previous cursor
+records incomplete coverage, never a full-history claim. Page fetch failure does
+not advance. Convergence write failure prevents acknowledgement; successful
+convergence and seen snapshots fsync before it.
+
+Tests at the actual poll seam cover failed detail then fresh-interpreter retry,
+valid empty versus invalid evidence, failed chain execution, disk/persistence
+failure, corruption, stale cursor writer, bounded overflow, poison rotation and
+crash-after-sighting replay dedup by wallet. Delivery is at least once: a crash
+between downstream effects and acknowledgement can replay. This does not prove
+exactly-once sell/notification/execution effects, abrupt AGT crash recovery,
+provider completeness or a qualified strategy. Existing sell attribution and
+convergence-policy approximations are not repaired by acquisition persistence.

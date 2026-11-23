@@ -210,36 +210,40 @@ def rpc(method, params, api_key=None):
     return _shared_rpc_transport().rpc(method, params)
 
 
-def get_buy_details(wallet, sig, api_key):
+_UNFETCHED = object()
+
+
+def get_buy_details(wallet, sig, api_key, tx=_UNFETCHED, strict=False):
     """Extract wallet buys from a transaction.
 
-    Returns [{mint, tokens_bought, sol_spent, block_ts}]. sol_spent is the
+    Returns [{mint, tokens_bought, sol_spent, block_ts}]. strict=True
+    distinguishes unavailable/invalid evidence (None) from valid no-buy ([]).
+    sol_spent is the
     wallet's total SOL outflow in the tx (buy + fee); for multi-mint txs it
     is split equally across the bought mints (documented approximation —
     the staleness filter fail-opens when the price can't be parsed).
     """
-    tx = rpc("getTransaction",
-             [sig, {"encoding": "json",
-                    "maxSupportedTransactionVersion": 0}],
-             api_key)
+    if tx is _UNFETCHED:
+        tx = rpc("getTransaction",
+                 [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}], api_key)
     if not tx:
-        return []
+        return None if strict else []
     try:
         # Failed chain transactions are not buys. Missing execution
         # status is unknown, not success. Validate the whole response
         # before returning any partial wallet-sighting evidence.
         if not isinstance(tx, dict) or not isinstance(tx.get("meta"), dict):
-            return []
+            return None if strict else []
         meta = tx["meta"]
         if "err" not in meta or meta["err"] is not None:
-            return []
+            return None if strict else []
         keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys")
         if not isinstance(keys, list) or wallet not in keys:
-            return []
+            return None if strict else []
         signatures = (tx.get("transaction") or {}).get("signatures")
         if (not isinstance(signatures, list) or not signatures
                 or signatures[0] != sig):
-            return []
+            return None if strict else []
         idx = keys.index(wallet)
         pre_bal, post_bal = meta.get("preBalances"), meta.get("postBalances")
         def number(value):
@@ -248,39 +252,39 @@ def get_buy_details(wallet, sig, api_key):
                 raise ValueError("invalid measured amount")
             return float(value)
         if not isinstance(pre_bal, list) or not isinstance(post_bal, list):
-            return []
+            return None if strict else []
         sol_out = max(0.0, (number(pre_bal[idx]) - number(post_bal[idx])) / 1e9)
         block_ts = number(tx.get("blockTime"))
         if block_ts <= 0:
-            return []
+            return None if strict else []
         before, after = {}, {}
         account_identities = {}
         for field, target in (("preTokenBalances", before), ("postTokenBalances", after)):
             balances = meta.get(field)
             if not isinstance(balances, list):
-                return []
+                return None if strict else []
             seen_indices = set()
             for balance in balances:
                 if not isinstance(balance, dict):
-                    return []
+                    return None if strict else []
                 account_index = balance.get("accountIndex")
                 if (type(account_index) is not int or account_index < 0
                         or account_index >= len(keys) or account_index in seen_indices):
-                    return []
+                    return None if strict else []
                 seen_indices.add(account_index)
                 # Missing owner cannot establish that a pre-holding
                 # was somebody else's. Refuse ambiguous deltas.
                 if not isinstance(balance.get("owner"), str) or not balance["owner"]:
-                    return []
+                    return None if strict else []
                 mint = balance.get("mint")
                 identity = (balance["owner"], mint)
                 if account_index in account_identities and account_identities[account_index] != identity:
-                    return []
+                    return None if strict else []
                 account_identities[account_index] = identity
                 if balance["owner"] != wallet:
                     continue
                 if not isinstance(mint, str) or not mint:
-                    return []
+                    return None if strict else []
                 amount = number((balance.get("uiTokenAmount") or {}).get("uiAmount"))
                 # Multiple accounts of the same mint are summed;
                 # an account-to-account transfer must not become a buy.
@@ -295,10 +299,10 @@ def get_buy_details(wallet, sig, api_key):
             buy["sol_spent"] = number(sol_out / len(buys))
         return buys
     except (ValueError, TypeError, IndexError, AttributeError, OverflowError):
-        return []
+        return None if strict else []
 
 
-def get_sold_mints(wallet, sig, api_key):
+def get_sold_mints(wallet, sig, api_key, tx=_UNFETCHED):
     """Extract sold mints from a transaction (for hold-time tracking).
 
     Phase 1: we need to know when wallets EXIT to identify farmers
@@ -306,10 +310,9 @@ def get_sold_mints(wallet, sig, api_key):
     Returns [(mint, sold_fraction)] where sold_fraction is 0-1 of
     the pre-transaction balance that was sold.
     """
-    tx = rpc("getTransaction",
-             [sig, {"encoding": "json",
-                    "maxSupportedTransactionVersion": 0}],
-             api_key)
+    if tx is _UNFETCHED:
+        tx = rpc("getTransaction",
+                 [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}], api_key)
     if not tx:
         return []
     out = []
@@ -957,15 +960,15 @@ def handle_sighting(wallet, buy, registry, seen):
     if not _HAS_FILTERS:
         logger.error("FILTERS MISSING: smartwatch_filters not importable; "
                      "refusing to fire unfiltered card")
-        return
+        return False
     now = time.time()
     mint = buy.get("mint", "")
     if not mint:
-        return
+        return False
     ledger = load_convergence()
     rec = ledger.get(mint) or {}
     if rec.get("card_fired") or mint in seen:
-        return
+        return True
     group = wallet_group(wallet, registry)
     buy_ts = buy.get("block_ts") or now
     tokens = buy.get("tokens_bought") or 0
@@ -989,21 +992,22 @@ def handle_sighting(wallet, buy, registry, seen):
             pass
     n_groups, converged = eval_convergence(rec.get("sightings") or [])
     if not converged:
-        save_convergence(ledger)
+        saved = save_convergence(ledger)
         logger.warning("CONVERGENCE HOLD: %s bought %s (1 group, "
                        "awaiting 2nd wallet)", wallet[:6], mint[:8])
-        return
+        return saved
     last = float(rec.get("last_attempt_ts") or 0)
     if last and now - last < RETRY_EVERY_S:
-        save_convergence(ledger)
-        return  # attempt spacing — the retry sweep owns the next try
+        return save_convergence(ledger)  # attempt spacing — the retry sweep owns the next try
     outcome = _attempt_fire(mint, rec, n_groups, seen, retry=False)
-    save_convergence(ledger)
+    saved = save_convergence(ledger)
     if outcome != "fired":
         logger.warning("CONVERGENCE HELD %s: %s (%s) — retrying for "
                        "up to %dm while it keeps running", mint[:8],
                        outcome, rec.get("last_block_reason") or "?",
                        RETRY_WINDOW_S // 60)
+
+    return saved
 
 
 def sweep_expired_convergence(seen):
@@ -1285,6 +1289,111 @@ class _WalletWake:
                 pass
 
 
+def _persist_seen_before_ack(seen):
+    import tempfile
+    directory=os.path.dirname(SEEN_FILE) or '.'
+    os.makedirs(directory,exist_ok=True)
+    fd,name=tempfile.mkstemp(dir=directory,prefix='.seen-')
+    try:
+        with os.fdopen(fd,'w') as f:
+            json.dump(sorted(seen)[-500:],f);f.flush();os.fsync(f.fileno())
+        os.replace(name,SEEN_FILE)
+        directory_fd=os.open(directory,os.O_RDONLY)
+        try:os.fsync(directory_fd)
+        finally:os.close(directory_fd)
+    finally:
+        if os.path.exists(name):os.unlink(name)
+
+
+def poll_wallet(wallet, api_key, registry, seen, intake):
+    """One existing-cadence poll with durable at-least-once intake.
+
+    No extra retry loop: pending details are tried once per normal cycle.
+    A transport/null/malformed detail stays pending across process restart.
+    Page failure does not advance the cursor; bounded page overflow is
+    explicitly recorded as incomplete coverage, not silently called complete.
+    """
+    state = intake.wallet(wallet)
+    first = rpc("getSignaturesForAddress", [wallet, {"limit": SIG_LIMIT}], api_key)
+    if first and isinstance(first, list):
+        prev = state['cursor'] if state else None
+        newest = first[0].get('signature')
+        if not state:
+            # Preserve startup posture: establish a starting cursor,
+            # not a fabricated promise of pre-start backfill.
+            intake.stage(wallet, None, newest, [], gap='bootstrap_no_prestart_backfill')
+        else:
+            page, discovered, pages, gap, complete = first, [], 0, None, False
+            while page:
+                found = False
+                for item in page:
+                    sig = item.get('signature')
+                    if not isinstance(sig,str) or not sig:
+                        raise ValueError('malformed signature page')
+                    if sig == prev:
+                        found = True;break
+                    if sig not in discovered:discovered.append(sig)
+                if found or len(page) < SIG_LIMIT:
+                    if not found:gap='cursor_not_found_in_available_history'
+                    complete=True;break
+                if pages >= PAGEBACK_MAX:
+                    gap='pageback_limit_incomplete_history';complete=True;break
+                page=rpc('getSignaturesForAddress',
+                         [wallet, {'limit':SIG_LIMIT,'before':page[-1]['signature']}],api_key)
+                pages+=1
+                if not page:break
+            if complete:
+                intake.stage(wallet,prev,newest,list(reversed(discovered)),gap=gap)
+    state=intake.wallet(wallet)
+    pending=(state or {}).get('pending',[])[:SIG_LIMIT*(PAGEBACK_MAX+1)]
+    def fetch(signature):
+        try:
+            return _shared_rpc_transport().rpc_typed(
+                'getTransaction',[signature,{'encoding':'json','maxSupportedTransactionVersion':0}])
+        except Exception:
+            return None,'error'
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        details=list(pool.map(fetch,pending))
+    for signature,(tx,kind) in zip(pending,details):
+        # A bounded batch and durable rotation preserve retry liveness
+        # without a new timer or retry storm on a single poison detail.
+        intake.defer(wallet,signature)
+        if kind!='ok' or not isinstance(tx,dict):
+            continue
+        meta=tx.get('meta')
+        if not isinstance(meta,dict) or 'err' not in meta:
+            continue
+        transaction=tx.get('transaction')
+        if not isinstance(transaction,dict):
+            continue
+        signatures=transaction.get('signatures')
+        if not isinstance(signatures,list) or not signatures or signatures[0]!=signature:
+            continue
+        if meta['err'] is not None:
+            if not isinstance(meta['err'],(str,dict)) or not meta['err']:
+                continue
+            # Definitively failed execution is terminal, not a buy.
+            intake.acknowledge(wallet,signature);continue
+        buys=get_buy_details(wallet,signature,api_key,tx=tx,strict=True)
+        if buys is None:
+            continue
+        # Invalid successful payloads and valid zero-buy transactions
+        # need separate classification; keep unknown shape pending.
+        if not all(isinstance(meta.get(k),list) for k in
+                   ('preBalances','postBalances','preTokenBalances','postTokenBalances')):
+            continue
+        for buy in buys:
+            if buy['mint'] not in seen:
+                if handle_sighting(wallet,buy,registry,seen) is not True:
+                    raise OSError('sighting was not durably accepted')
+        sold=get_sold_mints(wallet,signature,api_key,tx=tx)
+        if sold:_record_sells(wallet,sold)
+        # Seen is durable before acknowledging intake. Crash before
+        # this point retries rather than losing the acquisition.
+        _persist_seen_before_ack(seen)
+        intake.acknowledge(wallet,signature)
+
+
 def main():
     api_key = get_helius_key()
     if not api_key and not _shared_rpc_transport()._alchemy_key():
@@ -1310,99 +1419,16 @@ def main():
     registry = load_registry()
 
     seen = load_seen()
-    last_sig = {}
-    # Initialize: get current latest sig for each wallet
-    for w in wallets:
-        sigs = rpc("getSignaturesForAddress",
-                   [w, {"limit": 5}], api_key) or []
-        if sigs and sigs[0].get("signature"):
-            last_sig[w] = sigs[0]["signature"]
-        time.sleep(0.3)
-
+    from wallet_intake import WalletIntake
+    intake = WalletIntake(HOME)
     while True:
         try:
             registry = load_registry()  # pick up label/mute changes
             for wallet in wallets:
-                first_page = rpc("getSignaturesForAddress",
-                                 [wallet, {"limit": SIG_LIMIT}], api_key) or []
-                if not first_page:
-                    continue
-                prev = last_sig.get(wallet)
-                if first_page[0].get("signature"):
-                    last_sig[wallet] = first_page[0]["signature"]
-                # Walk back through pages until the previous cursor is hit.
-                # A full window used to jump the cursor over intermediate txs
-                # and lose their buys forever; now it pages back instead.
-                new_sigs = []
-                page = first_page
-                paged_back = 0
-                skipped = False
-                while True:
-                    found_prev = False
-                    for s in page:
-                        sig = (s or {}).get("signature")
-                        if not sig:
-                            continue
-                        if sig == prev:
-                            found_prev = True
-                            break
-                        new_sigs.append(sig)
-                    if found_prev or len(page) < SIG_LIMIT or prev is None:
-                        break
-                    oldest = page[-1].get("signature")
-                    if not oldest or paged_back >= PAGEBACK_MAX:
-                        skipped = True
-                        break
-                    page = rpc("getSignaturesForAddress",
-                               [wallet, {"limit": SIG_LIMIT,
-                                        "before": oldest}],
-                               api_key) or []
-                    paged_back += 1
-                    if not page:
-                        break
-                if skipped:
-                    logger.warning(
-                        "sig window overflow for %s: >%d txs in one cycle, "
-                        "oldest txs skipped", wallet[:6],
-                        SIG_LIMIT * (paged_back + 1))
-                # Resolve buys in parallel (I/O bound). The old sequential
-                # loop + 0.3s/sig sleep made busy cycles take minutes,
-                # stretching the effective poll cadence far past POLL_SECS.
-                buys = []   # [{mint, tokens_bought, sol_spent, block_ts}]
-                sold = []  # Phase 1: track sells for hold-time analysis
-                if new_sigs:
-                    with ThreadPoolExecutor(max_workers=6) as ex:
-                        for details in ex.map(
-                                lambda sg: get_buy_details(
-                                    wallet, sg, api_key),
-                                reversed(new_sigs)):
-                            buys.extend(details or [])
-                    # Sell detection (same sigs, check for exits)
-                    with ThreadPoolExecutor(max_workers=6) as ex:
-                        for sells in ex.map(
-                                lambda sg: get_sold_mints(
-                                    wallet, sg, api_key),
-                                reversed(new_sigs)):
-                            sold.extend(sells or [])
-                # Record sells and compute hold times (farmer detection)
-                if sold:
-                    try:
-                        _record_sells(wallet, sold)
-                    except Exception:
-                        pass
-                # Convergence filter (2026-10-17 rebuild): a single wallet's
-                # buy only records a sighting — the card fires when a 2nd
-                # INDEPENDENT wallet buys the same mint within 15 min, and
-                # is skipped when the token already pumped >=50% since the
-                # market price at first sighting (anchor_price_usd).
-                seen_this_cycle = set()
-                for buy in buys:
-                    mint = buy.get("mint", "")
-                    if not mint or mint in seen or mint in seen_this_cycle:
-                        continue
-                    # oldest-first order: the earliest buy wins the anchor
-                    seen_this_cycle.add(mint)
-                    handle_sighting(wallet, buy, registry, seen)
+                try:
+                    poll_wallet(wallet, api_key, registry, seen, intake)
+                except Exception:
+                    logger.exception('wallet intake unavailable for %s', wallet[:6])
                 time.sleep(0.5)
             sweep_expired_convergence(seen)
             retry_convergences(seen)

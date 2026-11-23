@@ -830,7 +830,7 @@ def _cmd_account(ctx, chat_id, user_id, update_id, args):
                      "Spendable cash: %s" % _fmt_money(snap.get("cash_spendable")),
                      "Pending SOL settlements: %d, retained basis %s (not spendable cash)" % (
                          len(snap.get("pending_sol") or []), _fmt_money(snap.get("pending_sol_basis", 0.))),
-                     "Cost exposure (open, at basis): %s"
+                     "Retained cost basis (open + pending): %s"
                      % _fmt_money(snap.get("cost_exposure")),
                      "Book value: %s" % _fmt_money(snap.get("book_value")),
                      "Realized P/L: %s" % _fmt_money(snap.get("realized_pnl"))]

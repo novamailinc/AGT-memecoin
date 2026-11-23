@@ -18,7 +18,11 @@ class TestSharedPendingTelegram:
         messages=[]
         ctx=SimpleNamespace(send=lambda chat,text,*a:messages.append(text))
         commands._cmd_account(ctx,1,1,1,['demo'])
+        commands._cmd_positions(ctx,1,1,1,['demo'])
         body='\n'.join(messages)
         assert 'Spendable cash: $8.00' in body
         assert 'Pending SOL settlements: 1' in body
         assert 'retained basis $2.00' in body
+        assert 'SIMULATED, 0 open' in body
+        assert 'Pending USD settlement:' in body
+        assert 'Retained cost basis (open + pending): $2.00' in body

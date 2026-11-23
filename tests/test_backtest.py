@@ -34,11 +34,18 @@ def _hist(prices, narratives=None, source="pumpfun",
     return {
         "mint": "MINT%d" % len(prices), "symbol": "T", "chain": "solana",
         "source": source, "t0": 0.0, "snapshots": snaps,
+        # Synthetic fixture: safety is contemporaneous with the first
+        # snapshot by construction (declared, not backfilled).
+        "safety_eval_t": 0.0,
         "safety": {"score": safety_score, "passed": safety_score >= 50.0,
                    "fails": [], "unknown": unknown},
         "sentiment": None, "narratives": list(narratives or []),
         "outcome": {"peak_mult": max(prices), "peak_t": 0.0,
-                    "rug": rug, "end_t": len(prices) * t_step},
+                    # Synthetic fixture: the rug label is contemporaneous
+                    # with detection (declared recorded_t), so it gates
+                    # under BOTH replay models.
+                    "rug": rug, "end_t": len(prices) * t_step,
+                    "recorded_t": 0.0},
     }
 
 

@@ -27,6 +27,18 @@ from typing import Any, Dict, List, Optional, Tuple
 # Bump when the recorded-history record shape changes.
 HISTORY_SCHEMA_VERSION = 1
 
+# Replay semantics versions (2026-11-23). v1-legacy: the original replay,
+# which could gate a simulated entry on a safety report refreshed AFTER
+# the earliest retained snapshot (F1 lookahead) and gated on outcome.rug
+# without provenance (F2 latent hazard). v2-timestamp-correct: entries
+# only at/after safety_eval_t when a real safety score is present;
+# records with a score but no trustworthy safety_eval_t are explicitly
+# ineligible (never backfilled); rug labels gate only when their
+# provenance time shows they existed at the earliest snapshot.
+REPLAY_MODEL_V1 = "v1-legacy"
+REPLAY_MODEL_V2 = "v2-timestamp-correct"
+REPLAY_MODELS = (REPLAY_MODEL_V1, REPLAY_MODEL_V2)
+
 _DEFAULT_ENTRY_RULES = {
     "min_safety_score": 50.0,
     "require_known_safety": True,
@@ -76,7 +88,12 @@ class BacktestEngine:
     def __init__(self, entry_rules: Optional[Dict[str, Any]] = None,
                  exit_rules: Optional[Dict[str, Any]] = None,
                  costs: Optional[Dict[str, Any]] = None,
-                 seed: int = 0):
+                 seed: int = 0,
+                 replay_model: str = REPLAY_MODEL_V2):
+        if replay_model not in REPLAY_MODELS:
+            raise ValueError("unknown replay_model %r (want one of %s)"
+                             % (replay_model, ", ".join(REPLAY_MODELS)))
+        self.replay_model = replay_model
         # Stage A cost model (request section 12). OFF by default so
         # historical reports stay comparable; when enabled every
         # simulated fill is dragged and charged:
@@ -137,25 +154,57 @@ class BacktestEngine:
         self.time_stop_h = _f(exitr.get("time_stop_h"))
 
     # -- entry ---------------------------------------------------------
-    def _history_gate(self, hist: Dict[str, Any]) -> Tuple[bool, str]:
-        """History-level gates. Returns (ok, block_reason)."""
+    def _history_gate(self, hist: Dict[str, Any],
+                      snaps: List[Dict[str, Any]]) -> Tuple[bool, str, Dict[str, Any]]:
+        """History-level gates. Returns (ok, block_reason, info).
+
+        v2 rug guard (audit F2): a rug label may gate eligibility ONLY
+        when its provenance shows it existed at the earliest snapshot.
+        Exact provenance is outcome.recorded_t (written by the recorder);
+        outcome.end_t is the fallback. A label with no provenance, or
+        provenanced after the first snapshot, is a conditional/future
+        label: it is kept OUT of trade eligibility (the trade is
+        simulated as real-time logic would have seen it) and counted.
+        """
+        info: Dict[str, Any] = {}
         outcome = hist.get("outcome")
         if not isinstance(outcome, dict):
             outcome = {}
         if outcome.get("rug"):
-            return False, "rug"
+            if self.replay_model == REPLAY_MODEL_V2:
+                first_t = min(
+                    (_f(snap.get("t")) for snap in snaps
+                     if isinstance(snap, dict)), default=0.0)
+                prov = outcome.get("recorded_t")
+                if prov is None:
+                    prov = outcome.get("end_t")
+                if prov is None or _f(prov) > first_t:
+                    info["rug_label_ignored"] = True
+                else:
+                    return False, "rug", info
+            else:
+                return False, "rug", info
         safety = hist.get("safety")
         if not isinstance(safety, dict):
             safety = {}
         if self.require_known_safety and (
                 safety.get("unknown") or safety.get("score") is None):
-            return False, "safety-unknown"
+            return False, "safety-unknown", info
         if _f(safety.get("score")) < self.min_safety_score:
-            return False, "safety-score"
-        return True, ""
+            return False, "safety-score", info
+        return True, "", info
 
-    def _find_entry(self, snaps: List[Dict[str, Any]]) -> Optional[int]:
-        """Index of the first snapshot satisfying entry rules, else None."""
+    def _find_entry(self, snaps: List[Dict[str, Any]],
+                    floor_t: Optional[float] = None
+                    ) -> Tuple[Optional[int], bool]:
+        """Index of the first snapshot satisfying entry rules, else None.
+
+        v2 (audit F1): when floor_t is set (the safety report's
+        evaluation time), snapshots before it are INELIGIBLE - the
+        simulated entry may not use information that did not exist yet.
+        Returns (index, blocked_by_floor): the second flag is True when
+        an otherwise-valid entry existed only BEFORE the floor."""
+        blocked_by_floor = False
         for i, snap in enumerate(snaps):
             if not isinstance(snap, dict):
                 continue
@@ -164,8 +213,11 @@ class BacktestEngine:
                 continue
             if _f(snap.get("mcap_usd")) > self.max_entry_mcap:
                 continue
-            return i
-        return None
+            if floor_t is not None and _f(snap.get("t")) < floor_t:
+                blocked_by_floor = True
+                continue
+            return i, blocked_by_floor
+        return None, blocked_by_floor
 
     # -- exit simulation ------------------------------------------------
     def _simulate(self, snaps: List[Dict[str, Any]],
@@ -271,6 +323,10 @@ class BacktestEngine:
         if self.costs_enabled and self.cost_notional_usd > 0 and self.cost_ata_usd > 0:
             proceeds -= self.cost_ata_usd / self.cost_notional_usd
         return {
+            # Entry provenance: the exact snapshot the replay entered on
+            # (timestamp-correctness is auditable from the report).
+            "entry_t": entry_t,
+            "entry_price": entry_price,
             "proceeds_mult": proceeds,
             "pnl_mult": proceeds - 1.0,
             "peak_mult": peak,
@@ -348,6 +404,13 @@ class BacktestEngine:
             "per_narrative": {},
             "per_gate_blocked": {},
             "skipped_malformed": 0,
+            # Replay semantics version (comparisons across runs must key
+            # on this: v1-legacy vs v2-timestamp-correct are DIFFERENT
+            # models; see module constants).
+            "replay_model": self.replay_model,
+            # v2: rug labels kept out of eligibility for lack of
+            # contemporaneous provenance (trades still simulated).
+            "n_rug_future_label_ignored": 0,
             "trades": [],
             # Stage A cost-model accounting (0 / absent when disabled).
             "costs_enabled": self.costs_enabled,
@@ -395,13 +458,33 @@ class BacktestEngine:
             if not isinstance(snaps, list) or not snaps:
                 _block("no-snapshots")
                 continue
-            ok, reason = self._history_gate(hist)
+            ok, reason, info = self._history_gate(hist, snaps)
             if not ok:
                 _block(reason)
                 continue
-            entry_idx = self._find_entry(snaps)
+            if info.get("rug_label_ignored"):
+                report["n_rug_future_label_ignored"] += 1
+            # v2 (audit F1): a record carrying a REAL safety score may
+            # only enter at/after the score's evaluation time; a score
+            # without trustworthy timing provenance makes the record
+            # explicitly ineligible - never backfilled with a guess.
+            floor_t: Optional[float] = None
+            if self.replay_model == REPLAY_MODEL_V2:
+                saf = hist.get("safety")
+                if not isinstance(saf, dict):
+                    saf = {}
+                has_score = (saf.get("score") is not None
+                             and not saf.get("unknown"))
+                if has_score:
+                    floor_raw = hist.get("safety_eval_t")
+                    if floor_raw is None:
+                        _block("safety-timing-unknown")
+                        continue
+                    floor_t = _f(floor_raw)
+            entry_idx, floor_blocked = self._find_entry(snaps, floor_t)
             if entry_idx is None:
-                _block("entry-mcap")
+                _block("safety-timing-no-eligible-snapshot"
+                       if floor_blocked else "entry-mcap")
                 continue
 
             if self.costs_enabled and self._rng.random() < self.cost_fail_entry:
@@ -451,6 +534,8 @@ class BacktestEngine:
                 "symbol": hist.get("symbol"),
                 "source": source,
                 "narratives": [str(t) for t in narrs if str(t)],
+                "entry_t": trade.get("entry_t"),
+                "entry_price": trade.get("entry_price"),
                 "proceeds_mult": round(mult, 4),
                 "pnl_mult": round(pnl, 4),
                 "exit_reason": trade["exit_reason"],
@@ -542,11 +627,13 @@ class BacktestEngine:
         dev_engine = BacktestEngine(entry_rules=self._cfg_entry,
                                     exit_rules=self._cfg_exit,
                                     costs=self._cfg_costs,
-                                    seed=self._seed + 1)
+                                    seed=self._seed + 1,
+                                    replay_model=self.replay_model)
         eval_engine = BacktestEngine(entry_rules=self._cfg_entry,
                                      exit_rules=self._cfg_exit,
                                      costs=self._cfg_costs,
-                                     seed=self._seed + 2)
+                                     seed=self._seed + 2,
+                                     replay_model=self.replay_model)
         return {
             "split_index": k,
             "holdout_fraction": frac,
@@ -603,6 +690,10 @@ def synthetic_history(mint: str = "SYNTH1", symbol: str = "SYN",
         "source": source,
         "t0": t0,
         "snapshots": snaps,
+        # Synthetic fixture: all labels are declared contemporaneous with
+        # detection (t0) - v2-timestamp-correct treats them as available
+        # from the first snapshot.
+        "safety_eval_t": t0,
         "safety": {"score": score, "passed": score >= 50.0,
                    "fails": [], "unknown": False},
         "sentiment": None,
@@ -612,6 +703,7 @@ def synthetic_history(mint: str = "SYNTH1", symbol: str = "SYN",
             "peak_t": peak_t,
             "rug": bool(rug),
             "end_t": snaps[-1]["t"],
+            "recorded_t": t0,
         },
     }
 
@@ -741,6 +833,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "pumpswap-canonical-min=30bps / "
                          "pumpswap-noncanonical=30bps, as of 2026-11 "
                          "captures); alternative to --fee-bps")
+    ap.add_argument("--replay-model", default=REPLAY_MODEL_V2,
+                    choices=list(REPLAY_MODELS),
+                    help="replay semantics version; v2-timestamp-correct "
+                         "(default) never enters before safety_eval_t and "
+                         "ignores unprovenanced/future rug labels for "
+                         "eligibility; v1-legacy reproduces prior output")
     ap.add_argument("--holdout", type=float, default=None,
                     help="chronological dev/eval split: the LATER "
                          "fraction (e.g. 0.3) is the evaluation holdout")
@@ -792,7 +890,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                  else args.impact_bps),
         }
     engine = BacktestEngine(entry_rules=entry_rules,
-                            exit_rules=exit_rules, costs=costs)
+                            exit_rules=exit_rules, costs=costs,
+                            replay_model=args.replay_model)
     if args.holdout is not None:
         split = engine.run_with_holdout(histories, args.holdout)
         print("SEGMENTS: %s" % split["portfolio_note"])

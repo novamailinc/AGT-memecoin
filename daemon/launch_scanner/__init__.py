@@ -3442,16 +3442,21 @@ class LaunchScanner(Daemon):
                 last = float(cand.get("last_mcap") or 0)
                 gain = last / first if first > 0 else 1.0
                 outcome = {"peak_mult": round(gain, 3), "peak_t": now,
-                           "rug": False, "end_t": now}
+                           "rug": False, "end_t": now, "recorded_t": now}
             else:
                 outcome = {"peak_mult": 1.0, "peak_t": now,
-                           "rug": False, "end_t": now}
+                           "rug": False, "end_t": now, "recorded_t": now}
             backtest.record_history(path, {
                 "schema_version": backtest.HISTORY_SCHEMA_VERSION,
                 # "judge": outcome synthesized from judge snapshots at
                 # confirm/reject time. Real realized outcomes arrive via
                 # _backtest_record_paper_close with outcome_kind="paper".
                 "outcome_kind": "judge",
+                # Timestamp-correctness provenance (2026-11-23, audit
+                # F1): when the stored safety report was evaluated.
+                # None = unknown -> timestamp-correct replay marks the
+                # record explicitly ineligible; never backfilled.
+                "safety_eval_t": cand.get("safety_eval_t"),
                 "mint": mint, "symbol": cand.get("symbol") or "",
                 "chain": cand.get("chain") or "",
                 "source": cand.get("source") or "",
@@ -3550,7 +3555,8 @@ class LaunchScanner(Daemon):
                 "exit_version": EXIT_POLICY_VERSION,
                 "rug": rug,
                 "outcome": {"peak_mult": round(peak_mult, 4),
-                            "peak_t": now, "rug": rug, "end_t": now},
+                            "peak_t": now, "rug": rug, "end_t": now,
+                            "recorded_t": now},
                 "safety": {"score": saf_score,
                            "unknown": saf_score is None,
                            "fails": pos.get("safety_fails") or []},
@@ -3676,6 +3682,10 @@ class LaunchScanner(Daemon):
                             "safety report", cand.get("symbol"),
                             cand.get("mint"))
                         cand["safety"] = None
+                        # No report -> no trustworthy evaluation time;
+                        # timestamp-correct replay treats this as
+                        # unknown, never backfilled.
+                        cand["safety_eval_t"] = None
                         cand["unvetted_confirmed"] = True
                     else:
                         logger.warning("BLOCKED (%s) %s %s", reason,
@@ -3737,6 +3747,9 @@ class LaunchScanner(Daemon):
                     cand["bundle"] = deep
                 if not cand.get("unvetted_confirmed"):
                     cand["safety"] = report
+                    # Provenance: this report was produced by the
+                    # confirm-time refresh above (safety.check_token).
+                    cand["safety_eval_t"] = now
                 # Unvetted confirmed coins keep safety=None (set above) so
                 # the card renders the UNVETTED label, never a phantom score.
             # Full alert + paper entry path.

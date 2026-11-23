@@ -229,78 +229,19 @@ def get_buy_details(wallet, sig, api_key, tx=_UNFETCHED, strict=False):
                  [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}], api_key)
     if not tx:
         return None if strict else []
-    try:
-        # Failed chain transactions are not buys. Missing execution
-        # status is unknown, not success. Validate the whole response
-        # before returning any partial wallet-sighting evidence.
-        if not isinstance(tx, dict) or not isinstance(tx.get("meta"), dict):
-            return None if strict else []
-        meta = tx["meta"]
-        if "err" not in meta or meta["err"] is not None:
-            return None if strict else []
-        keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys")
-        if not isinstance(keys, list) or wallet not in keys:
-            return None if strict else []
-        signatures = (tx.get("transaction") or {}).get("signatures")
-        if (not isinstance(signatures, list) or not signatures
-                or signatures[0] != sig):
-            return None if strict else []
-        idx = keys.index(wallet)
-        pre_bal, post_bal = meta.get("preBalances"), meta.get("postBalances")
-        def number(value):
-            if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not math.isfinite(value) or value < 0):
-                raise ValueError("invalid measured amount")
-            return float(value)
-        if not isinstance(pre_bal, list) or not isinstance(post_bal, list):
-            return None if strict else []
-        sol_out = max(0.0, (number(pre_bal[idx]) - number(post_bal[idx])) / 1e9)
-        block_ts = number(tx.get("blockTime"))
-        if block_ts <= 0:
-            return None if strict else []
-        before, after = {}, {}
-        account_identities = {}
-        for field, target in (("preTokenBalances", before), ("postTokenBalances", after)):
-            balances = meta.get(field)
-            if not isinstance(balances, list):
-                return None if strict else []
-            seen_indices = set()
-            for balance in balances:
-                if not isinstance(balance, dict):
-                    return None if strict else []
-                account_index = balance.get("accountIndex")
-                if (type(account_index) is not int or account_index < 0
-                        or account_index >= len(keys) or account_index in seen_indices):
-                    return None if strict else []
-                seen_indices.add(account_index)
-                # Missing owner cannot establish that a pre-holding
-                # was somebody else's. Refuse ambiguous deltas.
-                if not isinstance(balance.get("owner"), str) or not balance["owner"]:
-                    return None if strict else []
-                mint = balance.get("mint")
-                identity = (balance["owner"], mint)
-                if account_index in account_identities and account_identities[account_index] != identity:
-                    return None if strict else []
-                account_identities[account_index] = identity
-                if balance["owner"] != wallet:
-                    continue
-                if not isinstance(mint, str) or not mint:
-                    return None if strict else []
-                amount = number((balance.get("uiTokenAmount") or {}).get("uiAmount"))
-                # Multiple accounts of the same mint are summed;
-                # an account-to-account transfer must not become a buy.
-                target[mint] = number(target.get(mint, 0.0) + amount)
-        buys = [{"mint": mint, "tokens_bought": amount - before.get(mint, 0.0),
-                 "block_ts": block_ts, "signature": sig,
-                 "acquisition_provenance": "successful_transaction_balance_delta"}
-                for mint, amount in after.items()
-                if mint.endswith("pump") and amount > before.get(mint, 0.0)]
-        for buy in buys:
-            buy["tokens_bought"] = number(buy["tokens_bought"])
-            buy["sol_spent"] = number(sol_out / len(buys))
-        return buys
-    except (ValueError, TypeError, IndexError, AttributeError, OverflowError):
+    from wallet_transaction import wallet_balance_evidence
+    evidence=wallet_balance_evidence(wallet,sig,tx)
+    if evidence is None:return None if strict else []
+    before,after=evidence['before'],evidence['after']
+    buys=[{'mint':mint,'tokens_bought':amount-before.get(mint,0.0),
+           'block_ts':evidence['block_ts'],'signature':sig,
+           'acquisition_provenance':'successful_transaction_balance_delta'}
+          for mint,amount in after.items()
+          if mint.endswith('pump') and amount>before.get(mint,0.0)]
+    for buy in buys:buy['sol_spent']=evidence['sol_out']/len(buys)
+    if any(not math.isfinite(buy['tokens_bought']) or not math.isfinite(buy['sol_spent']) for buy in buys):
         return None if strict else []
+    return buys
 
 
 def get_sold_mints(wallet, sig, api_key, tx=_UNFETCHED, details=False):

@@ -183,9 +183,19 @@ resave, not rollback. No new grading or trading threshold is activated.
 The repaired `scripts/smart-watcher.poll_wallet` is NOT the only wallet source.
 `daemon.launch_scanner.smartmoney.poll_wallets` is called directly by the actual
 scanner cycle, then `_smart_fasttrack` consumes returned activity. Inspection
-finds that separate path still advances its saved cursor before transaction
-success and uses a legacy unvalidated last-account balance parser. It is OPEN,
-not covered by the smart-watcher parser/retry acceptance. Its configured cadence
+previously found that separate path advanced its saved cursor before transaction
+success and used a legacy unvalidated last-account balance parser. It now shares
+the pure successful wallet-evidence parser with smart-watcher (including
+jsonParsed pubkey normalization), keeping its original unrestricted mint selector.
+Its separate scanner_wallet_intake journal stages signatures before detail reads,
+retains invalid/unavailable details for bounded ordinary-cadence retry, and saves
+mint deliveries before returning activity. Actual scanner fasttrack, grade
+recording and co-buy handoff require a direct successful state write and readback
+before explicit outbox ACK. The committed snapshot carries exact batch references
+so restart can finish a missed ACK without duplicating grade/co-buy effects.
+Partial fasttrack failures roll back in-memory handoff markers so the cycle's
+finally-save cannot consume them. Unverified/uncertain state writes may replay. This is at-least-once intake, not atomic external
+publication, lifetime exactly-once, or full scanner lifecycle acceptance. Its configured cadence
 is max(smart_poll_seconds default120, registry_count*12) in the actual caller,
 while the standalone poll function's default is180; do not silently speed either.
 
@@ -199,6 +209,11 @@ remains another integration boundary.
 
 Grade recording counts now require successful snapshot save; buy/reconciliation
 persistence failure raises to the existing scanner error logger rather than
-reporting a fictional committed count. This fixes count honesty only: the scanner
-caller previously ignored counts, and its already-advanced acquisition cursor
-still needs durable pending/outbox acceptance at that actual path.
+reporting a fictional committed count. The scanner fasttrack now propagates that
+failure to retain its outbox. Tests cover its real parser, pending retry,
+fresh-interpreter delivery replay, successful-empty no-buy acceptance, corrupt
+journal preservation, downstream write/readback failure and partial state rollback.
+An actual run_once cycle fixture joins discovery to grade/co-buy state commit and
+second-cycle dedup, with unrelated network/drain functions stubbed and stop-before-
+scan enabled. This is not whole scan/qualification or AGT runtime acceptance.
+The broader acquisition inventory remains open.

@@ -15,8 +15,8 @@ import time
 
 
 class WalletIntake:
-    def __init__(self, home):
-        self.path = Path(home)/'launch_scanner'/'wallet_intake.json'
+    def __init__(self, home, filename='wallet_intake.json'):
+        self.path = Path(home)/'launch_scanner'/filename
 
     @contextlib.contextmanager
     def _locked(self):
@@ -39,6 +39,9 @@ class WalletIntake:
                     or any(not isinstance(s,str) or not s for s in rec['pending'])
                     or len(set(rec['pending']))!=len(rec['pending'])):
                 raise ValueError('intake record unavailable')
+            deliveries=rec.get('deliveries',{})
+            if not isinstance(deliveries,dict) or any(not isinstance(k,str) or not k or k not in rec['pending'] or not isinstance(v,list) or any(not isinstance(m,str) or not m for m in v) or len(set(v))!=len(v) for k,v in deliveries.items()):
+                raise ValueError('intake deliveries unavailable')
         return d
 
     def _save(self,d):
@@ -92,4 +95,29 @@ class WalletIntake:
             d=self._read();rec=d['wallets'].get(wallet)
             if not rec or signature not in rec['pending']:return
             rec['pending'].remove(signature);rec['pending'].append(signature)
+            self._save(d)
+
+    def deliver(self,wallet,signature,mints):
+        """Persist scanner handoff before returning activity to its caller."""
+        if not isinstance(mints,list) or any(not isinstance(m,str) or not m for m in mints):
+            raise ValueError('invalid delivery')
+        with self._locked():
+            d=self._read();rec=d['wallets'][wallet]
+            if signature not in rec['pending']:
+                raise ValueError('delivery not pending')
+            outbox=rec.setdefault('deliveries',{})
+            if not isinstance(outbox,dict):raise ValueError('invalid deliveries')
+            if signature in outbox and outbox[signature]!=mints:
+                raise ValueError('conflicting delivery')
+            outbox[signature]=mints
+            self._save(d)
+
+    def accept_deliveries(self,wallet,signatures):
+        with self._locked():
+            d=self._read();rec=d['wallets'][wallet]
+            for signature in signatures:
+                if signature not in rec.setdefault('deliveries',{}):
+                    continue  # a reference never authorizes dropping unresolved details
+                rec['deliveries'].pop(signature)
+                if signature in rec['pending']:rec['pending'].remove(signature)
             self._save(d)

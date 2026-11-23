@@ -71,17 +71,23 @@ class SmartMoneyRegistryTest(unittest.TestCase):
 
 
 class SmartMoneyPollTest(unittest.TestCase):
-    def _tx(self, mint, amt):
-        return {"meta": {
-            "preTokenBalances": [],
-            "postTokenBalances": [{
-                "owner": WALLET, "mint": mint,
-                "uiTokenAmount": {"uiAmount": amt}}]}}
+    def setUp(self):
+        import tempfile
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.home_patch=patch.object(smartmoney,'_HOME',Path(self.tmp.name))
+        self.home_patch.start();self.addCleanup(self.home_patch.stop)
+
+    def _tx(self, mint, amt,signature):
+        return {'blockTime':123,'transaction':{'signatures':[signature],
+            'message':{'accountKeys':[{'pubkey':WALLET},{'pubkey':'TOKEN'}]}},
+            'meta':{'err':None,'preBalances':[200],'postBalances':[100],
+            'preTokenBalances':[], 'postTokenBalances':[{'accountIndex':1,
+                'owner':WALLET,'mint':mint,'uiTokenAmount':{'uiAmount':amt}}]}}
 
     def test_poll_detects_buys(self):
         state = {}
         sigs = [{"signature": "sig1"}, {"signature": "sig0"}]
-        txs = {"sig1": self._tx("MINTA", 100.0), "sig0": self._tx("MINTB", 5.0)}
+        txs = {"sig1": self._tx("MINTA", 100.0,"sig1"), "sig0": self._tx("MINTB", 5.0,"sig0")}
 
         def fake_rpc(method, params):
             if method == "getSignaturesForAddress":
@@ -99,6 +105,8 @@ class SmartMoneyPollTest(unittest.TestCase):
         self.assertEqual(set(fresh), {"MINTA", "MINTB"})
         self.assertEqual(state["smart_activity"]["MINTA"], [WALLET])
         self.assertEqual(smartmoney.smart_buys_for(state, "MINTA"), 1)
+        # Only explicit durable downstream acceptance consumes the outbox.
+        smartmoney.acknowledge_wallet_activity(state)
         # Second poll: no new signatures -> no fresh activity.
         with patch.object(smartmoney, "api_key", return_value="k"), \
              patch.object(smartmoney, "_rpc", side_effect=fake_rpc), \

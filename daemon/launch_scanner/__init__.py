@@ -287,7 +287,11 @@ class LaunchScanner(Daemon):
 
         store = get_store()
         event_bus.configure(store=store)
-        state = get_daemon_state(store, self.name) or {}
+        from daemon.common import state_load_ok
+        state = get_daemon_state(store, self.name)
+        if not state_load_ok(state):
+            logger.warning('launch_scanner: state unavailable; retaining wallet outbox')
+            return
         state.setdefault("seen", {})
         state.setdefault("degen_positions", {})
         state.setdefault("hl_tokens", [])
@@ -395,17 +399,8 @@ class LaunchScanner(Daemon):
                 poll_seconds = max(base_poll, float(n_wallets) * 12.0)
                 fresh = smartmoney.poll_wallets(state,
                                                 poll_seconds=poll_seconds)
-                if fresh:
-                    self._smart_fasttrack(config, state, fresh)
-                # Wallet-pack detection: record fresh buys for
-                # co-buy mining (mode-gated inside; off = no-op).
-                try:
-                    from . import packdetect  # noqa: PLC0415 (lazy)
-                    packdetect.record_fresh(state, config.degen, fresh,
-                                            time.time())
-                except Exception:
-                    logger.warning("packdetect record failed",
-                                   exc_info=True)
+                if state.get('smart_delivery_refs'):
+                    self._handoff_smart_wallet_activity(config,store,state,fresh)
             except Exception:
                 logger.warning("smart-money poll failed", exc_info=True)
             try:
@@ -608,6 +603,48 @@ class LaunchScanner(Daemon):
         return any(isinstance(d, dict) and d.get("mint") == mint
                    for d in (state.get("early_digest") or []))
 
+    def _handoff_smart_wallet_activity(self,config,store,state,fresh):
+        import copy
+        before=copy.deepcopy(state)
+        try:
+            if fresh:
+                self._smart_fasttrack(config,state,fresh)
+            # Co-buy state is part of this same durable handoff.
+            from . import packdetect
+            packdetect.record_fresh(state,config.degen,fresh,time.time())
+            self._commit_smart_wallet_activity(store,state)
+        except Exception:
+            # The cycle's finally block may persist state even after errors.
+            # Never persist partial fasttrack dedup markers without queues.
+            if state.get('smart_handoff_durable')!=before.get('smart_handoff_durable'):
+                raise  # verified handoff, ACK may be partially applied
+            state.clear();state.update(before)
+            state['smart_delivery_refs']={}
+            raise
+
+    def _commit_smart_wallet_activity(self,store,state):
+        """Persist actual scanner handoff state before consuming outbox.
+
+        Generic save_daemon_state swallows write failures, so it cannot
+        authorize intake ACK. Require a direct successful write and exact
+        readback token. Committed references finish a missed ACK on restart.
+        """
+        import uuid
+        token=uuid.uuid4().hex
+        import copy
+        state['smart_handoff_commit']=token
+        state['smart_committed_refs']=copy.deepcopy(state.get('smart_delivery_refs') or {})
+        store.journal_add({'kind':'daemon_state','symbol':self.name,'detail':dict(state)})
+        rows=store.journal_query(kind='daemon_state',symbol=self.name,limit=1)
+        if not rows or (rows[0].get('detail') or {}).get('smart_handoff_commit')!=token:
+            raise OSError('scanner handoff persistence not verified')
+        state['smart_handoff_durable']=token
+        smartmoney.acknowledge_wallet_activity(state)
+        try:
+            store.prune_journal(kind='daemon_state',symbol=self.name,keep=10)
+        except Exception:
+            logger.warning('scanner state history prune failed',exc_info=True)
+
     def _smart_fasttrack(self, config, state: Dict[str, Any],
                          fresh: Dict[str, List[str]]) -> None:
         """Smart-buy fast-track (#4a): a tracked wallet's FIRST buy of a
@@ -638,6 +675,7 @@ class LaunchScanner(Daemon):
             smartgrade.record_wallet_buys(fresh, degen)
         except Exception:
             logger.warning("wallet-grade record failed", exc_info=True)
+            raise  # leave scanner delivery pending for its next ordinary cycle
         if not getattr(degen, "smart_fasttrack_enabled", True):
             return
         for mint, addrs in (fresh or {}).items():

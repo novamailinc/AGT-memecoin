@@ -228,24 +228,14 @@ def _f(value: Any) -> float:
         return 0.0
 
 
-def _bought_mints(wallet: str, signature: str) -> Set[str]:
-    """Mints whose balance increased for this wallet in one transaction."""
-    tx = _rpc("getTransaction",
-              [signature, {"encoding": "jsonParsed",
-                           "maxSupportedTransactionVersion": 0}]) or {}
-    meta = tx.get("meta") or {}
-    pre = {(str(b.get("owner")), str(b.get("mint"))):
-           _f((b.get("uiTokenAmount") or {}).get("uiAmount"))
-           for b in meta.get("preTokenBalances") or []}
-    post = {(str(b.get("owner")), str(b.get("mint"))):
-            _f((b.get("uiTokenAmount") or {}).get("uiAmount"))
-            for b in meta.get("postTokenBalances") or []}
-    out: Set[str] = set()
-    for (owner, mint), post_amt in post.items():
-        if owner == wallet and mint and post_amt - pre.get((owner, mint),
-                                                            0.0) > 0:
-            out.add(mint)
-    return out
+def _bought_mints(wallet: str, signature: str):
+    """None is unavailable/invalid, set() is a successful no-increase."""
+    from .wallet_transaction import wallet_balance_evidence
+    tx=_rpc('getTransaction',[signature,{'encoding':'jsonParsed','maxSupportedTransactionVersion':0}])
+    evidence=wallet_balance_evidence(wallet,signature,tx)
+    if evidence is None:return None
+    return {mint for mint,amount in evidence['after'].items()
+            if amount>evidence['before'].get(mint,0.0)}
 
 
 def load_registry() -> Dict[str, Dict[str, Any]]:
@@ -270,56 +260,78 @@ def save_registry(wallets: Dict[str, Dict[str, Any]]) -> bool:
         return False
 
 
-def poll_wallets(state: Dict[str, Any],
-                 poll_seconds: float = 180.0) -> Dict[str, List[str]]:
-    """Poll tracked wallets for new buys. Throttled; returns
-    {mint: [wallets]} of fresh activity this poll. No key -> {}."""
-    now = time.time()
-    if not api_key():
-        return {}
-    if now - float(state.get("smart_last_poll", 0)) < poll_seconds:
-        return {}
-    state["smart_last_poll"] = now
-    wallets = load_registry()
-    if not wallets:
-        return {}
-    last_sig = state.setdefault("smart_last_sig", {})
-    activity = state.setdefault("smart_activity", {})
-    fresh: Dict[str, List[str]] = {}
-    for wallet in list(wallets)[:_MAX_WALLETS_PER_POLL]:
-        sigs = _rpc("getSignaturesForAddress",
-                    [wallet, {"limit": _SIG_LIMIT}]) or []
-        if not sigs:
-            continue
-        prev = last_sig.get(wallet)
-        new_sigs = []
-        for s in sigs:
-            sig = (s or {}).get("signature")
-            if not sig:
-                continue
-            if sig == prev:
-                break
-            new_sigs.append(sig)
-        if sigs and (sigs[0] or {}).get("signature"):
-            last_sig[wallet] = (sigs[0] or {})["signature"]
-        for sig in reversed(new_sigs):  # oldest first
-            try:
-                for mint in _bought_mints(wallet, sig):
-                    holders = activity.setdefault(mint, [])
-                    if wallet not in holders:
-                        holders.append(wallet)
-                    fresh.setdefault(mint, [])
-                    if wallet not in fresh[mint]:
-                        fresh[mint].append(wallet)
-            except Exception:
-                logger.warning("smart wallet tx scan failed for %s",
-                               wallet[:8])
-            time.sleep(0.15)
-    # Keep the activity map bounded: drop mints untouched for a day.
-    if len(activity) > 500:
-        for mint in list(activity)[:len(activity) - 500]:
-            activity.pop(mint, None)
+def _intake():
+    from .wallet_intake import WalletIntake
+    return WalletIntake(_HOME,filename='scanner_wallet_intake.json')
+
+
+def poll_wallets(state: Dict[str, Any], poll_seconds: float = 180.0) -> Dict[str,List[str]]:
+    """Existing-cadence discovery plus durable at-least-once handoff.
+
+    The caller MUST acknowledge only after durable downstream acceptance.
+    Restart can replay returned activity, never infer accepted from a cursor.
+    """
+    now=time.time()
+    # A loaded committed batch survived downstream state persistence but
+    # may have crashed before outbox acceptance. Consume only that batch.
+    if state.get('smart_committed_refs'):
+        intake=_intake()
+        for wallet,signatures in state['smart_committed_refs'].items():
+            intake.accept_deliveries(wallet,signatures)
+        state['smart_committed_refs']={}
+    state['smart_delivery_refs']={}
+    if not api_key():return {}
+    if now-float(state.get('smart_last_poll',0))<poll_seconds:return {}
+    state['smart_last_poll']=now
+    intake=_intake();fresh={};activity=state.setdefault('smart_activity',{})
+    delivery_refs={}
+    for wallet in list(load_registry())[:_MAX_WALLETS_PER_POLL]:
+        old=intake.wallet(wallet)
+        try:
+            page=_rpc('getSignaturesForAddress',[wallet,{'limit':_SIG_LIMIT}])
+            if page:
+                if not isinstance(page,list) or any(not isinstance(item,dict) or not isinstance(item.get('signature'),str) or not item['signature'] for item in page):
+                    raise ValueError('invalid signature page')
+                previous=(old or {}).get('cursor') or state.get('smart_last_sig',{}).get(wallet)
+                signatures=[]
+                for item in page:
+                    if item['signature']==previous:break
+                    signatures.append(item['signature'])
+                gap='limited_signature_window' if previous and previous not in [item['signature'] for item in page] else None
+                intake.stage(wallet,(old or {}).get('cursor'),page[0]['signature'],list(reversed(signatures)),gap=gap)
+        except (ValueError,TypeError,AttributeError):
+            logger.warning('scanner wallet signature discovery unavailable: %s',wallet[:8])
+        current=intake.wallet(wallet) or {}
+        deliveries=current.get('deliveries',{})
+        for signature in current.get('pending',[])[:_SIG_LIMIT]:
+            if signature not in deliveries:
+                mints=_bought_mints(wallet,signature)
+                time.sleep(.15)
+                if mints is None:
+                    intake.defer(wallet,signature);continue
+                intake.deliver(wallet,signature,sorted(mints))
+        current=intake.wallet(wallet) or {}
+        for signature,mints in current.get('deliveries',{}).items():
+            delivery_refs.setdefault(wallet,[]).append(signature)
+            for mint in mints:
+                holders=activity.setdefault(mint,[])
+                if wallet not in holders:holders.append(wallet)
+                wallets=fresh.setdefault(mint,[])
+                if wallet not in wallets:wallets.append(wallet)
+    # References are handoff metadata, not acknowledgement. The journal
+    # remains authoritative across scanner-state persistence/restart.
+    state['smart_delivery_refs']=delivery_refs
+    if len(activity)>500:
+        for mint in list(activity)[:len(activity)-500]:activity.pop(mint,None)
     return fresh
+
+
+def acknowledge_wallet_activity(state):
+    intake=_intake()
+    for wallet,signatures in (state.get('smart_delivery_refs') or {}).items():
+        intake.accept_deliveries(wallet,signatures)
+    state['smart_delivery_refs']={}
+    state['smart_committed_refs']={}
 
 
 def smart_buys_for(state: Dict[str, Any], mint: str) -> int:

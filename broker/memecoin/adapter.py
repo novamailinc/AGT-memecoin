@@ -270,7 +270,24 @@ class MemecoinAdapter(BrokerAdapter):
         process's journal appends."""
         self._load_state()
         self._fill_keys_cache = None
+        self._require_shared_binding()
         self._recover_native_intent()
+
+    def _require_shared_binding(self):
+        marker = self._data_dir / "shared_binding.json"
+        if marker.exists():
+            binding = json.loads(marker.read_text())
+            if self._shared_account is None:
+                raise ValueError("native book requires authoritative shared account binding")
+            actual = str(Path(self._shared_account.LEDGER_PATH).resolve())
+            if binding.get("account_path") != actual:
+                raise ValueError("native shared account identity conflict")
+            self._shared_book_id = binding["book_id"]
+        elif self._shared_account is not None:
+            binding = {"version":1,"book_id":uuid.uuid4().hex,
+                       "account_path":str(Path(self._shared_account.LEDGER_PATH).resolve())}
+            _write_json_atomic(marker,binding)
+            self._shared_book_id = binding["book_id"]
 
     def _intent_path(self) -> Path:
         return self._data_dir / "native_pending.json"
@@ -303,7 +320,7 @@ class MemecoinAdapter(BrokerAdapter):
                 intent["shared_entry"] = entry_plan(
                     "main", self._market.mint_for(fill["symbol"]), fill["ticket"],
                     fill["tokens"], fill["volume_sol"], fx,
-                    "native-entry:" + identity)
+                    "native-entry:" + self._shared_book_id + ":" + identity)
             else:
                 intent["shared_exits"] = []
                 for index, allocation in enumerate(fill["allocations"]):
@@ -312,7 +329,7 @@ class MemecoinAdapter(BrokerAdapter):
                         raise BrokerError(BROKER_UNAVAILABLE, "unbound native exit requires reconciliation")
                     intent["shared_exits"].append({
                         "lane": pos["shared_lane"],
-                        "mint": self._market.mint_for(fill["symbol"]),
+                        "mint": pos["shared_mint"],
                         "pos_id": pos["shared_pos_id"], "allocation": allocation,
                         "sold_at": datetime.fromisoformat(fill["ts"]).timestamp(),
                         "op_id": "native-pending:" + fill["native_op_id"] + ":" + str(index)})
@@ -412,7 +429,8 @@ class MemecoinAdapter(BrokerAdapter):
             binding = {"shared_pos_id": receipt["pos_id"],
                        "shared_entry_op_id": intent["shared_entry"]["op_id"],
                        "shared_entry_fx": intent["shared_entry"]["fx"],
-                       "shared_entry_usd": receipt["stake"], "shared_lane": receipt["lane"]}
+                       "shared_entry_usd": receipt["stake"], "shared_lane": receipt["lane"],
+                       "shared_mint": receipt["mint"], "shared_book_id": self._shared_book_id}
             after["positions"][str(fill["ticket"])].update(binding)
             fill.update(binding)
             self._seal_intent(intent)
@@ -804,13 +822,8 @@ class MemecoinAdapter(BrokerAdapter):
     def account_info(self) -> AccountInfo:
         self._ensure()
         if self._shared_account is not None:
-            snap = self._shared_account.snapshot()
-            equity = snap.get("marked_equity_conservative")
-            if snap.get("degraded") or equity is None:
-                raise BrokerError(BROKER_UNAVAILABLE, "shared account equity unavailable")
-            return AccountInfo(balance=snap["cash_spendable"], equity=equity,
-                               currency="USD", margin=0., free_margin=snap["cash_spendable"],
-                               leverage=1, login=0, server="memecoin-shared-paper")
+            raise BrokerError(BROKER_UNAVAILABLE,
+                              "shared USD account is not a SOL risk-sizing view; integration unqualified")
         # Equity = cash + current market value of open positions. (BUY
         # deducts the cost from cash, so adding only unrealized P/L would
         # double-count the cost basis.)
@@ -825,6 +838,13 @@ class MemecoinAdapter(BrokerAdapter):
             login=0,
             server="memecoin-paper" if self._mode == "paper" else "memecoin-live",
         )
+
+    def shared_account_snapshot(self):
+        """USD reporting only. Never feed native SOL risk sizing."""
+        self._ensure()
+        if self._shared_account is None:
+            raise ValueError("no shared account binding")
+        return self._shared_account.snapshot()
 
     # -- market data ---------------------------------------------------------
     def symbols(self, names: Optional[List[str]] = None) -> List[SymbolSpec]:
@@ -980,6 +1000,7 @@ class MemecoinAdapter(BrokerAdapter):
         — that the lock serializes across processes."""
         request = asdict(req)
         request["symbol"] = symbol
+        request["mint"] = self._market.mint_for(symbol)
         for field in ("volume", "stop_loss", "take_profit"):
             if request[field] is not None:
                 request[field] = float(request[field])

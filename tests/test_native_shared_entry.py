@@ -117,3 +117,35 @@ class TestNativeSharedEntry:
         assert len(b._positions)==1 and b._positions['2']['volume_sol']==pytest.approx(.01)
         assert b.submit_order(_req('BONK','SELL',.03,'exit')).ticket==3
         assert len(b._fills_path().read_text().splitlines())==3
+
+    def test_persisted_mode_blocks_noninjected_restart_and_old_process(self, account, tmp_path):
+        old=_adapter(str(tmp_path),FakeMarket({'SOL':100.,'BONK':.0001}))
+        old.connect({})
+        a=adapter(tmp_path)
+        a.submit_order(_req('BONK','BUY',.02,'a'))
+        with pytest.raises(ValueError,match='requires authoritative'):
+            _adapter(str(tmp_path),FakeMarket({'SOL':100.,'BONK':.0001}))
+        with pytest.raises(ValueError,match='requires authoritative'):
+            old.close_position_at(1,0.)
+        a.close_position_at(1,0.)
+        with pytest.raises(ValueError,match='requires authoritative'):
+            old.submit_order(_req('BONK','BUY',1.,'unfunded'))
+        assert pa.snapshot()['cash']==8.
+
+    def test_distinct_books_do_not_alias_one_shared_debit(self, account, tmp_path):
+        a=adapter(tmp_path/'a'); b=adapter(tmp_path/'b')
+        a.submit_order(_req('BONK','BUY',.02,'same'))
+        b.submit_order(_req('BONK','BUY',.02,'same'))
+        assert pa.snapshot()['cash']==6.
+        assert a._positions['1']['shared_pos_id']!=b._positions['1']['shared_pos_id']
+
+    def test_exit_uses_entry_mint_despite_symbol_registry_change(self, account, tmp_path):
+        a=adapter(tmp_path)
+        a.submit_order(_req('BONK','BUY',.02,'a'))
+        mint=a._positions['1']['shared_mint']
+        a._market.register('BONK','different-mint')
+        with pytest.raises(BrokerError,match='request conflict'):
+            a.submit_order(_req('BONK','BUY',.02,'a'))
+        a.close_position_at(1,0.)
+        assert pa.snapshot()['pending_sol'][0]['mint']==mint
+        assert not a._intent_path().exists()

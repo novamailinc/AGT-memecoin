@@ -46,8 +46,9 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
 sys.path.insert(0, _REPO_ROOT)
 
-HOME = tempfile.mkdtemp(prefix="realpath-home-")
-TMPD = tempfile.mkdtemp(prefix="realpath-t-")
+HOME = os.environ.get("AGT_REALPATH_TEST_HOME") or tempfile.mkdtemp(prefix="realpath-home-")
+TMPD = os.path.join(HOME, "realpath-test")
+os.makedirs(TMPD, exist_ok=True)
 os.environ["FOREX_AGENT_HOME"] = HOME
 os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
 os.environ["PAPER_ACCOUNT_START"] = "10"
@@ -257,6 +258,20 @@ check("proceeds credited to shared cash",
 check("proceeds are not P/L (realized_pnl = proceeds - settled cost)",
       abs(snap["realized_pnl"] - (proceeds - 0.5)) < 1e-6)
 qty_open = snap["lanes"]["watcher"]["positions"][0]["qty"]
+
+# Optional checkpoint for the separate external-process acceptance test.
+# The child stops after a real entry and partial settlement; a fresh
+# interpreter must recover this exact account/position, not a reset.
+if os.environ.get("AGT_REALPATH_CHECKPOINT") == "1":
+    with open(os.path.join(HOME, "fixture-checkpoint.json"), "w") as f:
+        json.dump({"mint": MINT, "ledger": W.LEDGER_PATH,
+                   "cash": snap["cash"], "pos_id": pos["pa_pos_id"],
+                   "entry_price": pos["entry_price"],
+                   "bus_path": bus_path}, f)
+    if FAILS:
+        raise SystemExit(1)
+    print("REALPATH CHECKPOINT WRITTEN")
+    raise SystemExit(0)
 
 # --- 6. simulated daemon restart: ledgers survive --------------------
 _lp = W.LEDGER_PATH

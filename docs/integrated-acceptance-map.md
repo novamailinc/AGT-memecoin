@@ -52,7 +52,13 @@ Original source: user's WhatsApp message `wamid.HBgNMjM0NzA0NDcxOTI1MRUCABIYFDNB
 8. Memory module reload and `launch_memory` retrieve that outcome.
 9. Total provider outage yields no fabricated wallet buy.
 
-Still substituted: HTTP transport, safety, enrichment, tape/price inputs and Telegram delivery. No scheduler process, live websocket subscription, actual signing, AGT boot or memory-based entry decision is proved. Connecting the wallet RPC path does not connect the separate intelligence event stack automatically.
+Still substituted: HTTP transport, safety, enrichment, tape/price inputs and Telegram delivery. `tests/test_realpath_process_restart.py` additionally drives three separate
+interpreters: first runs acquisition to partial settlement and exits; second
+recovers exact cash/pinned position, rejects duplicate intake, closes the
+remainder and reads memory; third verifies completed cash, no open position,
+and no duplicate outcome or intake. This is actual interpreter exit/restart,
+not module reload. Its orderly checkpoint is not an abrupt-kill or reboot test.
+No scheduler process, live websocket subscription, actual signing, AGT boot or memory-based entry decision is proved. Connecting the wallet RPC path does not connect the separate intelligence event stack automatically.
 
 ## Qualification accounting correction, proposed separately
 

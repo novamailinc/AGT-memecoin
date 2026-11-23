@@ -53,6 +53,29 @@ logger = logging.getLogger("forex_agent.daemon.launch_scanner.dossiers")
 HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
 DOSSIER_DIR = os.path.join(HOME, "dossiers")
 
+# Persistent launch memory (2026-11-23, request section 4.1):
+# dossiers expire after 24h, which used to erase everything the
+# bot learned about a launch. On TTL eviction the sweep now
+# archives a compact record to an append-only JSONL that never
+# expires: the launch is REMEMBERED (deployer, safety verdict
+# summary, birth facts), even though the working dossier is gone.
+# The archive is advisory memory only: no gate, entry or exit
+# reads it in this slice, so behavior is unchanged. Volume is
+# bounded by MAX_PER_DAY (<=400 archive lines/day, ~200 bytes
+# each, ~2.5 MB/month); compaction is a future slice.
+ARCHIVE_FILE = os.path.join(HOME, "memory", "launch_archive.jsonl")
+
+# Memory semantics (code-defined, no interpretation layer):
+# - every record carries a schema version ("v": 1); readers skip
+#   versions they do not understand instead of misreading them;
+# - conflict: two records for the same mint that disagree on the
+#   safety verdict resolve to "conflicting", never a silent pick;
+# - staleness: launch_memory() reports the record's age and a
+#   stale flag past ARCHIVE_STALE_S; a stale record is labeled,
+#   never silently treated as fresh.
+ARCHIVE_SCHEMA_V = 1
+ARCHIVE_STALE_S = 30 * 86400
+
 TTL_S = 24 * 3600
 SAFETY_FRESH_S = 1200.0     # reuse window for precomputed safety
 MAX_OPEN_DOSSIERS = 300
@@ -135,6 +158,99 @@ def _today():
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
+def _archive_dossier(d, now):
+    """Append one compact long-term record for an expiring dossier
+    to the persistent archive. Best-effort, never raises: memory
+    must never break the working-dossier lifecycle."""
+    try:
+        if not isinstance(d, dict) or not d.get("mint"):
+            return
+        safety = d.get("safety") or {}
+        report = safety.get("report")
+        verdict = None
+        if isinstance(report, dict):
+            verdict = "unknown" if report.get("unknown") else "conclusive"
+        rec = {
+            "v": ARCHIVE_SCHEMA_V,
+            "mint": d.get("mint"),
+            "born_ts": d.get("born_ts"),
+            "archived_ts": now,
+            "deployer": d.get("deployer"),
+            "safety_verdict": verdict,
+            "safety_source": (report or {}).get("source")
+            if isinstance(report, dict) else None,
+            "initial_buy_sol": d.get("initial_buy_sol"),
+            "market_cap_sol": d.get("market_cap_sol"),
+            "migrated": bool(d.get("migrated")),
+            "reserve_samples": len(d.get("reserve_samples") or []),
+        }
+        os.makedirs(os.path.dirname(ARCHIVE_FILE), exist_ok=True)
+        with open(ARCHIVE_FILE, "a") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def launch_archive(mint=None, deployer=None, limit=100):
+    """Persistent launch memory, newest first. Filter by mint
+    and/or deployer. Returns [] on any failure; never raises.
+    Advisory only: no gate consults this in the current slice."""
+    out = []
+    try:
+        with open(ARCHIVE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("v") != ARCHIVE_SCHEMA_V:
+                    continue  # unknown schema: skip, never misread
+                if mint is not None and rec.get("mint") != mint:
+                    continue
+                if deployer is not None \
+                        and rec.get("deployer") != deployer:
+                    continue
+                out.append(rec)
+    except Exception:
+        return []
+    out.reverse()
+    return out[:limit]
+
+
+def launch_memory(mint, now=None):
+    """The resolved durable record for one mint, or None.
+
+    Resolution is code-defined: the record with the newest
+    archived_ts wins; records that DISAGREE on the safety verdict
+    resolve to "conflicting" (never a silent pick); age_s and a
+    stale flag (past ARCHIVE_STALE_S) are attached so a consumer
+    reads labeled staleness, never silent freshness. Never
+    raises."""
+    try:
+        now = time.time() if now is None else now
+        recs = launch_archive(mint=mint, limit=1000)
+        if not recs:
+            return None
+        newest = max(recs, key=lambda r: float(r.get("archived_ts")
+                                                  or 0))
+        verdicts = {r.get("safety_verdict") for r in recs}
+        conflict = len(verdicts) > 1
+        out = dict(newest)
+        out["entries"] = len(recs)
+        out["conflict"] = conflict
+        if conflict:
+            out["safety_verdict"] = "conflicting"
+        age = now - float(newest.get("archived_ts") or now)
+        out["age_s"] = int(max(0.0, age))
+        out["stale"] = age > ARCHIVE_STALE_S
+        return out
+    except Exception:
+        return None
+
+
 def _sweep(now):
     """Opportunistic TTL cleanup + deployer census. Runs inside
     event handlers at most once per 300s of wall time."""
@@ -152,6 +268,10 @@ def _sweep(now):
                 with open(p) as f:
                     d = json.load(f)
                 if now - float(d.get("born_ts") or 0) > TTL_S:
+                    # Remember before forgetting (section 4.1):
+                    # archive the compact record, then evict.
+                    d.setdefault("mint", fn[:-5])
+                    _archive_dossier(d, now)
                     os.unlink(p)
             except Exception:
                 continue
@@ -257,6 +377,26 @@ def _intel_fields(deployer):
                 out["funding_cluster"] = {
                     "cluster_id": c.get("cluster_id"),
                     "size": int(c.get("size") or 0),
+                }
+        except Exception:
+            pass
+        # Long-term memory consumption (2026-11-23, section 4.1):
+        # the persistent launch archive (survives the 24h dossier
+        # TTL) is READ here so the deployer's durable record is
+        # visible on every new dossier. Display-only like the rest
+        # of this function: never consulted by the safety
+        # precompute or any verdict.
+        try:
+            recs = launch_archive(deployer=deployer, limit=1000)
+            if recs:
+                out["deployer_history"] = {
+                    "archived_launches": len(recs),
+                    "conclusive": sum(
+                        1 for r in recs
+                        if r.get("safety_verdict") == "conclusive"),
+                    "unknown": sum(
+                        1 for r in recs
+                        if r.get("safety_verdict") == "unknown"),
                 }
         except Exception:
             pass

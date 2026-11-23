@@ -74,7 +74,9 @@ KEY_SPEC: Dict[str, Tuple[Callable[[Any], Any], str]] = {
     "max_simultaneous_trades": (_pos_int, "open-position ceiling (inert)"),
     "max_total_exposure_usd": (_pos_float, "total open-exposure ceiling in USD (inert)"),
     "max_daily_loss_usd": (_pos_float, "daily loss limit in USD (inert)"),
-    "max_drawdown_pct": (_drawdown_pct, "max drawdown as percent (inert)"),
+    "max_drawdown_pct": (_drawdown_pct, "max drawdown as percent"),
+    "max_exposure_pct": (_drawdown_pct,
+                         "max total open exposure as percent of marked equity"),
     "slippage_bps": (_slippage_bps, "assumed slippage in bps (inert)"),
     "trading_mode": (_trading_mode, "operating intent: historical or demo only (inert)"),
 }
@@ -161,10 +163,13 @@ def require(key: str) -> Any:
 def render() -> str:
     """Human-readable /config output. Saved-but-inactive is explicit."""
     cur = load()
-    lines = ["⚙️ Owner config - saved but INACTIVE: values are recorded "
-             "intent only. They do not enforce trades, limits, or mode "
-             "changes at runtime until enforcement wiring is added, and "
-             "activation stays owner-approved."]
+    lines = ["⚙️ Owner config. Values are recorded intent; activation "
+             "stays owner-approved. max_daily_loss_usd, max_drawdown_pct "
+             "and max_exposure_pct ARE enforced by the paper-account "
+             "entry gates when the owner enables those gates "
+             "(PAPER_ACCOUNT_GATES_ENABLED=1); an unset gate limit "
+             "blocks entries fail-closed. Every other key is saved but "
+             "INACTIVE until its enforcement wiring is added."]
     for key in sorted(KEY_SPEC):
         marker = ("%r" % (cur[key],)) if key in cur else "(unset)"
         lines.append("  %s: %s - %s" % (key, marker, KEY_SPEC[key][1]))

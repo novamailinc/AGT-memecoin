@@ -155,11 +155,13 @@ def mark_ttl_s() -> float:
 
 
 # ---- Stage 2 account-level risk gates -------------------------------
-# PROVISIONAL, INACTIVE BY DEFAULT (PAPER_ACCOUNT_GATES_ENABLED=1
-# opts in, on top of PAPER_ACCOUNT_ENABLED). The default thresholds
-# below are agent-chosen engineering placeholders for the $10 demo
-# account, NOT owner-approved operational limits; the owner sets real
-# numbers before any runtime enabling.
+# INACTIVE BY DEFAULT (PAPER_ACCOUNT_GATES_ENABLED=1 opts in, on top of
+# PAPER_ACCOUNT_ENABLED). Thresholds resolve in order: explicit env
+# override (tests/tuning), then the OWNER-APPROVED value in
+# daemon/owner_config (set via /config_set), then NOTHING - there are
+# no placeholder defaults. A gate whose threshold is unset blocks the
+# entry fail-closed; it never falls back to an invented number.
+# Threshold selection and gate activation stay owner-owned.
 
 def gates_enabled() -> bool:
     return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
@@ -185,16 +187,29 @@ def _central_marks() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def max_daily_loss_usd() -> float:
-    return _env_f("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", 5.00)  # provisional
+def _owner_threshold(owner_key: str) -> Optional[float]:
+    """Owner-approved threshold from daemon/owner_config, or None when
+    unset (fail closed - never a placeholder)."""
+    try:
+        from daemon import owner_config  # noqa: PLC0415
+        return float(owner_config.require(owner_key))
+    except Exception:
+        return None
 
 
-def max_drawdown_pct() -> float:
-    return _env_f("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT", 50.0)  # provisional
+def max_daily_loss_usd() -> Optional[float]:
+    v = _env_f("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", None)
+    return v if v is not None else _owner_threshold("max_daily_loss_usd")
 
 
-def max_exposure_pct() -> float:
-    return _env_f("PAPER_ACCOUNT_MAX_EXPOSURE_PCT", 60.0)  # provisional
+def max_drawdown_pct() -> Optional[float]:
+    v = _env_f("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT", None)
+    return v if v is not None else _owner_threshold("max_drawdown_pct")
+
+
+def max_exposure_pct() -> Optional[float]:
+    v = _env_f("PAPER_ACCOUNT_MAX_EXPOSURE_PCT", None)
+    return v if v is not None else _owner_threshold("max_exposure_pct")
 
 
 def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
@@ -208,7 +223,8 @@ def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
     always allowed; credit() enforces ownership, quantity, op
     idempotency and ledger integrity instead).
 
-    Gates (all thresholds provisional, see above):
+    Gates (thresholds: env override, else owner_config, else the gate
+    FAILS CLOSED - no placeholder defaults):
       * degraded WAL (handled by the caller before this),
       * marks: with any position open, every mark must be present,
         fresh, finite and provenanced (marks_status "ok"), else the
@@ -228,19 +244,28 @@ def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
     if dl is None or view.get("drawdown_pct") is None:
         return ("gate: no trustworthy day-start/peak baseline yet; "
                 "entry blocked fail-closed")
-    if dl > max_daily_loss_usd():
-        return ("gate: daily loss $%.2f > limit $%.2f (provisional)"
-                % (dl, max_daily_loss_usd()))
-    if view["drawdown_pct"] > max_drawdown_pct():
-        return ("gate: drawdown %.1f%% > limit %.1f%% (provisional)"
-                % (view["drawdown_pct"], max_drawdown_pct()))
+    dl_lim, dd_lim, exp_lim = (max_daily_loss_usd(), max_drawdown_pct(),
+                               max_exposure_pct())
+    if dl_lim is None or dd_lim is None or exp_lim is None:
+        unset = [n for n, v in (("max_daily_loss_usd", dl_lim),
+                                ("max_drawdown_pct", dd_lim),
+                                ("max_exposure_pct", exp_lim))
+                 if v is None]
+        return ("gate: no owner-approved limit for %s; entry blocked "
+                "fail-closed (set via /config_set or env override)"
+                % ", ".join(unset))
+    if dl > dl_lim:
+        return ("gate: daily loss $%.2f > limit $%.2f"
+                % (dl, dl_lim))
+    if view["drawdown_pct"] > dd_lim:
+        return ("gate: drawdown %.1f%% > limit %.1f%%"
+                % (view["drawdown_pct"], dd_lim))
     if me <= 0:
         return "gate: marked equity $%.2f; no capacity" % me
     after = view["cost_exposure"] + new_stake
-    if after > max_exposure_pct() / 100.0 * me:
+    if after > exp_lim / 100.0 * me:
         return ("gate: exposure $%.2f after entry > %.0f%% of marked "
-                "equity $%.2f (provisional)"
-                % (after, max_exposure_pct(), me))
+                "equity $%.2f" % (after, exp_lim, me))
     return None
 
 
@@ -942,7 +967,7 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
     inconsistency refuses the debit — a refused paper entry costs
     nothing, a doubled one quietly invents money.
 
-    When PAPER_ACCOUNT_GATES_ENABLED=1 (PROVISIONAL, default OFF),
+    When PAPER_ACCOUNT_GATES_ENABLED=1 (default OFF),
     `marks` must carry the caller's current liquidation marks and
     the account-level risk gates run INSIDE the same lock as the
     reservation (see _gate_check_locked): evaluation and debit are

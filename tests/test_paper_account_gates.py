@@ -29,8 +29,8 @@ def check(name, cond):
         FAILS.append(name)
 
 
-def fresh(home, start="10.0", gates=True, max_daily=None,
-          max_dd=None, max_exp=None):
+def fresh(home, start="10.0", gates=True, max_daily=5.00,
+          max_dd=50.0, max_exp=60.0):
     os.environ["FOREX_AGENT_HOME"] = home
     os.environ["PAPER_ACCOUNT_START"] = start
     os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
@@ -74,10 +74,36 @@ check("gates OFF by default: entry without marks succeeds", ok)
 
 # ---- empty account: equity is exactly cash, no marks needed ---------
 H = tempfile.mkdtemp(prefix="gates-empty-")
+pa = fresh(H, max_daily=None, max_dd=None, max_exp=None)
+ok, why, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-e0")
+check("gates ON, NO limits configured anywhere: entry refused "
+      "fail-closed (no placeholder fallback)",
+      not ok and "no owner-approved limit" in why)
 pa = fresh(H)
 ok, why, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-e1")
-check("gates ON, empty account: first entry allowed without marks",
-      ok)
+check("gates ON with limits, empty account: first entry allowed "
+      "without marks", ok)
+
+# ---- owner_config limits (no env): the owner-approved path -----------
+H = tempfile.mkdtemp(prefix="gates-ownercfg-")
+os.environ["FOREX_AGENT_HOME"] = H
+import json as _json, os as _os
+_os.makedirs(H, exist_ok=True)
+with open(_os.path.join(H, "owner_config.json"), "w") as _fh:
+    _json.dump({"max_daily_loss_usd": 5.0, "max_drawdown_pct": 50.0,
+                "max_exposure_pct": 60.0}, _fh)
+pa = fresh(H, max_daily=None, max_dd=None, max_exp=None)
+# env threshold vars popped; owner_config file supplies
+ok, why, pid_oc = pa.try_debit("grad", "A", 5.0, 5.0, "g-oc1")
+check("owner_config limits (no env): entry allowed", ok)
+# tighten the owner limit: same loss profile must now refuse
+with open(_os.path.join(H, "owner_config.json"), "w") as _fh:
+    _json.dump({"max_daily_loss_usd": 0.01, "max_drawdown_pct": 50.0,
+                "max_exposure_pct": 60.0}, _fh)
+m = {"grad": {"A": mark(4.0, 5.0, pos_id=pid_oc)}}  # equity 9, loss 1
+ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-oc2", marks=m)
+check("owner_config tightened daily-loss limit: refused",
+      not ok and "daily loss" in why)
 
 # ---- open position: marks become mandatory ---------------------------
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-e2")
@@ -101,7 +127,7 @@ pa = fresh(H, max_daily=0.50)
 _, _, pid_d = pa.try_debit("grad", "A", 2.0, 2.0, "g-d1")
 m = {"grad": {"A": mark(1.0, 2.0, pos_id=pid_d)}}
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-d2", marks=m)
-check("daily loss over the provisional limit: refused",
+check("daily loss over the configured limit: refused",
       not ok and "daily loss" in why)
 pa = fresh(H, max_daily=5.00)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-d3", marks=m)
@@ -113,7 +139,7 @@ pa = fresh(H, max_dd=5.0)
 _, _, pid_x = pa.try_debit("grad", "A", 2.0, 2.0, "g-x1")
 m = {"grad": {"A": mark(1.0, 2.0, pos_id=pid_x)}}   # equity 9.00 vs peak 10 -> 10%
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-x2", marks=m)
-check("drawdown over the provisional limit: refused",
+check("drawdown over the configured limit: refused",
       not ok and "drawdown" in why)
 pa = fresh(H, max_dd=50.0)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-x3", marks=m)
@@ -121,7 +147,7 @@ check("drawdown under a raised limit: allowed (10% < 50%)", ok)
 
 # ---- exposure gate: evaluation + reservation are atomic ---------------
 H = tempfile.mkdtemp(prefix="gates-exp-")
-pa = fresh(H)  # default exposure cap 60% of equity 10 = 6.00
+pa = fresh(H)  # exposure cap 60% of equity 10 = 6.00
 ok, why, pid1 = pa.try_debit("grad", "A", 4.0, 4.0, "g-p1")
 check("first entry inside capacity ok", ok)
 m = {"grad": {"A": mark(4.0, 4.0, pos_id=pid1)}}

@@ -212,6 +212,10 @@ check("marked_by_source splits jup vs curve value (3.0 / 2.0)",
 # blocks fail-closed. Gates stay default-OFF; this proves the
 # wiring for when the owner enables them.
 os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"
+# gates are fail-closed without configured limits: set explicit ones
+os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "5.0"
+os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "50.0"
+os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "60.0"
 H = tempfile.mkdtemp(prefix="marks-auto-")
 pa, am = fresh(H)
 ok, why, pid = pa.try_debit("grad", "MINTA", 2.0, 1000.0, "g-1")
@@ -247,6 +251,9 @@ ok, why, _ = pa.try_debit(
                              "pos_id": pid2}}})
 check("caller-supplied marks still accepted", ok)
 os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED")
+os.environ.pop("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", None)
+os.environ.pop("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT", None)
+os.environ.pop("PAPER_ACCOUNT_MAX_EXPOSURE_PCT", None)
 
 if FAILURES:
     print("\nFAILURES: %s" % FAILURES)

@@ -139,5 +139,77 @@ rc, out, so, se, _ = run_trial(
     ["--seconds", "30", "--", sys.executable, "-c", "print('ok')"])
 check("clean child: outcome completed", "completed" in out and rc == 0)
 
+# 6. Wall stop kills the whole process group: child AND its own
+#    subprocess grandchild are dead after the supervisor returns.
+with tempfile.TemporaryDirectory() as td:
+    pidfile = os.path.join(td, "pids")
+    env = dict(os.environ)
+    env["FOREX_AGENT_HOME"] = td
+    p = subprocess.run(
+        [sys.executable, TRIAL, "--seconds", "2", "--",
+         sys.executable, "-c",
+         "import subprocess, sys, time\n"
+         "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+         "open(%r, 'w').write('%%d %%d' %% (__import__('os').getpid(), g.pid))\n"
+         "time.sleep(60)" % pidfile],
+        env=env, capture_output=True, text=True, timeout=60)
+    with open(pidfile) as f:
+        child_pid, grand_pid = map(int, f.read().split())
+    dead = True
+    for pid in (child_pid, grand_pid):
+        try:
+            os.kill(pid, 0)
+            dead = False
+        except (ProcessLookupError, PermissionError):
+            pass
+    check("wall: child and grandchild processes are dead", dead)
+
+# 7. One-shot: a second run against the same state dir refuses.
+with tempfile.TemporaryDirectory() as td:
+    env = dict(os.environ)
+    env["FOREX_AGENT_HOME"] = td
+    a = [sys.executable, TRIAL, "--seconds", "5", "--",
+         sys.executable, "-c", "print('ok')"]
+    subprocess.run(a, env=env, capture_output=True, text=True, timeout=60)
+    p2 = subprocess.run(a, env=env, capture_output=True, text=True,
+                        timeout=60)
+    check("one-shot: rerun against same state dir refuses",
+          p2.returncode == 3 and "already consumed" in p2.stderr)
+
+# 8. Redirects count per connect: a 302 chain produces two counted
+#    connections, so redirect loops cannot bypass the ceiling.
+try:
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    class H302(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/final":
+                self.send_response(200)
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/final")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), H302)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    rc, out, so, se, _ = run_trial(
+        ["--seconds", "30", "--max-requests", "100", "--",
+         sys.executable, "-c",
+         "import urllib.request\n"
+         "urllib.request.urlopen('http://127.0.0.1:%d/', timeout=5).read()"
+         % port])
+    check("redirect: counted once per connect (2 for one 302)",
+          "requests=2/100" in out)
+finally:
+    try:
+        httpd.shutdown()
+    except Exception:
+        pass
+
 print("FAILURES: %d" % len(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)

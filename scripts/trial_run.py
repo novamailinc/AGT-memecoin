@@ -10,21 +10,29 @@ watcher job):
   * Wall: TRIAL_SECONDS (default 600). On expiry the child's whole
     process group is SIGTERM'd, then SIGKILL'd after 5s.
   * Request ceiling: TRIAL_MAX_REQUESTS (default 900) counted across
-    EVERY outbound HTTP(S) call the lane makes, whichever transport:
-      - urllib: a sitecustomize shim prepended on PYTHONPATH wraps
-        urllib.request.urlopen, counts each call, and trips on any
-        HTTP 429 response.
-      - curl subprocess (reserves.py RPC transport, safety.py
-        curl-first): a `curl` shim earlier on PATH counts each call,
-        appends a status capture, and trips on HTTP 429.
-    Once the counter exceeds the ceiling, further requests are refused
-    (shims fail before touching the network) and the supervisor stops
-    the trial.
+    EVERY outbound connection the trial makes, whichever transport:
+      - Python sockets: a sitecustomize shim prepended on PYTHONPATH
+        wraps socket.socket.connect, so urllib (including redirect and
+        retry reconnects) and websocket-client (PumpPortal stream
+        connects/reconnects) are each counted per TCP connect. WS
+        messages flow on an already-counted connection; they are not
+        separately limited - the 10-minute wall bounds stream time.
+        An HTTP 429 response additionally trips the trial immediately
+        (urllib HTTPError path).
+      - curl subprocesses (reserves.py RPC transport, safety.py
+        curl-first - both resolve `curl` via PATH/shutil.which): a
+        `curl` shim earlier on PATH counts each invocation, appends a
+        status capture, and trips on HTTP 429.
+    Once the counter exceeds the ceiling, further connects are refused
+    (shims fail before touching the network) and the trial stops.
   * Rate-limit stop: any 429 seen by either shim writes the trip file;
     the supervisor polls it every second and kills the trial.
-  * No restart: the supervisor exits after the child stops. The phone
-    launch must invoke this script once (detached or one-shot job);
-    nothing here re-launches anything.
+  * No restart / one-shot: the supervisor exits after the child stops
+    and stamps <FOREX_AGENT_HOME>/trial_consumed at start; a second
+    run against the same state directory refuses unless the directory
+    is wiped (a fresh deployment is a fresh trial). The phone launch
+    must invoke this script once (detached or one-shot job); nothing
+    here re-launches anything.
 
 Ledger/journal state lives under FOREX_AGENT_HOME as usual, so the
 trial's accounting survives for inspection after exit.
@@ -99,7 +107,7 @@ def _bump():
 
 
 def urlopen_trial(url, *a, **kw):
-    _bump()
+    # Counting happens at socket.connect; here we only trip on 429.
     try:
         return _real_urlopen(url, *a, **kw)
     except urllib.error.HTTPError as e:
@@ -109,6 +117,24 @@ def urlopen_trial(url, *a, **kw):
 
 
 urllib.request.urlopen = urlopen_trial
+
+# Socket-level counting covers urllib, websocket-client, and any other
+# Python TCP client: every outbound connect counts once. Redirects and
+# retries reconnect, so they count too. Fail closed on any shim error.
+import socket as _socket
+
+_real_connect = _socket.socket.connect
+
+
+def _connect_trial(self, address):
+    # Count every TCP connect, loopback included: the lanes have no
+    # legitimate loopback networking, and the tests rely on refused
+    # loopback connects being counted.
+    _bump()
+    return _real_connect(self, address)
+
+
+_socket.socket.connect = _connect_trial
 '''
 
 
@@ -133,6 +159,14 @@ def main(argv):
     os.makedirs(home, exist_ok=True)
     count_file = os.path.join(home, "trial_request_count")
     trip_file = os.path.join(home, "trial_trip")
+    consumed = os.path.join(home, "trial_consumed")
+    if os.path.exists(consumed):
+        print("trial_run: refusing - trial already consumed for %s "
+              "(wipe the state dir for an explicitly new trial)" % home,
+              file=sys.stderr)
+        return 3
+    with open(consumed, "w") as f:
+        f.write(str(time.time()))
     for p in (count_file, trip_file, count_file + ".lock"):
         try:
             os.remove(p)

@@ -293,5 +293,65 @@ rc, out, so, se, _ = run_trial(
 check("tls: SSLSocket.recv and socket.recv are patched in child",
       "patches ok" in so)
 
+# 12. TLS handshake 429 through the real SSLSocket path: a local TLS
+#     server answers the upgrade request with HTTP 429 over TLS; the
+#     shim's SSLSocket.recv scan must trip the trial. (Skipped only if
+#     openssl is unavailable to mint a throwaway cert.)
+openssl = None
+for cand in ("/usr/bin/openssl", "/bin/openssl"):
+    if os.path.exists(cand):
+        openssl = cand
+        break
+if openssl is None:
+    import shutil as _sh
+    openssl = _sh.which("openssl")
+if not openssl:
+    check("tls 429: SKIP (no openssl to mint a test cert)", True)
+else:
+    with tempfile.TemporaryDirectory() as td:
+        cert = os.path.join(td, "cert.pem")
+        key = os.path.join(td, "key.pem")
+        subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", key, "-out", cert, "-days", "1",
+             "-subj", "/CN=localhost"],
+            capture_output=True, timeout=60)
+        import ssl as _ssl
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        lsrv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsrv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lsrv.bind(("127.0.0.1", 0))
+        lsrv.listen(1)
+        tls_port = lsrv.getsockname()[1]
+
+        def _serve_tls_429():
+            conn, _ = lsrv.accept()
+            try:
+                tls = ctx.wrap_socket(conn, server_side=True)
+                tls.recv(4096)
+                tls.sendall(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
+                tls.close()
+            except Exception:
+                pass
+
+        threading.Thread(target=_serve_tls_429, daemon=True).start()
+        rc, out, so, se, _ = run_trial(
+            ["--seconds", "30", "--max-requests", "100", "--",
+             sys.executable, "-c",
+             "import socket, ssl, time\n"
+             "raw = socket.create_connection(('127.0.0.1', %d), timeout=5)\n"
+             "ctx = ssl._create_unverified_context()\n"
+             "tls = ctx.wrap_socket(raw, server_hostname='localhost')\n"
+             "tls.sendall(b'GET / HTTP/1.1\\r\\n\\r\\n')\n"
+             "tls.recv(4096)\n"
+             "time.sleep(60)" % tls_port])
+        try:
+            lsrv.close()
+        except Exception:
+            pass
+        check("tls 429: outcome reports the trip over SSLSocket.recv",
+              "trip" in out)
+
 print("FAILURES: %d" % len(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)

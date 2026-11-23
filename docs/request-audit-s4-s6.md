@@ -50,7 +50,15 @@ Items marked FIXED name the landing commit.
 - 4.2 Wallet memory: IMPLEMENTED (measurement posture) — wallet_grader.py
   (statistical gates), funding_clusters.py (union-find funder clustering, explicitly
   non-gating), deployer_tracker.py / deployers.py, smartmoney.py, follower_grader.py.
-  PENDING: persistence depth per wallet over time.
+  FIXED (persistence depth): deployers.py now archives an entry before registry
+  eviction (append-only deployer_archive.jsonl under flock; eviction only after a
+  successful append - failed archives keep the entry, never a silent drop),
+  per-outcome bounded timestamps (outcome_ts) alongside the bounded launch_ts,
+  compaction keeps the latest record per deployer past the byte cap (bounded in
+  practice by cardinality, no enforceable-constant claim), and deployer_archive()
+  reports availability honestly (missing = zero history, unreadable lines counted).
+  Archived counters/timestamps are labeled recorded values, not verified skill;
+  advisory memory only, no gate/entry/exit reads it (tests in test_deployers.py).
 - 4.3 Trading memory: IMPLEMENTED — recorder.py, tap_journal.py, decision_journal.py
   (daemon/intelligence/signals/), verdict_ledger.py, exit_provenance.py, paper_account
   ledgers. decision journal + lessons.py settle records with outcomes.

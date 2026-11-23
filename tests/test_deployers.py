@@ -314,5 +314,93 @@ class ApiKeyFallbackTest(unittest.TestCase):
         self.assertIsNone(deployers.api_key())
 
 
+class DeployerArchiveTest(unittest.TestCase):
+    """Persistence depth (4.2): archive-before-eviction, fail-closed
+    durability, bounded outcome timestamps, compaction, honest
+    availability labels."""
+
+    def setUp(self):
+        self.tmp = Path("/tmp/deployer-archive-%d" % int(time.time() * 1e6))
+        self.tmp.mkdir(parents=True)
+        self.reg = self.tmp / "deployer_history.json"
+        self.arc = self.tmp / "deployer_archive.jsonl"
+        self.lock = self.tmp / "deployer_archive.lock"
+        for name, val in (("_REGISTRY_FILE", self.reg),
+                          ("_ARCHIVE_FILE", self.arc),
+                          ("_ARCHIVE_LOCK_FILE", self.lock),
+                          ("_MAX_REGISTRY", 2)):
+            p = patch.object(deployers, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_eviction_archives_before_pop(self):
+        deployers.record_launch(DEP1)
+        deployers.record_outcome("m1", DEP1, "rug")
+        deployers.record_launch(DEP2)
+        deployers.record_launch(DEP3)  # exceeds the cap of 2
+        hist = deployers.load_registry()
+        self.assertNotIn(DEP1, hist)
+        self.assertIn(DEP2, hist)
+        self.assertIn(DEP3, hist)
+        out = deployers.deployer_archive()
+        self.assertTrue(out["archive_status"]["available"])
+        self.assertEqual(len(out["records"]), 1)
+        rec = out["records"][0]
+        self.assertEqual(rec["deployer"], DEP1)
+        self.assertEqual(rec["launches_seen"], 1)
+        self.assertEqual(rec["rugs"], 1)
+        self.assertEqual(rec["evicted_reason"], "registry_cap")
+        self.assertEqual(
+            rec["memory_provenance"],
+            "recorded_counters_and_bounded_timestamps_not_verified_skill")
+        self.assertGreater(rec["archived_ts"], 0)
+
+    def test_eviction_fail_closed_when_archive_fails(self):
+        deployers.record_launch(DEP1)
+        deployers.record_launch(DEP2)
+        with patch.object(deployers, "_archive_append",
+                          return_value=False):
+            deployers.record_launch(DEP3)
+        hist = deployers.load_registry()
+        self.assertIn(DEP1, hist)  # never silently dropped
+        self.assertEqual(len(hist), 3)
+
+    def test_archive_unreadable_counted_not_clean_empty(self):
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "deployer": DEP1, "archived_ts": 5,
+                        "launches_seen": 4}) + "\nnot-json\n")
+        out = deployers.deployer_archive()
+        self.assertEqual(len(out["records"]), 1)
+        self.assertEqual(out["archive_status"]["unreadable_lines"], 1)
+        # Missing file = genuine zero history.
+        self.arc.unlink()
+        out2 = deployers.deployer_archive()
+        self.assertEqual(out2["records"], [])
+        self.assertFalse(out2["archive_status"]["available"])
+        self.assertEqual(out2["archive_status"]["reason"], "missing")
+
+    def test_compaction_keeps_latest_per_deployer(self):
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            deployers._archive_deployer(DEP1, {"launches_seen": 1}, 100.0)
+            deployers._archive_deployer(
+                DEP1, {"launches_seen": 9, "rugs": 2}, 200.0)
+            deployers._archive_deployer(DEP2, {"launches_seen": 3}, 150.0)
+        out = deployers.deployer_archive()
+        self.assertEqual(len(out["records"]), 2)
+        by_dep = {r["deployer"]: r for r in out["records"]}
+        self.assertEqual(by_dep[DEP1]["launches_seen"], 9)
+        self.assertEqual(by_dep[DEP1]["archived_ts"], 200.0)
+
+    def test_outcome_ts_bounded_history(self):
+        deployers.record_launch(DEP1)
+        for i in range(35):
+            deployers.record_outcome("mint%d" % i, DEP1, "rug")
+        entry = deployers.load_registry()[DEP1]
+        self.assertEqual(len(entry["outcome_ts"]), 30)
+        self.assertEqual(entry["outcome_ts"][-1]["outcome"], "rug")
+        self.assertEqual(entry["rugs"], 35)  # counters never truncated
+
+
 if __name__ == "__main__":
     unittest.main()

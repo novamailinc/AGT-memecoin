@@ -37,7 +37,33 @@ Registry (shared file, 0600 — same convention as smartmoney.py)::
 
     ~/.forex-agent/launch_scanner/deployer_history.json
 
-per deployer: ``{launches_seen, hits_2x, rugs, dead, first_seen, last_seen}``
+per deployer: ``{launches_seen, hits_2x, rugs, dead, first_seen, last_seen,
+launch_ts (bounded), outcome_ts (bounded)}``
+
+Persistence depth (2026-11-23, request section 4.2): the registry is
+capped at ``_MAX_REGISTRY`` live entries and eviction used to erase
+everything known about a cold deployer. An entry is now archived to an
+append-only JSONL before eviction (``deployer_archive.jsonl``, same
+disciplines as the launch archive): the deployer is REMEMBERED
+(counters, first/last seen, bounded launch/outcome timestamps), even
+though the live entry is gone. Memory semantics (code-defined):
+
+- durability: an entry is evicted only after its archive append
+  SUCCEEDS; a failed append keeps the entry (eviction retried on the
+  next launch), never a silent drop;
+- availability: a missing archive file means genuine zero archived
+  history; an unreadable one is counted in ``archive_status``
+  (``deployer_archive()``), never a clean empty history;
+- provenance: archived counters and timestamps are RECORDED values
+  (``memory_provenance``), not verified skill;
+- retention: compaction past ``_ARCHIVE_MAX_BYTES`` keeps the LATEST
+  record per deployer (records are self-contained aggregates, so no
+  counter merge is needed); total size is bounded in practice by
+  deployer cardinality and activity, NOT by an enforceable constant.
+  Retrieval is a full scan; a real index is a named future slice.
+
+The archive is advisory memory only: no gate, entry or exit reads it
+in this slice, so behavior is unchanged.
 
 Outcomes are graded independently in this module (``record_outcome``);
 a shared grading helper covering wallets AND deployers would be cleaner
@@ -53,6 +79,8 @@ Knobs (integrator adds to config/defaults.yaml, getattr-with-default):
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -68,9 +96,14 @@ logger = logging.getLogger("forex_agent.daemon.launch_scanner.deployers")
 
 _HOME = Path(os.environ.get("FOREX_AGENT_HOME", Path.home() / ".forex-agent"))
 _REGISTRY_FILE = _HOME / "launch_scanner" / "deployer_history.json"
+_ARCHIVE_FILE = _HOME / "launch_scanner" / "deployer_archive.jsonl"
+_ARCHIVE_LOCK_FILE = _HOME / "launch_scanner" / "deployer_archive.lock"
+_ARCHIVE_SCHEMA_V = 1
+_ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
 _CACHE_KEY = "deployer_cache"
 _SEEN_KEY = "deployer_fasttrack_seen"
 _MAX_REGISTRY = 2000
+_MAX_OUTCOME_TS = 30         # bounded per-deployer outcome history
 _TIMEOUT = 20
 
 _RPC_URL = "https://mainnet.helius-rpc.com/?api-key={key}"
@@ -323,7 +356,12 @@ def record_launch(deployer: str) -> Optional[Dict[str, Any]]:
                 key=lambda d: float((hist.get(d) or {}).get("last_seen")
                                     or 0))[:len(hist) - _MAX_REGISTRY]:
             if not _entry_is_hot(hist.get(dep), 3, 0.30):
-                hist.pop(dep, None)
+                # Memory durability (4.2): an entry is evicted only
+                # after its archive append SUCCEEDS - a failed
+                # append keeps the entry (retried next launch),
+                # never a silent drop.
+                if _archive_deployer(dep, hist.get(dep), now):
+                    hist.pop(dep, None)
                 break
     save_registry(hist)
     return entry
@@ -359,8 +397,165 @@ def record_outcome(mint: str, deployer: str, outcome: str) -> bool:
     else:
         entry["dead"] = int(entry.get("dead") or 0) + 1
     entry["last_seen"] = now
+    # Bounded per-outcome timestamps: depth over time per wallet
+    # (when each outcome landed), capped like launch_ts.
+    stamps = entry.get("outcome_ts")
+    if not isinstance(stamps, list):
+        stamps = []
+    stamps.append({"ts": now, "outcome": outcome})
+    entry["outcome_ts"] = stamps[-_MAX_OUTCOME_TS:]
     hist[deployer] = entry
     return save_registry(hist)
+
+
+# ----------------------------------------------------------------------
+# Deployer archive: persistence across registry eviction (4.2)
+# ----------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _archive_lock():
+    _ARCHIVE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    f = open(_ARCHIVE_LOCK_FILE, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield f
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def _archive_append(rec: Dict[str, Any]) -> bool:
+    """Append one archive record under an exclusive lock, compacting
+    opportunistically past the byte cap. Returns True only when the
+    record is durable. Never raises."""
+    try:
+        _ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _archive_lock():
+            with open(_ARCHIVE_FILE, "a") as out:
+                out.write(json.dumps(rec) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            _maybe_compact_archive()
+        return True
+    except Exception:
+        return False
+
+
+def _maybe_compact_archive() -> None:
+    """Past the byte cap, keep only the LATEST record per deployer
+    (records are self-contained aggregates, so no counter merge is
+    needed). Enforceable invariant: one record per distinct deployer
+    after every compaction; total size is bounded in practice by
+    deployer cardinality and activity, NOT by an enforceable
+    constant. Called with the archive lock held. Never raises."""
+    try:
+        if not os.path.exists(_ARCHIVE_FILE) \
+                or os.path.getsize(_ARCHIVE_FILE) <= _ARCHIVE_MAX_BYTES:
+            return
+        latest = {}
+        with open(_ARCHIVE_FILE) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue  # unreadable lines were already counted
+                if not isinstance(rec, dict) \
+                        or rec.get("v") != _ARCHIVE_SCHEMA_V \
+                        or rec.get("record_type") != "deployer_archive":
+                    continue
+                dep = rec.get("deployer")
+                if not dep:
+                    continue
+                if float(rec.get("archived_ts") or 0) >= float(
+                        (latest.get(dep) or {}).get("archived_ts") or 0):
+                    latest[dep] = rec
+        tmp = str(_ARCHIVE_FILE) + ".tmp"
+        with open(tmp, "w") as out:
+            for rec in latest.values():
+                out.write(json.dumps(rec) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, _ARCHIVE_FILE)
+        try:
+            os.chmod(_ARCHIVE_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _archive_deployer(deployer: str, entry: Optional[Dict[str, Any]],
+                      now: float) -> bool:
+    """Archive one evicted registry entry. The archived counters and
+    timestamps are RECORDED values, labeled as such - not verified
+    skill. Never raises; returns True only when durable."""
+    try:
+        e = entry if isinstance(entry, dict) else {}
+        rec = {"v": _ARCHIVE_SCHEMA_V, "record_type": "deployer_archive",
+               "deployer": deployer,
+               "archived_ts": now,
+               "first_seen": e.get("first_seen"),
+               "last_seen": e.get("last_seen"),
+               "launches_seen": int(e.get("launches_seen") or 0),
+               "hits_2x": int(e.get("hits_2x") or 0),
+               "rugs": int(e.get("rugs") or 0),
+               "dead": int(e.get("dead") or 0),
+               "launch_ts": list(e.get("launch_ts") or [])[
+                   -_MAX_LAUNCH_TS:],
+               "outcome_ts": list(e.get("outcome_ts") or [])[
+                   -_MAX_OUTCOME_TS:],
+               "evicted_reason": "registry_cap",
+               "memory_provenance":
+                   "recorded_counters_and_bounded_timestamps"
+                   "_not_verified_skill"}
+        return _archive_append(rec)
+    except Exception:
+        return False
+
+
+def deployer_archive(deployer: Optional[str] = None,
+                     limit: int = 100) -> Dict[str, Any]:
+    """Latest archived record per deployer (evicted from the live
+    registry), newest first. A missing archive file means genuine
+    zero archived history; an unreadable file/lines are counted in
+    ``archive_status``, never a clean empty history. Returns
+    {"records": [...], "archive_status": {...}}; never raises."""
+    status = {"available": False, "unreadable_lines": 0,
+              "reason": "missing"}
+    try:
+        if not os.path.exists(_ARCHIVE_FILE):
+            return {"records": [], "archive_status": status}
+        status["available"] = True
+        status["reason"] = "ok"
+        latest = {}
+        with open(_ARCHIVE_FILE) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    status["unreadable_lines"] += 1
+                    continue
+                if not isinstance(rec, dict) \
+                        or rec.get("v") != _ARCHIVE_SCHEMA_V \
+                        or rec.get("record_type") != "deployer_archive":
+                    continue
+                dep = rec.get("deployer")
+                if not dep:
+                    continue
+                if deployer is not None and dep != deployer:
+                    continue
+                if float(rec.get("archived_ts") or 0) >= float(
+                        (latest.get(dep) or {}).get("archived_ts") or 0):
+                    latest[dep] = rec
+        recs = sorted(latest.values(),
+                      key=lambda r: float(r.get("archived_ts") or 0),
+                      reverse=True)[:int(limit or 100)]
+        return {"records": recs, "archive_status": status}
+    except Exception:
+        status["reason"] = "unreadable"
+        return {"records": [], "archive_status": status}
 
 
 # ----------------------------------------------------------------------

@@ -141,3 +141,18 @@ state instead of silently resetting it. Eight processes recording64distinct mint
 check actual handle_sighting retention. Sell grading effects remain non-idempotent
 by transaction signature; separate-stage commits and replay remain open. Passing poll recovery is not proof of exactly-once
 signal/notification/sell execution or full acquisition coverage.
+
+
+## Causal fire-intent replay
+
+Before smart-watcher can publish a converged fire, its intent ID and creation
+time are saved to convergence state. Available wallet transaction signatures
+travel with sightings and the signal evidence. A retry after bus publication but
+failed convergence completion reuses that intent, rather than inventing a new
+retry-time event. The locked bus publication recognizes matching source/chain/ID
+within retained history and refuses rebinding it to another mint; watcher and
+smart-select fire keys use explicit identity when present, legacy timestamps
+otherwise. This is bounded retained-history dedup, not lifetime exactly-once,
+not instruction-level swap evidence, and not cross-file atomic execution.
+Notifications, mirrors and sell grading may still replay. The same-mint paper
+entry cash guard remains separate and unchanged.

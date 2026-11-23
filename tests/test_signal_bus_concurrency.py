@@ -60,3 +60,11 @@ for i in range(12):
         with tempfile.TemporaryDirectory() as home,patch.object(BUS,'BUS_PATH',str(Path(home)/'bus.jsonl')),patch.object(BUS,'MAX_BUS_LINES',2):
             for mint in ('one','two','three'):self.assertTrue(BUS.publish(BUS.make_signal('solana','fixture',mint)))
             self.assertEqual([json.loads(line)['mint'] for line in Path(BUS.BUS_PATH).read_text().splitlines()],['two','three'])
+
+    def test_event_identity_replay_dedups_but_rebinding_mint_refuses(self):
+        with tempfile.TemporaryDirectory() as home,patch.object(BUS,'BUS_PATH',str(Path(home)/'bus.jsonl')):
+            sig=BUS.make_signal('solana','fixture','one');sig['event_id']='intent1'
+            self.assertTrue(BUS.publish(sig))
+            self.assertTrue(BUS.publish(dict(sig,ts=sig['ts']+100)))
+            self.assertFalse(BUS.publish(dict(sig,mint='other')))
+            self.assertEqual(len(Path(BUS.BUS_PATH).read_text().splitlines()),1)

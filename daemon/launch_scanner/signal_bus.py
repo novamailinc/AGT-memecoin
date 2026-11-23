@@ -151,6 +151,27 @@ def publish(sig):
                     lines = f.read().splitlines()
             except FileNotFoundError:
                 pass
+            event_id=sig.get('event_id')
+            if event_id is not None:
+                if not isinstance(event_id,str) or not event_id:
+                    return False
+                for line in lines:
+                    try:existing=json.loads(line)
+                    except (ValueError,TypeError):continue
+                    if (isinstance(existing,dict) and existing.get('event_id')==event_id
+                            and existing.get('source')==sig.get('source')
+                            and existing.get('chain')==sig.get('chain')):
+                        # A source intent may not be rebound to another mint.
+                        if existing.get('mint')!=sig.get('mint'):
+                            return False
+                        # Reconfirm the visible snapshot's durability after a
+                        # prior ambiguous post-replace fsync failure.
+                        with open(BUS_PATH,'rb') as durable:
+                            os.fsync(durable.fileno())
+                        directory_fd=os.open(os.path.dirname(BUS_PATH),os.O_RDONLY)
+                        try:os.fsync(directory_fd)
+                        finally:os.close(directory_fd)
+                        return True
             lines.append(json.dumps(sig, separators=(",", ":")))
             lines = lines[-MAX_BUS_LINES:]
             fd,tmp=tempfile.mkstemp(dir=os.path.dirname(BUS_PATH),prefix='.signal-bus-')

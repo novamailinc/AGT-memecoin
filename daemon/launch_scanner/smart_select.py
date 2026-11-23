@@ -308,6 +308,8 @@ def _is_smart_fire(sig):
 
 
 def _fire_key(sig):
+    if isinstance(sig.get('event_id'),str) and sig['event_id']:
+        return '%s:%s:%s' % (sig.get('chain'),sig.get('source'),sig['event_id'])
     return "%.3f:%s" % (float(sig.get("ts") or 0), sig.get("mint") or "")
 
 

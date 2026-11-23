@@ -729,6 +729,12 @@ def fire_card(mint, info, safety_reason, n_wallets, wallet_names,
             # token (buys/sells/age): substitute the REAL measured
             # values where they exist and OMIT the keys where they
             # don't — never publish a zero/constant as a measurement.
+            if rec and rec.get('fire_event_id'):
+                sig['event_id']=rec['fire_event_id']
+                sig['ts']=rec['fire_created_ts']
+                sig['evidence']['transaction_signatures']=sorted({
+                    item['transaction_signature'] for item in rec.get('sightings',[])
+                    if isinstance(item.get('transaction_signature'),str)})
             sig.pop("score", None)  # no total score is measured here
             if "buys" in feat:
                 sig["buys"] = feat["buys"]
@@ -937,6 +943,15 @@ def _attempt_fire(mint, rec, n_groups, seen, retry):
     return outcome
 
 
+def _persist_fire_intent(ledger,rec):
+    """Intent identity must survive before a downstream publish can happen."""
+    if not isinstance(rec.get('fire_event_id'),str) or not rec['fire_event_id']:
+        import uuid
+        rec['fire_event_id']='smart-watcher:'+uuid.uuid4().hex
+        rec['fire_created_ts']=time.time()
+    return save_convergence(ledger)
+
+
 def _retry_pending(rec, now):
     """True while a converged record may still earn a card via retry."""
     try:
@@ -981,6 +996,11 @@ def handle_sighting(wallet, buy, registry, seen):
     buy_price = (sol_spent / tokens) if tokens > 0 and sol_spent > 0 else 0.0
     rec = add_sighting(ledger, mint, wallet, group, buy_ts, buy_price,
                        sol_spent, now)
+    for sighting in rec.get('sightings',[]):
+        if sighting.get('wallet')==wallet and not sighting.get('transaction_signature'):
+            if isinstance(buy.get('signature'),str) and buy['signature']:
+                sighting['transaction_signature']=buy['signature']
+            break
     # Anchor snapshot (2026-10-21): MARKET price when the pack first
     # touched this mint. Staleness/run-up is judged against this —
     # never against the tx-implied buy price (net-delta accounting,
@@ -1004,6 +1024,8 @@ def handle_sighting(wallet, buy, registry, seen):
     last = float(rec.get("last_attempt_ts") or 0)
     if last and now - last < RETRY_EVERY_S:
         return save_convergence(ledger)  # attempt spacing — the retry sweep owns the next try
+    if not _persist_fire_intent(ledger,rec):
+        return False
     proposed_seen=set(seen)
     outcome = _attempt_fire(mint, rec, n_groups, proposed_seen, retry=False)
     saved = save_convergence(ledger)
@@ -1084,6 +1106,8 @@ def retry_convergences(seen):
                 continue
             last = float(rec.get("last_attempt_ts") or 0)
             if last and now - last < RETRY_EVERY_S:
+                continue
+            if not _persist_fire_intent(ledger,rec):
                 continue
             outcome = _attempt_fire(mint, rec, n_groups, proposed_seen,
                                     retry=True)

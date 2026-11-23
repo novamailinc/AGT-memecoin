@@ -179,9 +179,14 @@ with patch.object(sw,'rpc',return_value=[]),patch.object(sw,'_shared_rpc_transpo
     def test_real_fire_seen_commits_only_after_convergence_persistence(self):
         # A successful production _attempt_fire mutates only proposed seen.
         # Failed save must force the NEXT poll through the handler again.
+        real_save=sw.save_convergence
+        attempts=[0]
+        def save_then_fail(ledger):
+            attempts[0]+=1
+            return real_save(ledger) if attempts[0]%2 else False
         with patch.object(sw,'eval_convergence',return_value=(2,True)), \
              patch.object(sw,'try_fire_converged_card',return_value='fired') as fire, \
-             patch.object(sw,'save_convergence',return_value=False):
+             patch.object(sw,'save_convergence',side_effect=save_then_fail):
             with self.assertRaises(OSError):self.poll(transaction())
             self.assertNotIn('Mpump',self.seen)
             self.assertEqual(self.intake.wallet('W')['pending'],['new'])
@@ -240,6 +245,36 @@ for i in range(8):
                 if worker.poll() is None:worker.kill();worker.wait()
         path=Path(self.tmp.name)/'launch_scanner/smart_convergence.json'
         self.assertEqual(len(json.loads(path.read_text())),64)
+
+
+    def test_bus_publication_replay_reuses_durable_intent_after_final_save_failure(self):
+        import signal_bus
+        from daemon.launch_scanner import watcher_lane
+        real_save=sw.save_convergence
+        writes=[0]
+        def fail_final(ledger):
+            writes[0]+=1
+            return real_save(ledger) if writes[0]==1 else False
+        info={'symbol':'FIX','price':1,'mcap':100000,'liq':50000,'vol':10000}
+        def fire(mint,rec,n_groups,retry):
+            return 'fired' if sw.fire_card(mint,info,'fixture',n_groups,'W',rec=rec) else 'blocked'
+        buspath=str(Path(self.tmp.name)/'bus.jsonl')
+        with patch.object(signal_bus,'BUS_PATH',buspath), \
+             patch.object(sw,'_HAS_CARDS',False),patch.object(sw,'_CARDS_ENABLED',False), \
+             patch.object(sw,'eval_convergence',return_value=(2,True)), \
+             patch.object(sw,'try_fire_converged_card',side_effect=fire):
+            with patch.object(sw,'save_convergence',side_effect=fail_final):
+                with self.assertRaises(OSError):self.poll(transaction())
+            row=json.loads(Path(buspath).read_text().splitlines()[0])
+            self.assertTrue(row['event_id'])
+            self.assertEqual(row['evidence']['transaction_signatures'],['new'])
+            self.assertEqual(self.intake.wallet('W')['pending'],['new'])
+            self.poll(transaction())
+            rows=[json.loads(line) for line in Path(buspath).read_text().splitlines()]
+            self.assertEqual(len(rows),1)
+            self.assertEqual(self.intake.wallet('W')['pending'],[])
+            replay=dict(row,ts=row['ts']+99)
+            self.assertEqual(watcher_lane._fire_key(row),watcher_lane._fire_key(replay))
 
 
 

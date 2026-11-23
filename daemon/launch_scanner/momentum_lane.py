@@ -157,6 +157,114 @@ def _paper_account():
         return None
 
 
+def _close_intents():
+    """The cross-ledger close-intent journal (Stage C, 2026-11-22),
+    or None when the shared account is off. Same engine-loading
+    caveats as _paper_account."""
+    if _paper_account() is None:
+        return None
+    try:
+        try:
+            from daemon.launch_scanner import close_intents
+        except ImportError:
+            import close_intents
+        return close_intents
+    except Exception:
+        logger.exception("momentum: close-intent journal unavailable")
+        return None
+
+
+# Intents whose account side is durable but whose lane-ledger write
+# has not yet been confirmed; tuples (intent_id, pos_id, mint,
+# suffix). _write flushes one only when the persist actually
+# carries its tranche/close.
+_PENDING_CLOSE_INTENTS = []
+_RECOVERY_DONE = False
+# A FROZEN intent blocks every entry (parent review 2026-11-22):
+# contradictory lane/account capital must not fund new risk.
+_ENTRY_BLOCKED = False
+
+
+def _recover_close_intents():
+    """Re-drive incomplete close intents once per process, before
+    this process's first entry/close. Account ops re-apply
+    idempotently (op_id dedupe); a still-open position is left to
+    its natural re-fire; a missing tranche on a closed position is
+    NOT reconstructed (operator territory) - it freezes."""
+    global _RECOVERY_DONE, _ENTRY_BLOCKED
+    if _RECOVERY_DONE:
+        return _ENTRY_BLOCKED
+    _RECOVERY_DONE = True
+    _ci = _close_intents()
+    if _ci is None:
+        return False
+
+    def account_apply(op):
+        _pa = _paper_account()
+        if _pa is None:
+            return False, "paper account disabled"
+        if op.get("kind") == "write_down":
+            ok, why = _pa.write_down(
+                LANE, op.get("mint"), op.get("op_id"),
+                pos_id=op.get("pos_id"), qty=op.get("qty"),
+                reason=op.get("reason") or "recovered")
+        else:
+            ok, why = _pa.credit(
+                LANE, op.get("mint"), op.get("amount"),
+                op.get("op_id"), pos_id=op.get("pos_id"),
+                qty=op.get("qty"), fee=op.get("fee") or 0.0,
+                price_kind=op.get("price_kind"))
+        if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
+                and not _pa.pos_ever_existed(
+                    pos_id=op.get("pos_id"), lane=LANE,
+                    mint=op.get("mint")):
+            return True, "orphan (converged, epoch-proven)"
+        return ok, why
+
+    def lane_has_close(intent):
+        info = intent.get("close_info") or {}
+        return _ci.tranche_lane_done(_read(), intent.get("pos_id"),
+                                     intent.get("mint"),
+                                     info.get("leg_suffix"))
+
+    def lane_apply(intent):
+        # An open position re-fires the tranche naturally (account
+        # dedupes by op_id). A tranche lost from a CLOSED position
+        # is genuine divergence: never reconstruct it silently.
+        d = _read()
+        pos = (d.get("positions") or {}).get(intent.get("mint"))
+        if pos is not None and (
+                not intent.get("pos_id")
+                or pos.get("pa_pos_id") == intent.get("pos_id")):
+            return None
+        return False
+
+    frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
+                              lane_apply)
+    if frozen:
+        _ENTRY_BLOCKED = True
+        logger.error("momentum: %d close intent(s) FROZEN - ledgers "
+                     "diverge, ENTRIES BLOCKED until operator "
+                     "resolution: %s", len(frozen), ",".join(frozen))
+    return _ENTRY_BLOCKED
+
+
+def _intent_open(lane_suffix, pos, ops, reason):
+    """begin() + return the pending tuple, or None when the journal
+    is off."""
+    _ci = _close_intents()
+    if _ci is None:
+        return None
+    mint = pos["mint"]
+    pa_pos_id = pos.get("pa_pos_id")
+    iid = _ci.begin(LANE, mint, pa_pos_id, ops,
+                    {"realized_usd": ops[0].get("amount") or 0.0,
+                     "closed_reason": reason,
+                     "close_ts": time.time(),
+                     "leg_suffix": lane_suffix})
+    return (iid, pa_pos_id, mint, lane_suffix)
+
+
 def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
     """Credit the shared account for one settlement tranche, when
     this position was opened through it. Same contract as the
@@ -175,12 +283,27 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
         return
     mint = pos["mint"]
     _op = "%s:%s:%s:%s" % (LANE, suffix, mint, pa_pos_id)
+    # Stage C: durable intent BEFORE the account op.
+    _pend = _intent_open(suffix, pos,
+                         [{"kind": "credit", "op_id": _op,
+                           "mint": mint, "amount": gross, "qty": qty,
+                           "fee": fee, "price_kind": price_kind,
+                           "pos_id": pa_pos_id}], suffix)
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
                            qty=qty, fee=fee, price_kind=price_kind)
-    if not _ok:
+    if not _ok and _pa.op_outcome(_op) == "orphan" \
+            and not _pa.pos_ever_existed(pos_id=pa_pos_id,
+                                         lane=LANE, mint=mint):
+        _ok, _why = True, ""
+    if _ok:
+        if _pend is not None:
+            _ci2 = _close_intents()
+            _ci2.mark_account_applied(LANE, _pend[0])
+            _PENDING_CLOSE_INTENTS.append(_pend)
+    else:
         logger.warning("momentum: shared paper account credit for "
-                       "%s (%s) failed: %s (journaled)", mint,
-                       suffix, _why)
+                       "%s (%s) failed: %s (journaled, intent open "
+                       "for recovery)", mint, suffix, _why)
 def _pa_write_down(pos, reason):
     """Move the shared-account position to the unresolved register
     for a zero-price write-down (design v4 Stage B): the units were
@@ -196,11 +319,25 @@ def _pa_write_down(pos, reason):
         return
     mint = pos["mint"]
     _op = "%s:writedown:%s:%s" % (LANE, mint, pa_pos_id)
+    _pend = _intent_open("writedown", pos,
+                         [{"kind": "write_down", "op_id": _op,
+                           "mint": mint, "pos_id": pa_pos_id,
+                           "reason": reason}], reason)
     _ok, _why = _pa.write_down(LANE, mint, _op, pos_id=pa_pos_id,
                                reason=reason)
-    if not _ok:
+    if not _ok and _pa.op_outcome(_op) == "orphan" \
+            and not _pa.pos_ever_existed(pos_id=pa_pos_id,
+                                         lane=LANE, mint=mint):
+        _ok, _why = True, ""
+    if _ok:
+        if _pend is not None:
+            _ci2 = _close_intents()
+            _ci2.mark_account_applied(LANE, _pend[0])
+            _PENDING_CLOSE_INTENTS.append(_pend)
+    else:
         logger.warning("paper account write-down for %s failed: "
-                       "%s (journaled)", mint, _why)
+                       "%s (journaled, intent open for recovery)",
+                       mint, _why)
 
 MAX_OPEN = 50              # bankroll binds first by design (see header)
 LANE = "watcher"
@@ -369,6 +506,22 @@ def _write(d):
                 os.close(dfd)
         except OSError:
             pass
+        # Stage C: flush lane-side intent marks ONLY for intents
+        # whose tranche/close THIS persist actually carries.
+        if _PENDING_CLOSE_INTENTS:
+            _ciw = _close_intents()
+            if _ciw is not None:
+                _keep = []
+                for _iid, _pid, _mint, _suffix in \
+                        _PENDING_CLOSE_INTENTS:
+                    if _ciw.tranche_lane_done(d, _pid, _mint,
+                                              _suffix):
+                        _ciw.mark_lane_applied(LANE, _iid)
+                    else:
+                        _keep.append((_iid, _pid, _mint, _suffix))
+                _PENDING_CLOSE_INTENTS[:] = _keep
+            else:
+                _PENDING_CLOSE_INTENTS.clear()
         return True
     except Exception:
         return False
@@ -889,6 +1042,15 @@ def _consider_candidate(cand, now):
         # so an entry instance is unique) under the LANE global.
         _pa = _paper_account()
         if _pa is not None:
+            # Stage C: reconcile pending close intents BEFORE any
+            # entry/capital decision; a FROZEN intent blocks the
+            # entry outright (parent review 2026-11-22).
+            _recover_close_intents()
+            if _ENTRY_BLOCKED:
+                return _skip(mint,
+                             "close-intent divergence frozen: "
+                             "entries blocked until operator "
+                             "resolution", False)
             _op = "%s:entry:%s:%d" % (LANE, mint,
                                       int(pos["entry_ts"] * 1000))
             _ok, _why, _pid = _pa.try_debit(LANE, mint, NOTIONAL_USD,
@@ -1200,6 +1362,7 @@ def _verdict_check(d):
 def _finalize(d, mint, pos, closed_reason):
     """Move an open position to closes, settle cash, record the lane
     trade, evaluate the pre-registered verdict. Lock held by caller."""
+    _recover_close_intents()
     realized = round(float(pos["realized_usd"]), 6)
     pnl = round(realized - NOTIONAL_USD, 4)
     d["bankroll"] = round(float(d["bankroll"]) + realized, 6)
@@ -1224,6 +1387,8 @@ def _finalize(d, mint, pos, closed_reason):
         "entry_features": pos.get("entry_features", {}),
         "quote_journal": list(pos.get("quote_journal") or [])[-10:],
         "exit_liquidity": pos.get("last_liquidity"),
+        # Stage C: match lane closes to account ops.
+        "pa_pos_id": pos.get("pa_pos_id"),
     }
     rec.update(_peak_fields(pos))
     rec["exit_price_kind"] = (

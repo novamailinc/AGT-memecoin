@@ -35,9 +35,11 @@ import time
 
 try:
     from daemon.launch_scanner import reserves as _res
+    from daemon.launch_scanner import reserve_monitor as _resmon
     from daemon.launch_scanner.logstream import WSClient, WSError
 except Exception:  # pragma: no cover - script-style import path
     import reserves as _res  # type: ignore
+    import reserve_monitor as _resmon  # type: ignore
     from logstream import WSClient, WSError  # type: ignore
 
 try:
@@ -54,6 +56,22 @@ ARMED_MULT = 1.5          # peak/entry at which a position arms
 STALE_S = 30.0            # no message for this long -> STALE
 MOVE_JOURNAL_PCT = 20.0   # reconnect moves worth journaling
 _RECV_TICK_S = 5.0
+
+
+def _record_reserve_snapshot(pool, mint, v):
+    """Feed the 6.2 reserve monitor from a vault resolution the
+    watcher ALREADY made - no new RPC, no added polling, cadence
+    unchanged. Measurement only: the monitor never gates, scores, or
+    exits, and a monitor failure must never affect the watch loop."""
+    try:
+        if not isinstance(v, dict):
+            return
+        _resmon.record_snapshot(pool, mint, time.time(),
+                                v.get("base_amount"),
+                                v.get("quote_amount"),
+                                source="armed_watch")
+    except Exception:
+        pass
 
 
 def _shared_guard():
@@ -224,6 +242,7 @@ class ArmedWatcher:
                             "base": v["base_amount"],
                             "quote": v["quote_amount"],
                             "ts": time.time()}
+                    _record_reserve_snapshot(pool, mint, v)
                 want[mint] = {"pool": pool,
                               "decimals": _res.mint_decimals(mint),
                               "base_vault": vaults["base_vault"],
@@ -515,6 +534,7 @@ class ArmedWatcher:
                 v = _res.resolve_vaults(w["pool"], mint)
                 if not v:
                     continue
+                _record_reserve_snapshot(w["pool"], mint, v)
                 with self._lock:
                     self._amounts[mint] = {
                         "base": v["base_amount"],

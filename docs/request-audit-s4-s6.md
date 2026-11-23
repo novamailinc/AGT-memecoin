@@ -166,8 +166,24 @@ Items marked FIXED name the landing commit.
   dossiers.py, lp_lock.py, locked_liq.py. PARTIAL: Token-2022 extension checks - presence-based traps (transferHook/permanentDelegate/nonTransferable fail; defaultAccountState-frozen fail; transferFeeConfig >10% fail) plus NAMED review classification of the canonical UiExtension serde names (pausableConfig, scaledUiAmountConfig, interestBearingConfig, memoTransfer, confidentialMintBurn, unparseableExtension, authority-mutable fee schedules), same REVIEW class (flag, pass, -5). PENDING: behavioral evaluation (hook program semantics, maximumFee/withheld modeling, pausable state tracing); named classification is not semantic safety.
 - 6.2 Liquidity intelligence: IMPLEMENTED — reserves.py, reserves_curve_price.py,
   curve_cache.py, liquidity_mirage.py, exit_liquidity_clock.py, price-impact modeling
-  in backtest.py. PENDING: continuous pool-reserve monitoring + migration/abnormal-
-  movement detection coverage.
+  in backtest.py. FIXED (monitoring depth, measurement-only): reserve_monitor.py
+  keeps a durable per-pool reserve-snapshot history (append-only JSONL under flock,
+  torn-tail repair counted, per-pool sample cap with labeled drops, byte-cap
+  compaction, missing file = unknown_missing never clean empty; bool/NaN/negative
+  reserves rejected and counted at the boundary) and derives two advisory
+  detections: abnormal movement (drain/spike vs the pool's OWN trailing median,
+  explicit insufficient_history / baseline_unusable labels, never a fabricated
+  baseline) and pool migration (per-mint canonical-pool transitions with
+  three-valued provenance: explicit marker > inferred_from_reserves > unrecorded;
+  both-pools-active labeled conflict, never silently resolved). Runtime wiring:
+  armed_watch records a snapshot from each vault resolution it ALREADY performs
+  (position arming + reconnect reconcile) - no new RPC, no added polling, cadence
+  unchanged, monitor failure can never break the watch loop (negative test).
+  BOUNDARY: detection output is advisory surface only (monitor_status /
+  detect_abnormal / detect_migration); no gate, score, entry, or exit reads it,
+  and continuous COVERAGE is bounded by armed positions - pools outside the
+  armed set have no history unless a caller feeds them (tests
+  test_reserve_monitor.py, 20 checks incl. wiring + negative probes).
 - 6.3 Wallet intelligence: see 4.2 + insiders.py, holder_tracker.py, holder_quality.py,
   dust_holders.py, anticrowd.py, funding_clusters.py.
 - 6.4 Trading intelligence: IMPLEMENTED — momentum.py, smartgrade.py, fusion.py

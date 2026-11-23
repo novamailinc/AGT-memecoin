@@ -524,6 +524,41 @@ def _maybe_warn_locked(s: Dict, lane: str, rep: Dict,
     })
     return True
 
+def _human_halt_engaged() -> bool:
+    """Global human emergency stop (Telegram /halt), stored in the
+    forex Store's kill_switch latch - a SEPARATE store from this
+    module's per-lane state (found 2026-11-23 by the independent VM
+    validator: /halt engaged the storage latch while memecoin lanes
+    kept opening positions, because nothing here consulted it).
+
+    Engaged = every lane halted, IN ADDITION to per-lane halts.
+    /resume releases it; per-lane halts stay human-only via
+    reenable(). Fail-closed: an unreadable latch counts as ENGAGED -
+    a stop command we cannot read is treated as given. A fresh
+    environment with no forex.db reads as not engaged (the Store
+    creates the DB on open; no row means never halted)."""
+    try:
+        try:
+            from storage.store import Store
+        except ImportError:
+            import sys as _sys
+            _repo = os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))
+            if _repo not in _sys.path:
+                _sys.path.insert(0, _repo)
+            from storage.store import Store
+        st = Store(os.path.join(HOME, "forex.db"))
+        try:
+            rec = st.get_kill_switch()
+        finally:
+            close = getattr(st, "close", None)
+            if callable(close):
+                close()
+        return bool(rec.get("engaged"))
+    except Exception:
+        return True
+
+
 def is_halted(lane: str) -> bool:
     """Check if a lane is halted. The single choke point.
     Fail-closed: unreadable state counts as halted — and so does
@@ -532,8 +567,14 @@ def is_halted(lane: str) -> bool:
     used to escape as a KeyError/TypeError that the entry gates'
     except: pass swallowed, so entry proceeded with no halt
     enforcement (HIGH-2, 2026-11-21). Now every exception is
-    halted; is_halted never raises."""
+    halted; is_halted never raises.
+
+    A lane is halted when EITHER its per-lane verdict halt is set
+    OR the global human emergency stop (Telegram /halt, storage
+    kill_switch latch) is engaged (2026-11-23)."""
     try:
+        if _human_halt_engaged():
+            return True
         s = _load()
         return _lane_state(s, lane).get("halted", False)
     except Exception:

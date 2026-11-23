@@ -184,6 +184,57 @@ try:
 finally:
     os.chmod(rohome, stat.S_IRWXU)
 
+# 4. Global human emergency stop (Telegram /halt -> storage
+#    kill_switch latch) halts every lane on top of per-lane state.
+#    Regression for the 2026-11-23 validator finding: /halt engaged
+#    the storage latch while grad.scan_once kept opening positions.
+hh = fresh_dir("hh")
+ks = reload_with(state_dir=hh,
+                 state_file=os.path.join(hh, "state.json"),
+                 shadow_file=os.path.join(hh, "state.json.bak"),
+                 lock_file=os.path.join(hh, "state.lock"))
+ks.HOME = TMPD  # forex.db lives under HOME
+try:
+    from storage.store import Store
+except ImportError:
+    sys.path.insert(0, REPO)
+    from storage.store import Store
+db = os.path.join(TMPD, "forex.db")
+store = Store(db)
+store.set_kill_switch(True, "regression-probe")
+check("human halt: is_halted True with clean lane state",
+      ks.is_halted("main"))
+check("human halt: gate False", not ks.gate("main"))
+check("human halt: applies to every lane",
+      ks.is_halted("grad") and ks.is_halted("watcher")
+      and ks.is_halted("degen"))
+# Exit capability preserved: recording a close still works while the
+# latch is engaged (exits never consult is_halted).
+ks.record_trade("main", -0.01)
+check("human halt: exits/closes still recordable",
+      os.path.isfile(os.path.join(hh, "state.json")))
+# /resume releases the global latch; the lane is tradeable again
+# (its own per-lane halt state untouched).
+store.set_kill_switch(False, "regression-probe")
+check("resume: lane tradeable again", not ks.is_halted("main"))
+check("resume: gate open", ks.gate("main"))
+
+# 5. Unreadable latch fails CLOSED (a stop command we cannot read
+#    is treated as given): make forex.db unopenable.
+os.unlink(db)
+os.makedirs(db)
+try:
+    check("unreadable latch: is_halted True", ks.is_halted("main"))
+    check("unreadable latch: gate False", not ks.gate("main"))
+finally:
+    os.rmdir(os.path.join(TMPD, "forex.db"))
+
+# 6. Fresh environment (no forex.db at all) reads as NOT engaged.
+ks.HOME = fresh_dir("fresh-home")
+reload_with()
+ks.HOME = fresh_dir("fresh-home2")
+check("no forex.db: not halted", not ks.is_halted("main"))
+
 print()
 if fails:
     print("FAILURES: %d" % len(fails))

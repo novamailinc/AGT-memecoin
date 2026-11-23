@@ -11,15 +11,20 @@ as of the last slot — there is no republisher in between.
 
 Layout evidence (verified live 2026-10-23 against pool
 52PfZrMW8XMcEdK86qSBFK4bArj2rCqAUgQH8quxhz4M, owner = PumpSwap
-program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA):
-creator @11, quote_mint (WSOL) @43, base_mint @75, lp_mint @107,
-pool_quote_vault @139, pool_base_vault @171, lp_supply u64 @203.
-Token-2022 pools included (vault accounts may be 170 bytes).
-The reader NEVER trusts field order blindly: vault accounts are
-mint-matched (the vault whose mint is WSOL is the quote vault; the
-one whose mint is the position mint is the base vault), and when the
-offset parse fails a getProgramAccounts scan by vault-owner finds
-them layout-free.
+program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA): creator @11,
+mints @43/@75, lp_mint @107, vault pubkeys @139/@171,
+lp_supply u64 @203. NOTE (2026-11-22): the authoritative pump_amm
+IDL (pump-public-docs) names @43 base_mint, @75 quote_mint, @139
+pool_BASE_token_account, @171 pool_QUOTE_token_account — the older
+docstring had the base/quote NAMES swapped; only the vault-pubkey
+offsets are used, and vault accounts are mint-matched (the vault
+whose mint is the position mint is base; the other's mint IS the
+quote asset), so the name swap never affected pricing. The quote
+asset is NOT always WSOL: PUMP-quoted pools exist, and the quote
+mint is read from the quote vault's token account (never assumed).
+Token-2022 pools included (vault accounts may be 170 bytes). When
+the offset parse fails a getProgramAccounts scan by vault-owner
+finds the vaults layout-free.
 
 Bonding curve (pre-graduation): PDA seeds ["bonding-curve", mint]
 under the pump program. Authoritative layout = the pump-public-docs
@@ -867,18 +872,29 @@ def parse_pumpswap_vaults(data):
 
 def match_vaults(accounts, mint):
     """accounts: {pubkey: (owner, data)}. Returns (base_vault,
-    quote_vault) matched BY MINT — base holds `mint`, quote holds
-    WSOL — or (None, None)."""
-    base_v = quote_v = None
+    quote_vault, quote_mint): base holds `mint`, quote is the OTHER
+    token account — its mint IS the pool's quote asset. Usually
+    WSOL, but PumpSwap pools can be quoted in other quote-control
+    mints (PUMP-quoted pools exist: never assume SOL). Any
+    ambiguity (duplicate base, a second quote mint, two candidate
+    quote vaults) refuses: (None, None, None)."""
+    base_v = quote_v = quote_mint = None
     for pk, (_owner, data) in (accounts or {}).items():
         ta = parse_token_account(data)
         if not ta:
             continue
         if ta["mint"] == mint:
+            if base_v is not None:
+                return None, None, None
             base_v = pk
-        elif ta["mint"] == WSOL:
+        else:
+            if quote_v is not None:
+                return None, None, None
             quote_v = pk
-    return base_v, quote_v
+            quote_mint = ta["mint"]
+    if not base_v or not quote_v:
+        return None, None, None
+    return base_v, quote_v, quote_mint
 
 
 def scan_pool_vaults(pool, mint, exempt=False):
@@ -900,7 +916,7 @@ def scan_pool_vaults(pool, mint, exempt=False):
                 if d:
                     accts[row["pubkey"]] = (
                         info.get("owner"), base64.b64decode(d[0]))
-            b, q = match_vaults(accts, mint)
+            b, q, _qm = match_vaults(accts, mint)
             if b and q:
                 return b, q
         except Exception:
@@ -918,18 +934,20 @@ def resolve_vaults(pool, mint, exempt=False):
     q_off, b_off = parse_pumpswap_vaults(data)
     if q_off and b_off:
         accts = get_accounts([q_off, b_off], exempt=exempt)
-        b, q = match_vaults(accts, mint)
+        b, q, qm = match_vaults(accts, mint)
         if b and q:
-            return _vault_amounts(accts, b, q)
+            return _vault_amounts(accts, b, q, qm)
     b, q = scan_pool_vaults(pool, mint, exempt=exempt)
     if b and q:
         accts = get_accounts([b, q], exempt=exempt)
-        return _vault_amounts(accts, b, q)
+        _b, _q, qm = match_vaults(accts, mint)
+        return _vault_amounts(accts, b, q, qm)
     return None
 
 
-def _vault_amounts(accts, base_v, quote_v):
-    out = {"base_vault": base_v, "quote_vault": quote_v}
+def _vault_amounts(accts, base_v, quote_v, quote_mint=None):
+    out = {"base_vault": base_v, "quote_vault": quote_v,
+           "quote_mint": quote_mint}
     for key, pk in (("base_amount", base_v), ("quote_amount", quote_v)):
         got = (accts or {}).get(pk)
         ta = parse_token_account(got[1]) if got else None
@@ -940,21 +958,32 @@ def _vault_amounts(accts, base_v, quote_v):
 
 
 def amounts_price(base_amount, quote_amount, base_decimals,
-                  sol_usd=None):
-    """USD price per token from raw vault amounts + SOL/USD.
-    price_sol = (quote/1e9) / (base/10^dec). None if unusable.
-    sol_usd may be injected (the armed watcher carries its own
-    cached source); otherwise the module cache/fetch is used."""
+                  sol_usd=None, quote_mint=None):
+    """USD price per token from raw vault amounts.
+    price_quote = (quote/10^qdec) / (base/10^dec), converted at the
+    quote asset's USD price. quote_mint None means the legacy
+    SOL-quoted call (quote decimals 9); when a quote mint is given,
+    its decimals are read (never assumed) and its USD price comes
+    from quote_usd_price — for WSOL that is the SOL cache, where an
+    injected sol_usd (the armed watcher's own cached source) takes
+    precedence. None if any input is unusable."""
     try:
         if not base_amount or quote_amount is None or \
                 base_decimals is None:
             return None
-        sol = sol_usd if sol_usd else sol_usd_price()
-        if not sol:
+        if quote_mint is None or quote_mint == WSOL:
+            qdec = 9
+            qusd = sol_usd if sol_usd else sol_usd_price()
+        else:
+            qdec = quote_decimals(quote_mint)
+            if qdec is None:
+                return None
+            qusd, _qts = quote_usd_price(quote_mint)
+        if not qusd:
             return None
-        price_sol = (quote_amount / 1e9) / (base_amount /
-                                            (10 ** base_decimals))
-        return price_sol * sol
+        price_quote = (quote_amount / (10 ** qdec)) / \
+                      (base_amount / (10 ** base_decimals))
+        return price_quote * qusd
     except Exception:
         return None
 
@@ -969,11 +998,14 @@ def pool_price_usd(pool, mint, exempt=False):
         if not v:
             return 0.0, "vaults unresolved"
         dec = mint_decimals(mint, exempt=exempt)
-        px = amounts_price(v["base_amount"], v["quote_amount"], dec)
+        px = amounts_price(v["base_amount"], v["quote_amount"], dec,
+                           quote_mint=v.get("quote_mint"))
         if not px:
-            return 0.0, "amounts unusable"
-        return px, "pumpswap reserves %s/%s" % (v["base_vault"][:8],
-                                                v["quote_vault"][:8])
+            return 0.0, "amounts unusable (quote asset %s)" % \
+                str(v.get("quote_mint") or "WSOL")[:8]
+        return px, "pumpswap reserves %s/%s quote=%s" % (
+            v["base_vault"][:8], v["quote_vault"][:8],
+            str(v.get("quote_mint") or "WSOL")[:8])
     except Exception as e:
         return 0.0, "reserves error: %s" % e
 

@@ -74,12 +74,43 @@ check("pool offsets: quote vault @139, base vault @171",
 
 accts = {qv: (R.TOKEN_PROGRAM, _token_acct(R.WSOL, 5_000_000_000)),
          bv: (R.TOKEN_PROGRAM, _token_acct(MINT, 100_000_000_000))}
-mb, mq = R.match_vaults(accts, MINT)
-check("vault mint-matching (order-proof)", mb == bv and mq == qv)
-va = R._vault_amounts(accts, bv, qv)
+mb, mq, mqm = R.match_vaults(accts, MINT)
+check("vault mint-matching (order-proof)",
+      mb == bv and mq == qv and mqm == R.WSOL)
+va = R._vault_amounts(accts, bv, qv, mqm)
 check("vault amounts parsed",
       va["base_amount"] == 100_000_000_000
-      and va["quote_amount"] == 5_000_000_000)
+      and va["quote_amount"] == 5_000_000_000
+      and va["quote_mint"] == R.WSOL)
+
+# PUMP-quoted pool (quote-control mints are a program feature):
+# the quote vault holds PUMP, not WSOL — the old WSOL-only match
+# failed closed (unreadable); now the quote mint comes from the
+# quote vault's own token account.
+PUMP_M = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+accts_p = {qv: (R.TOKEN_PROGRAM, _token_acct(PUMP_M, 5_000_000)),
+           bv: (R.TOKEN_PROGRAM, _token_acct(MINT, 100_000_000_000))}
+mb2, mq2, mqm2 = R.match_vaults(accts_p, MINT)
+check("PUMP-quoted vaults match, quote mint = PUMP",
+      mb2 == bv and mq2 == qv and mqm2 == PUMP_M)
+# two different non-base mints = ambiguous -> refuse
+accts_bad = dict(accts_p)
+accts_bad["XvV1111111111111111111111111111111111111111"] = (
+    R.TOKEN_PROGRAM, _token_acct(PUMP_M, 1))
+mb3, mq3, mqm3 = R.match_vaults(accts_bad, MINT)
+check("three-vault ambiguity refused", mb3 is None and mq3 is None)
+with patch.object(R, "quote_usd_price", return_value=(0.00253, 1.0)), \
+     patch.object(R, "quote_decimals", return_value=6):
+    # 5 PUMP (dec 6) / 100_000 tokens (dec 6) x $0.00253
+    px2 = R.amounts_price(100_000_000_000, 5_000_000, 6,
+                          quote_mint=PUMP_M)
+check("amounts_price PUMP-quoted math",
+      px2 is not None
+      and abs(px2 - (5.0 / 100_000.0) * 0.00253) < 1e-12)
+with patch.object(R, "quote_decimals", return_value=None):
+    check("amounts_price: unknown quote decimals -> None",
+          R.amounts_price(100_000_000_000, 5_000_000, 6,
+                          quote_mint=PUMP_M) is None)
 
 with patch.object(R, "sol_usd_price", return_value=100.0):
     px = R.amounts_price(100_000_000_000, 5_000_000_000, 6)

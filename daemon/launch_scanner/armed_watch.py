@@ -206,7 +206,8 @@ class ArmedWatcher:
                     if not v:
                         continue
                     vaults = {"base_vault": v["base_vault"],
-                              "quote_vault": v["quote_vault"]}
+                              "quote_vault": v["quote_vault"],
+                              "quote_mint": v.get("quote_mint")}
                     self._vault_cache[pool] = vaults
                     try:
                         pos["pool_vaults"] = vaults
@@ -477,9 +478,12 @@ class ArmedWatcher:
                 amt["ts"] = time.time()
                 dec = (self._want.get(mint) or {}).get("decimals")
                 base, quote = amt.get("base"), amt.get("quote")
-            px = _res.amounts_price(base, quote, dec,
-                                    sol_usd=self._sol_usd_fn()) \
-                if base and quote else None
+            quote_mint_px = ((self._vault_cache.get(
+                (self._want.get(mint) or {}).get("pool") or "")
+                or {}).get("quote_mint"))
+            px = _res.amounts_price(
+                base, quote, dec, sol_usd=self._sol_usd_fn(),
+                quote_mint=quote_mint_px) if base and quote else None
             if px:
                 with self._lock:
                     self._last_px[mint] = px
@@ -510,7 +514,8 @@ class ArmedWatcher:
                 px = _res.amounts_price(v["base_amount"],
                                         v["quote_amount"],
                                         w["decimals"],
-                                        sol_usd=self._sol_usd_fn())
+                                        sol_usd=self._sol_usd_fn(),
+                                        quote_mint=v.get("quote_mint"))
                 if px:
                     with self._lock:
                         self._last_px[mint] = px

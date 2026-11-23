@@ -1049,11 +1049,34 @@ def _curve_price_impl(mint, exempt=False):
             return 0.0, read_ts, "no sol/usd"
         sol_ts = _SOL_CACHE.get("ts") or read_ts
         obs_ts = min(read_ts, sol_ts)
-        price_sol = (c["v_sol"] / 1e9) / (c["v_token"] /
-                                          (10 ** dec))
+        price_sol = (c["v_sol"]/1e9) / (c["v_token"] / (10 ** dec))
+        # Plausibility band (2026-11-22 live verification): the
+        # standard pump.fun curve's spot price lives between its
+        # creation ratio (~2.8e-8 SOL) and its graduation ratio
+        # (~4e-7 SOL); [1e-8, 1.5e-6] leaves generous margin. A
+        # value outside the band means the offsets do not describe
+        # this account — len-166 curve accounts read 27x-inflated
+        # "reserves" under the documented 2026-10-23 layout — and
+        # the only safe answer is no price (fail-closed), for exit
+        # pricing and account marks alike. If pump.fun legitimately
+        # changes curve parameters this band must be re-derived
+        # from chain evidence, not widened on faith.
+        if not (CURVE_PRICE_MIN_SOL <= price_sol <= CURVE_PRICE_MAX_SOL):
+            return 0.0, read_ts, ("implausible curve price %.3g SOL "
+                                  "(band %.0g..%.0g); account layout "
+                                  "not trusted" % (price_sol,
+                                                   CURVE_PRICE_MIN_SOL,
+                                                   CURVE_PRICE_MAX_SOL))
         return price_sol * sol, obs_ts, "bonding curve %s" % pda[:8]
     except Exception as e:
         return 0.0, read_ts, "curve error: %s" % e
+
+
+# Plausibility band for the curve spot price in SOL (see
+# _curve_price_impl): derived from the standard pump.fun curve's
+# creation and graduation price ratios with generous margin.
+CURVE_PRICE_MIN_SOL = 1e-8
+CURVE_PRICE_MAX_SOL = 1.5e-6
 
 
 def curve_price_usd(mint, exempt=False):

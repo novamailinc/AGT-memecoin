@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .security import SecurityContext
 from . import watchlist as _watchlist
 from . import filters as _filters
+from daemon import owner_config as _owner_config
 
 logger = logging.getLogger("forex_agent.daemon.telegram")
 
@@ -139,6 +140,8 @@ HELP_TEXT = (
     "/heat — which narratives are running hot (learned, read-only)\n"
     "/tune — feedback-loop proposals: list / scan / apply / dismiss (you decide)\n"
     "/review — weekly learner review on demand (proposals, grades, win rate)\n"
+    "/config — owner risk settings (saved but INACTIVE until enforcement is wired)\n"
+    "/config_set <key> <value> — set one (two-step confirm; never live/mainnet)\n"
     "🎚 personal filters (tighten-only, never loosen the gates):\n"
     "/minscore <0-100>|off — only signal cards at/above your score\n"
     "/lane <lowcap|established|both> — momentum lane filter\n"
@@ -220,7 +223,8 @@ def handle_message(ctx: HandlerContext, chat_id: Any, user_id: Any,
     args = parts[1:]
 
     mutating = cmd in ("trade", "close", "closeall", "resume", "confirm",
-                       "halt", "add", "sethelius", "heliuskey", "repair")
+                       "halt", "add", "sethelius", "heliuskey", "repair",
+                       "config_set")
     if not sec.check_rate(chat_id, mutating=mutating):
         ctx.send(chat_id, "⏳ Slow down — rate limit hit. Try again in a few seconds.", None)
         return
@@ -1894,6 +1898,15 @@ def _do_confirm(ctx: HandlerContext, chat_id: Any, user_id: Any, update_id: int,
             ok = bool(res.get("ok")) and not res.get("engaged", True)
             msg = ("🟢 Kill switch RELEASED. Paper entries re-enabled."
                    if ok else "⚠️ Release failed: %s" % res)
+        elif action == "config_set":
+            # Validation ran again inside set_value; nothing here
+            # activates anything - the value is recorded intent only.
+            val = _owner_config.set_value(payload["key"], payload["value"])
+            ok = True
+            msg = ("✅ Saved: %s = %r (saved but INACTIVE - it enforces "
+                   "no trades, limits, or mode changes until enforcement "
+                   "wiring is added; activation stays owner-approved)"
+                   % (payload["key"], val))
         else:
             ok, msg = False, "unknown action"
     except Exception as exc:
@@ -1902,6 +1915,44 @@ def _do_confirm(ctx: HandlerContext, chat_id: Any, user_id: Any, update_id: int,
     if answer_cb:
         answer_cb("done" if ok else "failed")
     _audit(ctx, chat_id, user_id, update_id, action + ".executed", "%s ok=%s" % (req_id, ok), ok)
+
+
+# ----------------------------------------------------------------------
+# owner config (request section 16): validated, saved-but-inactive
+# ----------------------------------------------------------------------
+def _cmd_config(ctx, chat_id, user_id, update_id, args):
+    """/config — show owner settings. Read-only; every value is
+    saved-but-inactive until enforcement wiring is added."""
+    ctx.send(chat_id, _owner_config.render(), None)
+
+
+def _cmd_config_set(ctx, chat_id, user_id, update_id, args):
+    """/config_set <key> <value> — record one owner setting.
+
+    Two-step confirmed like every mutation. Validation fails closed:
+    unknown keys and malformed values are refused, and trading_mode
+    accepts only historical/demo (the dispatcher hard-refuses the
+    live/mainnet words before this handler ever runs). Setting a value
+    activates nothing.
+    """
+    if len(args) < 2:
+        ctx.send(chat_id,
+                 "Usage: /config_set <key> <value>\n"
+                 "Keys: %s" % ", ".join(sorted(_owner_config.KEY_SPEC)),
+                 None)
+        return
+    key, raw = args[0], " ".join(args[1:])
+    try:
+        val = _owner_config.validate(key, raw)
+    except ValueError as exc:
+        ctx.send(chat_id, "⛔ Refused: %s" % exc, None)
+        _audit(ctx, chat_id, user_id, update_id, "config_set.refused",
+               "%s %r: %s" % (key, raw, exc), False)
+        return
+    _ask_confirm(ctx, chat_id, user_id, update_id, "config_set",
+                 "%s = %r (saved but INACTIVE - enforces nothing yet)"
+                 % (key, val),
+                 {"key": key, "value": val})
 
 
 # ----------------------------------------------------------------------
@@ -2038,4 +2089,6 @@ _COMMANDS: Dict[str, Callable] = {
     "lane": _cmd_lane,
     "quiet": _cmd_quiet,
     "filters": _cmd_filters,
+    "config": _cmd_config,
+    "config_set": _cmd_config_set,
 }

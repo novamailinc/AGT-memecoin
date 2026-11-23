@@ -319,7 +319,7 @@ class MemecoinAdapter(BrokerAdapter):
                 from broker.memecoin.shared_capital import entry_plan
                 if any(not p.get("shared_pos_id") for p in intent["before"]["positions"].values()):
                     raise BrokerError(BROKER_UNAVAILABLE, "unbound legacy native inventory")
-                fx = self._observe_entry_fx()
+                fx = self._entry_pricing_fx
                 identity = fill.get("idempotency_key") or fill["native_op_id"]
                 intent["shared_entry"] = entry_plan(
                     "main", self._market.mint_for(fill["symbol"]), fill["ticket"],
@@ -1077,7 +1077,18 @@ class MemecoinAdapter(BrokerAdapter):
                 return recovered
 
         self._verify_position_mints(symbol)
-        price_sol = self._price_sol(symbol)  # raises BROKER_UNAVAILABLE when blind
+        if self._shared_account is not None and req.direction == "BUY":
+            # One FX observation prices native entry and its USD debit. A stale
+            # SOL cache must not silently manufacture token units at another rate.
+            self._entry_pricing_fx = self._observe_entry_fx()
+            quote = self._market.get_quote(symbol)
+            usd = quote.get("price_usd") if isinstance(quote, dict) else None
+            if (isinstance(usd, bool) or not isinstance(usd, (int, float))
+                    or not math.isfinite(usd) or usd <= 0):
+                raise BrokerError(BROKER_UNAVAILABLE, "native entry token price unavailable")
+            price_sol = usd / self._entry_pricing_fx["usd_per_sol"]
+        else:
+            price_sol = self._price_sol(symbol)  # raises when blind
 
         if self._mode == "devnet":
             return self._devnet_fill(req, symbol, price_sol)

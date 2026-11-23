@@ -71,3 +71,47 @@ class TestNativeSharedRisk:
         result=RiskManager(RiskConfig(),store=store).check(signal,a)
         assert not result.allowed and 'identity unbound' in result.reason
         assert store.state==before
+
+    def test_persistent_store_identity_restart_crossbook_refusal(self, account, tmp_path):
+        from storage.store import Store
+        path=str(tmp_path/'risk.db')
+        fx=lambda:{'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'}
+        def make(folder):
+            a=_adapter(str(folder),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+                       fx_observer=fx,shared_mark_observer=lambda:{})
+            a.connect({});return a
+        signal=Signal(symbol='BONK',timeframe='M1',direction='BUY',entry_price=.000001,
+              stop_loss=.000000999,take_profit=.000002,ema_fast=0.,ema_slow=0.,rsi_value=0.,
+              atr_value=0.,candle_time=datetime.now(timezone.utc),trigger='fixture')
+        cfg=RiskConfig(use_percent_risk_sizing=True,max_risk_per_trade=.01,
+                       max_total_exposure_lots=1.)
+        a=make(tmp_path/'native')
+        first=RiskManager(cfg,store=Store(path)).check(signal,a)
+        assert first.allowed
+        restart=RiskManager(cfg,store=Store(path)).check(signal,make(tmp_path/'native'))
+        assert restart.allowed and restart.lot_size==first.lot_size
+        before=Store(path).get_risk_state()
+        other=RiskManager(cfg,store=Store(path)).check(signal,make(tmp_path/'other'))
+        assert not other.allowed and 'identity conflict' in other.reason
+        assert Store(path).get_risk_state()==before
+
+    def test_intervening_fx_then_final_cash_refusal_no_stale_cache_units(self, account, tmp_path):
+        rate=[100.]
+        a=_adapter(str(tmp_path),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+              fx_observer=lambda:{'usd_per_sol':rate[0],'observed_at':time.time(),'source':'fixture'},
+              shared_mark_observer=lambda:{})
+        a.connect({})
+        assert a.account_info().equity==.1
+        a._sol_price_usd()  # Cache old100 FX in ordinary native pricing path.
+        rate[0]=200.
+        a.submit_order(_req('BONK','BUY',.02,'entry'))
+        pos=a._positions['1']
+        assert pos['shared_entry_usd']==4.
+        assert pos['tokens']==pytest.approx(40000.)
+        assert pos['entry_price_sol']==pytest.approx(.0000005)
+        assert pa.try_debit('watcher','N',6.,1.,'other')[0]
+        before=a._state_path().read_bytes()
+        with pytest.raises(BrokerError,match='shared capital refused'):
+            a.submit_order(_req('BONK','BUY',.01,'after-epoch'))
+        assert a._state_path().read_bytes()==before
+        assert pa.snapshot()['cash']==0.

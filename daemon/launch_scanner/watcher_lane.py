@@ -1271,6 +1271,21 @@ def _peak_fields(pos):
                             if pos.get("peak_partial") else "tracked")}
 
 
+def _verdict_visibility(closes):
+    """Additive Stage-C visibility (owner-approved 2026-11-22): the
+    registered halt math is UNCHANGED - this only attaches the
+    sample's price-kind breakdown and not-qualified status to the
+    verdict record. Defensive: a visibility failure never breaks a
+    verdict."""
+    try:
+        try:
+            from daemon.launch_scanner import exit_provenance as _pk
+        except ImportError:
+            import exit_provenance as _pk  # type: ignore
+        return _pk.verdict_visibility(closes)
+    except Exception:
+        return {}
+
 def _verdict_check(d):
     """The PRE-REGISTERED verdict, evaluated in-ledger at the moment
     the sample completes (grad.py semantics). Mutates d (lock held
@@ -1297,6 +1312,7 @@ def _verdict_check(d):
                    "SURVIVED — sample expectancy > 0"),
         "sample_closes": VERDICT_SAMPLE_CLOSES,
     }
+    d["verdict"].update(_verdict_visibility(closes))
     logger.warning("watcher VERDICT at %d closes: expectancy %.4f "
                    "(ex-top-1 %.4f) -> %s", len(closes), exp,
                    exp_ex_top1, d["verdict"]["action"])

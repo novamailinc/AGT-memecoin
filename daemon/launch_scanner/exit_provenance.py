@@ -50,6 +50,60 @@ def classify_reason(reason, f2_reason=None):
     return CURRENT
 
 
+# The qualification status every simulated performance number
+# carries (owner-reviewed 2026-11-22): a simulated fill is never
+# execution proof, and the fill model is UNVALIDATED until a
+# timestamp-correct fill model is reviewed in. Price-source labels
+# classify where a price CAME FROM; fill-model readiness is a
+# separate axis and stays False regardless of labels.
+QUALIFICATION_STATUS = "simulation_unvalidated_not_qualified"
+FILL_MODEL_VALIDATED = False
+
+
+def sample_breakdown(closes):
+    """Per-kind provenance tally for a sample of close records.
+
+    counts every close under its aggregate exit_price_kind label
+    (missing label = UNKNOWN, never silently promoted), then:
+      unverified - closes NOT priced at a current observed quote
+                   (stale, write-down, unknown, and any mixed close
+                   all count; mixed current+stale is still
+                   contaminated)
+      mixed      - closes aggregating more than one kind
+      unknown    - closes with no usable kind at all
+    Visibility only: these numbers must never gate or re-weight an
+    evaluation."""
+    per_kind = {}
+    for c in closes:
+        k = (c or {}).get("exit_price_kind") or UNKNOWN
+        per_kind[k] = per_kind.get(k, 0) + 1
+    unverified = sum(n for k, n in per_kind.items() if k != CURRENT)
+    mixed = sum(n for k, n in per_kind.items()
+                if k.startswith("mixed:"))
+    unknown = sum(n for k, n in per_kind.items()
+                  if k == UNKNOWN or "unknown" in k)
+    return {"total": len(closes), "per_kind": per_kind,
+            "unverified": unverified, "mixed": mixed,
+            "unknown": unknown}
+
+
+def verdict_visibility(closes):
+    """The additive verdict-record fields (owner-approved 2026-11-22):
+    the registered halt math and existing verdict fields are
+    untouched; these fields make the sample's provenance and
+    qualification status explicit so a legacy expectancy number can
+    never be READ as qualified performance. Any change to the
+    registered evaluation itself is an owner decision, not a
+    technical default."""
+    return {
+        "price_kind_breakdown": sample_breakdown(closes),
+        "qualification_status": QUALIFICATION_STATUS,
+        "fill_model_validated": FILL_MODEL_VALIDATED,
+        "expectancy_presentation":
+            "reproducibility_only_not_qualified_performance",
+    }
+
+
 def aggregate(kinds):
     """Collapse per-tranche kinds into one close-summary label.
 

@@ -498,6 +498,13 @@ def _print_report(report: Dict[str, Any]) -> None:
             paper["avg_mult"], paper["expectancy_mult"]))
         print("realized P&L %+.6f SOL  rugs %d" % (
             paper["total_pnl_sol"], paper["rugs"]))
+        # Stage-C visibility (owner-approved 2026-11-22): simulated
+        # outcomes are never qualified performance; the fill model is
+        # unvalidated and dataset paper closes predate price-kind
+        # labelling.
+        print("qualification: simulation_unvalidated_not_qualified "
+              "(fill model unvalidated; expectancy above is NOT "
+              "qualified performance)")
         for label, bucket in (("narrative", paper["per_narrative"]),
                               ("exit", paper["per_exit_reason"])):
             if bucket:

@@ -272,11 +272,17 @@ def log_decision(lane, mint, entry_ts, features, symbol=None,
 
 
 def settle_decision(lane, mint, entry_ts, pnl_usd, realized_mult,
-                    close_reason, close_ts, home=None):
+                    close_reason, close_ts, home=None,
+                    exit_price_kind=None):
     """Settle a PENDING record at close. Idempotent: a close
     settles its pending record once; a second call for the same
     (mint, entry_ts) is a no-op returning False. Returns True
-    only when a record was settled by this call. Never raises."""
+    only when a record was settled by this call. Never raises.
+
+    exit_price_kind is additive Stage-C visibility (2026-11-22):
+    the outcome's price provenance is recorded with the settled
+    decision so a lesson built on stale/write-down/unknown-priced
+    outcomes is visibly unqualified. It never gates anything."""
     try:
         mint = str(mint or "")
         if not mint or lane not in LANES:
@@ -294,6 +300,8 @@ def settle_decision(lane, mint, entry_ts, pnl_usd, realized_mult,
                     rec["close_reason"] = str(close_reason or "")
                     rec["close_ts"] = _num(close_ts)
                     rec["settled_ts"] = time.time()
+                    rec["exit_price_kind"] = str(
+                        exit_price_kind or "unknown")
                     changed = True
                     break
             if changed:
@@ -321,7 +329,8 @@ def settle_from_close(lane, close_rec, home=None):
         if settle_decision(
                 lane, mint, rec.get("entry_ts"), rec.get("pnl_usd"),
                 rec.get("realized_mult"), rec.get("closed_reason"),
-                rec.get("close_ts"), home=home):
+                rec.get("close_ts"), home=home,
+                exit_price_kind=rec.get("exit_price_kind")):
             return True
         with _file_lock(decisions_path(lane, home)):
             recs = _read_all(lane, home)
@@ -343,6 +352,8 @@ def settle_from_close(lane, close_rec, home=None):
                 "close_reason": str(rec.get("closed_reason") or ""),
                 "close_ts": _num(rec.get("close_ts")),
                 "settled_ts": time.time(),
+                "exit_price_kind": str(
+                    rec.get("exit_price_kind") or "unknown"),
                 "source": "close",
             })
             _write_all(lane, recs, home)
@@ -553,11 +564,30 @@ def generate_lessons(lane, decisions, generated_at=None):
                 "win_rate": round(wins / closes, 4) if closes else 0.0,
                 "resolved_at": resolved, "generated_at": gen,
             })
+        # Stage-C visibility (owner-approved 2026-11-22): the
+        # payload states the provenance of the outcomes the lessons
+        # were templated from, and that the numbers are simulated
+        # and unvalidated - never qualified performance.
+        try:
+            try:
+                from daemon.launch_scanner import \
+                    exit_provenance as _pk
+            except ImportError:
+                import exit_provenance as _pk  # type: ignore
+            _bd = _pk.sample_breakdown(settled)
+            _vis = {
+                "price_kind_breakdown": _bd,
+                "qualification_status": _pk.QUALIFICATION_STATUS,
+                "fill_model_validated": _pk.FILL_MODEL_VALIDATED,
+            }
+        except Exception:
+            _vis = {}
         return {
             "lane": lane, "generated_at": gen,
             "resolved_at": resolved if closes else None,
             "n_settled": closes,
             "lessons": lessons,
+            "visibility": _vis,
         }
     except Exception:
         return {"lane": lane, "generated_at": generated_at or 0,

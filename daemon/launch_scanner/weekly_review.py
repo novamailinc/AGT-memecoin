@@ -173,6 +173,29 @@ def _paper_section_live(papers, coverage, missing):
     out.append(f"win rate: {_fmt_pct(len(wins), n)} | avg realized: "
                f"{avg_mult:.3f}x | expectancy: {avg_mult - 1:+.3f}x")
     out.append(f"total realized P&L: {pnl:+.2f} USD (stored closes only)")
+    # Stage C visibility (owner-approved 2026-11-22): simulated
+    # performance is never presented as qualified. The expectancy
+    # above is reproducibility material only.
+    try:
+        from daemon.launch_scanner import exit_provenance as _pk
+    except ImportError:
+        try:
+            import exit_provenance as _pk  # type: ignore
+        except Exception:
+            _pk = None
+    if _pk is not None:
+        _bd = _pk.sample_breakdown(papers)
+        out.append("price provenance of stored closes: "
+                   + (" | ".join("%s: %d" % (k, v) for k, v in
+                                 sorted(_bd["per_kind"].items()))
+                      or "none"))
+        out.append(
+            "qualification: %s "
+            "(fill model unvalidated; %d/%d stored closes not "
+            "current-price labelled: %d mixed, %d unknown) - "
+            "expectancy above is NOT qualified performance."
+            % (_pk.QUALIFICATION_STATUS, _bd["unverified"],
+               _bd["total"], _bd["mixed"], _bd["unknown"]))
     by_exit = Counter(r.get("exit_reason") or "?" for r in papers)
     out.append("by exit: " + " | ".join(
         f"{k}: {v}" for k, v in by_exit.most_common()))

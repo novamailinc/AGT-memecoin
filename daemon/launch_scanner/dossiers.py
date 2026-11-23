@@ -82,19 +82,20 @@ ARCHIVE_FILE = os.path.join(HOME, "memory", "launch_archive.jsonl")
 # - durability: a dossier is only evicted after its archive write
 #   SUCCEEDS; writers append under an exclusive flock so
 #   concurrent daemons never interleave a line;
-# - retention, with an ENFORCEABLE invariant (no blanket
-#   "bounded" claim): after every compaction the file holds at
-#   most (a) one anchor, (b) MAX_KEPT_LAUNCHES per-mint launch
-#   records (a hard cap - older ones are first aggregated into
-#   per-deployer-per-year launch_rollup records so deployer
-#   linkage survives), (c) raw outcome records younger than
-#   OUTCOME_RAW_S (older ones aggregate into per-
-#   (lane, year, deployer) outcome_rollup records, so the
-#   mint->deployer linkage resolvable at rollup time is kept),
-#   (d) rollup rows, which grow only with distinct
-#   (deployer, year) and (lane, year, deployer) pairs. Retrieval
-#   is a full scan of exactly that file; a real index is a
-#   future slice if rollup cardinality itself outgrows scanning.
+# - retention, with ONE enforceable invariant and no blanket
+#   "bounded" claim. The invariant: the per-mint LAUNCH set is
+#   hard-capped at MAX_KEPT_LAUNCHES after every compaction
+#   (older ones are first aggregated into per-deployer-per-year
+#   launch_rollup records so deployer linkage survives). What is
+#   NOT hard-bounded: raw outcomes are bounded only by the
+#   OUTCOME_RAW_S time window, not by rate, so a high close rate
+#   grows the file within the year; and rollup rows grow with
+#   distinct (deployer, year) and (lane, year, deployer)
+#   cardinality, which no constant caps. Total file size and
+#   full-scan retrieval cost are therefore bounded in practice
+#   by activity, NOT by an enforceable constant. Retrieval is a
+#   full scan; a real index and a rollup-cardinality policy are
+#   named future slices, not claimed here.
 # - outcome provenance, two axes: every outcome is a SIMULATED
 #   paper-lane result (never verified real money), AND each
 #   carries exit_price_kind classifying the close price as a

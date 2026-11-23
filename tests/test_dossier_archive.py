@@ -743,7 +743,96 @@ def test_max_kept_launches_hard_cap():
             dossiers.MAX_KEPT_LAUNCHES = real_max
 
 
+def test_end_to_end_memory_consumed_after_restart():
+    """Full consumer chain in one flow: birth -> dossier -> close
+    outcome via the verdict-ledger funnel -> TTL eviction archives
+    -> live dossier GONE -> durable archive is the only deployer
+    linkage -> rugger registry refresh joins dead_mints through
+    the archive -> intel surface consumes both registries -> a
+    fresh PROCESS (restart) sees the same consumed record."""
+    import subprocess
+    from daemon.launch_scanner import rugger_registry as rr
+    with _Ctx() as c:
+        real_reg = rr.REGISTRY_PATH
+        rr.REGISTRY_PATH = os.path.join(c.home, "rugger_registry.json")
+        try:
+            now = time.time()
+            mints = ["MINT-E2E-%d" % i for i in range(3)]
+            # 1. births -> dossiers with one deployer.
+            for m in mints:
+                c.write_dossier(m, born_ts=now - 90000,
+                                deployer="DEP-E2E",
+                                safety={"report": {"unknown": False,
+                                                   "source": "x"}})
+            # 2. one close outcome via the verdict-ledger funnel.
+            os.environ["FOREX_AGENT_HOME"] = c.home
+            try:
+                from daemon.launch_scanner import verdict_ledger
+                verdict_ledger.append(
+                    "grad", "close",
+                    {"mint": mints[0], "pnl_usd": -1.0,
+                     "realized_mult": 0.4, "closed_reason": "stop"})
+            finally:
+                del os.environ["FOREX_AGENT_HOME"]
+            # 3. TTL eviction archives and unlinks the dossiers.
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now)
+            check("e2e: live dossiers evicted after archiving",
+                  not os.listdir(dossiers.DOSSIER_DIR))
+            # 4. grad ledger marks all three mints dead.
+            with open(os.path.join(c.home, "grad_ledger.json"),
+                      "w") as f:
+                json.dump({"dead_mints": {
+                    m: {"ts": now, "reason":
+                        "safety: rugcheck danger: rug"}
+                    for m in mints}}, f)
+            # 5. registry refresh: dead_mints join through the
+            # ARCHIVE (live dossiers are gone).
+            rr.refresh()
+            r = rr.lookup("DEP-E2E")
+            check("e2e: registry flags deployer via archive join",
+                  r["flagged"] is True and r["dead"] == 3
+                  and r["launches"] == 3)
+            srcs = rr.load_registry()["deployers"]["DEP-E2E"][
+                "sources"]
+            check("e2e: archive join auditable in sources",
+                  "dead_mints+launch_archive" in srcs)
+            # 6. intel surface consumes BOTH durable inputs.
+            fields = dossiers._intel_fields("DEP-E2E")
+            check("e2e: rugger advisory surfaced from durable join",
+                  (fields.get("deployer_rugger") or {})
+                  .get("flagged") is True)
+            h = fields.get("deployer_history") or {}
+            check("e2e: deployer history consumed with kinds",
+                  h.get("archived_launches") == 3
+                  and h.get("outcomes") == 1
+                  and h.get("simulated_losses") == 1
+                  and h.get("outcomes_not_current_price") == 0)
+            # 7. restart proof: a FRESH PROCESS with only the home
+            # env reads the same consumed record.
+            child = (
+                "import json, os;"
+                "import sys;"
+                "sys.path.insert(0, %r);"
+                "from daemon.launch_scanner import rugger_registry"
+                " as rr;"
+                "print(json.dumps(rr.lookup('DEP-E2E')))"
+                % os.path.join(os.path.dirname(__file__), ".."))
+            env = dict(os.environ)
+            env["FOREX_AGENT_HOME"] = c.home
+            out = subprocess.check_output(
+                [sys.executable, "-c", child], env=env,
+                timeout=60)
+            got = json.loads(out.decode())
+            check("e2e: fresh process (restart) sees flagged record",
+                  got.get("flagged") is True
+                  and got.get("dead") == 3)
+        finally:
+            rr.REGISTRY_PATH = real_reg
+
+
 def main():
+    test_end_to_end_memory_consumed_after_restart()
     test_exit_price_kind_labels()
     test_deployer_history_current_price_only()
     test_outcome_rollup_preserves_deployer_linkage()

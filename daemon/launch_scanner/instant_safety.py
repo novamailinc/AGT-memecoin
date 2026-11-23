@@ -504,6 +504,31 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
                 elif name == "confidentialTransferMint":
                     flags.append(
                         "Token-2022 confidential transfer mint")
+                elif name in ("interestBearingMint",
+                              "interestBearingConfig"):
+                    _ext_flag(
+                        "Token-2022 interest-bearing mint: displayed "
+                        "balances drift from real balances "
+                        "(unverified — review)")
+                elif name == "memoTransfer":
+                    _ext_flag(
+                        "Token-2022 memo-gated transfers: venues "
+                        "that omit memos cannot move the token "
+                        "(unverified — review)")
+                elif name == "pausable":
+                    # Same power class as a freeze authority, which
+                    # this checker also FLAGS rather than fails.
+                    _ext_flag(
+                        "Token-2022 pausable: an authority can halt "
+                        "all transfers (unverified — review)")
+                elif name == "scaledUiAmount":
+                    _ext_flag(
+                        "Token-2022 scaled UI amount: an issuer "
+                        "multiplier rescales displayed amounts "
+                        "(unverified — review)")
+                elif name == "confidentialTransferFeeConfig":
+                    flags.append(
+                        "Token-2022 confidential transfer fee config")
                 elif name not in _KNOWN_SAFE_EXTENSIONS:
                     _ext_flag("Token-2022 extension %r unrecognized "
                               "(unverified — review)" % name)

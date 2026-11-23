@@ -68,7 +68,7 @@ Items marked FIXED name the landing commit.
 
 - 6.1 Launch intelligence: IMPLEMENTED (partial depth) — safety.py (RugCheck +
   instant_safety on-chain fallback: authorities, freeze, mint characteristics),
-  dossiers.py, lp_lock.py, locked_liq.py. PENDING: Token-2022 extension checks.
+  dossiers.py, lp_lock.py, locked_liq.py. FIXED (5e29a6b): Token-2022 extension depth - interestBearingMint/interestBearingConfig, memoTransfer, pausable, scaledUiAmount and confidentialTransferFeeConfig now get named review flags with precise risk text instead of the generic unrecognized bucket (same REVIEW class: flag, verdict passes, score unchanged; fail classes untouched).
 - 6.2 Liquidity intelligence: IMPLEMENTED — reserves.py, reserves_curve_price.py,
   curve_cache.py, liquidity_mirage.py, exit_liquidity_clock.py, price-impact modeling
   in backtest.py. PENDING: continuous pool-reserve monitoring + migration/abnormal-

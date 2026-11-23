@@ -106,14 +106,32 @@ check("recognized trap still fails", not rep["passed"]
       and any("transfer hook" in f for f in rep["fails"]))
 
 # --- unknown: REVIEW flag, never a silent pass, never a fail ---------
-rep = run("unknown extension", make_rpc(
+rep = run("interest-bearing extension", make_rpc(
     holders=ONE_HOLDER,
     extensions=[ext("interestBearingMint",
                     {"rateAuthority": WALLET})]))
-check("unknown extension flagged for review (score 90)",
+check("interest-bearing named and flagged for review (score 90)",
       rep["passed"] and rep["score"] == 90
-      and any("interestBearingMint" in f and "unrecognized" in f
+      and any("interest-bearing" in f and "review" in f
               for f in rep["flags"]))
+rep = run("named review extensions", make_rpc(
+    holders=ONE_HOLDER,
+    extensions=[ext("memoTransfer"), ext("pausable"),
+                ext("scaledUiAmount"),
+                ext("interestBearingConfig")]))
+check("memo/pausable/scaled/interest named, not generic "
+      "unrecognized",
+      rep["passed"]
+      and any("memo-gated" in f for f in rep["flags"])
+      and any("pausable" in f.lower() for f in rep["flags"])
+      and any("scaled UI amount" in f for f in rep["flags"])
+      and any("interest-bearing" in f for f in rep["flags"])
+      and not any("unrecognized" in f for f in rep["flags"]))
+check("named review extensions keep REVIEW class (flag, pass)",
+      rep["passed"] and not rep["fails"]
+      and rep["instant"]["token2022_extensions"]
+      == ["memoTransfer", "pausable", "scaledUiAmount",
+          "interestBearingConfig"])
 rep = run("unknown future extension", make_rpc(
     holders=ONE_HOLDER,
     extensions=[ext("quantumTransfer", {})]))

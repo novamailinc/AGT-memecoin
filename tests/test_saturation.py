@@ -66,7 +66,15 @@ _empty_rec = tempfile.mkdtemp(prefix="sat-test-norec-")
 S.RECORDER_DIR = _empty_rec  # Phase 3: no local census either
 S.STATE_PATH = os.path.join(_tmp, "ticker_saturation.json")
 
-NOW = int(time.time() * 1000)
+# Day-boundary-proof fixtures (2026-11-23): anchoring "today's"
+# births to wall-clock now made every counter check fail when the
+# suite ran in the first ~7 minutes after UTC midnight (stamps
+# 11-400s old landed on the PREVIOUS day; CI build 45085952486
+# failed exactly this way at 00:00:08 UTC). Anchor instead at one
+# hour after UTC midnight of the current day: the stamps are always
+# inside today, and the "yesterday" coin is always inside yesterday.
+_MIDNIGHT_MS = int(time.time() // 86400 * 86400 * 1000)
+NOW = _MIDNIGHT_MS + 3600_000   # 01:00 UTC today, as epoch ms
 
 
 def _coin(sym, ts, mint):

@@ -122,7 +122,9 @@ class SecurityContext:
         allowlisted = self.matches_env_allowlist(chat_id, user_id)
         if not allowlisted:
             expected = os.environ.get("TELEGRAM_PAIR_CODE") or ""
-            if not expected:
+            expected_hash = os.environ.get("TELEGRAM_PAIR_CODE_SHA256") or ""
+            salt = os.environ.get("TELEGRAM_PAIR_CODE_SALT") or ""
+            if not expected and not expected_hash:
                 return False, ("pairing denied: no pairing code or "
                                "allowlist is configured")
             if self.state.get("pair_code_consumed"):
@@ -134,7 +136,15 @@ class SecurityContext:
                         return False, "pairing denied: pairing code expired"
                 except ValueError:
                     return False, "pairing denied: bad expiry configuration"
-            if not hmac.compare_digest(code.strip(), expected):
+            if expected_hash:
+                # Hash-only configuration: deployment environments carry
+                # just the salted digest, so the plaintext pairing code
+                # never appears in job payloads, logs, or process env.
+                digest = hashlib.sha256(
+                    (salt + code.strip()).encode("utf-8")).hexdigest()
+                if not hmac.compare_digest(digest, expected_hash):
+                    return False, "pairing denied: invalid pairing code"
+            elif not hmac.compare_digest(code.strip(), expected):
                 return False, "pairing denied: invalid pairing code"
             self.state["pair_code_consumed"] = True
         self.state["paired_chat_id"] = chat_id

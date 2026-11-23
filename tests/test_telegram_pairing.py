@@ -113,5 +113,23 @@ ok, msg = s.try_pair("111", "222")
 check("partial allowlist (user-only): denied", not ok and not s.is_paired())
 del os.environ["TELEGRAM_ALLOWED_USER_ID"]
 
+# Hash-only code configuration: the deployment env carries only the
+# salted sha256 of the code, never the plaintext.
+import hashlib
+os.environ["TELEGRAM_PAIR_CODE_SALT"] = "s3-salt"
+os.environ["TELEGRAM_PAIR_CODE_SHA256"] = hashlib.sha256(
+    ("s3-salt" + "topsecret-code").encode()).hexdigest()
+s = fresh()
+ok, msg = s.try_pair("111", "222", code="wrong")
+check("hash gate: wrong code denied", not ok and not s.is_paired())
+ok, msg = s.try_pair("111", "222", code="topsecret-code")
+check("hash gate: right code pairs", ok and s.is_paired())
+check("hash gate: code marked consumed", s.state.get("pair_code_consumed") is True)
+s3 = sec_mod.SecurityContext(s.state)
+ok, msg = s3.try_pair("333", "333", code="topsecret-code")
+check("hash gate: replay after restart cannot rebind", not ok)
+os.environ.pop("TELEGRAM_PAIR_CODE_SHA256")
+os.environ.pop("TELEGRAM_PAIR_CODE_SALT")
+
 print("FAILURES: %d" % len(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)

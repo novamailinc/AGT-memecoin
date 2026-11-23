@@ -175,6 +175,26 @@ def append(lane, kind, payload, ts=None, path=None):
                     os.makedirs(parent, exist_ok=True)
                 with open(chain_path, "a") as f:
                     f.write(line)
+        # Durable-memory linkage (2026-11-23, section 4.1): a lane
+        # close is a resolved signal outcome; mirror it into the
+        # persistent launch archive so the bot's long-term memory
+        # holds outcomes, not just launches. Observability only:
+        # same never-raises discipline as the chain itself, and a
+        # mirror failure never affects the True result above.
+        if str(kind or "") == "close":
+            try:
+                try:
+                    from daemon.launch_scanner import dossiers as _doss
+                except Exception:
+                    import dossiers as _doss  # type: ignore
+                _doss.record_outcome(
+                    body_payload.get("mint"), str(lane or ""),
+                    ts=rec_ts,
+                    pnl_usd=body_payload.get("pnl_usd"),
+                    realized_mult=body_payload.get("realized_mult"),
+                    closed_reason=body_payload.get("closed_reason"))
+            except Exception:
+                pass
         return True
     except Exception as e:
         try:

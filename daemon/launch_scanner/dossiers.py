@@ -60,9 +60,11 @@ DOSSIER_DIR = os.path.join(HOME, "dossiers")
 # expires: the launch is REMEMBERED (deployer, safety verdict
 # summary, birth facts), even though the working dossier is gone.
 # The archive is advisory memory only: no gate, entry or exit
-# reads it in this slice, so behavior is unchanged. Volume is
-# bounded by MAX_PER_DAY (<=400 archive lines/day, ~200 bytes
-# each, ~2.5 MB/month); compaction is a future slice.
+# reads it in this slice, so behavior is unchanged. Volume: the
+# MAX_PER_DAY dossier cap bounds launch-record inflow
+# (<=400/day), outcomes are low-volume (closes only), and past
+# ARCHIVE_MAX_BYTES the sweep compacts to the resolved kept set
+# (latest launch per mint + all outcomes + anchor).
 ARCHIVE_FILE = os.path.join(HOME, "memory", "launch_archive.jsonl")
 
 # Memory semantics (code-defined, no interpretation layer):
@@ -72,9 +74,55 @@ ARCHIVE_FILE = os.path.join(HOME, "memory", "launch_archive.jsonl")
 #   safety verdict resolve to "conflicting", never a silent pick;
 # - staleness: launch_memory() reports the record's age and a
 #   stale flag past ARCHIVE_STALE_S; a stale record is labeled,
-#   never silently treated as fresh.
+#   never silently treated as fresh;
+# - availability: a missing archive file means genuine zero
+#   history; an unreadable one means UNAVAILABLE (archive_status
+#   and launch_memory say so) - corrupt memory never looks like
+#   a clean empty history;
+# - durability: a dossier is only evicted after its archive write
+#   SUCCEEDS; writers append under an exclusive flock so
+#   concurrent daemons never interleave a line;
+# - retention: the file is append-only but NOT unbounded - past
+#   ARCHIVE_MAX_BYTES the sweep compacts it (latest launch record
+#   per mint + all outcome records + a compaction anchor naming
+#   how many records were dropped). Retrieval stays a bounded
+#   scan; a real index is a future slice if volume outgrows it.
 ARCHIVE_SCHEMA_V = 1
 ARCHIVE_STALE_S = 30 * 86400
+ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _archive_lock_path():
+    return ARCHIVE_FILE + ".lock"
+
+
+@contextlib.contextmanager
+def _archive_write_lock():
+    """Exclusive cross-process lock for archive appends (the
+    verdict_ledger events.jsonl.lock pattern). Never raises: on
+    any lock failure the writer proceeds WITHOUT the lock - the
+    reader tolerates a torn line (skips it) and the alternative
+    is losing the record entirely."""
+    fd = None
+    try:
+        fd = os.open(_archive_lock_path(), os.O_CREAT | os.O_RDWR,
+                     0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
 
 TTL_S = 24 * 3600
 SAFETY_FRESH_S = 1200.0     # reuse window for precomputed safety
@@ -158,13 +206,28 @@ def _today():
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
+def _archive_append(rec):
+    """One locked append to the archive. Returns True only when
+    the record is durably written. Never raises."""
+    try:
+        os.makedirs(os.path.dirname(ARCHIVE_FILE), exist_ok=True)
+        with _archive_write_lock():
+            with open(ARCHIVE_FILE, "a") as f:
+                f.write(json.dumps(rec, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def _archive_dossier(d, now):
     """Append one compact long-term record for an expiring dossier
-    to the persistent archive. Best-effort, never raises: memory
-    must never break the working-dossier lifecycle."""
+    to the persistent archive. Returns True when the record is
+    durably written; the caller MUST NOT evict the dossier on
+    False (memory loss is worse than a stale dossier). Never
+    raises."""
     try:
         if not isinstance(d, dict) or not d.get("mint"):
-            return
+            return False
         safety = d.get("safety") or {}
         report = safety.get("report")
         verdict = None
@@ -172,6 +235,7 @@ def _archive_dossier(d, now):
             verdict = "unknown" if report.get("unknown") else "conclusive"
         rec = {
             "v": ARCHIVE_SCHEMA_V,
+            "record_type": "launch",
             "mint": d.get("mint"),
             "born_ts": d.get("born_ts"),
             "archived_ts": now,
@@ -184,11 +248,70 @@ def _archive_dossier(d, now):
             "migrated": bool(d.get("migrated")),
             "reserve_samples": len(d.get("reserve_samples") or []),
         }
-        os.makedirs(os.path.dirname(ARCHIVE_FILE), exist_ok=True)
-        with open(ARCHIVE_FILE, "a") as f:
-            f.write(json.dumps(rec, sort_keys=True) + "\n")
+        return _archive_append(rec)
     except Exception:
-        pass
+        return False
+
+
+def record_outcome(mint, lane, ts=None, pnl_usd=None,
+                   realized_mult=None, closed_reason=None):
+    """Record one resolved signal outcome (a lane close) in the
+    durable archive. Called from the verdict-ledger funnel
+    (kind=\"close\"). Observability-grade: returns True when the
+    record is durably written, False otherwise; never raises,
+    never touches a decision path."""
+    try:
+        if not mint:
+            return False
+        rec = {
+            "v": ARCHIVE_SCHEMA_V,
+            "record_type": "outcome",
+            "mint": mint,
+            "lane": lane,
+            "archived_ts": time.time() if ts is None else ts,
+            "pnl_usd": pnl_usd,
+            "realized_mult": realized_mult,
+            "closed_reason": closed_reason,
+        }
+        return _archive_append(rec)
+    except Exception:
+        return False
+
+
+def archive_status():
+    """Availability + integrity of the durable memory, so no
+    consumer ever mistakes a corrupt store for a clean empty
+    history. Never raises.
+
+    available=False means the memory cannot be read (present but
+    unreadable/foreign): consumers must treat history as
+    UNKNOWN, never as zero. A missing file is available=True
+    with records=0: nothing has been archived yet - a genuine
+    zero history."""
+    st = {"available": True, "records": 0, "unreadable_lines": 0,
+          "error": None}
+    try:
+        if not os.path.exists(ARCHIVE_FILE):
+            return st
+        with open(ARCHIVE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    st["unreadable_lines"] += 1
+                    continue
+                if isinstance(rec, dict) \
+                        and rec.get("v") == ARCHIVE_SCHEMA_V:
+                    st["records"] += 1
+                else:
+                    st["unreadable_lines"] += 1
+    except Exception as e:
+        st["available"] = False
+        st["error"] = type(e).__name__
+    return st
 
 
 def launch_archive(mint=None, deployer=None, limit=100):
@@ -220,6 +343,13 @@ def launch_archive(mint=None, deployer=None, limit=100):
     return out[:limit]
 
 
+def outcome_records(mint=None, limit=1000):
+    """Outcome records (lane closes), newest first. Same reader
+    discipline as launch_archive; never raises."""
+    return [r for r in launch_archive(mint=mint, limit=limit)
+            if r.get("record_type") == "outcome"]
+
+
 def launch_memory(mint, now=None):
     """The resolved durable record for one mint, or None.
 
@@ -231,21 +361,39 @@ def launch_memory(mint, now=None):
     raises."""
     try:
         now = time.time() if now is None else now
-        recs = launch_archive(mint=mint, limit=1000)
-        if not recs:
+        st = archive_status()
+        if not st.get("available"):
+            # Corrupt/unreadable memory is NOT a clean empty
+            # history: say so explicitly.
+            return {"unavailable": True,
+                    "error": st.get("error") or "unreadable"}
+        recs = [r for r in launch_archive(mint=mint, limit=1000)
+                if r.get("record_type", "launch") == "launch"]
+        outcomes = outcome_records(mint=mint)
+        if not recs and not outcomes:
             return None
-        newest = max(recs, key=lambda r: float(r.get("archived_ts")
-                                                  or 0))
-        verdicts = {r.get("safety_verdict") for r in recs}
-        conflict = len(verdicts) > 1
-        out = dict(newest)
-        out["entries"] = len(recs)
-        out["conflict"] = conflict
-        if conflict:
-            out["safety_verdict"] = "conflicting"
-        age = now - float(newest.get("archived_ts") or now)
-        out["age_s"] = int(max(0.0, age))
-        out["stale"] = age > ARCHIVE_STALE_S
+        out = {}
+        if recs:
+            newest = max(recs, key=lambda r: float(
+                r.get("archived_ts") or 0))
+            verdicts = {r.get("safety_verdict") for r in recs}
+            conflict = len(verdicts) > 1
+            out = dict(newest)
+            out["entries"] = len(recs)
+            out["conflict"] = conflict
+            if conflict:
+                out["safety_verdict"] = "conflicting"
+            age = now - float(newest.get("archived_ts") or now)
+            out["age_s"] = int(max(0.0, age))
+            out["stale"] = age > ARCHIVE_STALE_S
+        else:
+            age = now - float(outcomes[0].get("archived_ts") or now)
+            out = {"mint": mint, "entries": 0, "conflict": False,
+                   "age_s": int(max(0.0, age)),
+                   "stale": age > ARCHIVE_STALE_S}
+        out["outcomes"] = outcomes
+        out["resolved_lanes"] = sorted(
+            {str(o.get("lane")) for o in outcomes if o.get("lane")})
         return out
     except Exception:
         return None
@@ -269,12 +417,16 @@ def _sweep(now):
                     d = json.load(f)
                 if now - float(d.get("born_ts") or 0) > TTL_S:
                     # Remember before forgetting (section 4.1):
-                    # archive the compact record, then evict.
+                    # evict ONLY after the archive write lands -
+                    # a failed archive keeps the dossier, because
+                    # losing the memory is worse than a stale
+                    # dossier.
                     d.setdefault("mint", fn[:-5])
-                    _archive_dossier(d, now)
-                    os.unlink(p)
+                    if _archive_dossier(d, now):
+                        os.unlink(p)
             except Exception:
                 continue
+        _maybe_compact_archive(now)
         # Lever 3 (2026-11-16): clean per-mint lock files whose
         # dossier is gone/expired. Only unlink when no builder
         # holds the lock (flock EX|NB succeeds) — a held lock
@@ -309,6 +461,57 @@ def _sweep(now):
                     os.close(fd)
             except Exception:
                 continue
+    except Exception:
+        pass
+
+
+def _maybe_compact_archive(now):
+    """Bounded retention: past ARCHIVE_MAX_BYTES, rewrite the
+    archive keeping the latest launch record per mint, ALL
+    outcome records (low volume, the actual track record), and a
+    compaction anchor naming how many records were dropped.
+    Best-effort under the write lock; never raises."""
+    try:
+        if not os.path.exists(ARCHIVE_FILE):
+            return
+        if os.path.getsize(ARCHIVE_FILE) <= ARCHIVE_MAX_BYTES:
+            return
+        launches, outcomes, other, dropped = {}, [], 0, 0
+        with open(ARCHIVE_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    dropped += 1
+                    continue
+                if not isinstance(rec, dict) \
+                        or rec.get("v") != ARCHIVE_SCHEMA_V:
+                    dropped += 1
+                    continue
+                rtype = rec.get("record_type", "launch")
+                if rtype == "outcome":
+                    outcomes.append(rec)
+                elif rtype == "launch" and rec.get("mint"):
+                    launches[rec["mint"]] = rec  # newest wins
+                else:
+                    other += 1
+                    dropped += 1
+        kept = list(launches.values()) + outcomes
+        anchor = {"v": ARCHIVE_SCHEMA_V,
+                  "record_type": "compaction_anchor",
+                  "archived_ts": now,
+                  "dropped_records": dropped + other * 0,
+                  "kept_records": len(kept)}
+        tmp = ARCHIVE_FILE + ".compact-tmp"
+        with _archive_write_lock():
+            with open(tmp, "w") as f:
+                f.write(json.dumps(anchor, sort_keys=True) + "\n")
+                for rec in kept:
+                    f.write(json.dumps(rec, sort_keys=True) + "\n")
+            os.replace(tmp, ARCHIVE_FILE)
     except Exception:
         pass
 
@@ -387,17 +590,36 @@ def _intel_fields(deployer):
         # of this function: never consulted by the safety
         # precompute or any verdict.
         try:
-            recs = launch_archive(deployer=deployer, limit=1000)
-            if recs:
-                out["deployer_history"] = {
-                    "archived_launches": len(recs),
-                    "conclusive": sum(
-                        1 for r in recs
-                        if r.get("safety_verdict") == "conclusive"),
-                    "unknown": sum(
-                        1 for r in recs
-                        if r.get("safety_verdict") == "unknown"),
-                }
+            st = archive_status()
+            if st.get("available"):
+                launches = [
+                    r for r in launch_archive(deployer=deployer,
+                                              limit=1000)
+                    if r.get("record_type", "launch") == "launch"]
+                if launches:
+                    mints = {r.get("mint") for r in launches}
+                    outcomes = [o for o in outcome_records()
+                                if o.get("mint") in mints]
+                    mults = [o.get("realized_mult") for o in outcomes
+                             if isinstance(o.get("realized_mult"),
+                                           (int, float))]
+                    out["deployer_history"] = {
+                        "archived_launches": len(launches),
+                        "conclusive": sum(
+                            1 for r in launches
+                            if r.get("safety_verdict")
+                            == "conclusive"),
+                        "unknown": sum(
+                            1 for r in launches
+                            if r.get("safety_verdict") == "unknown"),
+                        "outcomes": len(outcomes),
+                        # win/loss by recorded realized multiple,
+                        # code-defined: > 1.0 is a win.
+                        "wins": sum(1 for m in mults if m > 1.0),
+                        "losses": sum(1 for m in mults if m <= 1.0),
+                    }
+            # unavailable -> field omitted: unknown history is
+            # never shown as zero history.
         except Exception:
             pass
     except Exception:

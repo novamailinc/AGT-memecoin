@@ -246,7 +246,177 @@ def test_intel_fields_consume_archive():
                   "archived_launches") == 1)
 
 
+def test_eviction_suppressed_when_archive_write_fails():
+    """A failed archive write must NOT still unlink the dossier:
+    losing the memory is worse than a stale dossier."""
+    with _Ctx() as c:
+        now = time.time()
+        c.write_dossier("MINT-NODEL", now - 25 * 3600,
+                        deployer="DEP-1")
+        # Make the archive unwritable: its parent path is a FILE,
+        # so makedirs/open fail and _archive_append returns False.
+        blocker = os.path.join(c.home, "memory")
+        with open(blocker, "w") as f:
+            f.write("not a dir")
+        dossiers._sweep(now)
+        check("durability: failed archive keeps the dossier",
+              os.path.exists(os.path.join(dossiers.DOSSIER_DIR,
+                                          "MINT-NODEL.json")))
+
+
+def test_archive_status_distinguishes_empty_from_unavailable():
+    with _Ctx() as c:
+        st = dossiers.archive_status()
+        check("status: missing archive is available zero-history",
+              st.get("available") is True
+              and st.get("records") == 0)
+        # Present but unreadable file -> unavailable, never "zero".
+        os.makedirs(os.path.dirname(dossiers.ARCHIVE_FILE),
+                    exist_ok=True)
+        with open(dossiers.ARCHIVE_FILE, "w") as f:
+            f.write(json.dumps({"v": 1, "mint": "M1"}) + "\n")
+        os.chmod(dossiers.ARCHIVE_FILE, 0o000)
+        try:
+            st2 = dossiers.archive_status()
+            check("status: unreadable archive is UNAVAILABLE",
+                  st2.get("available") is False)
+            mem = dossiers.launch_memory("M1")
+            check("status: launch_memory says unavailable, not None",
+                  isinstance(mem, dict)
+                  and mem.get("unavailable") is True)
+        finally:
+            os.chmod(dossiers.ARCHIVE_FILE, 0o600)
+
+
+def test_outcome_linkage_via_verdict_ledger_close():
+    with _Ctx() as c:
+        os.environ["FOREX_AGENT_HOME"] = c.home
+        try:
+            from daemon.launch_scanner import verdict_ledger
+            ok = verdict_ledger.append(
+                "grad", "close",
+                {"mint": "MINT-OC", "pnl_usd": 1.5,
+                 "realized_mult": 2.0, "closed_reason": "trail"})
+            check("outcome: verdict-ledger close lands in archive",
+                  ok is True)
+            outs = dossiers.outcome_records(mint="MINT-OC")
+            check("outcome: one outcome record with fields",
+                  len(outs) == 1
+                  and outs[0].get("lane") == "grad"
+                  and outs[0].get("realized_mult") == 2.0
+                  and outs[0].get("closed_reason") == "trail")
+            mem = dossiers.launch_memory("MINT-OC")
+            check("outcome: launch_memory joins outcomes + lanes",
+                  mem is not None
+                  and len(mem.get("outcomes") or []) == 1
+                  and mem.get("resolved_lanes") == ["grad"])
+            # A non-close kind does NOT create an outcome.
+            verdict_ledger.append("grad", "verdict", {"closes": 1})
+            check("outcome: non-close kinds are not outcomes",
+                  len(dossiers.outcome_records(mint="MINT-OC"))
+                  == 1)
+        finally:
+            del os.environ["FOREX_AGENT_HOME"]
+
+
+def test_compaction_bounds_size_and_keeps_resolved_state():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        dossiers.ARCHIVE_MAX_BYTES = 2000  # tiny cap for the test
+        try:
+            for i in range(60):
+                dossiers.record_outcome(
+                    "MINT-C%d" % (i % 3), "grad", ts=now + i,
+                    pnl_usd=float(i), realized_mult=1.0 + i * 0.01,
+                    closed_reason="trail")
+            for i in range(29):
+                c.write_dossier("MINT-C%d" % (i % 3),
+                                now - (25 + i) * 3600,
+                                deployer="DEP-%d" % i)
+                dossiers._last_sweep = 0.0
+                dossiers._sweep(now + i + 100)
+            # The kept set (3 launches + 60 outcomes + anchor)
+            # is larger than the tiny test cap, so every sweep
+            # past the cap rewrites to the SAME bounded kept set
+            # instead of growing: two consecutive sweeps produce
+            # the same size. (With the production 8 MB cap and
+            # real volumes the kept set fits under the cap; the
+            # cap then bounds total size outright.)
+            c.write_dossier("MINT-C0", now - 60 * 3600,
+                            deployer="DEP-last")
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now + 5000)
+            size_a = os.path.getsize(dossiers.ARCHIVE_FILE)
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now + 6000)
+            size_b = os.path.getsize(dossiers.ARCHIVE_FILE)
+            check("compaction: repeated sweeps hold a bounded "
+                  "steady state, never regrow",
+                  size_a == size_b)
+            with open(dossiers.ARCHIVE_FILE) as f:
+                lines = [json.loads(l) for l in f if l.strip()]
+            anchors = [l for l in lines
+                       if l.get("record_type")
+                       == "compaction_anchor"]
+            check("compaction: anchor names the compaction",
+                  len(anchors) >= 1)
+            kept = [l for l in lines
+                    if l.get("record_type", "launch") == "launch"]
+            mints = {l.get("mint") for l in kept}
+            check("compaction: latest launch per mint survives",
+                  mints == {"MINT-C0", "MINT-C1", "MINT-C2"})
+            kept_outcomes = [l for l in lines
+                             if l.get("record_type") == "outcome"]
+            check("compaction: all outcomes survive",
+                  len(kept_outcomes) == 60)
+            # And it stays bounded: a second sweep past the cap
+            # re-compacts rather than growing back.
+            size1 = os.path.getsize(dossiers.ARCHIVE_FILE)
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now + 1000)
+            check("compaction: steady state does not regrow",
+                  os.path.getsize(dossiers.ARCHIVE_FILE)
+                  <= size1)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+
+
+def test_concurrent_appends_never_interleave():
+    import threading
+    with _Ctx() as c:
+        now = time.time()
+
+        def worker(n):
+            for i in range(25):
+                dossiers.record_outcome(
+                    "MINT-T", "lane%d" % n, ts=now + i,
+                    realized_mult=1.0, closed_reason="t")
+        threads = [threading.Thread(target=worker, args=(n,))
+                   for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with open(dossiers.ARCHIVE_FILE) as f:
+            lines = [l for l in f if l.strip()]
+        ok = 0
+        for l in lines:
+            try:
+                json.loads(l)
+                ok += 1
+            except Exception:
+                pass
+        check("concurrency: every appended line is intact",
+              ok == 100 and len(lines) == 100)
+
+
 def main():
+    test_eviction_suppressed_when_archive_write_fails()
+    test_archive_status_distinguishes_empty_from_unavailable()
+    test_outcome_linkage_via_verdict_ledger_close()
+    test_compaction_bounds_size_and_keeps_resolved_state()
+    test_concurrent_appends_never_interleave()
     test_expired_dossier_is_archived_before_eviction()
     test_fresh_dossier_not_archived_or_evicted()
     test_unknown_safety_archived_as_unknown()

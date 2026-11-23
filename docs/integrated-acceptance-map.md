@@ -17,7 +17,7 @@ Original source: user's WhatsApp message `wamid.HBgNMjM0NzA0NDcxOTI1MRUCABIYFDNB
 | 7 Entry | Actual sighting-to-bus-to-watcher entry path fixture-tested | Real source completeness, all-lane integration and strategy effectiveness unproved |
 | 8 Exit | Actual exit polling, tranche/account settlement and adverse-close fixtures | Real executable liquidity and adverse-market reliability unproved |
 | 9 Providers | Shared reserve RPC supports paced Alchemy-first fallback; candidate wires wallet transaction acquisition to it | Broader router/Chainstack/workload integration and live operational evidence incomplete |
-| 10 Event correctness | Dedup, timestamp and event-store component tests | No complete acquisition-to-decision causal coverage across every source |
+| 10 Event correctness | Dedup/timestamp/event-store tests; wallet parser rejects failed/unknown execution and invalid amounts atomically, aggregates same-mint accounts | No complete acquisition-to-decision causal coverage across every source |
 | 11 Unified decision/risk | Shared paper account, kill switches and lane controls | Full unified policy proof absent; frozen verdict still includes stale estimated close P/L |
 | 12A Historical/offline | Timestamp-correct replay v2 and fixture tests | Representative historical data, realistic execution coverage, untouched chronological holdout and advantage evidence missing |
 | 12B Live-market demo | Shared simulated account machinery | No completed authorized continuous real-mainnet-data lifecycle demonstration |
@@ -74,3 +74,16 @@ Proposed correction for review: retain the original registered verdict as an imm
 4. Obtain/validate historical data and run timestamp-correct chronological evaluation. Missing data remains missing.
 5. Only with grounded cadence/provider-usage authority, run the requested mainnet-data simulated lifecycle. Original §13.2 sets an initial engineering target of at least 500 completed demo trades and 30 calendar days, extending for insufficient frequency/diversity. This is an evidence target, not a promised delivery date.
 6. Actual AGT installation/reboot/restore and mainnet readiness remain separate demonstrations. No automatic graduation.
+
+## Transaction evidence follow-up
+
+The wallet-buy acquisition parser now requires meta.err to be explicitly null,
+valid wallet identity, finite nonnegative native/token amounts and positive
+block time before producing any buys. It validates the whole response before
+returning output, aggregates multiple token accounts for the same mint, and
+records signature/provenance. This prevents failed chain transactions and
+malformed later records from becoming partial sighting evidence. Suffix-based
+Pump mint selection and equal split of SOL outflow remain existing approximations.
+The polling cursor still advances before transaction-detail success, so lost
+acquisitions on transient detail failure remain an unresolved production gap.
+No missing execution status is guessed successful.

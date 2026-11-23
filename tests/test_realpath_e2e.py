@@ -151,7 +151,7 @@ def transport(url, body, method, host, timeout):
     wallet = req["params"][0].split(":", 1)[1]
     tx = {"blockTime": int(time.time()),
           "transaction": {"message": {"accountKeys": [wallet]}},
-          "meta": {"preBalances": [2000000000], "postBalances": [600000000],
+          "meta": {"err": None, "preBalances": [2000000000], "postBalances": [600000000],
                    "preTokenBalances": [], "postTokenBalances": [
                        {"owner": wallet, "mint": MINT,
                         "uiTokenAmount": {"uiAmount": 1000}}]}}
@@ -177,6 +177,15 @@ with patch.object(R, "rpc_url_pairs", return_value=pairs), \
     with patch.object(R, "_rpc_attempt", return_value=(None, "null", 0.001)):
         check("definitive primary null yields no fabricated wallet buy",
               sw.get_buy_details("WalN", "sig:WalN", "unused") == [])
+    # An RPC-success response can still describe a failed chain
+    # transaction. The parser, not the fake transport, must reject it.
+    def failed_chain(*args):
+        tx, kind, elapsed = transport(*args)
+        tx["meta"]["err"] = {"InstructionError": [0, "fixture_failure"]}
+        return tx, kind, elapsed
+    with patch.object(R, "_rpc_attempt", side_effect=failed_chain):
+        check("failed chain transaction produces no sighting input",
+              sw.get_buy_details("WalF", "sig:WalF", "unused") == [])
     before_outage = len(seen)
     with patch.object(R, "_rpc_attempt", return_value=(None, "fail", 0.001)):
         check("total provider failure yields no fabricated wallet buy",

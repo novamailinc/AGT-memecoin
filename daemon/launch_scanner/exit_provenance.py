@@ -95,30 +95,36 @@ def verdict_visibility(closes):
     never be READ as qualified performance. Any change to the
     registered evaluation itself is an owner decision, not a
     technical default."""
-    # Quantified contamination visibility (2026-11-23): the registered
-    # expectancy ingests stale-estimated closes BY FROZEN DESIGN. This
-    # figure puts the qualified number NEXT to it - expectancy over
-    # current-price closes only - so the gap is measured, not hidden.
-    # It never feeds HALT, excludes nothing from the registered sample,
-    # and re-registers nothing; changing the registered evaluation
-    # itself stays an owner decision.
-    qualified = [float((c or {}).get("pnl_usd") or 0) for c in closes
-                 if (c or {}).get("exit_price_kind") == CURRENT]
+    # Diagnostic contamination measurement (2026-11-23): the
+    # registered expectancy ingests stale-estimated closes BY FROZEN
+    # DESIGN. This DIAGNOSTIC puts a current-price-only number next to
+    # it so the gap is measured, not hidden. It is NOT qualified
+    # performance: the current-price-only subset can carry missingness
+    # bias (the closes that lack a current quote may not be random), so
+    # it is a diagnostic of how much the frozen number depends on
+    # estimates, nothing more. It never feeds HALT, excludes nothing
+    # from the registered sample, and re-registers nothing; changing
+    # the registered evaluation itself stays an owner decision.
+    current_only = [float((c or {}).get("pnl_usd") or 0) for c in closes
+                    if (c or {}).get("exit_price_kind") == CURRENT]
     return {
         "price_kind_breakdown": sample_breakdown(closes),
         "qualification_status": QUALIFICATION_STATUS,
         "fill_model_validated": FILL_MODEL_VALIDATED,
         "expectancy_presentation":
             "reproducibility_only_not_qualified_performance",
-        "qualified_expectancy_visibility": {
-            "current_price_closes": len(qualified),
-            "expectancy_current_only": (
-                round(sum(qualified) / len(qualified), 6)
-                if qualified else None),
-            "note": ("visibility only - the registered verdict math "
-                     "is UNCHANGED (all closes, frozen); this figure "
-                     "never feeds HALT, excludes nothing from the "
-                     "registered sample, re-registers nothing"),
+        "stale_estimate_diagnostic": {
+            "current_price_closes": len(current_only),
+            "expectancy_current_price_only_diagnostic": (
+                round(sum(current_only) / len(current_only), 6)
+                if current_only else None),
+            "note": ("diagnostic only, NOT qualified performance - "
+                     "the current-price subset can carry missingness "
+                     "bias; the registered verdict math is UNCHANGED "
+                     "(all closes, frozen) and keeps ingesting "
+                     "stale-estimate P/L until the owner changes it; "
+                     "this figure never feeds HALT, excludes nothing, "
+                     "re-registers nothing"),
         },
     }
 

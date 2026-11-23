@@ -271,18 +271,19 @@ if abs(exp_with - exp_without) > 1e-9:
             "non-current-price closes" % (exp_with, exp_without))
 check("verdict contamination demonstrated (activation blocker)",
       abs(exp_with - exp_without) > 1e-9)
-# Resolution within the frozen-math scope (2026-11-23): the registered
-# number still ingests the stale close (asserted above, unchanged),
-# and the verdict record now carries the QUALIFIED figure alongside -
-# measured, labeled visibility-only, never feeding HALT.
-qev = (scratch["verdict"].get("qualified_expectancy_visibility")
-       or {})
-check("qualified expectancy attached to the verdict record",
+# Within the frozen-math scope (2026-11-23): the registered number
+# still ingests the stale close (asserted above, unchanged - the
+# activation blocker STANDS), and the verdict record now carries a
+# DIAGNOSTIC current-price-only figure alongside: measured, explicitly
+# unqualified (missingness-bias-prone), never feeding HALT.
+qev = (scratch["verdict"].get("stale_estimate_diagnostic") or {})
+check("diagnostic current-price-only figure attached to the verdict",
       qev.get("current_price_closes") == n - 1
-      and abs(float(qev.get("expectancy_current_only") or 0)
-              - exp_without) < 1e-9)
-check("qualified figure labeled visibility-only, never a halt input",
-      "never feeds HALT" in (qev.get("note") or ""))
+      and abs(float(qev.get("expectancy_current_price_only_diagnostic")
+                    or 0) - exp_without) < 1e-9)
+check("diagnostic labeled unqualified, never a halt input",
+      "NOT qualified performance" in (qev.get("note") or "")
+      and "never feeds HALT" in (qev.get("note") or ""))
 
 # ---------- 7. killswitch risk path saw the trades -----------------
 check("killswitch risk path recorded the closes under the temp home",

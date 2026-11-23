@@ -205,8 +205,8 @@
     },
     "time_only_unquotable": {
       "close": {
-        "pnl_usd": -25.001,
-        "realized_mult": -0.0,
+        "pnl_usd": -25.0,
+        "realized_mult": 0.0,
         "reason": "time_stop_24h_unquotable"
       },
       "open": false
@@ -260,8 +260,8 @@
     "zero_price_aged": [
       {
         "close": {
-          "pnl_usd": -25.001,
-          "realized_mult": -0.0,
+          "pnl_usd": -25.0,
+          "realized_mult": 0.0,
           "reason": "time_stop_24h_unquotable"
         },
         "legs": null,

@@ -144,6 +144,7 @@ class Pacer:
 calls = []
 fail_primary = [False]
 fail_detail = [False]
+sell_mode = [False]
 def transport(url, body, method, host, timeout):
     req = json.loads(body)
     calls.append((host, req["method"]))
@@ -151,7 +152,9 @@ def transport(url, body, method, host, timeout):
         return None, "fail", 0.001
     if req['method']=='getSignaturesForAddress':
         wallet=req['params'][0]
-        return [{'signature':'sig:'+wallet},{'signature':'old:'+wallet}], 'ok', 0.001
+        newest=('sell:' if sell_mode[0] else 'sig:')+wallet
+        previous=('sig:' if sell_mode[0] else 'old:')+wallet
+        return [{'signature':newest},{'signature':previous}], 'ok', 0.001
     if fail_detail[0]:
         return None,'fail',0.001
     wallet = req["params"][0].split(":", 1)[1]
@@ -162,6 +165,9 @@ def transport(url, body, method, host, timeout):
                    "preTokenBalances": [], "postTokenBalances": [
                        {"accountIndex": 1, "owner": wallet, "mint": MINT,
                         "uiTokenAmount": {"uiAmount": 1000}}]}}
+    if req['params'][0].startswith('sell:'):
+        tx['meta']['preTokenBalances']=tx['meta']['postTokenBalances']
+        tx['meta']['postTokenBalances']=[]
     return tx, "ok", 0.001
 
 pairs = [("https://fixture.g.alchemy.com/v2/not-a-key", "alchemy-fixture"),
@@ -190,6 +196,24 @@ with patch.object(R, "rpc_url_pairs", return_value=pairs), \
     check("actual poll used signature discovery and transaction detail methods",
           {method for _,method in calls}=={'getSignaturesForAddress','getTransaction'})
     fail_primary[0] = False
+    sell_mode[0]=True
+    import smartgrade as GRADE
+    with patch.object(GRADE,'save_grades',return_value=False):
+        try:
+            sw.poll_wallet('WalA','unused-fixture',REGISTRY,seen,intake)
+            check('actual poll refuses acknowledgement after sell history write failure',False)
+        except OSError:
+            check('actual poll refuses acknowledgement after sell history write failure',
+                  intake.wallet('WalA')['pending']==['sell:WalA'])
+    sw.poll_wallet('WalA','unused-fixture',REGISTRY,seen,intake)
+    sw.poll_wallet('WalA','unused-fixture',REGISTRY,seen,intake)
+    sells=GRADE.load_grades()['WalA']['sell_events']
+    check('actual closed-account sell retry records one causal event',
+          len(sells)==1 and sells[0]['signature']=='sell:WalA'
+          and sells[0]['sold_fraction']==1
+          and sells[0]['holding_period_status']=='unavailable_no_causal_buy_match'
+          and intake.wallet('WalA')['pending']==[])
+    sell_mode[0]=False
     with patch.object(R, "_rpc_attempt", return_value=(None, "null", 0.001)):
         check("definitive primary null yields no fabricated wallet buy",
               sw.get_buy_details("WalN", "sig:WalN", "unused") == [])

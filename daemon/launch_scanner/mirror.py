@@ -44,6 +44,7 @@ logger = logging.getLogger("forex_agent.daemon.launch_scanner.mirror")
 
 try:
     from daemon.launch_scanner import fills as _fills
+    from daemon.launch_scanner import risk_controls as _risk
     from daemon.launch_scanner import chain_costs as _costs
     from daemon.launch_scanner import killswitch as _ks
     from daemon.launch_scanner import veto as _veto
@@ -53,6 +54,7 @@ try:
 except Exception:
     try:
         import fills as _fills
+        import risk_controls as _risk
         import chain_costs as _costs
         import killswitch as _ks
         import veto as _veto
@@ -610,6 +612,15 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
     eff_notional = NOTIONAL_USD - gas_in
     if eff_notional <= 0:
         return False, "costs exceed notional"
+
+    # Declared slippage cap (fills.MAX_SLIPPAGE_PCT, tighten-only via
+    # AGT_RISK_MAX_SLIPPAGE_PCT): a fill the model can only price at
+    # the cap is not an honest entry. Retryable - liquidity can
+    # recover.
+    _slip_ok, _slip_why, _ = _risk.check_slippage(
+        eff_notional, liquidity or None)
+    if not _slip_ok:
+        return False, "risk: " + _slip_why
     try:
         filled = _fills.honest_entry(quoted, eff_notional, liquidity or None)
     except Exception:

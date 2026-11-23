@@ -44,6 +44,7 @@ logger = logging.getLogger("forex_agent.daemon.launch_scanner.grad")
 
 try:
     from daemon.launch_scanner import fills as _fills
+    from daemon.launch_scanner import risk_controls as _risk
     from daemon.launch_scanner import chain_costs as _costs
     from daemon.launch_scanner import killswitch as _ks
     from daemon.launch_scanner import veto as _veto
@@ -53,6 +54,7 @@ try:
 except Exception:
     try:
         import fills as _fills
+        import risk_controls as _risk
         import chain_costs as _costs
         import killswitch as _ks
         import veto as _veto
@@ -1146,6 +1148,14 @@ def _consider_candidate(cand, now):
     eff_notional = _stake - gas_in
     if eff_notional <= 0:
         return _skip(mint, "costs exceed notional", True)
+    # Declared slippage cap (fills.MAX_SLIPPAGE_PCT, tighten-only via
+    # AGT_RISK_MAX_SLIPPAGE_PCT): a fill the model can only price at
+    # the cap is not an honest entry. Retryable - liquidity can
+    # recover.
+    _slip_ok, _slip_why, _slip_cap = _risk.check_slippage(
+        eff_notional, liquidity or None)
+    if not _slip_ok:
+        return _skip(mint, "slippage: " + _slip_why, False)
     try:
         filled = _fills.honest_entry(quoted, eff_notional,
                                       liquidity or None)

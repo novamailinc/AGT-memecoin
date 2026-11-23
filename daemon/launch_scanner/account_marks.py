@@ -37,10 +37,15 @@ Mark contract (validated by paper_account._mark_value):
            cache ts) for a curve mark - never the time this module
            wrapped a cached number>,
      "source": "jup-v3" | "reserves:curve",
-     "qty": <remaining units the value was computed from; the
-            account re-checks this against the CURRENT position
-            under its lock, so a mark collected before a tranche
-            close or reopen is rejected as qty drift>}
+     "qty": <remaining units the value was computed from>,
+     "pos_id": <the open instance the value was computed for>}
+  The account re-checks qty AND pos_id against the CURRENT
+  position under its lock, so a mark collected before a tranche
+  close is rejected as qty drift and one collected before a
+  close/reopen - even at the same size - is rejected as pos_id
+  drift. Source timestamps are passed through, never clamped:
+  a future-dated source observation fails the account's TTL
+  check instead of being laundered into freshness.
 
 Paper only. Nothing here touches real money, keys, or wallets.
 """
@@ -102,18 +107,21 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
         logger.warning("account marks: snapshot failed: %s",
                        type(e).__name__)
         return {}
-    wanted = []   # (lane, mint, qty)
+    wanted = []   # (lane, mint, qty, pos_id)
     mints = []
     try:
         for lane, info in (snap.get("lanes") or {}).items():
             for p in info.get("positions") or []:
                 mint = p.get("mint")
                 qty = p.get("qty")
+                pos_id = p.get("pos_id")
                 if (not isinstance(mint, str) or not mint
                         or not isinstance(qty, (int, float))
-                        or isinstance(qty, bool) or qty <= 0):
+                        or isinstance(qty, bool) or qty <= 0
+                        or not isinstance(pos_id, str)
+                        or not pos_id):
                     continue
-                wanted.append((lane, mint, float(qty)))
+                wanted.append((lane, mint, float(qty), pos_id))
                 if mint not in mints:
                     mints.append(mint)
     except Exception as e:
@@ -157,12 +165,12 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
             if _ok_price(px) and isinstance(obs, (int, float)) \
                     and not isinstance(obs, bool) \
                     and math.isfinite(obs):
-                curve_px[mint] = (float(px), min(float(obs), now))
+                curve_px[mint] = (float(px), float(obs))
         except Exception as e:
             logger.warning("account marks: curve %s failed: %s",
                            mint[:8], type(e).__name__)
     marks = {}
-    for lane, mint, qty in wanted:
+    for lane, mint, qty, pos_id in wanted:
         try:
             jpx, jts = prices.get(mint, (None, None))
             if _ok_price(jpx):
@@ -177,9 +185,10 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
                 ots = now
             marks.setdefault(lane, {})[mint] = {
                 "value": round(qty * px, 6),
-                "ts": min(float(ots), now),
+                "ts": float(ots),
                 "source": source,
                 "qty": qty,
+                "pos_id": pos_id,
             }
         except Exception as e:
             logger.warning("account marks: %s/%s skipped: %s",

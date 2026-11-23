@@ -219,7 +219,7 @@ check("gated first entry on an empty account passes", ok)
 
 am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
     now=None: {"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
-                                  "source": "test", "qty": 1000.0}}}
+                                  "source": "test", "qty": 1000.0, "pos_id": pid}}}
 ok, why, pid2 = pa.try_debit("ceo", "MINTB", 1.0, 100.0, "g-2")
 check("gated second entry: central marks admit", ok)
 
@@ -232,15 +232,19 @@ check("gated entry with an empty collect: blocked fail-closed",
 # Caller-supplied marks still win over the central collect.
 am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
     now=None: {"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
-                                  "source": "test", "qty": 1000.0}},
+                                  "source": "test", "qty": 1000.0,
+                                  "pos_id": pid}},
                "ceo": {"MINTB": {"value": 1.0, "ts": time.time(),
-                                 "source": "test", "qty": 100.0}}}
+                                 "source": "test", "qty": 100.0,
+                                 "pos_id": pid2}}}
 ok, why, _ = pa.try_debit(
     "watcher", "MINTC", 1.0, 100.0, "g-4",
     marks={"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
-                              "source": "test", "qty": 1000.0}},
+                              "source": "test", "qty": 1000.0,
+                              "pos_id": pid}},
            "ceo": {"MINTB": {"value": 1.0, "ts": time.time(),
-                             "source": "test", "qty": 100.0}}})
+                             "source": "test", "qty": 100.0,
+                             "pos_id": pid2}}})
 check("caller-supplied marks still accepted", ok)
 os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED")
 

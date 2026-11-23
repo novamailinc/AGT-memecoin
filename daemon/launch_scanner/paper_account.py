@@ -949,20 +949,26 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
 
 
 def _mark_value(mark: Any, now: float, ttl: float,
-                want_qty: Optional[float]
+                want_qty: Optional[float],
+                want_pos_id: Optional[str]
                 ) -> Tuple[Optional[float], Optional[str]]:
-    """Validate one mark: {value, ts, source, qty} with a finite,
-    nonnegative value, a timestamp within the TTL, and a qty that
-    matches the position's CURRENT remaining units (the mark is
-    collected before the account lock; a tranche close or reopen
-    between collection and evaluation must not let a stale-sized
-    value through). ts is the source's observation time, so a
-    cached price older than the TTL is stale even when the marker
-    just wrapped it. Returns (value, None) or (None, problem).
-    A mark that cannot prove it is fresh, well-formed and sized to
-    the current position is not a mark."""
+    """Validate one mark: {value, ts, source, qty, pos_id} with a
+    finite, nonnegative value, an observation timestamp within the
+    TTL in BOTH directions (future-dated sources are rejected, not
+    trusted), a qty matching the position's CURRENT remaining
+    units, and a pos_id matching the CURRENT open instance (the
+    mark is collected before the account lock; a tranche close or
+    a close/reopen in between must not let a stale-sized or
+    stale-instance value through - same-qty reopens get a NEW
+    pos_id precisely so their old marks die). ts is the source's
+    observation time, so a cached price older than the TTL is
+    stale even when the marker just wrapped it. Returns
+    (value, None) or (None, problem). A mark that cannot prove it
+    is fresh, well-formed and bound to the current position
+    instance is not a mark."""
     if not isinstance(mark, dict):
-        return None, "malformed (need {value, ts, source, qty})"
+        return None, ("malformed (need {value, ts, source, qty, "
+                      "pos_id})")
     v = mark.get("value")
     if (not isinstance(v, (int, float)) or isinstance(v, bool)
             or not math.isfinite(v) or v < 0):
@@ -985,6 +991,12 @@ def _mark_value(mark: Any, now: float, ttl: float,
         return None, ("qty drift (mark %.8g vs current %.8g - "
                       "position changed since collection)"
                       % (float(mq), want_qty))
+    if not want_pos_id:
+        return None, "position id unknown (cannot bind mark)"
+    if mark.get("pos_id") != want_pos_id:
+        return None, ("pos_id drift (mark %r vs current %r - "
+                      "instance changed since collection)"
+                      % (mark.get("pos_id"), want_pos_id))
     return float(v), None
 
 
@@ -1004,9 +1016,11 @@ def _view_locked(led: Dict[str, Any],
         for mint, p in st.get("open", {}).items():
             pb = _pos_basis(p)
             basis += pb
-            open_positions.append((name, mint, _pos_qty(p)))
+            open_positions.append((name, mint, _pos_qty(p),
+                                   p.get("pos_id")))
             positions.append({"mint": mint, "qty": _pos_qty(p),
-                              "basis": round(pb, 6)})
+                              "basis": round(pb, 6),
+                              "pos_id": p.get("pos_id")})
         exposure += basis
         out_lanes[name] = {
             "open_count": len(st.get("open", {})),
@@ -1039,12 +1053,13 @@ def _view_locked(led: Dict[str, Any],
         by_source: Dict[str, float] = {}
         now = time.time()
         ttl = mark_ttl_s()
-        for lane, mint, want_qty in open_positions:
+        for lane, mint, want_qty, want_pos_id in open_positions:
             m = (marks.get(lane) or {}).get(mint)
             if m is None:
                 problems.append("%s/%s: no mark" % (lane, mint))
                 continue
-            v, problem = _mark_value(m, now, ttl, want_qty)
+            v, problem = _mark_value(m, now, ttl, want_qty,
+                                     want_pos_id)
             if problem is not None:
                 problems.append("%s/%s: %s" % (lane, mint, problem))
             else:

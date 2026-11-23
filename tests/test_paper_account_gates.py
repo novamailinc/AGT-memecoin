@@ -49,10 +49,10 @@ def fresh(home, start="10.0", gates=True, max_daily=None,
     return importlib.reload(pa)
 
 
-def mark(value, qty, age_s=0.0):
-    # qty binds the mark to the position's current remaining units.
+def mark(value, qty, age_s=0.0, pos_id="p"):
+    # qty+pos_id bind the mark to the current open instance.
     return {"value": value, "ts": time.time() - age_s,
-            "source": "test-harness", "qty": qty}
+            "source": "test-harness", "qty": qty, "pos_id": pos_id}
 
 
 def marks_at_cost(pa):
@@ -61,8 +61,8 @@ def marks_at_cost(pa):
     out = {}
     for lane, info in snap["lanes"].items():
         for p in info["positions"]:
-            out.setdefault(lane, {})[p["mint"]] = mark(p["basis"],
-                                                       p["qty"])
+            out.setdefault(lane, {})[p["mint"]] = mark(
+                p["basis"], p["qty"], pos_id=p["pos_id"])
     return out
 
 
@@ -85,10 +85,11 @@ check("open position + no marks: entry refused (fail-closed)",
       not ok and "marks not trustworthy" in why)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-e3",
                           marks={"grad": {"A": mark(5.0, 5.0,
-                                                    age_s=3600)}})
+                                                    age_s=3600,
+                                                    pos_id=pid)}})
 check("stale mark: entry refused", not ok and "stale" in why)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-e4",
-                          marks={"grad": {"A": mark(5.0, 5.0)}})
+                          marks={"grad": {"A": mark(5.0, 5.0, pos_id=pid)}})
 check("fresh provenanced mark: entry allowed", ok)
 
 # ---- daily loss gate --------------------------------------------------
@@ -97,8 +98,8 @@ check("fresh provenanced mark: entry allowed", ok)
 # so the DAILY LOSS limit alone decides.
 H = tempfile.mkdtemp(prefix="gates-daily-")
 pa = fresh(H, max_daily=0.50)
-pa.try_debit("grad", "A", 2.0, 2.0, "g-d1")
-m = {"grad": {"A": mark(1.0, 2.0)}}
+_, _, pid_d = pa.try_debit("grad", "A", 2.0, 2.0, "g-d1")
+m = {"grad": {"A": mark(1.0, 2.0, pos_id=pid_d)}}
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-d2", marks=m)
 check("daily loss over the provisional limit: refused",
       not ok and "daily loss" in why)
@@ -109,8 +110,8 @@ check("same loss under a raised limit: allowed", ok)
 # ---- drawdown gate -----------------------------------------------------
 H = tempfile.mkdtemp(prefix="gates-dd-")
 pa = fresh(H, max_dd=5.0)
-pa.try_debit("grad", "A", 2.0, 2.0, "g-x1")
-m = {"grad": {"A": mark(1.0, 2.0)}}   # equity 9.00 vs peak 10 -> 10%
+_, _, pid_x = pa.try_debit("grad", "A", 2.0, 2.0, "g-x1")
+m = {"grad": {"A": mark(1.0, 2.0, pos_id=pid_x)}}   # equity 9.00 vs peak 10 -> 10%
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-x2", marks=m)
 check("drawdown over the provisional limit: refused",
       not ok and "drawdown" in why)
@@ -123,7 +124,7 @@ H = tempfile.mkdtemp(prefix="gates-exp-")
 pa = fresh(H)  # default exposure cap 60% of equity 10 = 6.00
 ok, why, pid1 = pa.try_debit("grad", "A", 4.0, 4.0, "g-p1")
 check("first entry inside capacity ok", ok)
-m = {"grad": {"A": mark(4.0, 4.0)}}
+m = {"grad": {"A": mark(4.0, 4.0, pos_id=pid1)}}
 ok, why, _ = pa.try_debit("ceo", "B", 3.0, 3.0, "g-p2", marks=m)
 check("second entry over 60% exposure refused ($4+$3 > $6)",
       not ok and "exposure" in why)
@@ -172,7 +173,7 @@ check("race left a consistent account (exposure $4 <= $6)",
 H = tempfile.mkdtemp(prefix="gates-exit-")
 pa = fresh(H, max_daily=0.50)
 ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-z1")
-m = {"grad": {"A": mark(0.5, 5.0)}}  # daily loss 4.50 >> 0.50
+m = {"grad": {"A": mark(0.5, 5.0, pos_id=pid)}}  # daily loss 4.50 >> 0.50
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-z2", marks=m)
 check(" blown daily-loss blocks entries", not ok)
 ok, why = pa.credit("grad", "A", 0.50, "g-z3", pos_id=pid)
@@ -188,7 +189,7 @@ H = tempfile.mkdtemp(prefix="gates-drift-")
 pa = fresh(H)
 ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-q1")
 # Marks sized for the full 5.0 units...
-m_stale = {"grad": {"A": mark(5.0, 5.0)}}
+m_stale = {"grad": {"A": mark(5.0, 5.0, pos_id=pid)}}
 # ...then a tranche settles half the units before the gated entry
 # reaches the lock (the concurrent-close race, simulated in order).
 ok, why = pa.credit("grad", "A", 2.60, "g-q2", pos_id=pid, qty=2.5)
@@ -197,7 +198,7 @@ ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-q3",
                           marks=m_stale)
 check("tranche between collect and lock: entry refused (qty drift)",
       not ok and "qty drift" in why)
-m_now = {"grad": {"A": mark(2.6, 2.5)}}
+m_now = {"grad": {"A": mark(2.6, 2.5, pos_id=pid)}}
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-q4", marks=m_now)
 check("re-collected marks sized to the CURRENT units: allowed", ok)
 
@@ -206,7 +207,7 @@ check("re-collected marks sized to the CURRENT units: allowed", ok)
 H = tempfile.mkdtemp(prefix="gates-reopen-")
 pa = fresh(H)
 ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-o1")
-m_old = {"grad": {"A": mark(5.0, 5.0)}}
+m_old = {"grad": {"A": mark(5.0, 5.0, pos_id=pid)}}
 pa.credit("grad", "A", 5.0, "g-o2", pos_id=pid)
 ok, _, pid2 = pa.try_debit("grad", "A", 5.0, 50.0, "g-o3",
                            marks={})
@@ -216,11 +217,40 @@ ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-o4",
 check("reopen with different size: old marks refused (qty drift)",
       not ok and "qty drift" in why)
 
+# Same-size reopen: quantity alone must NOT bind. The new instance
+# gets a new pos_id, so the old instance's marks die with it.
+H = tempfile.mkdtemp(prefix="gates-reopen-same-")
+pa = fresh(H)
+ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-s1")
+m_old = {"grad": {"A": mark(5.0, 5.0, pos_id=pid)}}
+pa.credit("grad", "A", 5.0, "g-s2", pos_id=pid)
+ok, _, pid2 = pa.try_debit("grad", "A", 5.0, 5.0, "g-s3",
+                           marks={})
+assert ok and pid2 != pid
+ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-s4",
+                          marks=m_old)
+check("same-qty reopen: old-instance marks refused (pos_id drift)",
+      not ok and "pos_id drift" in why)
+ok, why, _ = pa.try_debit(
+    "grad", "B", 1.0, 1.0, "g-s5",
+    marks={"grad": {"A": mark(5.0, 5.0, pos_id=pid2)}})
+check("marks bound to the CURRENT instance: allowed", ok)
+
+# Future-dated source timestamps are rejected, not trusted.
+H = tempfile.mkdtemp(prefix="gates-future-")
+pa = fresh(H)
+ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-f1")
+ok, why, _ = pa.try_debit(
+    "grad", "B", 1.0, 1.0, "g-f2",
+    marks={"grad": {"A": mark(5.0, 5.0, age_s=-3600,
+                              pos_id=pid)}})
+check("future-dated mark: entry refused", not ok)
+
 # ---- rollover with no marks: fail closed -------------------------------
 H = tempfile.mkdtemp(prefix="gates-rollover-")
 pa = fresh(H)
-pa.try_debit("grad", "A", 5.0, 5.0, "g-r1")
-pa.snapshot(marks={"grad": {"A": mark(5.0, 5.0)}})  # capture baselines
+_, _, pid_r = pa.try_debit("grad", "A", 5.0, 5.0, "g-r1")
+pa.snapshot(marks={"grad": {"A": mark(5.0, 5.0, pos_id=pid_r)}})  # capture baselines
 with open(pa.LEDGER_PATH) as f:
     led = json.load(f)
 led["day"] = "2000-01-01"
@@ -231,7 +261,7 @@ pa = fresh(H)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-r2")
 check("rollover + no marks: entry refused (fail-closed)", not ok)
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-r3",
-                          marks={"grad": {"A": mark(5.0, 5.0)}})
+                          marks={"grad": {"A": mark(5.0, 5.0, pos_id=pid_r)}})
 check("rollover + trustworthy marks: entry allowed, new baseline",
       ok)
 snap = pa.snapshot()

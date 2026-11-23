@@ -64,11 +64,12 @@ def fresh(home, start=None, cap=None):
     return importlib.reload(pa)
 
 
-def mark(value, age_s=0.0, qty=5.0):
-    # qty must bind to the position's CURRENT remaining units;
-    # DOWN1 was debited with qty 5.0 and is never tranched here.
+def mark(value, age_s=0.0, qty=5.0, pos_id=None):
+    # qty+pos_id bind the mark to the CURRENT open instance; DOWN1
+    # was debited with qty 5.0 and is never tranched here.
     return {"value": value, "ts": time.time() - age_s,
-            "source": "test-harness", "qty": qty}
+            "source": "test-harness", "qty": qty,
+            "pos_id": pos_id or DOWN1_PID}
 
 
 HOME = tempfile.mkdtemp(prefix="paper-account-test-")
@@ -613,7 +614,7 @@ check("concurrent recovery: final state settled exactly once",
 # ---- marks: book value vs marked equity, freshness/provenance ------
 HOME11 = tempfile.mkdtemp(prefix="paper-account-marks-")
 pa9 = fresh(HOME11, start=10.0)
-pa9.try_debit("grad", "DOWN1", 5.0, 5.0, "mk-d1")
+_, _, DOWN1_PID = pa9.try_debit("grad", "DOWN1", 5.0, 5.0, "mk-d1")
 snap = pa9.snapshot()
 check("no marks: marked fields None, status unavailable",
       snap["marked_equity"] is None and snap["marked_exposure"] is None

@@ -150,10 +150,11 @@ def transport(url, body, method, host, timeout):
         return None, "fail", 0.001
     wallet = req["params"][0].split(":", 1)[1]
     tx = {"blockTime": int(time.time()),
-          "transaction": {"message": {"accountKeys": [wallet]}},
+          "transaction": {"signatures": [req["params"][0]],
+                          "message": {"accountKeys": [wallet, "fixture-token-account"]}},
           "meta": {"err": None, "preBalances": [2000000000], "postBalances": [600000000],
                    "preTokenBalances": [], "postTokenBalances": [
-                       {"owner": wallet, "mint": MINT,
+                       {"accountIndex": 1, "owner": wallet, "mint": MINT,
                         "uiTokenAmount": {"uiAmount": 1000}}]}}
     return tx, "ok", 0.001
 

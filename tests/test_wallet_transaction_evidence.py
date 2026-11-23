@@ -13,10 +13,11 @@ sw = importlib.machinery.SourceFileLoader('smart_tx_validation', str(ROOT/'scrip
 class TransactionEvidence(unittest.TestCase):
     def setUp(self):
         self.tx = {'blockTime': int(time.time()),
-                   'transaction': {'message': {'accountKeys': ['W']}},
+                   'transaction': {'signatures': ['fixture-signature'],
+                                   'message': {'accountKeys': ['W', 'TA1', 'TA2']}},
                    'meta': {'err': None, 'preBalances': [2000000000],
                             'postBalances': [1000000000], 'preTokenBalances': [],
-                            'postTokenBalances': [{'owner': 'W', 'mint': 'Mpump',
+                            'postTokenBalances': [{'accountIndex': 1, 'owner': 'W', 'mint': 'Mpump',
                                                   'uiTokenAmount': {'uiAmount': 10}}]}}
 
     def parse(self, tx):
@@ -39,7 +40,7 @@ class TransactionEvidence(unittest.TestCase):
         for amount in (True, float('nan'), float('inf'), -1, None, '10'):
             tx = copy.deepcopy(self.tx)
             tx['meta']['postTokenBalances'].append(
-                {'owner': 'W', 'mint': 'BADpump', 'uiTokenAmount': {'uiAmount': amount}})
+                {'accountIndex': 2, 'owner': 'W', 'mint': 'BADpump', 'uiTokenAmount': {'uiAmount': amount}})
             self.assertEqual(self.parse(tx), [], repr(amount))
 
     def test_invalid_native_balance_and_time(self):
@@ -51,10 +52,29 @@ class TransactionEvidence(unittest.TestCase):
 
     def test_same_mint_account_transfer_not_false_buy(self):
         self.tx['meta']['preTokenBalances'] = [
-            {'owner': 'W', 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 10}}]
+            {'accountIndex': 1, 'owner': 'W', 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 10}}]
         self.tx['meta']['postTokenBalances'] = [
-            {'owner': 'W', 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 4}},
-            {'owner': 'W', 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 6}}]
+            {'accountIndex': 1, 'owner': 'W', 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 4}},
+            {'accountIndex': 2, 'owner': 'W', 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 6}}]
+        self.assertEqual(self.parse(self.tx), [])
+
+    def test_duplicate_account_index_rejected(self):
+        self.tx['meta']['postTokenBalances'] *= 2
+        self.assertEqual(self.parse(self.tx), [])
+
+    def test_missing_pre_owner_not_assumed_zero(self):
+        self.tx['meta']['preTokenBalances'] = [
+            {'accountIndex': 1, 'mint': 'Mpump', 'uiTokenAmount': {'uiAmount': 10}}]
+        self.assertEqual(self.parse(self.tx), [])
+
+    def test_finite_inputs_overflow_rejected(self):
+        self.tx['meta']['postTokenBalances'] = [
+            {'accountIndex': i, 'owner': 'W', 'mint': 'Mpump',
+             'uiTokenAmount': {'uiAmount': 1e308}} for i in (1, 2)]
+        self.assertEqual(self.parse(self.tx), [])
+
+    def test_response_signature_must_match_request(self):
+        self.tx['transaction']['signatures'] = ['different-response']
         self.assertEqual(self.parse(self.tx), [])
 
     def test_missing_wallet_or_malformed_status(self):

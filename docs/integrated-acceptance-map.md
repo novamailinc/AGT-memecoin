@@ -78,10 +78,12 @@ Proposed correction for review: retain the original registered verdict as an imm
 ## Transaction evidence follow-up
 
 The wallet-buy acquisition parser now requires meta.err to be explicitly null,
-valid wallet identity, finite nonnegative native/token amounts and positive
+matching response/request signature, unique in-range account indices and
+explicit owner identity, finite nonnegative native/token amounts and positive
 block time before producing any buys. It validates the whole response before
 returning output, aggregates multiple token accounts for the same mint, and
-records signature/provenance. This prevents failed chain transactions and
+records signature/provenance. Aggregate and derived arithmetic must remain finite.
+Block time is finite-positive only, not future-time or freshness qualified. This prevents failed chain transactions and
 malformed later records from becoming partial sighting evidence. Suffix-based
 Pump mint selection and equal split of SOL outflow remain existing approximations.
 The polling cursor still advances before transaction-detail success, so lost

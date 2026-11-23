@@ -236,6 +236,10 @@ def get_buy_details(wallet, sig, api_key):
         keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys")
         if not isinstance(keys, list) or wallet not in keys:
             return []
+        signatures = (tx.get("transaction") or {}).get("signatures")
+        if (not isinstance(signatures, list) or not signatures
+                or signatures[0] != sig):
+            return []
         idx = keys.index(wallet)
         pre_bal, post_bal = meta.get("preBalances"), meta.get("postBalances")
         def number(value):
@@ -250,29 +254,45 @@ def get_buy_details(wallet, sig, api_key):
         if block_ts <= 0:
             return []
         before, after = {}, {}
+        account_identities = {}
         for field, target in (("preTokenBalances", before), ("postTokenBalances", after)):
             balances = meta.get(field)
             if not isinstance(balances, list):
                 return []
+            seen_indices = set()
             for balance in balances:
                 if not isinstance(balance, dict):
                     return []
-                if balance.get("owner") != wallet:
-                    continue
+                account_index = balance.get("accountIndex")
+                if (type(account_index) is not int or account_index < 0
+                        or account_index >= len(keys) or account_index in seen_indices):
+                    return []
+                seen_indices.add(account_index)
+                # Missing owner cannot establish that a pre-holding
+                # was somebody else's. Refuse ambiguous deltas.
+                if not isinstance(balance.get("owner"), str) or not balance["owner"]:
+                    return []
                 mint = balance.get("mint")
+                identity = (balance["owner"], mint)
+                if account_index in account_identities and account_identities[account_index] != identity:
+                    return []
+                account_identities[account_index] = identity
+                if balance["owner"] != wallet:
+                    continue
                 if not isinstance(mint, str) or not mint:
                     return []
                 amount = number((balance.get("uiTokenAmount") or {}).get("uiAmount"))
                 # Multiple accounts of the same mint are summed;
                 # an account-to-account transfer must not become a buy.
-                target[mint] = target.get(mint, 0.0) + amount
+                target[mint] = number(target.get(mint, 0.0) + amount)
         buys = [{"mint": mint, "tokens_bought": amount - before.get(mint, 0.0),
                  "block_ts": block_ts, "signature": sig,
                  "acquisition_provenance": "successful_transaction_balance_delta"}
                 for mint, amount in after.items()
                 if mint.endswith("pump") and amount > before.get(mint, 0.0)]
         for buy in buys:
-            buy["sol_spent"] = sol_out / len(buys)
+            buy["tokens_bought"] = number(buy["tokens_bought"])
+            buy["sol_spent"] = number(sol_out / len(buys))
         return buys
     except (ValueError, TypeError, IndexError, AttributeError, OverflowError):
         return []

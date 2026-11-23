@@ -79,8 +79,12 @@ def exit_plan(lane, mint, allocation, pos_id, fx, op_id, now=None):
     Its native proceeds and basis remain pinned; there is no fabricated cash.
     """
     qty, proceeds = allocation['tokens'], allocation['proceeds_sol']
-    if (not pos_id or not op_id or not lane or not mint or
-            any(isinstance(v,bool) or not isinstance(v,(int,float))
+    if (not pos_id or not op_id or not lane or not mint
+            or type(allocation.get('ticket')) is not int or allocation['ticket'] <= 0
+            or not isinstance(allocation.get('basis_sol'), (int,float))
+            or isinstance(allocation['basis_sol'],bool)
+            or not math.isfinite(allocation['basis_sol']) or allocation['basis_sol'] < 0
+            or any(isinstance(v,bool) or not isinstance(v,(int,float))
                 or not math.isfinite(v) or v < 0 for v in (qty,proceeds)) or qty<=0):
         raise CapitalConflict('invalid native exit allocation')
     evidence = validate_fx(fx,now) if fx is not None else None

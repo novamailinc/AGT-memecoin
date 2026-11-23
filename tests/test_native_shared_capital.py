@@ -63,3 +63,40 @@ class TestNativeSharedCapital:
         with pytest.raises(CapitalConflict,match='disagreement'):
             apply_entry(plan,pa)
         assert json.loads(path.read_text())['cash']==8.
+
+    @pytest.mark.parametrize('target',['events.jsonl','ledger.json','directory'])
+    def test_receipt_has_strict_durability_barrier(self, account, target):
+        import os, stat
+        plan=entry_plan('scanner','M',1,100.,.02,
+                        {'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},'entry')
+        receipt,_=apply_entry(plan,pa)
+        real=os.fsync
+        attempted=[]
+        def fail(fd):
+            name=Path(os.readlink('/proc/self/fd/%d'%fd)).name
+            isdir=stat.S_ISDIR(os.fstat(fd).st_mode)
+            attempted.append((name,isdir))
+            if (target=='directory' and isdir) or name==target:
+                raise OSError('durability failure')
+            return real(fd)
+        with patch.object(os,'fsync',side_effect=fail):
+            with pytest.raises(OSError):
+                apply_entry(plan,pa)
+        assert attempted
+        assert apply_entry(plan,pa)[0]==receipt
+
+    def test_selective_new_wal_fsync_failure_never_returns_receipt(self, account):
+        import os
+        plan=entry_plan('scanner','M',1,100.,.02,
+                        {'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},'entry')
+        pa.snapshot()
+        real=os.fsync
+        def fail(fd):
+            if Path(os.readlink('/proc/self/fd/%d'%fd)).name=='events.jsonl':
+                raise OSError('WAL fsync failed')
+            return real(fd)
+        with patch.object(os,'fsync',side_effect=fail):
+            with pytest.raises(OSError):
+                apply_entry(plan,pa)
+        receipt,_=apply_entry(plan,pa)
+        assert receipt['stake']==2. and pa.snapshot()['cash']==8.

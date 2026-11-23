@@ -476,7 +476,7 @@ def _atomic_write(path: str, data: Dict[str, Any]) -> None:
         finally:
             os.close(dfd)
     except Exception:
-        pass
+        raise
 
 
 def _journal(event: Dict[str, Any]) -> None:
@@ -492,6 +492,8 @@ def _journal(event: Dict[str, Any]) -> None:
             os.fsync(f.fileno())
     except Exception:
         logger.exception("paper_account: journal write failed")
+        if event.get("instance") is True:
+            raise
 
 
 def _read_json(path: str) -> Optional[Dict[str, Any]]:
@@ -1520,6 +1522,16 @@ def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:
                    "settle_sol": ("pending_id", "fx", "proceeds")}.get(rec.get("event"), ())
         if any(event.get(k) != rec.get(k) for k in fields):
             return None, "operation WAL/state parameter disagreement"
+        # Visible bytes are not durability. Repair uncertain prior publication
+        # under the same account lock before acknowledging an exact receipt.
+        for path in (JOURNAL_PATH, LEDGER_PATH):
+            with open(path, "rb") as fh:
+                os.fsync(fh.fileno())
+        dfd = os.open(ACCOUNT_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
         return copy.deepcopy(rec), None
 
 

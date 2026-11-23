@@ -350,6 +350,23 @@ check("negative qty refused", not ok)
 ok, why = paR.credit("grad", "EXC", 1.00, "r-c5", qty=45.0)
 check("valid mid partial applies (45 of 90)", ok)
 
+# Example D (a tranche consuming ALL remaining units, qty given):
+# de-facto full close — settles all remaining basis and closes the
+# position rather than stranding dust. Buy 100 for $10, sell 100
+# for $12: realized +2.00, position closed, n_closes 1. (Runs after
+# the guard rails: fresh() reloads the module, so a later fixture
+# must not precede checks against paR.)
+HOMED = tempfile.mkdtemp(prefix="paper-account-partial-d-")
+paD = fresh(HOMED, start=10.0)
+paD.try_debit("grad", "EXD", 10.0, 100.0, "d-d1")
+ok, _ = paD.credit("grad", "EXD", 12.00, "d-c1", qty=100.0)
+snap = paD.snapshot()
+check("tranche consuming all units closes the position "
+      "(realized +2.00, nothing open)",
+      ok and snap["cash"] == 12.00 and snap["realized_pnl"] == 2.00
+      and snap["cost_exposure"] == 0.0
+      and snap["lanes"]["grad"]["n_closes"] == 1)
+
 # ---- legacy Stage-1 position: no qty -> full close only -------------
 HOMELEG = tempfile.mkdtemp(prefix="paper-account-legacy-")
 paL = fresh(HOMELEG, start=10.0)

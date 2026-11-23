@@ -450,12 +450,25 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
             return None, "bad qty"
         if qty_sold > have_qty + _EPS:
             return None, "qty exceeds remaining units"
-        alloc = round(basis * (qty_sold / have_qty), 6)
-        alloc = min(alloc, basis)
-        realized = round(net - alloc, 6)
-        pos["qty"] = round(have_qty - qty_sold, 12)
-        pos["basis"] = round(basis - alloc, 6)
-        closed = False
+        if qty_sold >= have_qty - _EPS:
+            # De-facto full close: this tranche consumes every
+            # remaining unit (within dust), so it settles ALL the
+            # remaining basis — the same accounting as an explicit
+            # final close. A tranche that left dust units behind
+            # would strand their basis in a zombie position.
+            alloc = basis
+            realized = round(net - alloc, 6)
+            st["open"].pop(mint)
+            pos["basis"] = 0.0
+            pos["qty"] = 0.0
+            closed = True
+        else:
+            alloc = round(basis * (qty_sold / have_qty), 6)
+            alloc = min(alloc, basis)
+            realized = round(net - alloc, 6)
+            pos["qty"] = round(have_qty - qty_sold, 12)
+            pos["basis"] = round(basis - alloc, 6)
+            closed = False
     pos["realized_pnl"] = round(
         float(pos.get("realized_pnl") or 0.0) + realized, 6)
     pos["proceeds"] = round(

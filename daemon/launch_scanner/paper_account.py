@@ -119,7 +119,7 @@ LOCK_FILE = os.path.join(ACCOUNT_DIR, ".lock")
 DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
-_MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol")
+_MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol", "debit_refused")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -844,6 +844,11 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                                   "reason": ev.get("reason")}
                                  if ev.get("instance") is True else {})}
             replayed += 1
+        elif kind == "debit_refused":
+            if not op_id or ev.get("instance") is not True:
+                return led, "invalid refused entry event"
+            ops[op_id] = {k:v for k,v in ev.items() if k not in ("seq", "event_id", "ts")}
+            replayed += 1
         elif kind in ("pending_sol", "settle_sol"):
             from daemon.launch_scanner import pending_sol
             reason = pending_sol.apply(led, ev, __import__(__name__, fromlist=["*"]))
@@ -912,6 +917,8 @@ def _derive_buckets_locked(led: Dict[str, Any],
                 return led, ("cash-split migration: write_down "
                              "%s: %s; manual reconciliation "
                              "required" % (ev.get("op_id"), why))
+        elif ev["event"] == "debit_refused":
+            continue  # exact attempt refusal, no economics
         elif ev["event"] in ("pending_sol", "settle_sol"):
             from daemon.launch_scanner import pending_sol
             reason = pending_sol.apply(gen, ev, __import__(__name__, fromlist=["*"]))
@@ -1108,6 +1115,21 @@ def try_debit_instance(lane: str, mint: str, stake: float, qty: float,
     return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=True)
 
 
+def _debit_refused(led, instance, lane, mint, stake, qty, op_id, why):
+    if instance:
+        seq = int(led.get("seq") or 0) + 1
+        event = {"event": "debit_refused", "instance": True,
+                 "lane": lane, "mint": mint, "stake": stake, "qty": qty,
+                 "op_id": op_id, "reason": why, "seq": seq,
+                 "event_id": "ev#%d" % seq}
+        _journal(event)
+        led["ops"][op_id] = {k:v for k,v in event.items()
+                              if k not in ("seq", "event_id")}
+        led["seq"] = seq
+        _save_locked(led)
+    return False, why, None
+
+
 def _try_debit(lane: str, mint: str, stake: float, qty: float,
               op_id: str, ts: Optional[float] = None,
               marks: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -1155,6 +1177,12 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        prior = led.get("ops", {}).get(op_id)
+        if instance and prior is not None and prior.get("event") == "debit_refused":
+            if any(prior.get(k) != v for k,v in
+                   {"lane":lane,"mint":mint,"stake":stake,"qty":qty,"instance":True}.items()):
+                return False, "refused entry attempt parameter conflict", None
+            return False, "original refusal: " + prior["reason"], None
         rec, conflict = _op_lookup(led, op_id, "debit", lane, mint,
                                    {"stake": stake, "qty": qty,
                                     "instance": instance})
@@ -1167,35 +1195,37 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         cash = float(led["cash"])
         spendable = float(led.get("cash_spendable", 0.0))
         if spendable < stake:
-            return (False, ("account spendable cash $%.2f < stake "
+            return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                                ("account spendable cash $%.2f < stake "
                             "$%.2f (total $%.2f incl. quarantined "
                             "estimated proceeds)"
-                            % (spendable, stake, cash)), None)
+                            % (spendable, stake, cash)))
         st = _lane(led, lane)
         if (mint in st["open"] or (not instance and any(
                 p.get("mint") == mint for p in st["open"].values()))):
-            return (False, ("%s already has an open %s position"
-                            % (lane, mint)), None)
+            return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                                  "%s already has an open %s position" % (lane, mint))
         cap = lane_cap()
         if cap is not None:
             open_basis = sum(_pos_basis(p) for p in st["open"].values())
             open_basis += sum(float(p["basis"]) for p in
                               led.get("pending_sol", {}).values() if p["lane"] == lane)
             if open_basis + stake > cap:
-                return (False, ("lane cap $%.2f would be exceeded "
+                return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                                    ("lane cap $%.2f would be exceeded "
                                 "($%.2f open + $%.2f new)"
-                                % (cap, open_basis, stake)), None)
+                                % (cap, open_basis, stake)))
         if gates_enabled():
             view = _view_locked(led, marks, degraded)
             _update_baselines_locked(led, view)
             view.update(_gate_fields(led, view))
             refusal = _gate_check_locked(led, view, stake)
             if refusal is not None:
-                return False, refusal, None
+                return _debit_refused(led, instance, lane, mint, stake, qty, op_id, refusal)
         if provider_health_gate_enabled():
             refusal = _provider_health_refusal()
             if refusal is not None:
-                return False, refusal, None
+                return _debit_refused(led, instance, lane, mint, stake, qty, op_id, refusal)
         led["seq"] = int(led.get("seq") or 0) + 1
         pid = _pos_id(lane, mint, led["seq"])
         _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
@@ -1515,6 +1545,7 @@ def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:
             return None, "operation has no exact instance contract"
         fields = ("event", "lane", "mint", "pos_id", "instance")
         fields += {"debit": ("stake", "qty"),
+                   "debit_refused": ("stake", "qty", "reason"),
                    "credit": ("proceeds", "fee", "qty", "price_kind", "realized"),
                    "write_down": ("qty", "reason"),
                    "pending_sol": ("qty", "proceeds_sol", "ticket", "native_basis_sol",

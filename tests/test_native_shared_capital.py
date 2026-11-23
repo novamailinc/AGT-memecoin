@@ -100,3 +100,22 @@ class TestNativeSharedCapital:
                 apply_entry(plan,pa)
         receipt,_=apply_entry(plan,pa)
         assert receipt['stake']==2. and pa.snapshot()['cash']==8.
+
+    @pytest.mark.parametrize('crash',[False,True])
+    def test_terminal_refusal_not_reopened_by_later_funding(self, account, crash):
+        holder=pa.try_debit_instance('watcher','N',10.,100.,'holder')[2]
+        plan=entry_plan('scanner','M',1,100.,.02,
+                        {'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},'attempt')
+        if crash:
+            with patch.object(pa,'_save_locked',side_effect=OSError('refusal after WAL')):
+                with pytest.raises(OSError):
+                    apply_entry(plan,pa)
+        else:
+            assert apply_entry(plan,pa)[0] is None
+        assert pa.credit('watcher','N',10.,'release',pos_id=holder,
+                         price_kind='current_price_simulated_fill')[0]
+        receipt,error=apply_entry(plan,pa)
+        assert receipt is None and 'spendable' in error
+        assert pa.snapshot()['cash']==10.
+        new=dict(plan,op_id='new-attempt')
+        assert apply_entry(new,pa)[0]['stake']==2.

@@ -51,6 +51,11 @@ def apply_entry(plan, account):
     rec, error = account.operation_receipt(plan['op_id'])
     if error:
         raise CapitalConflict(error)
+    if rec is not None and rec.get('event') == 'debit_refused':
+        expected_refusal = dict(expected,event='debit_refused')
+        if any(rec.get(k)!=v for k,v in expected_refusal.items()):
+            raise CapitalConflict('refused entry receipt parameter conflict')
+        return None, rec['reason']
     if rec is None:
         ok, why, _ = account.try_debit_instance(plan['lane'],plan['mint'],
                                                plan['stake'],plan['qty'],plan['op_id'])
@@ -66,6 +71,8 @@ def apply_entry(plan, account):
             rec,error = account.operation_receipt(plan['op_id'])
             if error:
                 raise CapitalConflict(error)
+    if isinstance(rec,dict) and rec.get('event')=='debit_refused':
+        return None, rec['reason']
     if (not isinstance(rec,dict) or not rec.get('pos_id')
             or any(rec.get(k)!=v for k,v in expected.items())):
         raise CapitalConflict('shared entry receipt conflicts with native intent')

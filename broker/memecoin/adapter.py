@@ -122,7 +122,7 @@ class MemecoinAdapter(BrokerAdapter):
                  market_data: Optional[MemecoinMarketData] = None,
                  chains: Optional[List[str]] = None,
                  key_provider=None,
-                 devnet_rpc_url: str = ""):
+                 devnet_rpc_url: str = "", shared_account=None, fx_observer=None):
         """
         data_dir: state directory (created if missing).
         mode: "paper" | "live". Live is fail-closed (see module docstring).
@@ -146,6 +146,12 @@ class MemecoinAdapter(BrokerAdapter):
         self._data_dir = Path(data_dir or os.path.join(home, "data", "memecoin"))
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._mode = mode
+        # Explicit injection only while integration qualification is incomplete.
+        # No environment switch activates the unfinished bridge.
+        self._shared_account = shared_account
+        self._fx_observer = fx_observer
+        if shared_account is not None and mode != "paper":
+            raise BrokerError(CONFIG_INVALID, "shared capital bridge is paper-only")
         self._paper_start_sol = float(paper_start_sol)
         self._live_armed = bool(live_armed)
         self._wallet_pubkey = (wallet_pubkey or "").strip()
@@ -287,8 +293,50 @@ class MemecoinAdapter(BrokerAdapter):
         self._validate_native_state(intent["after"])
         intent["sha256"] = hashlib.sha256(json.dumps(
             intent, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        if self._shared_account is not None:
+            if fill["kind"] == "BUY":
+                from broker.memecoin.shared_capital import entry_plan
+                if any(not p.get("shared_pos_id") for p in intent["before"]["positions"].values()):
+                    raise BrokerError(BROKER_UNAVAILABLE, "unbound legacy native inventory")
+                fx = self._observe_entry_fx()
+                identity = fill.get("idempotency_key") or fill["native_op_id"]
+                intent["shared_entry"] = entry_plan(
+                    "main", self._market.mint_for(fill["symbol"]), fill["ticket"],
+                    fill["tokens"], fill["volume_sol"], fx,
+                    "native-entry:" + identity)
+            else:
+                intent["shared_exits"] = []
+                for index, allocation in enumerate(fill["allocations"]):
+                    pos = intent["before"]["positions"][str(allocation["ticket"])]
+                    if not pos.get("shared_pos_id"):
+                        raise BrokerError(BROKER_UNAVAILABLE, "unbound native exit requires reconciliation")
+                    intent["shared_exits"].append({
+                        "lane": pos["shared_lane"],
+                        "mint": self._market.mint_for(fill["symbol"]),
+                        "pos_id": pos["shared_pos_id"], "allocation": allocation,
+                        "sold_at": datetime.fromisoformat(fill["ts"]).timestamp(),
+                        "op_id": "native-pending:" + fill["native_op_id"] + ":" + str(index)})
+            self._seal_intent(intent)
         _write_json_atomic(self._intent_path(), intent)
         self._recover_native_intent()
+
+    @staticmethod
+    def _seal_intent(intent):
+        intent.pop("sha256", None)
+        intent["sha256"] = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    def _observe_entry_fx(self):
+        from broker.memecoin.shared_capital import validate_fx
+        if self._fx_observer is not None:
+            return validate_fx(self._fx_observer())
+        q = self._market.get_quote("SOL")
+        observed = q.get("ts") if isinstance(q, dict) else None
+        if isinstance(observed, datetime):
+            observed = observed.timestamp()
+        return validate_fx({"usd_per_sol": q.get("price_usd") if q else None,
+                            "observed_at": observed,
+                            "source": q.get("source") if q else None})
 
     def _recover_native_intent(self) -> None:
         path = self._intent_path()
@@ -346,6 +394,51 @@ class MemecoinAdapter(BrokerAdapter):
                             if e.get("kind") == "BUY" and e is not (matches[0] if matches else None)}
         self._validate_fill(fill)
         self._fill_keys_cache = None
+        if intent.get("shared_entry") is not None:
+            from broker.memecoin.shared_capital import apply_entry
+            if self._shared_account is None:
+                raise ValueError("shared entry intent requires its account binding")
+            receipt, refusal = apply_entry(intent["shared_entry"], self._shared_account)
+            if refusal is not None:
+                # The account owns a durable terminal refusal for this attempt.
+                # Delete no evidence of an uncertain commit and never debit SOL.
+                self._load_state()
+                path.unlink()
+                _fsync_dir(path.parent)
+                raise BrokerError(RISK_LIMIT_EXCEEDED, "shared capital refused: " + refusal)
+            if intent.get("shared_receipt") not in (None, receipt):
+                raise ValueError("stored shared entry receipt conflict")
+            intent["shared_receipt"] = receipt
+            binding = {"shared_pos_id": receipt["pos_id"],
+                       "shared_entry_op_id": intent["shared_entry"]["op_id"],
+                       "shared_entry_fx": intent["shared_entry"]["fx"],
+                       "shared_entry_usd": receipt["stake"], "shared_lane": receipt["lane"]}
+            after["positions"][str(fill["ticket"])].update(binding)
+            fill.update(binding)
+            self._seal_intent(intent)
+            _write_json_atomic(path, intent)
+        if intent.get("shared_exits") is not None:
+            if self._shared_account is None:
+                raise ValueError("shared exit intent requires its account binding")
+            from daemon.launch_scanner import pending_sol
+            for item in intent["shared_exits"]:
+                allocation = item["allocation"]
+                ok, why = pending_sol.reserve(
+                    self._shared_account, item["lane"], item["mint"], item["pos_id"],
+                    allocation["tokens"], allocation["proceeds_sol"], allocation["ticket"],
+                    allocation["basis_sol"], item["sold_at"], item["op_id"], fee_sol=0.)
+                if not ok:
+                    raise ValueError("shared pending exit conflict: " + why)
+                receipt, error = self._shared_account.operation_receipt(item["op_id"])
+                if error or receipt is None:
+                    raise ValueError("shared pending exit receipt unavailable: " + str(error))
+                expected = {"event": "pending_sol", "lane":item["lane"],
+                            "mint":item["mint"], "pos_id":item["pos_id"],
+                            "qty":allocation["tokens"], "proceeds_sol":allocation["proceeds_sol"],
+                            "ticket":allocation["ticket"], "native_basis_sol":allocation["basis_sol"],
+                            "sold_at":item["sold_at"], "fee_sol":0., "instance":True}
+                if any(receipt.get(k)!=v for k,v in expected.items()):
+                    raise ValueError("shared pending exit receipt conflict")
         self._balance_sol = float(after["balance_sol"])
         self._positions = copy.deepcopy(after["positions"])
         self._next_ticket = int(after["next_ticket"])
@@ -362,6 +455,41 @@ class MemecoinAdapter(BrokerAdapter):
         # No later mutation can start until every projection is durable.
         path.unlink()
         _fsync_dir(path.parent)
+
+    def settle_pending_usd(self, fx: dict) -> list:
+        """Explicit dated SOL-to-USD settlement; no token exit or native rollback.
+
+        All pending items are already account-owned SOL, unspendable until each
+        exact allocation settles. Native->account lock order matches execution.
+        An unsettled item remains pending and cannot be called converged.
+        """
+        self._ensure()
+        if self._shared_account is None:
+            raise ValueError("no shared account binding")
+        from broker.memecoin.shared_capital import validate_fx
+        from daemon.launch_scanner import pending_sol
+        fx = validate_fx(fx)
+        results = []
+        with self._state_lock():
+            self._refresh_locked()
+            snapshot = self._shared_account.snapshot()
+            if snapshot.get("degraded"):
+                raise ValueError("shared account degraded")
+            for item in snapshot.get("pending_sol", []):
+                if item["lane"] != "main":
+                    continue
+                # Each allocation is atomic in the shared WAL; no batch atomicity.
+                proceeds = round(item["proceeds_sol"] * fx["usd_per_sol"], 6)
+                op_id = "native-settle:" + item["pending_id"]
+                ok, why = pending_sol.settle(
+                    self._shared_account, item["lane"], item["mint"], item["pos_id"],
+                    item["pending_id"], fx, proceeds, op_id)
+                if ok:
+                    receipt, error = self._shared_account.operation_receipt(op_id)
+                    if error or receipt is None:
+                        raise ValueError("shared settlement receipt unavailable")
+                results.append({"pending_id":item["pending_id"], "ok":ok, "reason":why})
+        return results
 
     def _fills_path(self) -> Path:
         return self._data_dir / "fills.jsonl"
@@ -675,6 +803,14 @@ class MemecoinAdapter(BrokerAdapter):
 
     def account_info(self) -> AccountInfo:
         self._ensure()
+        if self._shared_account is not None:
+            snap = self._shared_account.snapshot()
+            equity = snap.get("marked_equity_conservative")
+            if snap.get("degraded") or equity is None:
+                raise BrokerError(BROKER_UNAVAILABLE, "shared account equity unavailable")
+            return AccountInfo(balance=snap["cash_spendable"], equity=equity,
+                               currency="USD", margin=0., free_margin=snap["cash_spendable"],
+                               leverage=1, login=0, server="memecoin-shared-paper")
         # Equity = cash + current market value of open positions. (BUY
         # deducts the cost from cash, so adding only unrealized P/L would
         # double-count the cost basis.)
@@ -972,7 +1108,7 @@ class MemecoinAdapter(BrokerAdapter):
     def _paper_buy(self, req: OrderRequest, symbol: str,
                    price_sol: float) -> OrderResult:
         cost_sol = float(req.volume)
-        if cost_sol > self._balance_sol:
+        if self._shared_account is None and cost_sol > self._balance_sol:
             raise BrokerError(
                 RISK_LIMIT_EXCEEDED,
                 f"insufficient virtual balance: need {cost_sol:.6f} SOL, "

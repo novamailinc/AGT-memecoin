@@ -158,6 +158,7 @@ class MemecoinMarketData:
         return {
             "symbol": symbol.upper(),
             "mint": mint,
+            "source": "dexscreener:token-top-solana-pair",
             "price_usd": price_usd,
             "price_sol": price_sol,
             "pair": pair.get("pairAddress"),

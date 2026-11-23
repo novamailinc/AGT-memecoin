@@ -38,6 +38,14 @@ Items marked FIXED name the landing commit.
   fingerprints.py (durable fp_series_journal). GAP: TTL'd dossiers are not long-term
   memory of launches/patterns; "remember failed launches, liquidity collapses,
   historical signal outcomes" partially via verdict_ledger/lessons; depth check PENDING.
+  FIXED (0f7c1da lineage): durable launch archive - every expired dossier archives
+  before eviction with birth facts, safety verdict, three-valued migration
+  provenance (explicit / validated migrated_ts stamp / unrecorded; contradictions
+  labeled conflict), bounded preliminary curve-history digests (actual retained
+  samples with totals), and per-deployer-year rollups with honest counter merges
+  (corrupt counters marked partial, never silently summed; partial surfaces in
+  _intel_fields deployer_history). Curve-kind labels remain sample-count
+  categories, not verified curve/pump/regime history.
 - 4.2 Wallet memory: IMPLEMENTED (measurement posture) — wallet_grader.py
   (statistical gates), funding_clusters.py (union-find funder clustering, explicitly
   non-gating), deployer_tracker.py / deployers.py, smartmoney.py, follower_grader.py.
@@ -70,8 +78,15 @@ Items marked FIXED name the landing commit.
   simulated subset. walk_forward.py is a chronological classifier harness, not a
   general promotion controller. Existing degen-learner mutation is now contained:
   mandatory dry-run, save_weights refuses, scheduler invokes --dry-run explicitly.
-  No runtime LLM dependency added. PENDING: fuller record/feature completeness,
-  source-grounded promotion criteria and demo validation; no activation authorized.
+  No runtime LLM dependency added. FIXED (0f7c1da, promotion plumbing):
+  promotion.py - offline evaluation writes durable promotion_decision records
+  (PROMOTE-TO-DEMO / REJECT / NEED-DATA) with source-grounded criteria:
+  chronological expanding-window splits only, all-settled economics, labeled
+  exclusion of non-current-price/non-finite outcomes (never mixed, never
+  qualified performance), and activation fixed "not_authorized"
+  (tests/test_promotion.py). PENDING: wiring candidate generation from the
+  degen-learner dry-run into the evaluation record, fuller record/feature
+  completeness, owner-approved demo validation; no activation authorized.
 
 ## 6. Advanced market intelligence
 

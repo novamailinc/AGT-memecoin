@@ -426,7 +426,10 @@ class DeployerArchiveTest(unittest.TestCase):
         self.assertEqual(rec["launches_seen"], 9)
         self.assertEqual(rec["hits_2x"], 2)
         self.assertEqual(rec["regression_conflicts"], 1)
-        self.assertFalse(rec["partial"])
+        # The max combination may never have existed as an actual
+        # snapshot: a regression conflict makes the row partial so
+        # no consumer treats it as a verified record.
+        self.assertTrue(rec["partial"])
         self.assertEqual(rec["segments_merged"], 1)
         # Same result when the stale snapshot is read after
         # compaction, and when it arrives first.
@@ -478,6 +481,49 @@ class DeployerArchiveTest(unittest.TestCase):
         deployers.save_registry(hist)
         deployers.record_launch("DeplDDDD44444444444444444444444444444444444")
         self.assertIn(DEP1, deployers.load_registry())
+
+    def test_blocked_candidate_skipped_eviction_continues(self):
+        # Unarchivable oldest entry (no first_seen): skipped and
+        # counted, later eligible entries still evicted in a bounded
+        # pass, never silently deleted; all-blocked pass records an
+        # explicit overflow event.
+        deployers.save_registry({
+            "DepBAD": {"launches_seen": 9, "hits_2x": 0, "rugs": 9,
+                       "dead": 0, "first_seen": None,
+                       "last_seen": 1.0, "launch_ts": []}})
+        deployers.record_launch(DEP2)
+        deployers.record_launch(DEP3)  # over cap: only bad candidate
+        hist = deployers.load_registry()
+        self.assertIn("DepBAD", hist)
+        self.assertIn(DEP2, hist)  # slice covered only the bad one
+        out = deployers.deployer_archive()
+        self.assertGreaterEqual(
+            out["archive_status"].get("eviction_overflow_events"), 1)
+        deployers.record_launch(DEP1)  # pass widens: DEP2 evicted
+        hist = deployers.load_registry()
+        self.assertIn("DepBAD", hist)
+        self.assertNotIn(DEP2, hist)
+        out2 = deployers.deployer_archive()
+        self.assertGreaterEqual(
+            out2["archive_status"].get("eviction_skips_blocked"), 1)
+        recs = {r["deployer"]: r for r in out2["records"]}
+        self.assertIn(DEP2, recs)
+
+    def test_bool_and_nan_timestamps_counted_unusable(self):
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "segment_id": "b:1", "deployer": DEP1,
+                        "archived_ts": True, "launches_seen": 1})
+            + "\n"
+            + json.dumps({"v": 1, "record_type": "deployer_archive",
+                          "segment_id": "n:1", "deployer": DEP2,
+                          "archived_ts": float("nan"),
+                          "launches_seen": 1})
+            + "\n")
+        out = deployers.deployer_archive()
+        self.assertEqual(out["records"], [])
+        self.assertEqual(
+            out["archive_status"].get("unusable_records"), 2)
 
     def test_many_segments_survive_repeated_compactions(self):
         with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):

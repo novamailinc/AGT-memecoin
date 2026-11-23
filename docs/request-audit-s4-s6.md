@@ -62,9 +62,18 @@ Items marked FIXED name the landing commit.
   archive a stale snapshot after a fresh one), so same-id snapshots merge by
   monotonic maximum per cumulative counter; a decrease is an explicit
   regression_conflict label, never an invented total and never a silent
-  overwrite. Entries without a verifiable first_seen have no deterministic
+  overwrite, and any regression conflict makes the row partial (the max
+  combination may never have existed as an actual snapshot) so no consumer
+  can read it as a verified record. Entries without a verifiable first_seen have no deterministic
   identity: archiving fails closed (entry retained) rather than fabricating
-  recency. Records with corrupt archived_ts or no id are isolated and counted
+  recency. An unarchivable candidate does not block eviction liveness: the
+  bounded eviction pass skips it (counted as eviction_skips_blocked), tries
+  the remaining eligible entries, and never deletes unarchivable history
+  silently; a pass that evicts nothing is an explicit overflow event
+  (eviction_overflow_events), and no hard registry-size bound is claimed.
+  Every numeric boundary (counters, timestamps, archived_ts) rejects bools
+  and NaN/inf explicitly: a bool is not a count and NaN can never be ordered
+  or merged safely. Records with corrupt archived_ts or no id are isolated and counted
   (unusable_records / dropped_unreadable_total), never poisoning the read.
   Totals sum only over verifiable counters (corrupt counters mark the row
   partial); segment detail grows with distinct evictions (bounded in practice

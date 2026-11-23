@@ -50,9 +50,15 @@ though the live entry is gone. Memory semantics (code-defined):
 
 - durability: an entry is evicted only after its archive append
   SUCCEEDS; a failed append keeps the entry (eviction retried on the
-  next launch), never a silent drop. A torn tail (crash mid-append)
-  is repaired under the lock before the next append, and repairs are
-  counted in the meta file;
+  next launch), never a silent drop. A blocked (unarchivable)
+  eviction candidate is skipped, counted
+  (``eviction_skips_blocked``), and the remaining eligible entries
+  are tried within the same bounded pass; when every candidate is
+  blocked the registry overflows the cap, recorded as
+  ``eviction_overflow_events`` - an explicit unavailable eviction
+  state, so the live-registry cap is best-effort, NOT a hard bound.
+  A torn tail (crash mid-append) is repaired under the lock before
+  the next append, and repairs are counted in the meta file;
 - segments, not snapshots: each eviction archives one SEGMENT with a
   stable ``segment_id`` (deployer + its registry first_seen; an entry
   without a verifiable first_seen has no deterministic identity and
@@ -377,19 +383,30 @@ def record_launch(deployer: str) -> Optional[Dict[str, Any]]:
     _record_launch_ts(entry, now)  # bounded serial-launcher history
     hist[deployer] = entry
     if len(hist) > _MAX_REGISTRY:
-        # Evict least-recently-seen, never hot deployers.
+        # Evict least-recently-seen, never hot deployers. An entry
+        # is evicted only after its archive append SUCCEEDS; a
+        # blocked (unarchivable) candidate is SKIPPED, counted, and
+        # the remaining eligible entries are tried within this
+        # bounded pass - one blocked entry must not stall all
+        # future eviction, and unarchivable history is never
+        # silently deleted. When every candidate is blocked the
+        # registry overflows the cap: recorded as
+        # eviction_overflow_events, an explicit unavailable
+        # eviction state (no hard-bound claim).
+        evicted = False
         for dep in sorted(
                 hist,
                 key=lambda d: float((hist.get(d) or {}).get("last_seen")
                                     or 0))[:len(hist) - _MAX_REGISTRY]:
-            if not _entry_is_hot(hist.get(dep), 3, 0.30):
-                # Memory durability (4.2): an entry is evicted only
-                # after its archive append SUCCEEDS - a failed
-                # append keeps the entry (retried next launch),
-                # never a silent drop.
-                if _archive_deployer(dep, hist.get(dep), now):
-                    hist.pop(dep, None)
+            if _entry_is_hot(hist.get(dep), 3, 0.30):
+                continue
+            if _archive_deployer(dep, hist.get(dep), now):
+                hist.pop(dep, None)
+                evicted = True
                 break
+            _meta_bump("eviction_skips_blocked")
+        if not evicted:
+            _meta_bump("eviction_overflow_events")
     save_registry(hist)
     return entry
 
@@ -451,6 +468,25 @@ def _archive_lock():
             fcntl.flock(f, fcntl.LOCK_UN)
         finally:
             f.close()
+
+
+def _is_num(v: Any) -> bool:
+    """True only for a real finite number: bool is not a count and
+    NaN/inf can never be ordered or merged safely."""
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and v not in (float("inf"), float("-inf")))
+
+
+def _meta_bump(key: str, n: int = 1) -> None:
+    """Increment a persistent meta counter under the archive lock.
+    Best-effort; never raises."""
+    try:
+        with _archive_lock():
+            meta = _meta_read()
+            meta[key] = int(meta.get(key) or 0) + n
+            _meta_write(meta)
+    except Exception:
+        pass
 
 
 def _meta_read() -> Dict[str, Any]:
@@ -536,20 +572,21 @@ def _upsert_segment(state: Dict[str, Any], sid: str,
         or bool(seg.get("regression_conflict"))
     for k in _COUNTER_FIELDS:
         a, b = old.get(k), seg.get(k)
-        if isinstance(a, int) and isinstance(b, int):
+        a_ok = isinstance(a, int) and not isinstance(a, bool)
+        b_ok = isinstance(b, int) and not isinstance(b, bool)
+        if a_ok and b_ok:
             merged[k] = max(a, b)
             if b < a:
                 conflict = True
         else:
-            keep = a if isinstance(a, int) else b
-            if isinstance(keep, int):
+            keep = a if a_ok else b
+            if isinstance(keep, int) and not isinstance(keep, bool):
                 merged[k] = keep
             elif k in merged:
                 merged.pop(k)
     for k, fn in (("archived_ts", max), ("last_seen", max),
                   ("first_seen", min)):
-        vals = [v for v in (old.get(k), seg.get(k))
-                if isinstance(v, (int, float))]
+        vals = [v for v in (old.get(k), seg.get(k)) if _is_num(v)]
         if vals:
             merged[k] = fn(vals)
     merged["launch_ts"] = _merge_ts_lists(
@@ -574,15 +611,14 @@ def _fold_record(state: Dict[str, Any], rec: Dict[str, Any]) -> int:
     segs = rec.get("segments")
     if isinstance(segs, dict) and segs:
         for sid, seg in segs.items():
-            if not isinstance(seg, dict) or not isinstance(
-                    seg.get("archived_ts"), (int, float)):
+            if not isinstance(seg, dict) or not _is_num(
+                    seg.get("archived_ts")):
                 dropped += 1
                 continue
             _upsert_segment(state, sid, _seg_from_record(seg))
         return dropped
     sid = rec.get("segment_id")
-    if not sid or not isinstance(
-            rec.get("archived_ts"), (int, float)):
+    if not sid or not _is_num(rec.get("archived_ts")):
         return 1
     _upsert_segment(state, sid, _seg_from_record(rec))
     return 0
@@ -605,7 +641,7 @@ def _row_from_segments(deployer: str,
         total = 0
         for seg in segs.values():
             v = seg.get(k)
-            if isinstance(v, int):
+            if isinstance(v, int) and not isinstance(v, bool):
                 total += v
             else:
                 partial = True
@@ -616,19 +652,20 @@ def _row_from_segments(deployer: str,
     conflicts = sum(1 for seg in segs.values()
                     if seg.get("regression_conflict"))
     if conflicts:
+        # The per-field max combination may never have existed as an
+        # actual snapshot: regression conflicts make the row partial,
+        # an unavoidable status for any consumer.
         row["regression_conflicts"] = conflicts
+        row["partial"] = True
     first = [s.get("first_seen") for s in segs.values()]
     last = [s.get("last_seen") for s in segs.values()]
     arch = [s.get("archived_ts") for s in segs.values()]
-    row["first_seen"] = min(
-        [v for v in first if isinstance(v, (int, float))],
-        default=None)
-    row["last_seen"] = max(
-        [v for v in last if isinstance(v, (int, float))],
-        default=None)
-    row["archived_ts"] = max(
-        [v for v in arch if isinstance(v, (int, float))],
-        default=None)
+    row["first_seen"] = min([v for v in first if _is_num(v)],
+                            default=None)
+    row["last_seen"] = max([v for v in last if _is_num(v)],
+                           default=None)
+    row["archived_ts"] = max([v for v in arch if _is_num(v)],
+                             default=None)
     row["evicted_reason"] = "registry_cap"
     for k, cap in (("launch_ts", _MAX_LAUNCH_TS),
                    ("outcome_ts", _MAX_OUTCOME_TS)):
@@ -753,8 +790,12 @@ def _archive_deployer(deployer: str, entry: Optional[Dict[str, Any]],
     try:
         e = entry if isinstance(entry, dict) else {}
         first_seen = e.get("first_seen")
-        if not isinstance(first_seen, (int, float)):
-            return False  # fail closed: no deterministic identity
+        if not _is_num(first_seen):
+            # Fail closed: no deterministic identity, the caller
+            # retains the live entry (counted, never a silent drop
+            # and never a fabricated recency id).
+            _meta_bump("archive_fail_closed")
+            return False
         sid = "%s:%s" % (deployer, first_seen)
         rec = {"v": _ARCHIVE_SCHEMA_V, "record_type": "deployer_archive",
                "segment_id": sid,
@@ -799,7 +840,9 @@ def deployer_archive(deployer: Optional[str] = None,
             status["meta_available"] = True
             for k in ("dropped_unreadable_total",
                       "compaction_failures", "torn_tail_repairs",
-                      "compactions"):
+                      "compactions", "archive_fail_closed",
+                      "eviction_skips_blocked",
+                      "eviction_overflow_events"):
                 if k in meta:
                     status[k] = meta[k]
         else:

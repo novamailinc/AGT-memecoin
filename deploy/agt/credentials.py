@@ -53,8 +53,20 @@ import sys
 CREDENTIALS = (
     {
         "env": "HELIUS_API_KEY",
-        "required": True,
-        "purpose": "Helius main RPC key (live discovery + curve reads).",
+        # 2026-11-23: no longer REQUIRED. §9 (unified provider
+        # architecture) makes Alchemy the primary routine
+        # acquisition leg and Helius SELECTIVE enrichment; the lane
+        # RPC tiers use Helius when present and otherwise fail over
+        # to the budgeted public endpoint (reserves.py), so a
+        # deployment without a Helius key is a valid, labeled
+        # configuration - only the enriched capabilities refuse.
+        "required": False,
+        "required_when": "selective enriched Helius workloads "
+                         "(parsed streams / parsed events / "
+                         "enrichment) are enabled; lane RPC tiers "
+                         "use it when present",
+        "purpose": "Helius main RPC key (selective enriched "
+                   "intelligence + optional lane RPC tier).",
         "file_fallback": "helius/api_key",
         "env_first_in_code": ("daemon/launch_scanner/reserves.py",
                               "daemon/launch_scanner/smartmoney.py"),
@@ -72,13 +84,20 @@ CREDENTIALS = (
     },
     {
         "env": "ALCHEMY_API_KEY",
-        "required": False,
-        "required_when": "router enables the Alchemy provider "
-                         "(Phases 5-12 cutover; not the live leg today)",
-        "purpose": "Alchemy API key (key only, never the endpoint URL).",
+        # 2026-11-23: REQUIRED - §9 makes Alchemy the PRIMARY
+        # routine acquisition leg (HTTP RPC, general transaction
+        # reads, normal scanning) and reserves.py now wires the
+        # lane entry-critical reads through it as the first keyed
+        # tier. The paper bot's declared provider policy cannot be
+        # honored without it.
+        "required": True,
+        "purpose": "Alchemy API key - PRIMARY routine acquisition "
+                   "(§9): HTTP RPC, general transaction reads "
+                   "(key only, never the endpoint URL).",
         "file_fallback": "alchemy/api_key",
         "env_first_in_code": ("daemon/intelligence/acquisition/"
-                              "providers/base.py",),
+                              "providers/base.py",
+                              "daemon/launch_scanner/reserves.py"),
     },
     {
         "env": "CHAINSTACK_ENDPOINT",

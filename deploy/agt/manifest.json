@@ -32,8 +32,8 @@
       "purpose": "Second Helius key for research/discovery traffic, kept off the live signals' quota."
     },
     {
-      "name": "ALCHEMY_API_KEY",
-      "purpose": "Alchemy API key (key only, never the endpoint URL). Required only when the router enables Alchemy (Phases 5-12 cutover; not the live leg today)."
+      "name": "HELIUS_API_KEY",
+      "purpose": "Helius main RPC key. SELECTIVE per the §9 architecture: required only for enriched Helius workloads (parsed streams/events/enrichment); the lane RPC tiers use it when present and otherwise fail over to the budgeted public endpoint."
     },
     {
       "name": "CHAINSTACK_ENDPOINT",
@@ -54,8 +54,8 @@
   "repo_url": "https://github.com/olamoreA/meme-project",
   "required_env": [
     {
-      "name": "HELIUS_API_KEY",
-      "purpose": "Helius main RPC key (live discovery + curve reads). Startup fails closed without it."
+      "name": "ALCHEMY_API_KEY",
+      "purpose": "Alchemy API key (key only, or a full RPC URL; both shapes resolve). PRIMARY routine acquisition leg per the user's §9 provider architecture, wired into the lane entry-critical reads 2026-11-23. Startup fails closed without it."
     },
     {
       "name": "TELEGRAM_BOT_TOKEN",

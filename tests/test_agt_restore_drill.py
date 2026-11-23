@@ -44,6 +44,7 @@ FAKE_ENV = {
     # TEST- values outright (2026-11-22), and the GitHub secret
     # guard allowlists exactly this UUID (RFC 4122 example).
     "HELIUS_API_KEY": "123e4567-e89b-12d3-a456-426614174000",
+    "ALCHEMY_API_KEY": "fake-alchemy-key",
     "TELEGRAM_BOT_TOKEN": "123456789:fake-telegram-token",
 }
 

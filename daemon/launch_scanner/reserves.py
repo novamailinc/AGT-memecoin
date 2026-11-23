@@ -230,6 +230,55 @@ def _vault_url():
         return None
 
 
+# Alchemy primary tier (2026-11-23, §9 unified provider
+# architecture): the ordered architecture makes Alchemy the PRIMARY
+# routine acquisition leg (HTTP RPC, general transaction reads,
+# normal scanning) and Helius SELECTIVE enrichment. This read path
+# predates that order (Helius-first, built when Helius was the only
+# keyed provider); the tier below wires the declared policy into the
+# actual entry-critical reads. The key resolves through the SAME
+# resolver the central router's adapter uses
+# (providers/base.alchemy_key: env, then the two disk conventions) -
+# one source of truth, no second credential path. The pacer bucket
+# is namespaced ("alchemy:<key>") exactly like the vault bucket
+# above, so the Alchemy leg gets the same per-key 429 pacing
+# discipline, never a free pass.
+_ALCHEMY_HTTPS_TMPL = "https://solana-mainnet.g.alchemy.com/v2/{key}"
+
+
+def _alchemy_key():
+    """The configured Alchemy key via the router's own resolver,
+    or "" when unconfigured/unavailable. Never raises."""
+    try:
+        try:
+            from daemon.intelligence.acquisition.providers import \
+                base as _prov_base
+        except ImportError:
+            try:
+                from intelligence.acquisition.providers import \
+                    base as _prov_base  # type: ignore
+            except ImportError:
+                _prov_base = None
+        if _prov_base is not None:
+            return (_prov_base.alchemy_key(HOME) or "").strip()
+        return os.environ.get("ALCHEMY_API_KEY", "").strip()
+    except Exception:
+        return ""
+
+
+def _alchemy_url():
+    """Alchemy primary-tier URL, or None. The saved value may be a
+    bare key OR a full RPC URL (the ALCHEMY_API_KEY alias predates
+    the key-only convention); accept both. Never logs either
+    shape - both carry the credential."""
+    raw = _alchemy_key()
+    if not raw:
+        return None
+    if raw.startswith("https://") or raw.startswith("http://"):
+        return raw
+    return _ALCHEMY_HTTPS_TMPL.format(key=raw)
+
+
 def rpc_url_pairs():
     """[(url, bucket)] with the Helius keys rotated per call.
 
@@ -243,6 +292,18 @@ def rpc_url_pairs():
     pairs are exactly the disk keys + public, as before."""
     keys = _helius_keys()
     pairs = []
+    # §9 order: Alchemy primary routine acquisition FIRST, then the
+    # selective Helius keys, then the budgeted public leg (appended
+    # below). Unconfigured Alchemy changes nothing for the existing
+    # tiers.
+    alchemy_url = _alchemy_url()
+    if alchemy_url:
+        # Bucket from the raw saved value (key OR full URL):
+        # bucket_id_for_key sha256s it, so neither shape is ever
+        # logged or persisted, and each distinct credential gets
+        # its own pacing bucket.
+        pairs.append((alchemy_url, _helius_ratelimit.bucket_id_for_key(
+            "alchemy:" + _alchemy_key())))
     if keys:
         # Rotate the first key per call so consecutive calls start
         # on alternating keys and the load splits across both.
@@ -441,11 +502,16 @@ def _rpc_impl_typed(method, params, timeout=12, exempt=False):
     429 path. The vault-surrogate Helius key is WIRED (2026-11-20,
     after the re-probe returned HTTP 200 — the 2026-11-18 401 is
     gone; see helius_vault.py and rpc_url_pairs) as a third Helius
-    source: fallback order today is Helius disk keys + vault key
-    -> public RPC.
+    source. 2026-11-23 (§9 wiring): the declared provider policy
+    now orders the tiers here the way §9 orders them in the
+    architecture - Alchemy (PRIMARY routine acquisition, when
+    configured) -> Helius disk keys + vault key (selective) ->
+    budgeted public RPC. The Alchemy leg takes one paced attempt
+    and any failure falls through to the Helius tier unchanged.
     Every fallback attempt is logged with its source, and
     last_rpc_source() reports which provider answered, so the
-    select journal records helius / public-rpc per curve read.
+    select journal records alchemy / helius / public-rpc per
+    curve read.
 
     ``exempt`` (exit pricing only — see price_for_position): the
     call takes a PRIORITY pacer token (longer wait, may borrow
@@ -458,10 +524,37 @@ def _rpc_impl_typed(method, params, timeout=12, exempt=False):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                        "params": params}).encode()
     pairs = rpc_url_pairs()
+    alchemy_pairs = [(u, b) for (u, b) in pairs
+                     if "g.alchemy.com" in u]
     helius_pairs = [(u, b) for (u, b) in pairs if "helius-rpc.com" in u]
-    public_urls = [u for (u, _b) in pairs if "helius-rpc.com" not in u]
+    public_urls = [u for (u, _b) in pairs if "helius-rpc.com" not in u
+                   and "g.alchemy.com" not in u]
     pacer = _pacer()
     _LAST_SOURCE.value = None
+    # Alchemy primary tier (§9): one paced attempt; any failure falls
+    # through to the Helius tier (controlled failover to the NEXT
+    # tier, never a same-tier retry burn). A definitive null is
+    # returned as-is (same index family, mainnet). Helius health
+    # tracking is left untouched by this tier.
+    for url, bucket in alchemy_pairs:
+        if not bucket:
+            continue
+        if not pacer.acquire(bucket, priority=exempt):
+            continue
+        host = urllib.parse.urlparse(url).hostname or "unknown"
+        result, kind, elapsed = _rpc_attempt(url, body, method,
+                                             host, timeout)
+        if kind == "ok":
+            pacer.report(bucket, True)
+            _LAST_SOURCE.value = "alchemy"
+            return result, "ok"
+        if kind == "null":
+            pacer.report(bucket, True)
+            _LAST_SOURCE.value = "alchemy"
+            return None, "null"
+        if kind == "429":
+            pacer.report(bucket, False)
+        break
     # Take ONE pacer token per logical call, first key (in rotation
     # order) that has one. No token anywhere -> Helius is throttled
     # or down: fall through to the public leg once (own budget,

@@ -97,9 +97,11 @@ check("manifest: port is a valid TCP port",
       and 1 <= manifest["port"] <= 65535)
 check("manifest: paper only, mainnet disabled",
       manifest["mode"] == "paper" and manifest["mainnet_enabled"] is False)
-check("manifest: required env lists Helius key + Telegram token",
+check("manifest: required env lists Alchemy key + Telegram token "
+      "(2026-11-23: §9 made Alchemy the required primary "
+      "acquisition leg; Helius is optional/selective)",
       {e["name"] for e in manifest["required_env"]} == {
-          "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN"})
+          "ALCHEMY_API_KEY", "TELEGRAM_BOT_TOKEN"})
 check("manifest: env entries carry names only, never values",
       all("value" not in e and "secret" not in e
           for e in manifest["required_env"] + manifest["optional_env"]))
@@ -114,16 +116,16 @@ check("manifest: deploy kind is GitHub URL (the only git deploy AGT "
 check("credentials: full fake env passes the preflight",
       set(CREDS.check_credentials(FAKE_ENV)) == set(CREDS.present(FAKE_ENV))
       and len(CREDS.check_credentials(FAKE_ENV)) == 6)
-check("credentials: missing HELIUS_API_KEY fails closed",
+check("credentials: missing ALCHEMY_API_KEY fails closed",
       CREDS.missing_required(
           {k: v for k, v in FAKE_ENV.items()
-           if k != "HELIUS_API_KEY"}) == ["HELIUS_API_KEY"])
+           if k != "ALCHEMY_API_KEY"}) == ["ALCHEMY_API_KEY"])
 check("credentials: missing TELEGRAM_BOT_TOKEN fails closed",
       CREDS.missing_required(
           {k: v for k, v in FAKE_ENV.items()
            if k != "TELEGRAM_BOT_TOKEN"}) == ["TELEGRAM_BOT_TOKEN"])
 check("credentials: empty env fails closed naming both required vars",
-      CREDS.missing_required({}) == ["HELIUS_API_KEY",
+      CREDS.missing_required({}) == ["ALCHEMY_API_KEY",
                                      "TELEGRAM_BOT_TOKEN"])
 try:
     CREDS.check_credentials({})
@@ -131,12 +133,13 @@ try:
 except CREDS.CredentialError as exc:
     check("credentials: check_credentials raises on empty env", True)
     check("credentials: error names the missing variables, no values",
-          "HELIUS_API_KEY" in str(exc)
+          "ALCHEMY_API_KEY" in str(exc)
           and "TELEGRAM_BOT_TOKEN" in str(exc)
           and "TEST-" not in str(exc))
 check("credentials: optional vars are not required",
       CREDS.missing_required(
-          {"HELIUS_API_KEY": "x", "TELEGRAM_BOT_TOKEN": "y"}) == [])
+          {"HELIUS_API_KEY": "x", "ALCHEMY_API_KEY": "x",
+           "TELEGRAM_BOT_TOKEN": "y"}) == [])
 check("credentials: vault surrogate is unavailable without authd",
       CREDS.vault_surrogate_available() is False
       or os.path.exists("/run/hatch/auth/authd.sock"))
@@ -198,7 +201,8 @@ check("credentials: TEST- placeholder values are detected",
 try:
     CREDS.check_credentials(
         {"HELIUS_API_KEY": "TEST-HELIUS-KEY-AAAAAAAA",
-         "TELEGRAM_BOT_TOKEN": "TEST-TELEGRAM-TOKEN-CCCCCCCC"})
+         "TELEGRAM_BOT_TOKEN": "TEST-TELEGRAM-TOKEN-CCCCCCCC",
+         "ALCHEMY_API_KEY": "fake-alchemy-key"})
     check("credentials: check_credentials raises on TEST- values", False)
 except CREDS.CredentialError as exc:
     check("credentials: check_credentials raises on TEST- values", True)
@@ -229,11 +233,12 @@ check("credentials: --preflight output contains no credential value",
 proc = subprocess.run(
     [sys.executable, os.path.join(AGT, "credentials.py"), "--preflight"],
     env={k: v for k, v in os.environ.items()
-         if k not in ("HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN")},
+         if k not in ("HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN",
+                      "ALCHEMY_API_KEY")},
     capture_output=True, text=True)
 check("credentials: --preflight exits 1 with credentials missing",
       proc.returncode == 1
-      and "HELIUS_API_KEY" in proc.stdout + proc.stderr)
+      and "ALCHEMY_API_KEY" in proc.stdout + proc.stderr)
 # Home guard (2026-11-22): preflight never defaults to the live
 # ~/.forex-agent home — FOREX_AGENT_HOME must be set explicitly.
 env_no_home = {k: v for k, v in os.environ.items()
@@ -674,13 +679,14 @@ check("start.sh: smoke test proves dashboard /health + scheduler "
       "--dry-run",
       "smoke test OK" in proc.stdout)
 scrubbed = {k: v for k, v in os.environ.items()
-            if k not in ("HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN")}
+            if k not in ("HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN",
+                         "ALCHEMY_API_KEY")}
 proc = subprocess.run(["bash", os.path.join(AGT, "start.sh"),
                        "--preflight-only"], capture_output=True, text=True,
                       env=scrubbed, timeout=60)
 check("start.sh: --preflight-only fails closed without credentials",
       proc.returncode != 0
-      and "HELIUS_API_KEY" in proc.stdout + proc.stderr)
+      and "ALCHEMY_API_KEY" in proc.stdout + proc.stderr)
 
 # ---------------- supervisor start (isolated proof) ----------------
 # A second supervisor ADOPTS live daemons by cmdline token, so the

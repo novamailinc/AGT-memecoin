@@ -59,8 +59,8 @@ logger = logging.getLogger(
 JOURNAL_FILE = "acquisition_router_shadow.jsonl"
 
 # Live source names (reserves.last_rpc_source()) -> router provider.
-SERVED_MAP = {"helius": "helius", "public-rpc": "public",
-              "public": "public"}
+SERVED_MAP = {"alchemy": "alchemy", "helius": "helius",
+              "public-rpc": "public", "public": "public"}
 
 
 def served_to_provider(served):

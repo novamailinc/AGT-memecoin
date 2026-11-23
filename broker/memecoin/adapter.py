@@ -26,8 +26,12 @@ See RUNTIME.md for the full contract.
 """
 
 import contextlib
+import copy
+import uuid
 import fcntl
 import json
+import hashlib
+import math
 import logging
 import os
 import time
@@ -94,14 +98,15 @@ def _write_json_atomic(path: Path, obj) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    dfd = os.open(str(path), os.O_RDONLY)
     try:
-        dfd = os.open(str(path.parent) or ".", os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 class MemecoinAdapter(BrokerAdapter):
@@ -168,20 +173,51 @@ class MemecoinAdapter(BrokerAdapter):
         self._devnet_rpc_url = (devnet_rpc_url or "").strip()
         self._devnet = None  # DevnetExecutor once connected
         self._sol_price_cache: Optional[tuple] = None  # (ts, price_usd)
-        self._load_state()
+        with self._state_lock():
+            self._refresh_locked()
 
     # -- persisted paper state -------------------------------------------
     def _state_path(self) -> Path:
         return self._data_dir / "paper_state.json"
 
     def _load_state(self) -> None:
-        state = _read_json(self._state_path(), None)
+        path = self._state_path()
+        if path.exists():
+            state = json.loads(path.read_text())
+            self._validate_native_state(state)
+        else:
+            if self._fills_path().exists() and not self._intent_path().exists():
+                raise ValueError("native state missing with existing fill history")
+            state = {"balance_sol": self._paper_start_sol,
+                     "positions": {}, "next_ticket": 1}
+        self._balance_sol = float(state["balance_sol"])
+        self._positions = state["positions"]
+        self._next_ticket = state["next_ticket"]
+        self._loaded_native_state = self._native_snapshot()
+
+    def _native_snapshot(self) -> dict:
+        return {"balance_sol": self._balance_sol,
+                "positions": copy.deepcopy(self._positions),
+                "next_ticket": self._next_ticket}
+
+    @staticmethod
+    def _validate_native_state(state: dict) -> None:
         if not isinstance(state, dict):
-            state = {}
-        self._balance_sol: float = float(
-            state.get("balance_sol", self._paper_start_sol))
-        self._positions: Dict[str, dict] = state.get("positions", {})
-        self._next_ticket: int = int(state.get("next_ticket", 1))
+            raise ValueError("invalid native state")
+        balance, ticket, positions = (state["balance_sol"], state["next_ticket"],
+                                      state["positions"])
+        if (isinstance(balance, bool) or not math.isfinite(float(balance))
+                or type(ticket) is not int or ticket < 1
+                or not isinstance(positions, dict)):
+            raise ValueError("invalid native state values")
+        for key, pos in positions.items():
+            if str(int(key)) != key or not 0 < int(key) < ticket:
+                raise ValueError("invalid native position ticket")
+            for name in ("tokens", "volume_sol", "entry_price_sol"):
+                if not math.isfinite(float(pos[name])) or float(pos[name]) < 0:
+                    raise ValueError("invalid native position economics")
+            for name in ("symbol", "direction", "sl", "tp", "comment", "time_open"):
+                pos[name]  # missing required fields fail closed
 
     def _save_state(self) -> None:
         _write_json_atomic(self._state_path(), {
@@ -227,6 +263,72 @@ class MemecoinAdapter(BrokerAdapter):
         process's journal appends."""
         self._load_state()
         self._fill_keys_cache = None
+        self._recover_native_intent()
+
+    def _intent_path(self) -> Path:
+        return self._data_dir / "native_pending.json"
+
+    def _commit_native(self, fill: dict) -> None:
+        """Caller owns the state lock. Persist exact after-image before effects.
+
+        This is native-only durability, not shared-capital admission. No market
+        quote, FX, FIFO selection or ticket allocation is repeated on recovery.
+        """
+        fill = dict(fill, native_op_id=uuid.uuid4().hex,
+                    ts=_utcnow().isoformat(), mode=self._mode)
+        self._validate_fill(fill)
+        self._fill_keys_cache = None
+        intent = {"version": 1, "fill": fill,
+                  "before": self._loaded_native_state,
+                  "after": self._native_snapshot()}
+        self._validate_native_state(intent["after"])
+        intent["sha256"] = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        _write_json_atomic(self._intent_path(), intent)
+        self._recover_native_intent()
+
+    def _recover_native_intent(self) -> None:
+        path = self._intent_path()
+        if not path.exists():
+            return
+        # A corrupt intent is never equivalent to no intent. Admission freezes.
+        intent = json.loads(path.read_text())
+        if intent.get("version") != 1:
+            raise ValueError("unsupported native pending intent")
+        digest = intent.pop("sha256")
+        if digest != hashlib.sha256(json.dumps(
+                intent, sort_keys=True, allow_nan=False).encode()).hexdigest():
+            raise ValueError("native pending intent checksum mismatch")
+        fill, after = intent["fill"], intent["after"]
+        self._validate_native_state(after)
+        if self._loaded_native_state not in (intent["before"], after):
+            raise ValueError("native pending intent conflicts with state")
+        op_id = fill["native_op_id"]
+        if not isinstance(op_id, str) or not op_id:
+            raise ValueError("invalid native operation identity")
+        entries = []
+        if self._fills_path().exists():
+            entries = [json.loads(line) for line in
+                       self._fills_path().read_text().splitlines() if line.strip()]
+        matches = [e for e in entries if e.get("native_op_id") == op_id]
+        if matches and (len(matches) != 1 or matches[0] != fill):
+            raise ValueError("native pending intent conflicts with fill journal")
+        self._balance_sol = float(after["balance_sol"])
+        self._positions = copy.deepcopy(after["positions"])
+        self._next_ticket = int(after["next_ticket"])
+        self._save_state()
+        self._loaded_native_state = self._native_snapshot()
+        if not matches:
+            self._journal_fill(fill)
+        else:
+            # A prior replace can be visible even if its directory fsync failed.
+            # Re-establish durability before deleting the recovery source.
+            with open(self._fills_path(), "rb") as fh:
+                os.fsync(fh.fileno())
+            _fsync_dir(self._data_dir)
+        # No later mutation can start until every projection is durable.
+        path.unlink()
+        _fsync_dir(path.parent)
 
     def _fills_path(self) -> Path:
         return self._data_dir / "fills.jsonl"
@@ -244,8 +346,20 @@ class MemecoinAdapter(BrokerAdapter):
         # Both fail LOUD (raise) — a corrupt ledger is worse than a
         # missed write, and the caller must know.
         self._validate_fill(entry)
-        with open(self._fills_path(), "a") as fh:
+        # Atomic replacement avoids a torn append losing the trailing operation
+        # boundary. The pending intent remains until this projection is durable.
+        path = self._fills_path()
+        old = path.read_text() if path.exists() else ""
+        tmp = Path("%s.tmp.%d" % (path, os.getpid()))
+        with open(tmp, "w") as fh:
+            fh.write(old)
+            if old and not old.endswith("\n"):
+                fh.write("\n")
             fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
 
     def _seen_fill_keys(self) -> set:
         """(ticket, kind) pairs already in the journal. Cached per process."""
@@ -254,19 +368,17 @@ class MemecoinAdapter(BrokerAdapter):
             buy_ts = {}
             path = self._fills_path()
             if path.exists():
-                try:
-                    for line in path.read_text(encoding="utf-8").splitlines():
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        t, k = d.get("ticket"), d.get("kind")
-                        if t is not None and k:
-                            keys.add((t, k))
-                        if k == "BUY" and t is not None:
-                            buy_ts[t] = d.get("ts")
-                except OSError:
-                    pass
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    d = json.loads(line)
+                    if not isinstance(d, dict):
+                        raise ValueError("invalid native fill journal record")
+                    t, k = d.get("ticket"), d.get("kind")
+                    if t is not None and k:
+                        if (t, k) in keys:
+                            raise ValueError("duplicate native fill history")
+                        keys.add((t, k))
+                    if k == "BUY" and t is not None:
+                        buy_ts[t] = d.get("ts")
             self._fill_keys_cache = keys
             self._fill_buy_ts = buy_ts
         return self._fill_keys_cache
@@ -304,13 +416,17 @@ class MemecoinAdapter(BrokerAdapter):
         return self._data_dir / "idempotency.json"
 
     def _idempotent_get(self, key: str) -> Optional[dict]:
-        store = _read_json(self._idempotency_path(), {})
-        return store.get(key) if isinstance(store, dict) else None
+        path = self._idempotency_path()
+        store = json.loads(path.read_text()) if path.exists() else {}
+        if not isinstance(store, dict):
+            raise ValueError("invalid native idempotency store")
+        return store.get(key)
 
     def _idempotent_put(self, key: str, result: dict) -> None:
-        store = _read_json(self._idempotency_path(), {})
+        path = self._idempotency_path()
+        store = json.loads(path.read_text()) if path.exists() else {}
         if not isinstance(store, dict):
-            store = {}
+            raise ValueError("invalid native idempotency store")
         store[key] = result
         _write_json_atomic(self._idempotency_path(), store)
 
@@ -330,7 +446,7 @@ class MemecoinAdapter(BrokerAdapter):
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return None
-        for line in reversed(lines[-500:]):  # recent fills only
+        for line in reversed(lines):  # full-lifetime identity, not a recent window
             try:
                 entry = json.loads(line)
             except ValueError:
@@ -353,6 +469,9 @@ class MemecoinAdapter(BrokerAdapter):
                 message="paper fill (recovered from journal)",
                 raw={"mode": "paper",
                      "tokens": float(entry.get("tokens", 0.0)),
+                     **({"realized_pnl_sol": entry["realized_pnl_sol"],
+                         "closed_tickets": entry["closed_tickets"]}
+                        if entry.get("kind") == "SELL" else {}),
                      "recovered": True},
             )
         return None
@@ -830,8 +949,7 @@ class MemecoinAdapter(BrokerAdapter):
             "time_open": _utcnow().isoformat(),
         }
         self._balance_sol -= cost_sol
-        self._save_state()
-        self._journal_fill({
+        self._commit_native({
             "ticket": ticket, "kind": "BUY", "symbol": symbol,
             "volume_sol": cost_sol, "tokens": tokens,
             "price_sol": price_sol, "comment": comment,
@@ -871,10 +989,16 @@ class MemecoinAdapter(BrokerAdapter):
         remaining = tokens_to_sell
         realized = 0.0
         closed_tickets = []
+        allocations = []
         for ticket, p in holdings:
             if remaining <= 1e-12:
                 break
             take = min(p["tokens"], remaining)
+            basis = p["volume_sol"] * (take / p["tokens"])
+            allocations.append({"ticket": ticket, "tokens": take,
+                                "basis_sol": basis,
+                                "proceeds_sol": take * price_sol,
+                                "entry_price_sol": p["entry_price_sol"]})
             realized += (price_sol - p["entry_price_sol"]) * take
             p["tokens"] -= take
             # volume_sol tracks remaining cost basis proportionally
@@ -891,13 +1015,12 @@ class MemecoinAdapter(BrokerAdapter):
         # between the state write and the journal write, the ticket is
         # never reused on restart.
         ticket = self._next()
-        self._save_state()
         comment = req.order_comment()
-        self._journal_fill({
+        self._commit_native({
             "ticket": ticket, "kind": "SELL", "symbol": symbol,
             "volume_sol": proceeds_sol, "tokens": tokens_to_sell,
             "price_sol": price_sol, "realized_pnl_sol": realized,
-            "closed_tickets": closed_tickets,
+            "closed_tickets": closed_tickets, "allocations": allocations,
             "comment": comment, "signal_id": req.signal_id,
             "idempotency_key": req.idempotency_key,
             "balance_sol_after": self._balance_sol,
@@ -957,12 +1080,15 @@ class MemecoinAdapter(BrokerAdapter):
             proceeds = p["tokens"] * price_sol
             realized = (price_sol - p["entry_price_sol"]) * p["tokens"]
             self._balance_sol += proceeds
-            self._save_state()
-            self._journal_fill({
+            self._commit_native({
                 "ticket": ticket, "kind": "CLOSE", "symbol": p["symbol"],
                 "volume_sol": proceeds, "tokens": p["tokens"],
                 "price_sol": price_sol, "realized_pnl_sol": realized,
                 "balance_sol_after": self._balance_sol,
+                "allocations": [{"ticket": ticket, "tokens": p["tokens"],
+                                 "basis_sol": p["volume_sol"],
+                                 "proceeds_sol": proceeds,
+                                 "entry_price_sol": p["entry_price_sol"]}],
             })
         logger.info("paper CLOSE ticket %s (%s): %+.9f SOL realized",
                     ticket, p["symbol"], realized)
@@ -997,12 +1123,15 @@ class MemecoinAdapter(BrokerAdapter):
             proceeds = p["tokens"] * price_sol
             realized = (price_sol - p["entry_price_sol"]) * p["tokens"]
             self._balance_sol += proceeds
-            self._save_state()
-            self._journal_fill({
+            self._commit_native({
                 "ticket": ticket, "kind": "CLOSE", "symbol": p["symbol"],
                 "volume_sol": proceeds, "tokens": p["tokens"],
                 "price_sol": price_sol, "realized_pnl_sol": realized,
                 "balance_sol_after": self._balance_sol,
+                "allocations": [{"ticket": ticket, "tokens": p["tokens"],
+                                 "basis_sol": p["volume_sol"],
+                                 "proceeds_sol": proceeds,
+                                 "entry_price_sol": p["entry_price_sol"]}],
                 "close_reason": reason or "explicit",
             })
         logger.info("paper CLOSE@%s ticket %s (%s): %+.9f SOL realized",

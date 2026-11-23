@@ -105,6 +105,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -373,6 +374,7 @@ def _provider_health_refusal() -> Optional[str]:
 def _new_ledger() -> Dict[str, Any]:
     now = time.time()
     return {
+        "account_id": uuid.uuid4().hex,
         "created_ts": now,
         "seq": 0,
         "start_balance": start_balance(),
@@ -1004,7 +1006,7 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
     if not os.path.exists(LEDGER_PATH):
         led = _new_ledger()
         _journal({"event": "create", "start_balance":
-                  led["start_balance"]})
+                  led["start_balance"], "account_id": led["account_id"]})
         _save_locked(led)
         return led, True, degraded
     led = _read_json(LEDGER_PATH)
@@ -1515,6 +1517,26 @@ def write_down(lane: str, mint: str, op_id: str,
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
+
+
+def account_identity(expected=None):
+    """Generation identity, no regeneration when a native book is already bound."""
+    with _lock():
+        if expected is not None and not os.path.exists(LEDGER_PATH):
+            raise ValueError("bound shared account is missing")
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None or degraded:
+            raise ValueError("shared account identity unavailable")
+        identity = led.get("account_id")
+        if not isinstance(identity,str) or not identity:
+            raise ValueError("legacy account generation unbound")
+        if expected is not None and identity != expected:
+            raise ValueError("shared account generation mismatch")
+        entries,status,_ = _journal_read()
+        creates = [e for e in entries if e.get("event")=="create"]
+        if status is not None or len(creates)!=1 or creates[0].get("account_id")!=identity:
+            raise ValueError("shared account generation WAL mismatch")
+        return identity
 
 
 def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:

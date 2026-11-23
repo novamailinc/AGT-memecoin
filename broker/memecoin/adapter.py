@@ -282,9 +282,11 @@ class MemecoinAdapter(BrokerAdapter):
             actual = str(Path(self._shared_account.LEDGER_PATH).resolve())
             if binding.get("account_path") != actual:
                 raise ValueError("native shared account identity conflict")
+            self._shared_account.account_identity(binding["account_id"])
             self._shared_book_id = binding["book_id"]
         elif self._shared_account is not None:
             binding = {"version":1,"book_id":uuid.uuid4().hex,
+                       "account_id":self._shared_account.account_identity(),
                        "account_path":str(Path(self._shared_account.LEDGER_PATH).resolve())}
             _write_json_atomic(marker,binding)
             self._shared_book_id = binding["book_id"]
@@ -674,6 +676,15 @@ class MemecoinAdapter(BrokerAdapter):
         self._sol_price_cache = (now, price)
         return price
 
+    def _verify_position_mints(self, symbol):
+        if self._shared_account is not None:
+            mint = self._market.mint_for(symbol)
+            for pos in self._positions.values():
+                if pos["symbol"] == symbol and not pos.get("shared_mint"):
+                    raise BrokerError(INVALID_ORDER, "unbound legacy native inventory")
+                if pos["symbol"] == symbol and pos.get("shared_mint") != mint:
+                    raise BrokerError(INVALID_ORDER, "symbol mapping differs from immutable entry mint")
+
     def _price_sol(self, symbol: str) -> float:
         """Token price in SOL, via USD legs. Raises BROKER_UNAVAILABLE
         when market data is unreachable — paper fills are never priced
@@ -1037,6 +1048,7 @@ class MemecoinAdapter(BrokerAdapter):
                 })
                 return recovered
 
+        self._verify_position_mints(symbol)
         price_sol = self._price_sol(symbol)  # raises BROKER_UNAVAILABLE when blind
 
         if self._mode == "devnet":
@@ -1280,6 +1292,7 @@ class MemecoinAdapter(BrokerAdapter):
                     INVALID_ORDER,
                     f"no open paper position with ticket {ticket}")
             # Price FIRST: if the quote fails the position stays untouched.
+            self._verify_position_mints(p["symbol"])
             price_sol = self._price_sol(p["symbol"])
             del self._positions[str(ticket)]
             proceeds = p["tokens"] * price_sol

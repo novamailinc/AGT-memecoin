@@ -149,3 +149,29 @@ class TestNativeSharedEntry:
         a.close_position_at(1,0.)
         assert pa.snapshot()['pending_sol'][0]['mint']==mint
         assert not a._intent_path().exists()
+
+    def test_account_generation_loss_refuses_bound_book(self, account, tmp_path):
+        import shutil
+        a=adapter(tmp_path/'native')
+        a.submit_order(_req('BONK','BUY',.02,'a'))
+        shutil.rmtree(pa.ACCOUNT_DIR)
+        with pytest.raises(ValueError,match='account is missing'):
+            adapter(tmp_path/'native')
+        assert not __import__('pathlib').Path(pa.LEDGER_PATH).exists()
+        pa.snapshot()  # Explicit separate genesis does not authorize rebinding.
+        with pytest.raises(ValueError,match='generation mismatch'):
+            adapter(tmp_path/'native')
+
+    def test_priced_close_sell_and_new_entry_refuse_remapped_asset(self, account, tmp_path):
+        a=adapter(tmp_path)
+        a.submit_order(_req('BONK','BUY',.02,'a'))
+        a._market.register('BONK','other-mint')
+        a._market.usd['BONK']=100.
+        before=a._state_path().read_bytes()
+        with pytest.raises(BrokerError,match='immutable entry mint'):
+            a.close_position(1)
+        for side in ('BUY','SELL'):
+            with pytest.raises(BrokerError,match='immutable entry mint'):
+                a.submit_order(_req('BONK',side,.01,'new-'+side))
+        assert a._state_path().read_bytes()==before
+        assert pa.snapshot()['cash']==8.

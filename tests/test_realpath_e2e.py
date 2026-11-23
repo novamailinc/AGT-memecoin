@@ -20,10 +20,16 @@ Also covered: duplicate intake (second process_new_fires opens
 nothing), negative safety (check_safety False -> blocked, no bus
 record, block reason journaled), proceeds-vs-PnL separation.
 
-Boundary this test does NOT cross: live source polling (PumpPortal /
-RPC / DexScreener) is stubbed at the two named network seams, so
-this proves the detection->bus->intake->account->exit->telegram
-machinery, not live data acquisition.
+Acquisition extension: actual smart-watcher get_buy_details -> shared
+reserves RPC -> primary/fallback -> transaction parser -> sighting;
+only the HTTP attempt and pacer are fixtures. Total transport outage
+must create no buy. Complete exit polling then joins the real verdict
+funnel to durable outcome memory and reload retrieval.
+
+Boundary: network transports, enrichment, safety and tape/price sources
+are fixtures. This proves programmed integration, NOT real provider
+availability, strategy qualification, memory-based decisions, or an
+AGT process/reboot test. No live source polling or real credentials.
 
 Run: python3 tests/test_realpath_e2e.py   (never pytest)
 """
@@ -34,6 +40,7 @@ import os
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
@@ -68,7 +75,7 @@ def check(name, cond):
         FAILS.append(name)
 
 
-MINT = "REALPATHmint%038d" % 1
+MINT = ("REALPATHmint%034d" % 1) + "pump"
 MINT2 = "REALPATHmint%038d" % 2
 PRICES = {}
 # Verifiably CLEAN DexScreener-shaped tape for the entry-time toxicity
@@ -126,11 +133,54 @@ sw.check_safety = lambda mint: (True, "ok", {"passed": True,
 sw.enrich = _enrich
 seen = set()
 
-# --- 1. real upstream detection: 3 sightings, 3 groups ---------------
-for w in ("WalA", "WalB", "WalC"):
-    sw.handle_sighting(w, {"mint": MINT, "block_ts": time.time(),
-                           "tokens_bought": 1000.0, "sol_spent": 1.4},
-                       REGISTRY, seen)
+# --- 1. real transaction acquisition -> wallet-buy parser -> sightings ---
+from daemon.launch_scanner import reserves as R
+
+class Pacer:
+    def acquire(self, *a, **kw): return True
+    def report(self, *a, **kw): pass
+
+calls = []
+fail_primary = [False]
+def transport(url, body, method, host, timeout):
+    req = json.loads(body)
+    calls.append((host, req["method"]))
+    if fail_primary[0] and "alchemy" in host:
+        return None, "fail", 0.001
+    wallet = req["params"][0].split(":", 1)[1]
+    tx = {"blockTime": int(time.time()),
+          "transaction": {"message": {"accountKeys": [wallet]}},
+          "meta": {"preBalances": [2000000000], "postBalances": [600000000],
+                   "preTokenBalances": [], "postTokenBalances": [
+                       {"owner": wallet, "mint": MINT,
+                        "uiTokenAmount": {"uiAmount": 1000}}]}}
+    return tx, "ok", 0.001
+
+pairs = [("https://fixture.g.alchemy.com/v2/not-a-key", "alchemy-fixture"),
+         ("https://fixture.helius-rpc.com/?api-key=not-a-key", "helius-fixture")]
+with patch.object(R, "rpc_url_pairs", return_value=pairs), \
+        patch.object(R, "_pacer", return_value=Pacer()), \
+        patch.object(R, "_rpc_attempt", side_effect=transport):
+    for wallet in ("WalA", "WalB", "WalC"):
+        fail_primary[0] = wallet == "WalB"
+        buys = sw.get_buy_details(wallet, "sig:" + wallet, "unused-fixture")
+        check("actual transaction parser yields buy for " + wallet,
+              len(buys) == 1 and buys[0]["mint"] == MINT)
+        for buy in buys:
+            sw.handle_sighting(wallet, buy, REGISTRY, seen)
+    check("primary failure traversed actual Helius fallback tier",
+          any("helius" in host for host, _ in calls))
+    check("all acquisition requests used transaction method",
+          all(method == "getTransaction" for _, method in calls))
+    fail_primary[0] = False
+    with patch.object(R, "_rpc_attempt", return_value=(None, "null", 0.001)):
+        check("definitive primary null yields no fabricated wallet buy",
+              sw.get_buy_details("WalN", "sig:WalN", "unused") == [])
+    before_outage = len(seen)
+    with patch.object(R, "_rpc_attempt", return_value=(None, "fail", 0.001)):
+        check("total provider failure yields no fabricated wallet buy",
+              sw.get_buy_details("WalD", "sig:WalD", "unused") == [])
+    check("provider outage created no resolved token", len(seen) == before_outage)
 
 bus_path = BUS.BUS_PATH
 check("bus file exists after real detection", os.path.exists(bus_path))
@@ -264,6 +314,26 @@ check("/account demo labels SIMULATED", "SIMULATED" in demo_acct)
 check("/positions demo renders pinned id", pos["pa_pos_id"] in demo_pos)
 check("/positions demo renders exact remaining qty",
       str(qty_open) in demo_pos)
+# --- 8. completed close -> real verdict funnel -> durable memory -> restart ---
+from daemon.launch_scanner import dossiers as D
+PRICES[MINT] = pos["entry_price"] * 0.1
+W2.poll_exits(price_fn=lambda c, m, spot: PRICES.get(m, 0))
+check("remaining position closes through actual exit polling",
+      MINT not in W2.open_positions())
+outcomes = D.outcome_records(mint=MINT)
+check("actual watcher close reaches durable outcome archive",
+      len(outcomes) == 1 and outcomes[0]["lane"] == "watcher"
+      and outcomes[0]["qualified"] is False
+      and outcomes[0]["provenance"] == "simulated")
+D2 = importlib.reload(D)
+mem = D2.launch_memory(MINT)
+check("memory retrieval joins resolved outcome after module restart",
+      mem is not None and len(mem.get("outcomes") or []) == 1
+      and "watcher" in (mem.get("resolved_lanes") or []))
+cash_before_reload = PA2.snapshot()["cash"]
+check("post-close restart retains shared account cash",
+      abs(importlib.reload(PA).snapshot()["cash"] - cash_before_reload) < 1e-9)
+
 
 print()
 if FAILS:

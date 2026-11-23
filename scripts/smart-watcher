@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smart-wallet watcher: real-time bridge to degen lane.
 
-Polls the 9 tracked smart wallets every 30s via Helius RPC.
+Polls tracked smart wallets through the shared paced RPC transport.
 When a wallet buys a NEW mint, immediately enriches it and fires
 a 🎲 DEGEN card if it passes safety + basic filters.
 
@@ -189,11 +189,24 @@ def get_wallets():
         return []
 
 
-def rpc(method, params, api_key):
-    url = "https://mainnet.helius-rpc.com/?api-key=%s" % api_key
-    resp = _http(url, {"jsonrpc": "2.0", "id": 1,
-                       "method": method, "params": params})
-    return (resp or {}).get("result")
+def _shared_rpc_transport():
+    # Same production path as reserve reads. Imports remain lazy so
+    # script tools that only render cards do not need RPC setup.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo not in _sys.path:
+        _sys.path.insert(0, repo)
+    from daemon.launch_scanner import reserves
+    return reserves
+
+
+def rpc(method, params, api_key=None):
+    """Shared Alchemy-first paced RPC, with existing controlled fallbacks.
+
+    api_key remains for caller compatibility, never used to create a
+    second unpaced Helius-only path. This changes routing, not polling
+    cadence; no request is made by importing this module.
+    """
+    return _shared_rpc_transport().rpc(method, params)
 
 
 def get_buy_details(wallet, sig, api_key):
@@ -1242,15 +1255,15 @@ class _WalletWake:
 
 def main():
     api_key = get_helius_key()
-    if not api_key:
-        logger.warning("no helius key, exiting")
+    if not api_key and not _shared_rpc_transport()._alchemy_key():
+        logger.warning("no configured primary or fallback RPC credential, exiting")
         return
     wallets = get_wallets()
     if not wallets:
         logger.warning("no wallets, exiting")
         return
     wake = None
-    if _HAS_STREAM:
+    if _HAS_STREAM and api_key:
         wake = threading.Event()
         try:
             _WalletWake(api_key, wallets, wake).start()

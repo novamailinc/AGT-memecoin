@@ -279,7 +279,10 @@ def _archive_dossier(d, now):
             "initial_buy_sol": d.get("initial_buy_sol"),
             "market_cap_sol": d.get("market_cap_sol"),
             "migrated": bool(d.get("migrated")),
-            "reserve_samples": len(d.get("reserve_samples") or []),
+            "reserve_samples": len(d.get("curve_samples")
+                if "curve_samples" in d else (d.get("reserve_samples") or [])),
+            "reserve_acquisition": d.get("reserve_acquisition") or {
+                "status": "unknown", "reason": "legacy_unrecorded"},
         }
         return _archive_append(rec)
     except Exception:
@@ -1023,6 +1026,7 @@ def _build_inner(item):
                                     or 0),
             "safety": {"ts": 0.0, "report": None},
             "curve_samples": [],
+            "reserve_acquisition": {"status": "unavailable", "reason": "module_unavailable", "ts": now},
             "migrated_ts": 0.0,
         }
         if _res is not None:
@@ -1037,12 +1041,16 @@ def _build_inner(item):
                 _o, data = _res.get_account(
                     _res.derive_curve_pda(mint) or "")
                 c = _res.parse_bonding_curve(data)
+                d["reserve_acquisition"] = {
+                    "status": "available" if c else "unknown",
+                    "reason": "parsed" if c else "unreadable_response", "ts": now}
                 if c:
                     d["curve_samples"].append(
                         {"ts": now, "v_sol": c["v_sol"],
                          "v_token": c["v_token"]})
             except Exception:
-                pass
+                d["reserve_acquisition"] = {"status": "unavailable",
+                    "reason": "acquisition_failed", "ts": now}
         _write(mint, d)
         rep = None
         if _safety is not None:

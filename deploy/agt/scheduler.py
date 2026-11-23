@@ -155,10 +155,10 @@ JOBS = (
     {"id": "degen-learner-nightly", "source": "degen-learner-nightly",
      "title": "Degen learner — nightly auto-tune",
      "cadence": {"kind": "daily", "time": "03:00"},
-     "command": ["python3", "scripts/degen-learner"],
+     "command": ["python3", "scripts/degen-learner", "--dry-run"],
      "timeout_s": 900, "status": "ready",
-     "notes": "Adjusts degen feed score weights within guardrails; "
-              "report only when it makes tuning changes."},
+     "notes": "Offline advisory candidate diagnostics only; weight mutation "
+              "disabled. Promotion requires offline evaluation and demo validation."},
     {"id": "smart-registry-rotate", "source": "smart-registry-rotate",
      "title": "Smart-wallet registry rotation (14d)",
      "cadence": {"kind": "daily", "time": "03:52"},

@@ -486,37 +486,38 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
                             "default (defaultAccountState=frozen)")
                 elif name == "transferFeeConfig":
                     bps = _transfer_fee_bps(state)
-                    # Exact fee math is possible from mint data
-                    # alone (UiTransferFee: epoch, maximumFee in
-                    # RAW BASE UNITS, transferFeeBasisPoints):
-                    # fee(x) = min(x * bps / 10000, maximumFee).
-                    # The cap is token-denominated, so no price
-                    # context is needed; expose the inputs so a
-                    # consumer can compute the exact fee for any
-                    # transfer amount.
-                    def _maxfee():
-                        vals = []
-                        for k in ("newerTransferFee",
-                                  "olderTransferFee"):
-                            sub = state.get(k)
-                            if isinstance(sub, dict) \
-                                    and sub.get("maximumFee") \
-                                    is not None:
+                    # Keep epoch schedules paired. Max-bps safety
+                    # classification below is not an exact transfer fee.
+                    schedules = {}
+                    for key in ("olderTransferFee", "newerTransferFee"):
+                        sub = state.get(key)
+                        parsed = {}
+                        if isinstance(sub, dict):
+                            for field, upper in (("epoch", 2**64 - 1),
+                                    ("maximumFee", 2**64 - 1),
+                                    ("transferFeeBasisPoints", 10000)):
+                                value = sub.get(field)
                                 try:
-                                    vals.append(
-                                        int(sub["maximumFee"]))
+                                    if isinstance(value, bool) or not \
+                                            str(value).isdigit():
+                                        continue
+                                    value = int(value)
+                                    if 0 <= value <= upper:
+                                        parsed[field] = value
                                 except (TypeError, ValueError):
                                     pass
-                        return max(vals) if vals else None
-                    mf = _maxfee()
-                    if bps is not None:
-                        transfer_fee_detail["bps"] = bps
-                    if mf is not None:
-                        transfer_fee_detail["maximum_fee_raw"] = mf
-                        if bps:
-                            transfer_fee_detail[
-                                "cap_binds_above_raw"] = int(
-                                    mf * 10000 // bps)
+                        schedules[key] = {
+                            "status": "available" if len(parsed) == 3
+                            else "unknown", **parsed}
+                    transfer_fee_detail.update({
+                        "schedules": schedules,
+                        "current_epoch": None,
+                        "selected_schedule": None,
+                        "status": "epoch_selection_required",
+                        "fee_formula": "min((amount_raw*bps+9999)//10000, maximumFee)",
+                        "selection_rule": "newer if current_epoch >= newer.epoch else older",
+                        "amount_unit": "token_base_units",
+                    })
                     if bps is not None:
                         if bps > 1000:
                             fails.append(

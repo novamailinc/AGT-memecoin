@@ -69,7 +69,7 @@ def _dec(mint, entry_ts, close_ts, pnl, age=None, dep=None,
             "entry_price": 0.001, "mcap": 60000.0,
             "liquidity": 5000.0},
         "lessons_in_context": [], "pnl_usd": pnl,
-        "realized_mult": 1.0 + pnl / 25.0,
+        "realized_mult": max(0.0, 1.0 + pnl / 25.0),
         "close_reason": "time_stop_24h", "close_ts": close_ts,
         "exit_price_kind": kind,
     }
@@ -311,6 +311,7 @@ eng = GR.make_engine()
 _tmp = tempfile.mkdtemp(prefix="lessons-eng-")
 eng.LEDGER_PATH = os.path.join(_tmp, "grad_raw_ledger.json")
 eng.ensure_ledger()
+eng._jup = None  # no unconditional batch HTTP before fixture price_fn
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
 eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
@@ -504,13 +505,6 @@ check("ceo: lessons_context returns the block (advisory only)",
       isinstance(C.lessons_context("grad_select"), str)
       and "grad_select" in C.lessons_context("grad_select"))
 
-print()
-if fails:
-    print("FAILURES: %d" % len(fails))
-    for f in fails:
-        print("  FAIL " + f)
-    sys.exit(1)
-print("ALL LESSONS TESTS PASSED")
 # ============ 4.6 learning hygiene: incomplete records excluded ============
 hq = [_dec("QWin%d" % i, BASE - 500 + i, BASE + 500 + i, 10.0, age=10.0)
       for i in range(3)]
@@ -544,3 +538,30 @@ check("hygiene: missing label fails closed (excluded, not learned)",
           "grad_select",
           [{k: v for k, v in hq[0].items() if k != "exit_price_kind"}],
           generated_at=BASE + 902)["n_qualified"] == 0)
+
+for bad in (None, float("nan"), float("inf"), "bad"):
+    broken = dict(hq[0], pnl_usd=bad)
+    check("hygiene: invalid PnL excluded %r" % bad,
+          L.generate_lessons("grad_select", [broken])["n_qualified"] == 0)
+check("hygiene: close before entry excluded",
+      L.generate_lessons("grad_select", [dict(hq[0], close_ts=0)])["n_qualified"] == 0)
+check("hygiene: all-settled recorded economics preserved separately",
+      hp["all_settled_recorded_economics"]["records"] == 7
+      and hp["all_settled_recorded_economics"]["recorded_pnl_usd"] == 4.0
+      and hp["excluded_recorded_economics"]["recorded_pnl_usd"] == -26.0
+      and hp["excluded_by_price_kind"]["stale_price_estimate"]["records"] == 2)
+_backfill_home = tempfile.mkdtemp(prefix="lessons-provenance-")
+_backfill_row = dict(mint="BF", entry_ts=1000, close_ts=2000, pnl_usd=1,
+                     realized_mult=1.04, exit_price_kind="current_price_simulated_fill")
+with open(L.ledger_path("grad_select", _backfill_home), "w") as f:
+    json.dump({"closes": [_backfill_row]}, f)
+check("hygiene: ledger backfill preserves existing price provenance",
+      L.decisions_from_ledger("grad_select", home=_backfill_home)[0]["exit_price_kind"]
+      == "current_price_simulated_fill")
+print()
+if fails:
+    print("FAILURES: %d" % len(fails))
+    for f in fails:
+        print("  FAIL " + f)
+    sys.exit(1)
+print("ALL LESSONS TESTS PASSED")

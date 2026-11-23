@@ -107,8 +107,14 @@ check("learner: not gated at 10 winners-with-features",
       not L["is_gated"](10))
 check("learner: not gated at 25 winners-with-features",
       not L["is_gated"](25))
-check("learner: dry-run is opt-in (off by default in tests)",
-      L["DRY_RUN"] is False)
+check("learner: advisory dry-run is mandatory",
+      L["DRY_RUN"] is True)
+try:
+    L["save_weights"]({"weights": {}})
+    _promotion_refused = False
+except RuntimeError:
+    _promotion_refused = True
+check("learner: direct weight promotion refused", _promotion_refused)
 
 # --- 3. peak tracker: durable peaks + candidates ----------------------
 P = load_script("degen-peak-tracker")

@@ -164,11 +164,13 @@ rep = run("fee math inputs exposed", make_rpc(
                              "transferFeeBasisPoints": 100,
                              "maximumFee": 50}})]))
 _fd = rep["instant"].get("transfer_fee") or {}
-check("fee detail: exact per-amount inputs exposed (raw units)",
-      rep["passed"]
-      and _fd.get("bps") == 500
-      and _fd.get("maximum_fee_raw") == 1000000
-      and _fd.get("cap_binds_above_raw") == 20000000)
+check("fee detail: paired epoch schedules, no fabricated exact fee",
+      rep["passed"] and _fd.get("current_epoch") is None
+      and _fd["schedules"]["newerTransferFee"]["maximumFee"] == 1000000
+      and _fd["schedules"]["olderTransferFee"]["maximumFee"] == 50
+      and _fd["schedules"]["olderTransferFee"]["transferFeeBasisPoints"] == 100
+      and "bps" not in _fd and "cap_binds_above_raw" not in _fd
+      and "9999" in _fd["fee_formula"])
 rep = run("no fee extension", make_rpc(holders=ONE_HOLDER,
                                        extensions=None))
 check("no fee extension: transfer_fee detail is absent",

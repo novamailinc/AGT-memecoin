@@ -58,9 +58,10 @@ SCORE_COMPONENTS = ["freshness", "buy_pressure", "buyer_count",
                     "momentum", "fdv_zone", "smart_money",
                     "deployer", "holders", "lp_locked"]
 
-# --dry-run: resolve + report only. Never writes the weights file and
+# Advisory candidate generation only, regardless of CLI flags.
+# Resolve + report only. Never writes the weights file and
 # never appends to the live learner log; the summary goes to stdout.
-DRY_RUN = "--dry-run" in sys.argv
+DRY_RUN = True  # candidate generation only; no runtime promotion path
 
 
 def record_has_components(rec):
@@ -127,9 +128,7 @@ def load_weights():
 
 
 def save_weights(w):
-    w["_updated"] = datetime.utcnow().isoformat() + "Z"
-    with open(WEIGHTS_FILE, "w") as f:
-        json.dump(w, f, indent=2)
+    raise RuntimeError("automatic weight promotion disabled; offline evaluation and demo validation required")
 
 
 def log_change(msg):

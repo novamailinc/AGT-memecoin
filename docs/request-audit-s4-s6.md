@@ -45,9 +45,12 @@ Items marked FIXED name the landing commit.
 - 4.3 Trading memory: IMPLEMENTED — recorder.py, tap_journal.py, decision_journal.py
   (daemon/intelligence/signals/), verdict_ledger.py, exit_provenance.py, paper_account
   ledgers. decision journal + lessons.py settle records with outcomes.
-- 4.4 Strategy memory: IMPLEMENTED (advisory) — lessons.py (per-lane JSONL decision
-  memory, templated lessons, ADVISORY ONLY v1), winner_model.py, win_classifier.py,
-  lane_bandit.py (Thompson sampling, PNL-scaled, time decay).
+- 4.4 Strategy memory: PARTIAL (advisory) - lessons.py persists entry features
+  and settled outcomes, generates deterministic per-band summaries, and journals
+  context IDs in grad_select. No lesson-based verdict gate or point-in-time lesson
+  application is built. lane_bandit + lane-bandit-shadow are diagnostic allocations,
+  not verified entry consumers. ceo.lessons_context has no production caller found;
+  the auto-tune comment does not prove runtime LLM consumption.
 - 4.5 Operational memory: IMPLEMENTED — acquisition/provider_health.py
   (ok/degraded/down/unconfigured, latency/error/429 surfacing, public-fallback-only
   alert), health_monitor.py, event_recovery.py, helius_ratelimit.py,
@@ -60,9 +63,15 @@ Items marked FIXED name the landing commit.
   provider not "ok" blocks the entry fail-closed: uncertain market information is
   never treated as reliable. Exits never gated. tests/test_provider_health_gate.py
   (12 checks).
-- 4.6 Controlled learning: posture matches — lessons advisory-only, lane_bandit
-  bounded, no silent safety-limit rewrites found. PENDING: verify no module
-  auto-promotes untested strategies; walk_forward.py exists for offline evaluation.
+- 4.6 Controlled learning: PARTIAL - advisory lesson statistics exclude non-current
+  price provenance and nonfinite/inconsistent core outcomes; all-settled and
+  excluded recorded economics remain separate diagnostic figures, not executable
+  truth or qualified performance. Selective missingness can bias the included
+  simulated subset. walk_forward.py is a chronological classifier harness, not a
+  general promotion controller. Existing degen-learner mutation is now contained:
+  mandatory dry-run, save_weights refuses, scheduler invokes --dry-run explicitly.
+  No runtime LLM dependency added. PENDING: fuller record/feature completeness,
+  source-grounded promotion criteria and demo validation; no activation authorized.
 
 ## 6. Advanced market intelligence
 

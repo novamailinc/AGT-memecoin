@@ -41,6 +41,7 @@ Paper only. Nothing here touches real money, keys, or wallets.
 
 import fcntl
 import json
+import math
 import os
 import time
 
@@ -406,6 +407,7 @@ def decisions_from_ledger(lane, ledger_file=None, home=None):
                 "realized_mult": _num(c.get("realized_mult")),
                 "close_reason": str(c.get("closed_reason") or ""),
                 "close_ts": _num(c.get("close_ts")),
+                "exit_price_kind": str(c.get("exit_price_kind") or "unknown"),
                 "source": "ledger",
             })
         return out
@@ -513,10 +515,28 @@ def _qualified_for_learning(rec):
     EXCLUDED from learning; their count is reported, never learned
     from. Anything unreadable or unlabeled fails closed (excluded)."""
     try:
-        return str(rec.get("exit_price_kind") or "") == \
-            "current_price_simulated_fill"
+        if rec.get("exit_price_kind") != "current_price_simulated_fill":
+            return False
+        if not rec.get("mint") or not isinstance(rec.get("features"), dict):
+            return False
+        nums = {}
+        for key in ("pnl_usd", "realized_mult", "entry_ts", "close_ts"):
+            value = _num(rec.get(key))
+            if value is None or not math.isfinite(value):
+                return False
+            nums[key] = value
+        if nums["entry_ts"] < 0 or nums["close_ts"] < nums["entry_ts"] \
+                or nums["realized_mult"] < 0:
+            return False
+        for value in rec["features"].values():
+            if value is not None:
+                parsed = _num(value)
+                if parsed is None or not math.isfinite(parsed):
+                    return False
+        return True
     except Exception:
         return False
+
 
 
 def _summarize(rows):
@@ -527,6 +547,16 @@ def _summarize(rows):
     resolved = max((_num(r.get("close_ts")) or 0 for r in rows),
                    default=0) or None
     return closes, wins, net, resolved
+
+
+def _recorded_economics(rows):
+    """Recorded figures, not executable proceeds or qualified performance."""
+    valid = [_num(r.get("pnl_usd")) for r in rows]
+    valid = [v for v in valid if v is not None and math.isfinite(v)]
+    return {"records": len(rows), "finite_pnl_records": len(valid),
+            "invalid_or_missing_pnl_records": len(rows) - len(valid),
+            "recorded_pnl_usd": round(sum(valid), 4),
+            "evidence_status": "simulated_unvalidated_not_executable_truth"}
 
 
 def generate_lessons(lane, decisions, generated_at=None):
@@ -615,8 +645,17 @@ def generate_lessons(lane, decisions, generated_at=None):
             "resolved_at": resolved if closes else None,
             "n_settled": len(settled),
             "n_qualified": len(qualified),
+            "n_qualified_semantics": "eligible_for_advisory_statistics_only_not_performance_qualified",
+            "all_settled_recorded_economics": _recorded_economics(settled),
+            "included_recorded_economics": _recorded_economics(qualified),
+            "excluded_recorded_economics": _recorded_economics(excluded),
+            "excluded_by_price_kind": {kind: _recorded_economics([r for r in excluded
+                if str(r.get("exit_price_kind") or "unknown") == kind])
+                for kind in sorted({str(r.get("exit_price_kind") or "unknown")
+                                    for r in excluded})},
             "n_excluded_unqualified": len(excluded),
             "learning_price_kind": "current_price_simulated_fill",
+            "learning_evidence_status": "simulated_unvalidated_not_performance_qualified",
             "lessons": lessons,
             "visibility": _vis,
         }
@@ -699,6 +738,10 @@ def context_block(lane, n=5, home=None):
                     "(no settled decisions reflected)." % lane)
         lines = ["Decision-memory lessons for %s (advisory only — "
                  "never gate entries):" % lane]
+        payload = read_lessons(lane, home) or {}
+        lines.append("Simulated, unvalidated subset: %s included of %s settled; %s excluded. Not qualified performance. Selective missingness can bias this subset." % (
+            payload.get("n_qualified", "unknown"), payload.get("n_settled", "unknown"),
+            payload.get("n_excluded_unqualified", "unknown")))
         for l in top:
             lines.append("- %s" % l.get("text", ""))
         return "\n".join(lines)

@@ -306,8 +306,11 @@ def provider_health_gate_mode() -> str:
     any named provider not-ok blocks the entry. "all_down"
     (2026-11-23, section 4.5 faithful to the fallback chain): the
     entry is refused only when NO named provider is known-ok -
-    a primary outage absorbed by a healthy fallback is not
-    missing reliable data. Unknown mode strings fail closed
+    Configured names must be interchangeable for the SAME
+    entry-critical capability. This status-only gate cannot establish
+    capability coverage; mixing unrelated provider roles is invalid.
+    A healthy provider does not prove any particular read succeeded.
+    Unknown mode strings fail closed
     (treated as incomplete configuration)."""
     return os.environ.get("PROVIDER_HEALTH_GATE_MODE") or "any_down"
 

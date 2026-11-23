@@ -80,6 +80,8 @@ def main(argv=None):
               % (now, lane, n, len(payload.get("lessons") or []),
                  payload.get("generated_at") or 0,
                  payload.get("resolved_at")))
+        print("  Advisory subset: %s included, %s excluded; simulated/unvalidated, not qualified performance. Missingness may bias results." % (
+            payload.get("n_qualified", "unknown"), payload.get("n_excluded_unqualified", "unknown")))
         for lesson in L._rank(payload.get("lessons") or [])[:5]:
             print("  - %s" % lesson.get("text", ""))
     return 0

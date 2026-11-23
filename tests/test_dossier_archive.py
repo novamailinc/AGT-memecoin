@@ -27,6 +27,7 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         FAILS.append(name)
+        raise AssertionError(name)
 
 
 class _Ctx:
@@ -1051,7 +1052,7 @@ def test_fixture_failure_paths_not_hidden():
     def _wait_dossier(m):
         for _ in range(200):
             d = dossiers.read_dossier(m)
-            if d:
+            if d and (d.get("safety") or {}).get("ts", 0) > 0:
                 return d
             time.sleep(0.05)
         return None
@@ -1074,7 +1075,9 @@ def test_fixture_failure_paths_not_hidden():
             d2 = _wait_dossier("MINT-F2")
             check("fixture: reserve failure does not break build",
                   d2 is not None
-                  and d2.get("curve_samples") == [])
+                  and d2.get("curve_samples") == []
+                  and d2["reserve_acquisition"]["status"] == "unavailable"
+                  and d2["reserve_acquisition"]["reason"] == "acquisition_failed")
             check("fixture: unknown safety stays unknown",
                   ((d2 or {}).get("safety") or {})
                   .get("report", {}).get("unknown") is True)

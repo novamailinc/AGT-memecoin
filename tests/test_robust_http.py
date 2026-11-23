@@ -12,23 +12,25 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
     if not cond: fails.append(name)
 
-# 1. Live smoke: both APIs respond through the hardened client
-# (uses high tries; proxy has bad moments — client must ride through)
+# 1. Offline success fixture. Live provider smoke is not a regression test.
+import threading, http.server
+class _HSuccess(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"data":[{"id":"fixture"}],"schemaVersion":"fixture"}')
+    def log_message(self, *a):
+        pass
+_success = http.server.HTTPServer(("127.0.0.1", 0), _HSuccess)
+threading.Thread(target=_success.serve_forever, daemon=True).start()
 try:
-    d = rh.get_json("https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
-                    tries=10, timeout=25)
-    check("gecko live", isinstance(d.get("data"), list) and len(d["data"]) > 0)
-except Exception as e:
-    check("gecko live (%s)" % str(e)[:40], False)
-
-try:
-    d = rh.get_json("https://api.dexscreener.com/latest/dex/pairs/solana/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB5",
-                    tries=10, timeout=25)
-    # API returns dict with schemaVersion; pair data may be null for dead pairs
-    ok = isinstance(d, dict) and "schemaVersion" in d
-    check("dex live", ok)
-except Exception as e:
-    check("dex live (%s)" % str(e)[:40], False)
+    d = rh.get_json("http://127.0.0.1:%d/success" % _success.server_port,
+                    tries=1, timeout=2)
+    check("local fixture success", isinstance(d.get("data"), list)
+          and d.get("schemaVersion") == "fixture")
+finally:
+    pass  # reused for the local rate-gap check below
 
 # 2. Fail-fast on 404 (no retry storm): should raise quickly.
 # Hermetic: a local 404 responder, not a live API — the live version of
@@ -110,12 +112,14 @@ rh._last_call.clear()
 # clear any fails from 404 test so circuit doesn't interfere
 rh._circuit_fails.clear()
 try:
-    rh.get_json("https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1", tries=10, timeout=25)
-    rh.get_json("https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=2", tries=10, timeout=25)
+    rh.MIN_GAP["127.0.0.1:%d" % _success.server_port] = 1.0
+    for page in (1, 2):
+        rh.get_json("http://127.0.0.1:%d/page%d" % (_success.server_port, page), tries=1, timeout=2)
     dt = time.time() - t0
     check("min gap enforced (%.1fs >= 1.0s)" % dt, dt >= 1.0)
 except Exception as e:
     check("min gap (%s)" % str(e)[:40], False)
 
+_success.shutdown()
 print("\n%d failures" % len(fails))
 sys.exit(1 if fails else 0)

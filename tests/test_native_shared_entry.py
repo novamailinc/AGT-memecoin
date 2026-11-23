@@ -199,8 +199,23 @@ class TestNativeSharedEntry:
         tickets={p['ticket'] for p in state['degen_positions'].values()}
         assert tickets=={1,2}
         assert card['entry']['volume_sol']==.04
-        a.close_position(1)
-        a.close_position(2)
+        # Real scanner time-stop decision, actual adapter closes and economics.
+        for position in state['degen_positions'].values():
+            position['entry_ts']=time.time()-30*3600
+        degen.trail_trigger_pct=50.
+        degen.trail_drawdown_pct=30.
+        published=[]
+        from agent import events
+        with patch.object(events,'publish',side_effect=published.append), \
+                patch.object(scanner,'_grade_deployer_close'), \
+                patch.object(scanner,'_record_narrative_close'), \
+                patch.object(scanner,'_backtest_record_paper_close'):
+            scanner._manage_exits(SimpleNamespace(degen=degen),a,state)
+        assert state['degen_positions']=={}
+        closes=[e for e in published if e.get('event')=='position.closed']
+        assert len(closes)==2
+        assert {e['reason'] for e in closes}=={'degen_max_hold'}
+        assert all(e['profit']==0. for e in closes)
         pending=pa.snapshot()['pending_sol']
         assert len(pending)==2 and pa.snapshot()['cash']==6.
         assert all(x['ok'] for x in a.settle_pending_usd({

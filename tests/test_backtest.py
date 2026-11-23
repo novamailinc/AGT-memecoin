@@ -242,7 +242,7 @@ class BacktestEngineTest(unittest.TestCase):
     def test_failed_entry_execution_counted_not_traded(self):
         eng = backtest.BacktestEngine(
             exit_rules={"tp_ladder": [(2.0, 0.5)]},
-            costs={"fail_prob_entry": 1.0}, seed=1)
+            costs={"fee_bps": 0.0, "fail_prob_entry": 1.0}, seed=1)
         r = eng.run([_hist([1.0, 2.0, 1.0])])
         self.assertEqual(r["n_trades"], 0)
         self.assertEqual(r["n_failed_entry_executions"], 1)
@@ -251,7 +251,7 @@ class BacktestEngineTest(unittest.TestCase):
         eng = backtest.BacktestEngine(
             exit_rules={"tp_ladder": [(2.0, 0.5)], "trailing_stop_pct": 30.0,
                         "time_stop_h": 6.0},
-            costs={"fail_prob_exit": 1.0}, seed=1)
+            costs={"fee_bps": 0.0, "fail_prob_exit": 1.0}, seed=1)
         r = eng.run([_hist([1.0, 2.0, 1.0])])
         trade = r["trades"][0]
         self.assertEqual(trade["exit_reason"], "exit-failed")
@@ -270,6 +270,35 @@ class BacktestEngineTest(unittest.TestCase):
                          r2["n_failed_entry_executions"])
         self.assertEqual(r1["trades"], r2["trades"])
 
+    def test_costs_require_explicit_fee(self):
+        # Unknown venue fee must never silently inherit a default.
+        with self.assertRaises(ValueError):
+            backtest.BacktestEngine(costs={"slippage_bps": 50.0})
+        # An explicit 0.0 is a deliberate choice and allowed.
+        backtest.BacktestEngine(costs={"fee_bps": 0.0})
+
+    def test_evidence_labels(self):
+        r = backtest.BacktestEngine().run([])
+        self.assertEqual(r["evidence_label"],
+                         "costs_disabled_not_stage_a_evidence")
+        r = backtest.BacktestEngine(costs={"fee_bps": 125.0}).run([])
+        self.assertEqual(r["evidence_label"],
+                         "scenario_assumptions_not_calibrated")
+
+    def test_failed_exit_stays_visible_as_inventory(self):
+        eng = backtest.BacktestEngine(
+            exit_rules={"tp_ladder": [(2.0, 0.5)], "trailing_stop_pct": 30.0,
+                        "time_stop_h": 6.0},
+            costs={"fee_bps": 0.0, "fail_prob_exit": 1.0}, seed=1)
+        r = eng.run([_hist([1.0, 2.0, 1.0])])
+        self.assertEqual(len(r["open_inventory"]), 1)
+        inv = r["open_inventory"][0]
+        self.assertGreater(inv["remainder_frac"], 0.99)
+        self.assertEqual(inv["last_mult"], 1.0)
+        self.assertGreater(inv["cost_basis_mult"], 0.99)
+        # ...and it is still in the headline tallies, not excluded.
+        self.assertEqual(r["n_trades"], 1)
+
     # -- Stage A chronological dev/eval separation ---------------------
     def test_holdout_split_is_chronological(self):
         hists = []
@@ -284,6 +313,29 @@ class BacktestEngineTest(unittest.TestCase):
         self.assertEqual(split["dev"]["n_histories"], 7)
         self.assertEqual(split["eval"]["n_histories"], 3)
 
+    def test_holdout_eval_independent_of_dev(self):
+        # Boundary-leakage guard: eval outcomes must be identical whether
+        # or not the dev segment ran first (no shared randomness/state).
+        hists = []
+        for i in range(10):
+            h = backtest.synthetic_history(seed=i, n_snaps=20)
+            for s in h["snapshots"]:
+                s["t"] += i * 100000.0
+            hists.append(h)
+        costs = {"fee_bps": 125.0, "fail_prob_entry": 0.4,
+                 "fail_prob_exit": 0.2}
+        eng = backtest.BacktestEngine(costs=costs, seed=10)
+        split = eng.run_with_holdout(hists, 0.5)
+        standalone = backtest.BacktestEngine(costs=costs,
+                                             seed=10 + 2).run(hists[5:])
+        self.assertEqual(split["eval"]["trades"], standalone["trades"])
+        self.assertEqual(split["eval"]["n_failed_entry_executions"],
+                         standalone["n_failed_entry_executions"])
+        # dev + eval histories partition the input: nothing lost or
+        # duplicated across the boundary.
+        self.assertEqual(split["dev"]["n_histories"] +
+                         split["eval"]["n_histories"], 10)
+
     def test_cli_with_costs_and_holdout(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "h.jsonl")
@@ -294,13 +346,34 @@ class BacktestEngineTest(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = backtest.main([path, "--with-costs",
+                                    "--venue", "pumpfun-curve",
                                     "--holdout", "0.25"])
             self.assertEqual(rc, 0)
             out = buf.getvalue()
             self.assertIn("costs: fee 125bps", out)
+            self.assertIn("EVIDENCE: scenario_assumptions_not_calibrated",
+                          out)
             self.assertIn("failed executions:", out)
             self.assertIn("DEV segment", out)
             self.assertIn("EVAL holdout", out)
+
+    def test_cli_costs_without_fee_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "h.jsonl")
+            backtest.record_history(
+                path, backtest.synthetic_history(seed=5, n_snaps=10))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = backtest.main([path, "--with-costs"])
+            self.assertEqual(rc, 2)
+            self.assertIn("--fee-bps", buf.getvalue())
+            # no costs flag: plain replay still prints its non-evidence label
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = backtest.main([path])
+            self.assertEqual(rc, 0)
+            self.assertIn("EVIDENCE: costs_disabled_not_stage_a_evidence",
+                          buf.getvalue())
 
     def test_cli_parses_overrides(self):
         with tempfile.TemporaryDirectory() as d:

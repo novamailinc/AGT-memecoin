@@ -94,7 +94,18 @@ class BacktestEngine:
         # prices: buys execute at price*(1+drag), sells at price*(1-drag).
         costs = dict(costs or {})
         self.costs_enabled = bool(costs)
+        if self.costs_enabled and costs.get("fee_bps") is None:
+            # Fail closed: an unknown venue fee must never silently
+            # inherit the pump.fun curve rate (or zero). Pass an
+            # explicit fee_bps - 0.0 is fine when DELIBERATE.
+            raise ValueError(
+                "cost model requires an explicit fee_bps (venue fee); "
+                "unknown venue must not silently inherit a default")
         self.cost_fee_bps = _f(costs.get("fee_bps"))
+        self._cfg_entry = dict(entry_rules or {})
+        self._cfg_exit = dict(exit_rules or {})
+        self._cfg_costs = dict(costs) if self.costs_enabled else None
+        self._seed = seed
         self.cost_slippage_bps = _f(costs.get("slippage_bps"))
         self.cost_impact_bps = _f(costs.get("price_impact_bps"))
         self.cost_fail_entry = _f(costs.get("fail_prob_entry"))
@@ -266,6 +277,9 @@ class BacktestEngine:
             "max_drawdown_mult": max_dd,
             "exit_reason": exit_reason,
             "failed_exit_attempts": failed_exits,
+            # Unsold remainder: open inventory, NOT realized proceeds.
+            "remainder_frac": remainder,
+            "last_mult": last_mult,
         }
 
     # -- realized paper tally ------------------------------------------
@@ -313,6 +327,13 @@ class BacktestEngine:
         """Replay histories. Returns the report dict (never raises)."""
         report: Dict[str, Any] = {
             "schema_version": HISTORY_SCHEMA_VERSION,
+            # Cost-free replays are NEVER qualifying Stage A evidence;
+            # the cost model's fixed drags and seeded failures are
+            # scenario assumptions, not calibrated execution evidence.
+            "evidence_label": (
+                "scenario_assumptions_not_calibrated"
+                if self.costs_enabled else
+                "costs_disabled_not_stage_a_evidence"),
             "n_histories": 0,
             "n_trades": 0,
             "wins": 0,
@@ -332,6 +353,10 @@ class BacktestEngine:
             "costs_enabled": self.costs_enabled,
             "n_failed_entry_executions": 0,
             "n_failed_exit_executions": 0,
+            # Positions whose exit never fully executed stay VISIBLE as
+            # inventory/exposure: they are never treated as realized
+            # proceeds and never dropped from the headline tallies.
+            "open_inventory": [],
             # Realized paper outcomes (outcome_kind="paper"): what the bot
             # actually did — never re-simulated, tallied as reported.
             "paper": {
@@ -431,8 +456,20 @@ class BacktestEngine:
                 "exit_reason": trade["exit_reason"],
                 "peak_mult": round(trade["peak_mult"], 4),
                 "max_drawdown_mult": round(trade["max_drawdown_mult"], 4),
+                "remainder_frac": round(_f(trade.get("remainder_frac")), 6),
             }
             report["trades"].append(trade_rec)
+            if _f(trade.get("remainder_frac")) > 1e-9:
+                # Unclosed exposure stays visible as inventory; its cost
+                # basis (remainder of the 1.0 entry notional) is NOT
+                # realized anywhere.
+                report["open_inventory"].append({
+                    "mint": hist.get("mint"),
+                    "symbol": hist.get("symbol"),
+                    "remainder_frac": round(_f(trade["remainder_frac"]), 6),
+                    "last_mult": round(_f(trade.get("last_mult")), 4),
+                    "cost_basis_mult": round(_f(trade["remainder_frac"]), 6),
+                })
 
         n = report["n_trades"]
         if n:
@@ -498,11 +535,23 @@ class BacktestEngine:
         n = len(ordered)
         frac = min(max(_f(holdout_fraction), 0.0), 1.0)
         k = min(n, max(0, int(round(n * (1.0 - frac)))))
+        # Independent engines per segment: the dev run must not consume
+        # randomness (or any state) that belongs to the eval run -
+        # otherwise dev histories would leak into eval outcomes through
+        # the shared failure-stream (boundary leakage).
+        dev_engine = BacktestEngine(entry_rules=self._cfg_entry,
+                                    exit_rules=self._cfg_exit,
+                                    costs=self._cfg_costs,
+                                    seed=self._seed + 1)
+        eval_engine = BacktestEngine(entry_rules=self._cfg_entry,
+                                     exit_rules=self._cfg_exit,
+                                     costs=self._cfg_costs,
+                                     seed=self._seed + 2)
         return {
             "split_index": k,
             "holdout_fraction": frac,
-            "dev": self.run(ordered[:k]),
-            "eval": self.run(ordered[k:]),
+            "dev": dev_engine.run(ordered[:k]),
+            "eval": eval_engine.run(ordered[k:]),
         }
 
 
@@ -591,6 +640,12 @@ def _parse_tp(spec: str) -> List[Tuple[float, float]]:
 def _print_report(report: Dict[str, Any]) -> None:
     n, t = report["n_histories"], report["n_trades"]
     print("Backtest — %d histories, %d trades" % (n, t))
+    print("EVIDENCE: %s" % report.get("evidence_label", "unknown"))
+    if report.get("open_inventory"):
+        oi = report["open_inventory"]
+        print("OPEN INVENTORY (unclosed exposure, NOT realized): %d "
+              "positions, cost basis %.4fx of entry" % (
+                  len(oi), sum(_f(p.get("cost_basis_mult")) for p in oi)))
     if not t:
         print("no trades taken (all histories blocked or malformed)")
     else:
@@ -674,6 +729,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--fee-bps", type=float, default=None)
     ap.add_argument("--slippage-bps", type=float, default=None)
     ap.add_argument("--impact-bps", type=float, default=None)
+    ap.add_argument("--venue", default=None,
+                    help="named venue fee schedule (pumpfun-curve=125bps, "
+                         "pumpswap-standard=30bps); alternative to "
+                         "--fee-bps")
     ap.add_argument("--holdout", type=float, default=None,
                     help="chronological dev/eval split: the LATER "
                          "fraction (e.g. 0.3) is the evaluation holdout")
@@ -697,8 +756,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     histories = _load_dataset(args.dataset)
     costs: Optional[Dict[str, Any]] = None
     if args.with_costs:
+        # The venue fee is NEVER silently assumed: --fee-bps explicitly,
+        # or a named venue with a published schedule.
+        venue_fees = {"pumpfun-curve": 125.0, "pumpswap-standard": 30.0}
+        if args.fee_bps is not None:
+            fee_bps = args.fee_bps
+        elif args.venue in venue_fees:
+            fee_bps = venue_fees[args.venue]
+        else:
+            print("--with-costs needs an explicit fee: --fee-bps BPS or "
+                  "--venue {%s}" % "|".join(sorted(venue_fees)))
+            return 2
         costs = {
-            "fee_bps": 125.0 if args.fee_bps is None else args.fee_bps,
+            "fee_bps": fee_bps,
             "slippage_bps": (50.0 if args.slippage_bps is None
                              else args.slippage_bps),
             "price_impact_bps": (100.0 if args.impact_bps is None

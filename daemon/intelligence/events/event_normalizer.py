@@ -184,8 +184,11 @@ class EventNormalizer(object):
         """Run the own decoders over one getTransaction result.
 
         Returns (event_type, fields, validation, core_decoded,
-        pump_events). ``fields`` are the decoded event fields of
-        the highest-priority pump event (or {} when none).
+        pump_events, program). ``fields`` are the decoded event fields
+        of the highest-priority pump event (or {} when none).
+        ``program`` is that same winning event's program_id (None
+        when nothing decoded) - the event record's program identity
+        (request section 5) comes from the decoder, never guessed.
         """
         core = _core.decode_transaction(tx) if tx is not None else None
         pump_events = []
@@ -207,9 +210,10 @@ class EventNormalizer(object):
         validation = "unknown"
         if core is not None and (core.get("meta") or {}).get("err") is not None:
             return (EVENT_TYPE_TRANSACTION_FAILED, {}, "unverified",
-                    core, pump_events)
+                    core, pump_events, None)
         best_priority = _EVENT_PRIORITY[EVENT_TYPE_UNKNOWN]
         best_is_event = False
+        best_program = None
         for ev in pump_events:
             etype = ev.get("event_type") or ""
             mapped = _PUMP_EVENT_TYPES.get(etype) \
@@ -231,7 +235,9 @@ class EventNormalizer(object):
                 event_type = mapped
                 fields = ev.get("fields") or {}
                 validation = ev.get("validation") or "unknown"
-        return event_type, fields, validation, core, pump_events
+                best_program = ev.get("program_id")
+        return event_type, fields, validation, core, pump_events, \
+            best_program
 
     def _movement_from_core(self, core):
         """SOL + token movement from the core decoder's meta."""
@@ -313,7 +319,8 @@ class EventNormalizer(object):
             raise ValueError(
                 "observation carries no signature (provider=%s)" % provider)
 
-        event_type, fields, validation, core, _pump = self._decode_own(tx)
+        event_type, fields, validation, core, _pump, program = \
+            self._decode_own(tx)
         sol_movement, token_movement = self._movement_from_core(core)
         accounts = self._normalized_accounts(core, fields)
 
@@ -326,10 +333,27 @@ class EventNormalizer(object):
         if meta_err is not None:
             event_type = EVENT_TYPE_TRANSACTION_FAILED
             validation = "unverified"
+            # A failed transaction still has program identity when the
+            # decoders recognised one; only the outcome changes.
+
+        # Recognition latency (request section 5): on-chain event time
+        # (block_time) to the bot's first recognition of it (this
+        # observation's receipt). Raw difference - clock skew shows up
+        # as a negative value and is itself the evidence; unknown
+        # block_time leaves it None, never zero.
+        recognition_latency_s = None
+        if block_time is not None:
+            try:
+                recognition_latency_s = round(
+                    float(observed_at) - float(block_time), 3)
+            except (TypeError, ValueError):
+                recognition_latency_s = None
 
         event = LogicalEvent(
             signature=signature, slot=slot, block_time=block_time,
             event_type=event_type,
+            program=program,
+            recognition_latency_s=recognition_latency_s,
             commitment=commitment,
             lifecycle_status=commitment,
             decoder_version=DECODER_VERSION,
@@ -344,6 +368,10 @@ class EventNormalizer(object):
         if block_time is not None:
             event.note_provenance("block_time", provider)
         event.note_provenance("event_type", provider)
+        if program is not None:
+            event.note_provenance("program", provider)
+        if recognition_latency_s is not None:
+            event.note_provenance("recognition_latency_s", provider)
         event.note_provenance("normalized_accounts", provider)
         event.note_provenance("sol_movement", provider)
         event.note_provenance("token_movement", provider)
@@ -487,6 +515,29 @@ class EventNormalizer(object):
                 and other.event_type != EVENT_TYPE_UNKNOWN:
             event.event_type = other.event_type
             event.note_provenance("event_type", provider)
+
+        # Program identity: unknown never overwrites known; two known
+        # programs that disagree are a recorded disagreement, never a
+        # silent pick.
+        if other.program is not None and event.program is not None \
+                and other.program != event.program:
+            event.add_disagreement("program", {
+                provider: other.program,
+                "existing": event.program})
+            self.stats["conflicts"] += 1
+        elif event.program is None and other.program is not None:
+            event.program = other.program
+            event.note_provenance("program", provider)
+
+        # Recognition latency: the honest metric is the EARLIEST
+        # recognition, so a later observation can only lower it
+        # (its receipt was earlier relative to the same block time).
+        if other.recognition_latency_s is not None and (
+                event.recognition_latency_s is None
+                or other.recognition_latency_s
+                < event.recognition_latency_s):
+            event.recognition_latency_s = other.recognition_latency_s
+            event.note_provenance("recognition_latency_s", provider)
 
         # Lifecycle: take the strongest confirmation seen.
         order = {"processed": 0, "confirmed": 1, "finalized": 2}

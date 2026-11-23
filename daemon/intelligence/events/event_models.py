@@ -160,7 +160,8 @@ class LogicalEvent(object):
                  normalized_accounts=None, sol_movement=None,
                  token_movement=None, provenance=None,
                  disagreements=None, event_id=None,
-                 created_at=None, updated_at=None):
+                 created_at=None, updated_at=None,
+                 program=None, recognition_latency_s=None):
         self.event_id = event_id or event_id_for(signature, slot)
         self.signature = signature
         self.slot = slot
@@ -180,6 +181,19 @@ class LogicalEvent(object):
         self.token_movement = list(token_movement or [])
         self.provenance = dict(provenance or {})
         self.disagreements = list(disagreements or [])
+        # Program identity (request section 5: every discovery event
+        # must carry program identity). None means UNKNOWN - the
+        # record never guesses; the normalizer fills it from the
+        # winning decoder event's program_id when one exists.
+        self.program = program
+        # Recognition latency (request section 5: measure latency from
+        # the earliest observable event to the bot's recognition).
+        # observed_at (first provider observation receipt) minus
+        # block_time (on-chain event time), seconds. None when
+        # block_time is unknown - never a fabricated zero. Raw value:
+        # clock skew can make it negative, and the raw sign is the
+        # evidence of that skew.
+        self.recognition_latency_s = recognition_latency_s
         now = time.time()
         self.created_at = created_at if created_at is not None else now
         self.updated_at = updated_at if updated_at is not None else now
@@ -255,6 +269,8 @@ class LogicalEvent(object):
             "disagreements": [dict(d) for d in self.disagreements],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "program": self.program,
+            "recognition_latency_s": self.recognition_latency_s,
         }
 
     @classmethod
@@ -283,4 +299,6 @@ class LogicalEvent(object):
             event_id=data.get("event_id"),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
+            program=data.get("program"),
+            recognition_latency_s=data.get("recognition_latency_s"),
         )

@@ -29,7 +29,7 @@ try:
                                     is_expired, load_convergence,
                                     save_convergence, add_sighting,
                                     CONVERGENCE_WINDOW_S)
-    from toxicity import check_toxicity
+    from toxicity import check_toxicity, check_toxicity_detailed
     _HAS_FILTERS = True
 except ImportError:
     _HAS_FILTERS = False
@@ -792,7 +792,16 @@ def try_fire_converged_card(mint, rec, n_groups, retry=False):
         return _block(gate_reason)
     # Toxicity veto (2026-10-17 rebuild): copier-farming fingerprints —
     # bump bots, one-sided wash flow, sniper-swarm launches. Fail-open.
-    toxic, tox_reason = check_toxicity(info)
+    toxic, tox_reason, tox_cov = check_toxicity_detailed(info)
+    # Unknown-vs-safe (2026-11-23): journal which fingerprints actually
+    # RAN on this mint, so a card that passed on absent data reads as
+    # unverifiable in the record, not as clean. No veto-behavior
+    # change: only the coverage journal is new.
+    rec["toxicity_coverage"] = tox_cov
+    if any(v.startswith("unverifiable") for v in tox_cov.values()):
+        logger.warning("TOXICITY COVERAGE %s: %s", mint[:8],
+                       ", ".join("%s=%s" % kv
+                                 for kv in sorted(tox_cov.items())))
     if toxic:
         logger.warning("TOXIC BLOCK %s: %s", mint[:8], tox_reason)
         return _block(tox_reason)

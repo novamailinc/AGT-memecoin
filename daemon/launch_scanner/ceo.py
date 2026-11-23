@@ -159,7 +159,12 @@ def _paper_account():
     if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1":
         return None
     try:
-        from . import paper_account
+        # Absolute with sibling fallback (see grad's note): engine
+        # loader variants exec lane modules outside the package.
+        try:
+            from daemon.launch_scanner import paper_account
+        except ImportError:
+            import paper_account
         return paper_account
     except Exception:
         logger.exception("ceo: paper account unavailable; shared "
@@ -189,7 +194,7 @@ def _pa_settle(pos, qty, gross, fee, suffix):
     if _pa is None:
         return
     mint = pos["mint"]
-    _op = "ceo:%s:%s:%s" % (suffix, mint, pa_pos_id)
+    _op = "%s:%s:%s:%s" % (LANE, suffix, mint, pa_pos_id)
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
                            qty=qty, fee=fee)
     if not _ok:
@@ -892,7 +897,7 @@ def _consider_card(sig):
         # is a new instance with a new entry ts.
         _pa = _paper_account()
         if _pa is not None:
-            _op = "ceo:entry:%s:%d" % (mint,
+            _op = "%s:entry:%s:%d" % (LANE, mint,
                                        int(pos["entry_ts"] * 1000))
             _ok, _why, _pid = _pa.try_debit(LANE, mint, NOTIONAL_USD,
                                             tokens, _op)

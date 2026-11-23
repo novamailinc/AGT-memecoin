@@ -271,7 +271,16 @@ def _paper_account():
     if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1":
         return None
     try:
-        from . import paper_account
+        # Absolute with sibling fallback, like this module's own
+        # import block: engine-loaded lane variants (grad_raw,
+        # grad_select, tranche, ...) exec this file OUTSIDE the
+        # package, where a relative import would fail and the
+        # fail-open guard below would silently disable the shared
+        # gate for every variant lane.
+        try:
+            from daemon.launch_scanner import paper_account
+        except ImportError:
+            import paper_account
         return paper_account
     except Exception:
         logger.exception("grad: paper account unavailable; shared "
@@ -1127,7 +1136,13 @@ def _consider_candidate(cand, now):
             # double-spending. qty is the filled unit amount.
             _born = float(cand.get("created_ts") or 0) or pos["entry_ts"]
             _qty = _stake / float(pos["entry_price"])
-            _op = "grad:entry:%s:%d" % (mint, int(_born * 1000))
+            # LANE (not a literal) keys the op_id: engine-loaded lane
+            # variants (grad_raw, grad_select, tranche, ...) run this
+            # same code under their own LANE override, and two lanes
+            # entering the SAME pool must never collapse onto one
+            # op_id — the retry dedupe would hand the second lane the
+            # first lane's outcome without debiting.
+            _op = "%s:entry:%s:%d" % (LANE, mint, int(_born * 1000))
             _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
                                             _op)
             if not _ok:
@@ -1499,8 +1514,8 @@ def _finalize(d, mint, pos, closed_reason):
         # Full close (qty=None settles all remaining units); op_id
         # is stable per position instance so a retried close after
         # an uncertain response cannot double-credit.
-        _op = "grad:close:%s:%s" % (mint, pos.get("pa_pos_id")
-                                    or "legacy")
+        _op = "%s:close:%s:%s" % (LANE, mint,
+                                  pos.get("pa_pos_id") or "legacy")
         _ok, _why = _pa.credit(LANE, mint, realized, _op,
                                pos_id=pos.get("pa_pos_id"))
         if not _ok:

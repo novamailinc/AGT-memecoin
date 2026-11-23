@@ -249,3 +249,38 @@ class TestNativeFillIntents:
         with pytest.raises(ValueError):
             a.submit_order(_req('BONK', 'BUY', 1., 'b'))
         assert len(fills(a)) == 1
+
+    @pytest.mark.parametrize('matched', [False, True])
+    def test_duplicate_history_preflight_before_any_projection(self, tmp_path, matched):
+        a = ready(tmp_path)
+        with patch.object(a, '_save_state', side_effect=OSError('stop')):
+            with pytest.raises(OSError):
+                a.submit_order(_req('BONK', 'BUY', 1., 'op'))
+        pending = json.loads(a._intent_path().read_text())
+        before = pending['before']
+        module._write_json_atomic(a._state_path(), before)
+        conflict = dict(pending['fill'], native_op_id='different-op')
+        entries = ([pending['fill']] if matched else []) + [conflict]
+        a._fills_path().write_text(''.join(json.dumps(x)+'\n' for x in entries))
+        state_bytes, pending_bytes = a._state_path().read_bytes(), a._intent_path().read_bytes()
+        with pytest.raises(ValueError):
+            ready(tmp_path)
+        assert a._state_path().read_bytes() == state_bytes
+        assert a._intent_path().read_bytes() == pending_bytes
+
+    @pytest.mark.parametrize('recover', [False, True])
+    @pytest.mark.parametrize('change', ['direction', 'volume', 'stop_loss', 'take_profit', 'features', 'signal_id'])
+    def test_request_key_conflict_before_mutation(self, tmp_path, recover, change):
+        a = ready(tmp_path)
+        a.submit_order(_req('BONK', 'BUY', 1., 'op'))
+        if recover:
+            a._idempotency_path().unlink()
+        request = _req('BONK', 'BUY', 1., 'op')
+        setattr(request, change, {'direction':'SELL', 'volume':.1,
+                                 'stop_loss':.1, 'take_profit':9.,
+                                 'features':{'x':1},'signal_id':'other'}[change])
+        before = a._state_path().read_bytes()
+        with pytest.raises(module.BrokerError, match='request conflict'):
+            a.submit_order(request)
+        assert a._state_path().read_bytes() == before
+        assert len(fills(a)) == 1

@@ -35,6 +35,7 @@ import math
 import logging
 import os
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -274,6 +275,8 @@ class MemecoinAdapter(BrokerAdapter):
         This is native-only durability, not shared-capital admission. No market
         quote, FX, FIFO selection or ticket allocation is repeated on recovery.
         """
+        if fill.get("kind") in ("BUY", "SELL"):
+            fill = dict(fill, request_fingerprint=self._request_fingerprint)
         fill = dict(fill, native_op_id=uuid.uuid4().hex,
                     ts=_utcnow().isoformat(), mode=self._mode)
         self._validate_fill(fill)
@@ -313,6 +316,32 @@ class MemecoinAdapter(BrokerAdapter):
         matches = [e for e in entries if e.get("native_op_id") == op_id]
         if matches and (len(matches) != 1 or matches[0] != fill):
             raise ValueError("native pending intent conflicts with fill journal")
+        # Validate the entire history and the intended fill BEFORE either
+        # projection. Even a matching op cannot hide a duplicate elsewhere.
+        keys, operations, request_keys = set(), set(), set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("invalid native fill journal record")
+            pair = (entry.get("ticket"), entry.get("kind"))
+            if pair in keys:
+                raise ValueError("duplicate native fill history")
+            keys.add(pair)
+            operation = entry.get("native_op_id")
+            if operation:
+                if operation in operations:
+                    raise ValueError("duplicate native operation identity")
+                operations.add(operation)
+            request_key = entry.get("idempotency_key")
+            if request_key and entry.get("kind") in ("BUY", "SELL"):
+                if request_key in request_keys:
+                    raise ValueError("duplicate native request identity")
+                request_keys.add(request_key)
+        self._fill_keys_cache = {pair for pair in keys if not matches or
+                                 pair != (fill["ticket"], fill["kind"])}
+        self._fill_buy_ts = {e["ticket"]: e.get("ts") for e in entries
+                            if e.get("kind") == "BUY" and e is not (matches[0] if matches else None)}
+        self._validate_fill(fill)
+        self._fill_keys_cache = None
         self._balance_sol = float(after["balance_sol"])
         self._positions = copy.deepcopy(after["positions"])
         self._next_ticket = int(after["next_ticket"])
@@ -469,6 +498,7 @@ class MemecoinAdapter(BrokerAdapter):
                 message="paper fill (recovered from journal)",
                 raw={"mode": "paper",
                      "tokens": float(entry.get("tokens", 0.0)),
+                     "request_fingerprint": entry.get("request_fingerprint"),
                      **({"realized_pnl_sol": entry["realized_pnl_sol"],
                          "closed_tickets": entry["closed_tickets"]}
                         if entry.get("kind") == "SELL" else {}),
@@ -808,11 +838,18 @@ class MemecoinAdapter(BrokerAdapter):
         (and have refreshed state): this is the read-modify-write
         section — idempotency check, fill, journal, idempotency put
         — that the lock serializes across processes."""
+        request = asdict(req)
+        request["symbol"] = symbol
+        request_fingerprint = hashlib.sha256(json.dumps(
+            request, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        self._request_fingerprint = request_fingerprint
         # Idempotency: a repeated key replays the original fill — the
         # position is never opened twice.
         if req.idempotency_key:
             prior = self._idempotent_get(req.idempotency_key)
             if prior is not None:
+                if prior.get("raw", {}).get("request_fingerprint") != request_fingerprint:
+                    raise BrokerError(INVALID_ORDER, "idempotency request conflict or unbound legacy request")
                 logger.info("idempotent replay for key %s (ticket %s)",
                             req.idempotency_key, prior.get("ticket"))
                 return OrderResult(**prior)
@@ -822,6 +859,8 @@ class MemecoinAdapter(BrokerAdapter):
             recovered = self._idempotent_recover_from_journal(
                 req.idempotency_key)
             if recovered is not None:
+                if recovered.raw.get("request_fingerprint") != request_fingerprint:
+                    raise BrokerError(INVALID_ORDER, "idempotency request conflict or unbound legacy request")
                 logger.info("idempotent recovery from journal for key %s "
                             "(ticket %s)", req.idempotency_key,
                             recovered.ticket)
@@ -964,7 +1003,8 @@ class MemecoinAdapter(BrokerAdapter):
         return OrderResult(ticket=ticket, symbol=symbol, direction="BUY",
                            volume=cost_sol, price=price_sol, retcode=0,
                            message="paper fill",
-                           raw={"mode": "paper", "tokens": tokens})
+                           raw={"mode": "paper", "tokens": tokens,
+                                "request_fingerprint": self._request_fingerprint})
 
     def _paper_sell(self, req: OrderRequest, symbol: str,
                     price_sol: float) -> OrderResult:
@@ -1032,6 +1072,7 @@ class MemecoinAdapter(BrokerAdapter):
                            volume=proceeds_sol, price=price_sol, retcode=0,
                            message="paper fill",
                            raw={"mode": "paper", "tokens": tokens_to_sell,
+                                "request_fingerprint": self._request_fingerprint,
                                 "realized_pnl_sol": realized,
                                 "closed_tickets": closed_tickets})
 

@@ -772,10 +772,53 @@ def test_launch_rollup_preserves_curve_and_migration_kind():
                   len(rollups) == 1
                   and rollups[0].get("launches") == 3
                   and rollups[0].get("migrated") == 1
-                  and rollups[0].get("not_migrated_observed") == 2
+                  and rollups[0].get("not_migrated_recorded") == 1
+                  and rollups[0].get("migration_unrecorded") == 1
                   and rollups[0].get("curve_kind_unknown_curve") == 1
                   and rollups[0].get("curve_kind_single_preliminary_snapshot") == 1
                   and rollups[0].get("curve_kind_multi_sample_curve_sequence") == 1)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.LAUNCH_RAW_S = real_lraw
+
+
+def test_launch_rollup_merge_preserves_new_counters():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_lraw = dossiers.LAUNCH_RAW_S
+        dossiers.ARCHIVE_MAX_BYTES = 100
+        dossiers.LAUNCH_RAW_S = 100
+        try:
+            for i in range(4):
+                migrated = True if i == 0 else (False if i == 1 else None)
+                fields = {"curve_samples": [{"v_sol": 1.0,
+                                             "v_token": 1.0}]}
+                if migrated is not None:
+                    fields["migrated"] = migrated
+                c.write_dossier("MINT-MERGE-%d" % i,
+                                born_ts=now - 90000 - i,
+                                deployer="DEP-MERGE",
+                                safety={"report": {"unknown": False,
+                                                   "source": "x"}},
+                                **fields)
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now)
+            dossiers._maybe_compact_archive(now + 1)
+            first = [r for r in dossiers.launch_archive(limit=1000)
+                     if r.get("record_type") == "launch_rollup"]
+            dossiers._maybe_compact_archive(now + 2)
+            second = [r for r in dossiers.launch_archive(limit=1000)
+                      if r.get("record_type") == "launch_rollup"]
+            check("rollup: second compaction preserves every launch counter",
+                  len(second) == 1
+                  and second[0].get("launches") == 4
+                  and second[0].get("migrated") == 1
+                  and second[0].get("not_migrated_recorded") == 1
+                  and second[0].get("migration_unrecorded") == 2
+                  and second[0].get("curve_kind_single_preliminary_snapshot") == 4
+                  and second[0].get("launches")
+                  == first[0].get("launches"))
         finally:
             dossiers.ARCHIVE_MAX_BYTES = real_cap
             dossiers.LAUNCH_RAW_S = real_lraw

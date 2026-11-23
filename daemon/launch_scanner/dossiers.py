@@ -295,10 +295,12 @@ def _archive_dossier(d, now):
             if isinstance(report, dict) else None,
             "initial_buy_sol": d.get("initial_buy_sol"),
             "market_cap_sol": d.get("market_cap_sol"),
-            "migrated": bool(d.get("migrated")),
+            "migrated": (True if d.get("migrated") is True else
+                (False if d.get("migrated") is False else None)),
             "reserve_samples": len(d.get("curve_samples")
                 if "curve_samples" in d else (d.get("reserve_samples") or [])),
-            "migrated": bool(d.get("migrated")),
+            "migrated": (True if d.get("migrated") is True else
+                (False if d.get("migrated") is False else None)),
             "curve_kind": _classify_curve_samples(d.get("curve_samples")
                 if "curve_samples" in d else (d.get("reserve_samples") or [])),
             "reserve_acquisition": d.get("reserve_acquisition") or {
@@ -639,11 +641,14 @@ def _rollup_add_launch(row, rec):
         row["conclusive"] += 1
     elif sv == "unknown":
         row["unknown"] += 1
-    if bool(rec.get("migrated")):
+    if rec.get("migrated") is True:
         row["migrated"] = row.get("migrated", 0) + 1
+    elif rec.get("migrated") is False:
+        row["not_migrated_recorded"] = row.get(
+            "not_migrated_recorded", 0) + 1
     else:
-        row["not_migrated_observed"] = row.get(
-            "not_migrated_observed", 0) + 1
+        row["migration_unrecorded"] = row.get(
+            "migration_unrecorded", 0) + 1
     kind = rec.get("curve_kind")
     if not kind:
         kind = "unknown_curve"  # no curve/reserve evidence recorded
@@ -748,10 +753,12 @@ def _maybe_compact_archive(now):
                                str(rec.get("year") or ""))
                         lru = launch_rollups.setdefault(
                             key, _launch_rollup_row(*key))
-                        for k in ("launches", "conclusive",
-                                  "unknown"):
+                        for k, v in rec.items():
+                            if k in ("v", "record_type", "deployer",
+                                     "year"):
+                                continue
                             try:
-                                lru[k] += int(rec.get(k) or 0)
+                                lru[k] = lru.get(k, 0) + int(v or 0)
                             except Exception:
                                 pass
                     elif rtype == "launch" and rec.get("mint"):

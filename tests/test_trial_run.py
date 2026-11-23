@@ -251,5 +251,47 @@ finally:
     except Exception:
         pass
 
+# 10. SIGTERM to the wrapper kills the child process group too (no
+#     orphaned lane consuming the network outside the trial).
+with tempfile.TemporaryDirectory() as td:
+    pidfile = os.path.join(td, "pids")
+    env = dict(os.environ)
+    env["FOREX_AGENT_HOME"] = td
+    p = subprocess.Popen(
+        [sys.executable, TRIAL, "--seconds", "300", "--",
+         sys.executable, "-c",
+         "import os, time\n"
+         "open(%r, 'w').write(str(os.getpid()))\n"
+         "time.sleep(300)" % pidfile],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+    for _ in range(50):
+        if os.path.exists(pidfile):
+            break
+        time.sleep(0.1)
+    with open(pidfile) as f:
+        child_pid = int(f.read().strip())
+    p.send_signal(15)  # SIGTERM
+    p.wait(timeout=30)
+    child_dead = True
+    try:
+        os.kill(child_pid, 0)
+        child_dead = False
+    except (ProcessLookupError, PermissionError):
+        pass
+    check("sigterm: wrapper exits and child group is dead",
+          p.returncode is not None and child_dead)
+
+# 11. The TLS path is patched too: inside the child, SSLSocket.recv
+#     is the scanning wrapper (same scanner as plaintext, tested in 9).
+rc, out, so, se, _ = run_trial(
+    ["--seconds", "30", "--", sys.executable, "-c",
+     "import ssl, socket\n"
+     "assert ssl.SSLSocket.recv.__name__ == '_ssl_recv_trial'\n"
+     "assert socket.socket.recv.__name__ == '_recv_trial'\n"
+     "print('patches ok')"])
+check("tls: SSLSocket.recv and socket.recv are patched in child",
+      "patches ok" in so)
+
 print("FAILURES: %d" % len(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)

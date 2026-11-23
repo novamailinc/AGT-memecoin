@@ -140,21 +140,41 @@ _socket.socket.connect = _connect_trial
 
 # 429 detection for raw-socket HTTP handshakes (the logstream WSClient
 # reads its own status line, bypassing urllib). The handshake response
-# is the first bytes on a fresh connection and starts with "HTTP/";
-# upgraded WS frames never do, so this cannot trip on stream data.
+# is the first application bytes on a fresh connection and starts with
+# "HTTP/"; upgraded WS frames never do, so this cannot false-trip on
+# stream data. Over TLS the WSClient wraps its socket with
+# ssl.wrap_socket, so reads arrive via SSLSocket.recv: patch both.
 _real_recv = _socket.socket.recv
 
 
-def _recv_trial(self, bufsize, flags=0):
-    data = _real_recv(self, bufsize, flags)
+def _check_429(data):
     if data[:5] == b"HTTP/":
         line = data.split(b"\r\n", 1)[0]
         if b" 429" in line:
             open(_TRIP, "a").close()
+
+
+def _recv_trial(self, bufsize, flags=0):
+    data = _real_recv(self, bufsize, flags)
+    _check_429(data)
     return data
 
 
 _socket.socket.recv = _recv_trial
+
+try:
+    import ssl as _ssl
+
+    _real_ssl_recv = _ssl.SSLSocket.recv
+
+    def _ssl_recv_trial(self, bufsize=1024, flags=0):
+        data = _real_ssl_recv(self, bufsize, flags)
+        _check_429(data)
+        return data
+
+    _ssl.SSLSocket.recv = _ssl_recv_trial
+except Exception:
+    pass  # ssl always present in the supported runtimes
 '''
 
 
@@ -195,8 +215,13 @@ def main(argv):
             pass
         while True:
             time.sleep(3600)
-    with open(consumed, "w") as f:
+    # Stamp the marker ATOMICALLY before any child (network) activity:
+    # a crash mid-write can never leave a half marker, and a restart
+    # sees the marker and idles before touching the network.
+    tmp_marker = consumed + ".tmp"
+    with open(tmp_marker, "w") as f:
         f.write(str(time.time()))
+    os.replace(tmp_marker, consumed)
     for p in (count_file, trip_file, count_file + ".lock"):
         try:
             os.remove(p)
@@ -224,6 +249,27 @@ def main(argv):
     env["TRIAL_REAL_CURL"] = real_curl
 
     child = subprocess.Popen(args, env=env, start_new_session=True)
+
+    def _stop_child(signum=None, frame=None):
+        # On SIGTERM/SIGINT (deploy stop, timeout kill), take the whole
+        # child process group down too: an orphaned lane would keep
+        # consuming the network outside the trial bounds.
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        raise SystemExit(128 + (signum or 0))
+
+    signal.signal(signal.SIGTERM, _stop_child)
+    signal.signal(signal.SIGINT, _stop_child)
     deadline = time.monotonic() + seconds
     outcome = "completed"
     while True:

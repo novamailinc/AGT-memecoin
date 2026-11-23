@@ -206,6 +206,40 @@ def pending(lane: str) -> List[Dict[str, Any]]:
             and st["frozen"] is None]
 
 
+def tranche_lane_done(d: Dict[str, Any], pos_id: Optional[str],
+                      mint: str, suffix: Optional[str]) -> bool:
+    """True when lane-ledger dict `d` reflects the lane-side write
+    for a TRANCHE-lane intent (watcher/ceo/momentum shape:
+    positions with legs a/b/c, closes list). Matching rules:
+    a close record carrying this pos_id always counts (the
+    position fully closed); otherwise the open position must
+    belong to the same account instance and show the intent's
+    legs done: 'leg:X' -> leg X done, 'remaining:XYZ' -> all of
+    X,Y,Z done, 'writedown' -> any leg done at write_down_zero."""
+    for rec in d.get("closes", []):
+        if pos_id and rec.get("pa_pos_id") == pos_id:
+            return True
+        if not pos_id and rec.get("mint") == mint:
+            return True
+    pos = (d.get("positions") or {}).get(mint)
+    if pos is None:
+        return False
+    if pos_id and pos.get("pa_pos_id") != pos_id:
+        return False
+    legs = pos.get("legs") or {}
+    if suffix and suffix.startswith("leg:"):
+        return bool((legs.get(suffix[4:]) or {}).get("done"))
+    if suffix and suffix.startswith("remaining:"):
+        ks = suffix[10:]
+        return bool(ks) and all(
+            (legs.get(k) or {}).get("done") for k in ks)
+    if suffix == "writedown":
+        return any(v.get("done")
+                   and v.get("exit_price_kind") == "write_down_zero"
+                   for v in legs.values())
+    return False
+
+
 def recover_lane(
     lane: str,
     account_apply: Callable[[Dict[str, Any]], Tuple[bool, str]],

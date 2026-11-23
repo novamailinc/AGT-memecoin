@@ -303,90 +303,40 @@ def get_buy_details(wallet, sig, api_key, tx=_UNFETCHED, strict=False):
         return None if strict else []
 
 
-def get_sold_mints(wallet, sig, api_key, tx=_UNFETCHED):
-    """Extract sold mints from a transaction (for hold-time tracking).
+def get_sold_mints(wallet, sig, api_key, tx=_UNFETCHED, details=False):
+    """Validated wallet balance decreases, not instruction-proven swaps.
 
-    Phase 1: we need to know when wallets EXIT to identify farmers
-    (sub-30s holds = farming copiers as exit liquidity).
-    Returns [(mint, sold_fraction)] where sold_fraction is 0-1 of
-    the pre-transaction balance that was sold.
+    Closed accounts contribute zero post balance. Same-wallet account
+    transfers aggregate before comparison. Existing >50% selector retained.
+    details=True carries causal identity and block time for durable recording.
     """
     if tx is _UNFETCHED:
-        tx = rpc("getTransaction",
-                 [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}], api_key)
-    if not tx:
+        tx=rpc('getTransaction',[sig,{'encoding':'json','maxSupportedTransactionVersion':0}],api_key)
+    if get_buy_details(wallet,sig,api_key,tx=tx,strict=True) is None:
         return []
-    out = []
-    try:
-        meta = tx.get("meta") or {}
-        for b in (meta.get("postTokenBalances") or []):
-            mint = b.get("mint", "")
-            if not mint.endswith("pump"):
-                continue
-            owner = b.get("owner", "")
-            if not (isinstance(owner, str) and owner == wallet):
-                continue
-            pre_amt = 0
-            for pb in (meta.get("preTokenBalances") or []):
-                if (pb.get("mint") == mint and
-                        pb.get("owner") == b.get("owner")):
-                    pre_amt = float(
-                        (pb.get("uiTokenAmount") or {}).get("uiAmount") or 0)
-            post_amt = float(
-                (b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
-            if pre_amt > 0 and post_amt < pre_amt:
-                sold_frac = (pre_amt - post_amt) / pre_amt
-                if sold_frac > 0.5:  # meaningful exit, not dust
-                    out.append((mint, sold_frac))
-    except Exception:
-        pass
+    meta=tx['meta'];before,after={},{}
+    for field,target in (('preTokenBalances',before),('postTokenBalances',after)):
+        for balance in meta[field]:
+            if balance['owner']==wallet:
+                mint=balance['mint']
+                target[mint]=target.get(mint,0.0)+float(balance['uiTokenAmount']['uiAmount'])
+    out=[]
+    for mint,pre in before.items():
+        post=after.get(mint,0.0)
+        if mint.endswith('pump') and pre>0 and post<pre:
+            fraction=(pre-post)/pre
+            if fraction>0.5:
+                out.append({'mint':mint,'sold_fraction':fraction,'signature':sig,
+                            'block_ts':float(tx['blockTime']),
+                            'provenance':'successful_transaction_balance_decrease'}
+                           if details else (mint,fraction))
     return out
 
 
 def _record_sells(wallet, sells):
-    """Record wallet sells and compute hold times.
-
-    Phase 1: identifies farmers (wallets that buy then dump in <30s,
-    using copiers as exit liquidity). Hold times are stored in the
-    grades file for the farmer-detection filter.
-    sells: [(mint, sold_fraction)]
-    """
-    grades_path = os.path.join(HOME, "launch_scanner", "smart_wallet_grades.json")
-    try:
-        with open(grades_path) as f:
-            grades = json.load(f)
-    except Exception:
-        return
-    # Find wallet key (prefix match)
-    wkey = None
-    for k in grades:
-        if k.startswith(wallet[:8]):
-            wkey = k
-            break
-    if not wkey:
-        return
-    now = time.time()
-    updated = False
-    for mint, sold_frac in sells:
-        # Find the most recent unmatched buy for this mint
-        buys = grades[wkey].get("buys", [])
-        for b in reversed(buys):
-            if b.get("mint") == mint and not b.get("sell_ts"):
-                b["sell_ts"] = now
-                b["hold_sec"] = now - b.get("buy_ts", now)
-                b["sold_frac"] = sold_frac
-                updated = True
-                if b["hold_sec"] < 30:
-                    logger.warning(
-                        "FARMER SIGNAL: %s held %s for %.0fs",
-                        wallet[:6], mint[:8], b["hold_sec"])
-                break
-    if updated:
-        try:
-            with open(grades_path, "w") as f:
-                json.dump(grades, f)
-        except Exception:
-            pass
+    """Persist causal sell evidence, never guess a buy match or hold time."""
+    import smartgrade
+    return smartgrade.record_wallet_sells(wallet,sells)
 
 
 def _instant_safety_fallback(mint):
@@ -1430,8 +1380,9 @@ def poll_wallet(wallet, api_key, registry, seen, intake):
             if buy['mint'] not in seen:
                 if handle_sighting(wallet,buy,registry,seen) is not True:
                     raise OSError('sighting was not durably accepted')
-        sold=get_sold_mints(wallet,signature,api_key,tx=tx)
-        if sold:_record_sells(wallet,sold)
+        sold=get_sold_mints(wallet,signature,api_key,tx=tx,details=True)
+        if sold and _record_sells(wallet,sold) is not True:
+            raise OSError('sell evidence was not durably accepted')
         # Seen is durable before acknowledging intake. Crash before
         # this point retries rather than losing the acquisition.
         _persist_seen_before_ack(seen)

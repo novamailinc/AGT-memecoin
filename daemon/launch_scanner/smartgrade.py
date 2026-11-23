@@ -37,6 +37,10 @@ Storage: ``~/.forex-agent/launch_scanner/smart_wallet_grades.json``
 from __future__ import annotations
 
 import json
+import fcntl
+import functools
+import tempfile
+import math
 import logging
 import os
 import statistics
@@ -64,24 +68,83 @@ def _num(name: str, degen: Any, default: float) -> float:
         return default
 
 
+def serialized_grades(fn):
+    @functools.wraps(fn)
+    def wrapped(*args,**kwargs):
+        _GRADES_FILE.parent.mkdir(parents=True,exist_ok=True)
+        with open(str(_GRADES_FILE)+'.lock','a') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            return fn(*args,**kwargs)
+    return wrapped
+
+
 def load_grades() -> Dict[str, Dict[str, Any]]:
     try:
-        data = json.loads(_GRADES_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+        data=json.loads(_GRADES_FILE.read_text())
+    except FileNotFoundError:
         return {}
+    if not isinstance(data,dict) or any(not isinstance(k,str) or not isinstance(v,dict) for k,v in data.items()):
+        raise ValueError('wallet grades unavailable')
+    return data
 
 
 def save_grades(grades: Dict[str, Dict[str, Any]]) -> bool:
+    tmp=None
     try:
         _GRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _GRADES_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(grades))
-        os.chmod(tmp, 0o600)
-        tmp.replace(_GRADES_FILE)
+        fd,tmp=tempfile.mkstemp(dir=_GRADES_FILE.parent,prefix='.wallet-grades-')
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w') as f:
+            json.dump(grades,f,allow_nan=False);f.flush();os.fsync(f.fileno())
+        os.replace(tmp,_GRADES_FILE)
+        directory=os.open(_GRADES_FILE.parent,os.O_RDONLY)
+        try:os.fsync(directory)
+        finally:os.close(directory)
         return True
-    except OSError as exc:
-        logger.warning("could not save smart wallet grades: %s", exc)
+    except (OSError,ValueError,TypeError) as exc:
+        logger.warning('could not save smart wallet grades: %s',exc)
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):os.unlink(tmp)
+
+
+@serialized_grades
+def record_wallet_sells(wallet,sells):
+    """Exact wallet+signature+mint evidence, no heuristic buy matching.
+
+    Keeps transaction block time and observation time separate. A balance
+    decrease is not an instruction-proven swap or a measured holding period.
+    Sell event identities are retained, not evicted by the buy-pruning window.
+    """
+    if not isinstance(wallet,str) or not wallet or not isinstance(sells,list):
+        return False
+    try:
+        validated=[]
+        for event in sells:
+            if not isinstance(event,dict):return False
+            mint,signature=event.get('mint'),event.get('signature')
+            fraction,block_ts=event.get('sold_fraction'),event.get('block_ts')
+            if (not isinstance(mint,str) or not mint or not isinstance(signature,str) or not signature
+                    or type(fraction) not in (int,float) or not math.isfinite(fraction) or not 0<fraction<=1
+                    or type(block_ts) not in (int,float) or not math.isfinite(block_ts) or block_ts<=0
+                    or event.get('provenance')!='successful_transaction_balance_decrease'):
+                return False
+            validated.append(dict(event))
+        grades=load_grades()
+        rec=grades.setdefault(wallet,{'buys':[],'last_active_ts':0.0})
+        existing=rec.setdefault('sell_events',[])
+        if not isinstance(existing,list) or any(not isinstance(e,dict) for e in existing):return False
+        changed=False
+        for event in validated:
+            prior=next((e for e in existing if e.get('signature')==event['signature'] and e.get('mint')==event['mint']),None)
+            if prior:
+                if any(prior.get(k)!=event[k] for k in ('sold_fraction','block_ts','provenance')):return False
+                continue
+            event.update(observed_at=time.time(),holding_period_status='unavailable_no_causal_buy_match')
+            existing.append(event);changed=True
+        # Retry a visible but previously uncertain fsync, without duplicate rows.
+        return save_grades(grades) if changed or validated else True
+    except (OSError,ValueError,TypeError):
         return False
 
 
@@ -94,6 +157,7 @@ def _recent_buy(rec: Dict[str, Any], mint: str,
     return False
 
 
+@serialized_grades
 def record_wallet_buys(fresh: Dict[str, List[str]],
                        degen: Any = None) -> int:
     """Record first-seen wallet buys from one poll's fresh activity.
@@ -147,6 +211,7 @@ def _f(value: Any) -> float:
         return 0.0
 
 
+@serialized_grades
 def reconcile(launch_state: Dict[str, Any], degen: Any = None) -> int:
     """Join buy ledger with milestone-tracker outcomes.
 
@@ -191,7 +256,7 @@ def reconcile(launch_state: Dict[str, Any], degen: Any = None) -> int:
                     b["last_check_ts"] = now
                     updated += 1
             rec["buys"] = kept
-            if not kept and not float(rec.get("last_active_ts") or 0):
+            if not kept and not rec.get('sell_events') and not float(rec.get("last_active_ts") or 0):
                 grades.pop(wallet, None)
         if updated:
             save_grades(grades)

@@ -156,3 +156,23 @@ otherwise. This is bounded retained-history dedup, not lifetime exactly-once,
 not instruction-level swap evidence, and not cross-file atomic execution.
 Notifications, mirrors and sell grading may still replay. The same-mint paper
 entry cash guard remains separate and unchanged.
+
+
+## Causal wallet decrease history
+
+The sell-side parser now uses the same successful wallet-response validation as
+buy acquisition, sums each wallet/mint across token accounts, and includes fully
+closed accounts as zero post-balance. Same-wallet transfers are not decreases.
+The existing >50% selector is unchanged. A balance decrease is not proof of a
+swap. Details carry response-bound signature, block time and provenance.
+
+Actual poll recording now uses exact full wallet identity and retains one event
+per signature/mint, rejecting conflicting replays. It does not mutate a guessed
+most-recent buy or compute a fictional holding period from observation time.
+Holding period is explicitly unavailable without a causal buy match. Existing
+buy grading/reconciliation and sell recording share whole-RMW locking and unique
+fsynced snapshots; unreadable existing grade state is not silently reset. A sell
+save failure keeps intake pending. Retained sell events are not currently bounded,
+so storage grows; this is not a complete buy/sell attribution or loss-forensics
+solution. A failed post-replace fsync can leave visible state, with retry dedup and
+resave, not rollback. No new grading or trading threshold is activated.

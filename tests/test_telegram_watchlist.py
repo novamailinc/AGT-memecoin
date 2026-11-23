@@ -57,6 +57,11 @@ timeframes:
 
 CHAT, USER = 6883056760, 111222333
 
+# Fail-closed pairing (2026-11-22): the test harness runs as the
+# allowlisted owner so /start pairs through the allowlist path.
+os.environ.setdefault("TELEGRAM_ALLOWED_CHAT_ID", str(CHAT))
+os.environ.setdefault("TELEGRAM_ALLOWED_USER_ID", str(USER))
+
 
 class FakeClient:
     def __init__(self):

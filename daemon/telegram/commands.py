@@ -174,7 +174,12 @@ def handle_message(ctx: HandlerContext, chat_id: Any, user_id: Any,
     if not sec.is_paired():
         first = text.split()[0].lower()
         if first in ("/start", "start"):
-            ok, msg = sec.try_pair(chat_id, user_id)
+            # Pairing code (when required) comes after /start; it is
+            # passed to the security layer only - never logged,
+            # audited, or echoed.
+            parts = text.split()
+            code = parts[1] if len(parts) > 1 else ""
+            ok, msg = sec.try_pair(chat_id, user_id, code=code)
             ctx.send(chat_id, "✅ Paired. This chat is now the control channel.\n\n" + HELP_TEXT
                      if ok else "⛔ " + msg, None)
         elif first in ("/repair", "repair"):
@@ -474,7 +479,10 @@ def _ask_confirm(ctx: HandlerContext, chat_id: Any, user_id: Any, update_id: int
 # read-only commands
 # ----------------------------------------------------------------------
 def _cmd_start(ctx, chat_id, user_id, update_id, args):
-    ok, msg = ctx.security.try_pair(chat_id, user_id)
+    # Pairing code (when required) comes after /start; it is passed to
+    # the security layer only - never logged, audited, or echoed.
+    code = args[0] if args else ""
+    ok, msg = ctx.security.try_pair(chat_id, user_id, code=code)
     ctx.send(chat_id, ("✅ This chat is already the paired control channel." if not ok and ctx.security.is_paired()
                        else ("✅ Paired. " if ok else "⛔ " + msg) + "\n\n" + HELP_TEXT), None)
 

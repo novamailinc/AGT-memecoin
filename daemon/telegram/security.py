@@ -27,6 +27,7 @@ daemon persists it after every cycle.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 import secrets
@@ -88,8 +89,20 @@ class SecurityContext:
             return False
         return True
 
-    def try_pair(self, chat_id: Any, user_id: Any) -> Tuple[bool, str]:
-        """Pair the first /start sender. Returns (ok, message)."""
+    def try_pair(self, chat_id: Any, user_id: Any,
+                 code: str = "") -> Tuple[bool, str]:
+        """Pair the control chat. Returns (ok, message).
+
+        Fail closed: pairing requires either a configured env allowlist
+        match (TELEGRAM_ALLOWED_CHAT_ID / TELEGRAM_ALLOWED_USER_ID) or
+        a one-time pairing secret (TELEGRAM_PAIR_CODE, optionally
+        time-boxed by TELEGRAM_PAIR_CODE_EXPIRES as a unix epoch). With
+        NEITHER configured, every claim is denied - first-sender
+        pairing does not exist. The secret is single-use: once a
+        pairing succeeds it is marked consumed in durable state, so a
+        replayed code or a daemon restart cannot rebind the bot. The
+        code is never logged or echoed back.
+        """
         env_chat, env_user = self._env_allowlist()
         if env_chat and str(chat_id) != str(env_chat):
             return False, "pairing denied: chat not in the configured allowlist"
@@ -97,6 +110,24 @@ class SecurityContext:
             return False, "pairing denied: user not in the configured allowlist"
         if self.is_paired():
             return False, "already paired"
+        allowlisted = self.matches_env_allowlist(chat_id, user_id)
+        if not allowlisted:
+            expected = os.environ.get("TELEGRAM_PAIR_CODE") or ""
+            if not expected:
+                return False, ("pairing denied: no pairing code or "
+                               "allowlist is configured")
+            if self.state.get("pair_code_consumed"):
+                return False, "pairing denied: pairing code already used"
+            expires = os.environ.get("TELEGRAM_PAIR_CODE_EXPIRES") or ""
+            if expires:
+                try:
+                    if time.time() > float(expires):
+                        return False, "pairing denied: pairing code expired"
+                except ValueError:
+                    return False, "pairing denied: bad expiry configuration"
+            if not hmac.compare_digest(code.strip(), expected):
+                return False, "pairing denied: invalid pairing code"
+            self.state["pair_code_consumed"] = True
         self.state["paired_chat_id"] = chat_id
         self.state["paired_user_id"] = user_id
         logger.warning("telegram paired to chat %s user %s", chat_id, user_id)
@@ -120,7 +151,10 @@ class SecurityContext:
         }
 
     def re_pair(self, chat_id: Any, user_id: Any) -> Tuple[bool, str]:
-        """Break an existing pairing and pair anew (explicit /repair)."""
+        """Break an existing pairing and pair anew (explicit /repair).
+
+        Only reachable through the env-allowlist gate in commands.py;
+        a consumed pairing code stays consumed and is not reset here."""
         self.state.pop("paired_chat_id", None)
         self.state.pop("paired_user_id", None)
         self.state["pending_confirms"] = {}

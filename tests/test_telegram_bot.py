@@ -39,6 +39,11 @@ from unittest.mock import patch                          # noqa: E402
 CHAT, USER = 6883056760, 111222333
 CHAT2, USER2 = 999888777, 444555666
 
+# Pairing requires a verified allowlist or a one-time code (2026-11-22
+# fail-closed pairing); the test harness runs as the allowlisted owner.
+os.environ.setdefault("TELEGRAM_ALLOWED_CHAT_ID", str(CHAT))
+os.environ.setdefault("TELEGRAM_ALLOWED_USER_ID", str(USER))
+
 
 # ----------------------------------------------------------------------
 # fakes
@@ -198,8 +203,8 @@ class SecurityTests(unittest.TestCase):
             ok, _ = sec.try_pair(CHAT, USER)
             self.assertTrue(ok)
         finally:
-            del os.environ["TELEGRAM_ALLOWED_CHAT_ID"]
-            del os.environ["TELEGRAM_ALLOWED_USER_ID"]
+            os.environ["TELEGRAM_ALLOWED_CHAT_ID"] = str(CHAT)
+            os.environ["TELEGRAM_ALLOWED_USER_ID"] = str(USER)
 
     def test_replay_protection(self):
         sec = tg_security.SecurityContext({})

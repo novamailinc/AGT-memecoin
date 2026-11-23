@@ -84,5 +84,34 @@ check("code gate: expired code denied", not ok and not s.is_paired())
 os.environ.pop("TELEGRAM_PAIR_CODE")
 os.environ.pop("TELEGRAM_PAIR_CODE_EXPIRES")
 
+# Partial allowlist (chat-only or user-only) is incomplete configuration:
+# it matches nobody and pairing fails closed. In a group, a chat-only
+# allowlist would otherwise hand control to every member of the group.
+os.environ["TELEGRAM_ALLOWED_CHAT_ID"] = "-100999"  # a group chat id only
+s = fresh()
+ok, msg = s.try_pair("-100999", "777")
+check("partial allowlist (chat-only): denied", not ok and not s.is_paired())
+check("partial allowlist (chat-only): allowlist match refused",
+      not s.matches_env_allowlist("-100999", "777"))
+# A group member who is NOT the paired user stays unauthorized even when
+# the chat itself is the paired chat.
+os.environ["TELEGRAM_ALLOWED_USER_ID"] = "222"
+s = fresh()
+ok, msg = s.try_pair("-100999", "222")
+check("group pairing: exact chat+user pairs", ok and s.is_paired())
+check("group auth: paired user in paired chat authorized",
+      s.is_authorized("-100999", "222"))
+check("group auth: other member of paired group denied",
+      not s.is_authorized("-100999", "333"))
+check("group auth: paired user in another chat denied",
+      not s.is_authorized("-100998", "222"))
+del os.environ["TELEGRAM_ALLOWED_CHAT_ID"]
+del os.environ["TELEGRAM_ALLOWED_USER_ID"]
+os.environ["TELEGRAM_ALLOWED_USER_ID"] = "222"  # user-only: also incomplete
+s = fresh()
+ok, msg = s.try_pair("111", "222")
+check("partial allowlist (user-only): denied", not ok and not s.is_paired())
+del os.environ["TELEGRAM_ALLOWED_USER_ID"]
+
 print("FAILURES: %d" % len(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)

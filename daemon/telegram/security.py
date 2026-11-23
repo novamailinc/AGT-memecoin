@@ -4,9 +4,11 @@ This module holds every rule that keeps a chat interface to a trading bot
 from becoming an attack surface:
 
 * **Pairing / allowlist** — exactly one Telegram chat and one Telegram user
-  may ever command the bot. Pairing happens from the first ``/start`` (the
-  user proves possession of the chat); optional hard-coded allowlists via
-  environment override it. Every other chat/user is ignored and audited.
+  may ever command the bot, and every authorization check requires BOTH the
+  paired chat id AND the paired user id (a group chat alone never suffices).
+  Pairing is fail closed: it needs a configured chat+user allowlist or a
+  single-use expiring pairing code; first-sender pairing does not exist.
+  Every other chat/user is ignored and audited.
 * **Replay protection** — every processed Telegram ``update_id`` is recorded
   in durable daemon state; redelivered updates are dropped silently.
 * **Alert deduplication** — every journal ``event_id`` fanned out as an
@@ -81,11 +83,14 @@ class SecurityContext:
         requester matches every allowlist value that is set. With no
         allowlist configured nobody matches — /repair is never open."""
         env_chat, env_user = self._env_allowlist()
-        if not env_chat and not env_user:
+        # The allowlist is a chat AND user pair. A chat-only (or user-only)
+        # configuration is incomplete and matches nobody: in a group chat a
+        # chat-only allowlist would hand control to every member.
+        if not env_chat or not env_user:
             return False
-        if env_chat and str(chat_id) != str(env_chat):
+        if str(chat_id) != str(env_chat):
             return False
-        if env_user and str(user_id) != str(env_user):
+        if str(user_id) != str(env_user):
             return False
         return True
 
@@ -104,6 +109,10 @@ class SecurityContext:
         code is never logged or echoed back.
         """
         env_chat, env_user = self._env_allowlist()
+        if bool(env_chat) != bool(env_user):
+            return False, ("pairing denied: incomplete allowlist configuration "
+                           "(both TELEGRAM_ALLOWED_CHAT_ID and "
+                           "TELEGRAM_ALLOWED_USER_ID are required)")
         if env_chat and str(chat_id) != str(env_chat):
             return False, "pairing denied: chat not in the configured allowlist"
         if env_user and str(user_id) != str(env_user):

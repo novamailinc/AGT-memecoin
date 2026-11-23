@@ -207,6 +207,7 @@ with W._ledger_lock():
     p3["quote_journal"] = []
     p3["peak_price"] = 1.0
     W._write(d)
+cash_before_wd = PA.snapshot()["cash"]
 closes3 = W.poll_exits(price_fn=lambda c, m, s: 0.0)
 rec3 = [c for c in closes3 if c["mint"] == M(3)]
 check("24h unquotable close fires",
@@ -216,22 +217,28 @@ if rec3:
     r = rec3[0]
     check("write-down close labeled write_down_zero",
           r.get("exit_price_kind") == PK.WRITEDOWN)
-    if float(r["realized_usd"]) < 0:
-        finding("write-down books a simulated fee on a sale that "
-                "never happened", "realized_usd %.6f < 0"
-                % float(r["realized_usd"]))
-    check("write-down fee defect visible (activation blocker)",
-          float(r["realized_usd"]) <= 0)
-    wpos = [p for p in PA.snapshot()["lanes"]["watcher"]["positions"]
+    # STAGE B REPAIR (was FINDINGS 3-4): a write-down is not a
+    # sale - no fee is booked, and the account moves the units +
+    # original cost to the unresolved register instead of refusing
+    # a zero-gross credit and diverging from the lane. These are
+    # impossibility assertions: a failure here is a hard FAIL.
+    check("write-down books no fee on a non-sale",
+          float(r["realized_usd"]) == 0.0)
+    snap3 = PA.snapshot()
+    wpos = [p for p in snap3["lanes"]["watcher"]["positions"]
             if p["mint"] == M(3)]
-    if wpos:
-        finding("write-down diverges lane vs shared account: closed "
-                "in the lane, still held in the account (credit "
-                "refused: fee exceeds gross), only a journal note",
-                "account still holds qty %.6f for M(3)"
-                % float(wpos[0]["qty"]))
-    check("write-down lane/account divergence visible "
-          "(activation blocker)", bool(wpos))
+    check("write-down no longer diverges lane vs account "
+          "(account holds no units)", not wpos)
+    un = [u for u in snap3.get("unresolved") or []
+          if u["mint"] == M(3)]
+    check("written-down units held in the unresolved register "
+          "with original cost",
+          len(un) == 1
+          and un[0]["status"] == "held_unresolved"
+          and float(un[0]["basis"]) > 0
+          and float(un[0]["qty"]) > 0)
+    check("write-down moved no cash",
+          abs(snap3["cash"] - cash_before_wd) < 1e-9)
 
 # ---------- 6. qualification: verdict math ingests estimates -------
 # lessons is grad-family scoped by design; watcher closes must not land

@@ -118,7 +118,7 @@ LOCK_FILE = os.path.join(ACCOUNT_DIR, ".lock")
 DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
-_MUTATION_EVENTS = ("debit", "credit")
+_MUTATION_EVENTS = ("debit", "credit", "write_down")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -223,7 +223,7 @@ def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
     if view["marks_status"] != "ok":
         return ("gate: marks not trustworthy (%s); entry blocked "
                 "fail-closed" % view["marks_status"])
-    me = view["marked_equity"]
+    me = view["marked_equity_conservative"]
     dl = view.get("daily_loss")
     if dl is None or view.get("drawdown_pct") is None:
         return ("gate: no trustworthy day-start/peak baseline yet; "
@@ -253,6 +253,13 @@ def _new_ledger() -> Dict[str, Any]:
         "cash": start_balance(),
         "cash_spendable": start_balance(),
         "cash_estimated": 0.0,
+        # pos_id -> {lane, mint, qty, basis, entry_qty, entry_cost,
+        #            reason, ts, status}: write-down register.
+        # Units moved here are HELD UNRESOLVED: not sold (no fee,
+        # no proceeds, no realized loss recognized), carrying value
+        # zero, cost preserved for later evidence-led resolution
+        # (design v4 Stage B). Never re-sellable.
+        "unresolved": {},
         "realized_pnl": 0.0,
         "day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "day_realized_pnl": 0.0,
@@ -638,6 +645,18 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                               "mint": mint, "pos_id": pid,
                               "realized": realized}
             replayed += 1
+        elif kind == "write_down" and lane and mint:
+            ok, why = _apply_write_down(
+                led, lane, mint, ev.get("pos_id"),
+                ev.get("reason"), ev.get("ts"))
+            if not ok:
+                return led, ("replay cannot apply write_down "
+                             "%s/%s: %s" % (lane, mint, why))
+            if op_id:
+                ops[op_id] = {"event": "write_down", "lane": lane,
+                              "mint": mint,
+                              "pos_id": ev.get("pos_id")}
+            replayed += 1
         # The seq advances only for entries actually processed: on
         # a divergence return above it stays BEHIND the offending
         # entry, so the next load sees the divergence again and
@@ -692,6 +711,14 @@ def _derive_buckets_locked(led: Dict[str, Any],
                          ev.get("pos_id")
                          or _pos_id(lane, mint, int(ev["seq"])),
                          ev.get("ts"))
+        elif ev["event"] == "write_down":
+            ok, why = _apply_write_down(
+                gen, lane, mint, ev.get("pos_id"),
+                ev.get("reason"), ev.get("ts"))
+            if not ok:
+                return led, ("cash-split migration: write_down "
+                             "%s: %s; manual reconciliation "
+                             "required" % (ev.get("op_id"), why))
         else:  # credit
             pos = _lane(gen, lane)["open"].get(mint)
             if pos is None:
@@ -1067,6 +1094,96 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         return True, "ok"
 
 
+def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
+                      pid: str, reason: Optional[str],
+                      ts: Optional[float]) -> Tuple[bool, str]:
+    """Move an open position to the unresolved register (write-down
+    of unquotable units). No cash moves, no fee, no realized P/L is
+    recognized: a write-down is not a sale. Caller holds the lock.
+    Idempotent per pos_id: a replay or retry of an applied
+    write-down is a no-op."""
+    reg = led.setdefault("unresolved", {})
+    if pid in reg:
+        return True, "already unresolved"
+    st = _lane(led, lane)
+    pos = st["open"].get(mint)
+    if pos is None:
+        return False, "no open position"
+    if pos.get("pos_id") != pid:
+        return False, ("pos_id mismatch (open is %s)"
+                       % pos.get("pos_id"))
+    reg[pid] = {"lane": lane, "mint": mint,
+                "qty": pos.get("qty"),
+                "basis": pos.get("basis"),
+                "entry_qty": pos.get("entry_qty"),
+                "entry_cost": pos.get("entry_cost"),
+                "reason": reason, "ts": ts or time.time(),
+                "status": "held_unresolved"}
+    st["open"].pop(mint)
+    return True, "ok"
+
+
+def write_down(lane: str, mint: str, op_id: str,
+               ts: Optional[float] = None,
+               pos_id: Optional[str] = None,
+               reason: Optional[str] = None
+               ) -> Tuple[bool, str]:
+    """Write a position down to zero carrying value: units and their
+    original cost move to the unresolved register as
+    held_unresolved (design v4 Stage B). NOT a sale: no fee, no
+    proceeds, no realized loss recognized; the register keeps the
+    original cost so a later evidence-led resolution can reconcile
+    exactly. Same durability contract as credit(): journaled with
+    seq before the state write, idempotent on op_id, pinned to the
+    pos_id instance."""
+    if not isinstance(lane, str) or not lane:
+        return False, "bad lane"
+    if not isinstance(mint, str) or not mint:
+        return False, "bad mint"
+    if not isinstance(op_id, str) or not op_id:
+        return False, "bad op_id"
+    ts = time.time() if ts is None else ts
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if led is None:
+            return False, "ledger unreadable"
+        prior = led["ops"].get(op_id)
+        if prior is not None:
+            return True, "already applied"
+        if degraded is not None:
+            _journal({"event": "write_down_intent", "lane": lane,
+                      "mint": mint, "op_id": op_id, "pos_id": pos_id,
+                      "reason": reason, "ts": ts,
+                      "note": "account degraded: intent journaled, "
+                              "not applied"})
+            return False, ("account degraded (%s): write-down "
+                           "journaled, not applied" % degraded)
+        pid = pos_id
+        pos = _lane(led, lane)["open"].get(mint)
+        if pid is None and pos is not None:
+            pid = pos.get("pos_id")
+        if pid is None:
+            return False, "no open position"
+        ok, why = _apply_write_down(led, lane, mint, pid, reason, ts)
+        if not ok:
+            _journal({"event": "write_down_refused", "lane": lane,
+                      "mint": mint, "op_id": op_id, "pos_id": pid,
+                      "reason": why, "ts": ts})
+            return False, "%s (journaled, not applied)" % why
+        led["seq"] = int(led.get("seq") or 0) + 1
+        led["ops"][op_id] = {"event": "write_down", "lane": lane,
+                             "mint": mint, "pos_id": pid}
+        _journal({"event": "write_down",
+                  "event_id": "ev#%d" % led["seq"],
+                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "pos_id": pid, "reason": reason,
+                  "qty": led["unresolved"][pid]["qty"],
+                  "basis": led["unresolved"][pid]["basis"],
+                  "seq": led["seq"], "ts": ts})
+        _save_locked(led)
+        return True, "ok"
+
+
 def _mark_value(mark: Any, now: float, ttl: float,
                 want_qty: Optional[float],
                 want_pos_id: Optional[str]
@@ -1153,6 +1270,13 @@ def _view_locked(led: Dict[str, Any],
     out = {
         "start_balance": led["start_balance"],
         "cash": round(cash, 6),
+        "unresolved": sorted(
+            (dict(v) for v in (led.get("unresolved")
+                               or {}).values()),
+            key=lambda v: v.get("ts") or 0),
+        "unresolved_cost": round(sum(
+            float(v.get("basis") or 0.0)
+            for v in (led.get("unresolved") or {}).values()), 6),
         "cash_spendable": round(float(led.get("cash_spendable")
                                       or 0.0), 6),
         "cash_estimated": round(float(led.get("cash_estimated")
@@ -1202,17 +1326,30 @@ def _view_locked(led: Dict[str, Any],
         # into the curve) versus a Jupiter-listed price.
         out["marked_by_source"] = by_source
         out["marked_equity"] = round(cash + marked, 6)
+        # CONSERVATIVE SERIES (quarantine acceptance, 2026-11-22):
+        # the equity series every risk input consumes is
+        # cash_SPENDABLE + marked exposure. Quarantined estimated
+        # proceeds are excluded by construction, so a stale-price
+        # tranche can neither boost risk headroom (baseline/peak
+        # captured without it) nor mask a drawdown (the series is
+        # internally consistent: estimates never enter it at any
+        # point in time). marked_equity above stays the gross
+        # diagnostic (total cash incl. quarantined).
+        out["marked_equity_conservative"] = round(
+            float(led.get("cash_spendable") or 0.0) + marked, 6)
         out["unrealized_pnl"] = round(marked - exposure, 6)
     elif marks or open_positions:
         out["marks_status"] = ("; ".join(problems) if problems
                                else "unavailable")
         out["marked_exposure"] = None
         out["marked_equity"] = None
+        out["marked_equity_conservative"] = None
         out["unrealized_pnl"] = None
     else:
         out["marks_status"] = "unavailable"
         out["marked_exposure"] = None
         out["marked_equity"] = None
+        out["marked_equity_conservative"] = None
         out["unrealized_pnl"] = None
     return out
 
@@ -1226,7 +1363,12 @@ def _update_baselines_locked(led: Dict[str, Any],
     closed). Caller holds the lock. Returns True when changed."""
     if view["marks_status"] != "ok":
         return False
-    me = view["marked_equity"]
+    if view.get("degraded") is not None \
+            or "cash_spendable" not in led:
+        # A degraded or pre-split account must not capture equity
+        # baselines: the conservative series would read collapsed.
+        return False
+    me = view["marked_equity_conservative"]
     now = time.time()
     today = time.strftime("%Y-%m-%d", time.gmtime(now))
     changed = False
@@ -1257,7 +1399,7 @@ def _gate_fields(led: Dict[str, Any], view: Dict[str, Any]
         out["peak_equity"] = dict(peak)
     if view["marks_status"] != "ok":
         return out
-    me = view["marked_equity"]
+    me = view["marked_equity_conservative"]
     today = view["day"]
     if (isinstance(baseline, dict)
             and _valid_amount(baseline.get("value"))

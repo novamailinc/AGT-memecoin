@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -216,11 +217,117 @@ def main():
           snap is not None and snap.get("degraded") is not None
           and "cash-split migration" in snap["degraded"])
 
-    print()
-    if FAILS:
-        print("FAILURES:", FAILS)
-        sys.exit(1)
-    print("ALL OK")
+def equity_quarantine():
+    """Parent acceptance check (2026-11-22): quarantined estimated
+    proceeds must neither boost risk headroom nor mask a drawdown.
+    Baselines, peak, daily_loss and drawdown consume ONLY the
+    conservative series (cash_spendable + trusted marks)."""
+    home = tempfile.mkdtemp()
+    pa = fresh(home)
+    ok, _, pid = pa.try_debit("watcher", "Q", 2.0, qty=100.0,
+                              op_id="watcher:buy:Q:1")
+    check("eq entry ok", ok)
+
+    def marks(qty, value):
+        return {"watcher": {"Q": {"value": value, "ts": time.time(),
+                                  "source": "test", "qty": qty,
+                                  "pos_id": pid}}}
+
+    snap = pa.snapshot(marks=marks(100.0, 2.0))
+    check("baseline captured from conservative equity",
+          snap["day_start_equity"]
+          and abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9)
+    # stale tranche: $1 estimated proceeds; position halves, mark
+    # falls to $1 -> conservative equity drops to 9.0
+    ok, _ = pa.credit("watcher", "Q", 1.0, "watcher:sell:Q:1",
+                      pos_id=pid, qty=50.0, price_kind=STALE)
+    check("eq stale credit ok", ok)
+    snap = pa.snapshot(marks=marks(50.0, 1.0))
+    check("gross equity includes the estimate (diagnostic)",
+          abs(snap["marked_equity"] - 10.0) < 1e-9)
+    check("conservative equity excludes the estimate",
+          abs(snap["marked_equity_conservative"] - 9.0) < 1e-9)
+    check("day-start baseline NOT boosted by the estimate",
+          abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9)
+    check("peak NOT boosted by the estimate",
+          abs(snap["peak_equity"]["value"] - 10.0) < 1e-9)
+    check("daily loss VISIBLE (estimate cannot mask it)",
+          snap["daily_loss"] is not None
+          and abs(snap["daily_loss"] - 1.0) < 1e-9)
+    check("drawdown VISIBLE (estimate cannot mask it)",
+          snap["drawdown_pct"] is not None
+          and abs(snap["drawdown_pct"] - 10.0) < 1e-6)
 
 
 main()
+
+
+equity_quarantine()
+
+
+def write_down_register():
+    """Stage B: write-down moves units + original cost to the
+    unresolved register; no cash moves, no fee, no realized loss
+    recognized; idempotent on op_id; pinned to the instance."""
+    home = tempfile.mkdtemp()
+    pa = fresh(home)
+    ok, _, pid = pa.try_debit("watcher", "Z", 2.0, qty=100.0,
+                              op_id="watcher:buy:Z:1")
+    check("z entry ok", ok)
+    before = pa.snapshot()
+    ok, why = pa.write_down("watcher", "Z", "watcher:wd:Z:1",
+                            pos_id=pid, reason="time_stop_24h_"
+                            "unquotable")
+    check("write-down applies", ok)
+    snap = pa.snapshot()
+    check("write-down moved no cash",
+          abs(snap["cash"] - before["cash"]) < 1e-9)
+    check("write-down booked no realized loss",
+          abs(snap["realized_pnl"] - before["realized_pnl"]) < 1e-9)
+    check("units + cost in the unresolved register",
+          len(snap["unresolved"]) == 1
+          and snap["unresolved"][0]["status"] == "held_unresolved"
+          and abs(float(snap["unresolved"][0]["basis"]) - 2.0)
+          < 1e-9
+          and abs(float(snap["unresolved"][0]["qty"]) - 100.0)
+          < 1e-9)
+    check("unresolved cost reported", abs(snap["unresolved_cost"]
+                                          - 2.0) < 1e-9)
+    check("cost exposure excludes unresolved units",
+          abs(snap["cost_exposure"]) < 1e-9)
+    ok, _ = pa.write_down("watcher", "Z", "watcher:wd:Z:1",
+                          pos_id=pid, reason="retry")
+    check("write-down retry idempotent", ok)
+    snap2 = pa.snapshot()
+    check("retry did not double-register",
+          len(snap2["unresolved"]) == 1)
+    # a reopened instance must not absorb the stale write-down
+    ok, _, pid2 = pa.try_debit("watcher", "Z", 1.0, qty=10.0,
+                               op_id="watcher:buy:Z:2")
+    check("reopen ok", ok)
+    ok, _ = pa.write_down("watcher", "Z", "watcher:wd:Z:9",
+                          pos_id=pid, reason="stale instance")
+    check("write-down for the old instance is a no-op (target "
+          "already unresolved)", ok)
+    snap3 = pa.snapshot()
+    check("stale write-down did not touch the new instance",
+          len(snap3["unresolved"]) == 1
+          and any(p["mint"] == "Z" and p["pos_id"] == pid2
+                  for p in snap3["lanes"]["watcher"]
+                  ["positions"]))
+    # restart: the register survives via the journal
+    import daemon.launch_scanner.paper_account as pa2
+    pa2 = importlib.reload(pa2)
+    snap4 = pa2.snapshot()
+    check("register survives restart",
+          len(snap4["unresolved"]) == 1
+          and abs(snap4["unresolved_cost"] - 2.0) < 1e-9)
+
+
+write_down_register()
+
+print()
+if FAILS:
+    print("FAILURES:", FAILS)
+    sys.exit(1)
+print("ALL OK")

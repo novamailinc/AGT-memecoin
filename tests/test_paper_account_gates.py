@@ -176,7 +176,7 @@ ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-z1")
 m = {"grad": {"A": mark(0.5, 5.0, pos_id=pid)}}  # daily loss 4.50 >> 0.50
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-z2", marks=m)
 check(" blown daily-loss blocks entries", not ok)
-ok, why = pa.credit("grad", "A", 0.50, "g-z3", pos_id=pid)
+ok, why = pa.credit("grad", "A", 0.50, "g-z3", pos_id=pid, price_kind="current_price_simulated_fill")
 check("exits bypass entry gates: close settles at a loss", ok)
 snap = pa.snapshot()
 check("settled at the loss (cash 5.50, realized -4.50)",
@@ -192,7 +192,7 @@ ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-q1")
 m_stale = {"grad": {"A": mark(5.0, 5.0, pos_id=pid)}}
 # ...then a tranche settles half the units before the gated entry
 # reaches the lock (the concurrent-close race, simulated in order).
-ok, why = pa.credit("grad", "A", 2.60, "g-q2", pos_id=pid, qty=2.5)
+ok, why = pa.credit("grad", "A", 2.60, "g-q2", pos_id=pid, qty=2.5, price_kind="current_price_simulated_fill")
 assert ok, why
 ok, why, _ = pa.try_debit("grad", "B", 1.0, 1.0, "g-q3",
                           marks=m_stale)
@@ -208,7 +208,7 @@ H = tempfile.mkdtemp(prefix="gates-reopen-")
 pa = fresh(H)
 ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-o1")
 m_old = {"grad": {"A": mark(5.0, 5.0, pos_id=pid)}}
-pa.credit("grad", "A", 5.0, "g-o2", pos_id=pid)
+pa.credit("grad", "A", 5.0, "g-o2", pos_id=pid, price_kind="current_price_simulated_fill")
 ok, _, pid2 = pa.try_debit("grad", "A", 5.0, 50.0, "g-o3",
                            marks={})
 assert ok, pid2
@@ -223,7 +223,7 @@ H = tempfile.mkdtemp(prefix="gates-reopen-same-")
 pa = fresh(H)
 ok, _, pid = pa.try_debit("grad", "A", 5.0, 5.0, "g-s1")
 m_old = {"grad": {"A": mark(5.0, 5.0, pos_id=pid)}}
-pa.credit("grad", "A", 5.0, "g-s2", pos_id=pid)
+pa.credit("grad", "A", 5.0, "g-s2", pos_id=pid, price_kind="current_price_simulated_fill")
 ok, _, pid2 = pa.try_debit("grad", "A", 5.0, 5.0, "g-s3",
                            marks={})
 assert ok and pid2 != pid

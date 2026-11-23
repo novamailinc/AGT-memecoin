@@ -296,6 +296,29 @@ def _migrated_evidence(d, now=None):
     return (True, False) if stamped else (None, False)
 
 
+CURVE_HISTORY_KEPT = 8  # retained samples per archived launch
+
+
+def _curve_history(d):
+    """Bounded actual curve-sample content for the archive record:
+    the newest CURVE_HISTORY_KEPT observed samples plus the total
+    seen, labeled preliminary (scanner snapshots, never verified
+    fills or a complete curve). Legacy reserve_samples entries have
+    no per-sample schema: they stay a count only, never dressed up
+    as curve history. None when there is nothing honest to keep."""
+    samples = d.get("curve_samples")
+    if not isinstance(samples, list) or not samples:
+        return None
+    pts = [x for x in samples if isinstance(x, dict)]
+    if not pts:
+        return None
+    kept = pts[-CURVE_HISTORY_KEPT:]
+    return {"samples": kept,
+            "samples_total": len(samples),
+            "retained": len(kept),
+            "preliminary": True}
+
+
 def _archive_dossier(d, now):
     """Append one compact long-term record for an expiring dossier
     to the persistent archive. Returns True when the record is
@@ -334,6 +357,9 @@ def _archive_dossier(d, now):
             # Explicit negative contradicted by a valid stamp:
             # labeled as a conflict, never silently False.
             rec["migration_conflict"] = True
+        ch = _curve_history(d)
+        if ch:
+            rec["curve_history"] = ch
         return _archive_append(rec)
     except Exception:
         return False

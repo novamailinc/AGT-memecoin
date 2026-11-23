@@ -1367,6 +1367,42 @@ def test_intel_fields_surfaces_rollup_partial():
             dossiers.ARCHIVE_MAX_BYTES = real_cap
 
 
+def test_curve_history_archived_bounded_and_labeled():
+    with _Ctx() as c:
+        now = time.time()
+        samples = [{"ts": now - 90000 + j, "v_sol": j + 1,
+                    "v_token": 10 + j} for j in range(12)]
+        c.write_dossier("MINT-CH", now - 25 * 3600, deployer="DEP-CH",
+                        safety={"ts": now - 25 * 3600,
+                                "report": {"unknown": False,
+                                           "source": "x"}},
+                        curve_samples=samples)
+        c.write_dossier("MINT-LEG", now - 25 * 3600, deployer="DEP-L",
+                        safety={"ts": now - 25 * 3600,
+                                "report": {"unknown": True}},
+                        reserve_samples=[1, 2, 3])
+        dossiers._sweep(now)
+        recs = {r.get("mint"): r
+                for r in dossiers.launch_archive(limit=1000)
+                if r.get("record_type") == "launch"}
+        ch = (recs.get("MINT-CH") or {}).get("curve_history") or {}
+        check("curve history: bounded retained samples with total",
+              ch.get("samples_total") == 12
+              and ch.get("retained")
+              == dossiers.CURVE_HISTORY_KEPT
+              and ch.get("preliminary") is True
+              and ch.get("samples") == samples[-dossiers
+                                               .CURVE_HISTORY_KEPT:])
+        check("curve history: legacy reserve_samples stay a count",
+              (recs.get("MINT-LEG") or {}).get("curve_history") is None
+              and (recs.get("MINT-LEG") or {}).get(
+                  "reserve_samples") == 3)
+        mem = dossiers.launch_memory("MINT-CH") or {}
+        check("curve history: consumer reads the same content",
+              (mem.get("curve_history") or {}).get(
+                  "samples_total") == 12)
+
+
 def test_launch_rollup_partial_when_corrupt_counter():
     with _Ctx() as c:
         now = time.time()

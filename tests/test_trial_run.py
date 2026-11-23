@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Bounded trial supervisor tests (2026-11-22).
+
+scripts/trial_run.py enforces the approved phone trial's bounds:
+a hard wall clock, a hard outbound request ceiling counted across
+BOTH transports the lanes use (urllib + the curl subprocess shim),
+an immediate stop on HTTP 429, and no restart after exit. These
+tests run fully offline: children hit 127.0.0.1:9 (discard, refused)
+or just sleep.
+
+Plain script - run directly (scripts/run_script_tests.py).
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRIAL = os.path.join(REPO, "scripts", "trial_run.py")
+
+fails = []
+
+
+def check(name, cond):
+    print(("PASS" if cond else "FAIL") + " " + name)
+    if not cond:
+        fails.append(name)
+
+
+def run_trial(args, env_extra=None, timeout=60):
+    env = dict(os.environ)
+    env.pop("TRIAL_TRIP_FILE", None)
+    env.pop("TRIAL_COUNT_FILE", None)
+    if env_extra:
+        env.update(env_extra)
+    with tempfile.TemporaryDirectory() as td:
+        env["FOREX_AGENT_HOME"] = td
+        p = subprocess.run([sys.executable, TRIAL] + args, env=env,
+                           capture_output=True, text=True, timeout=timeout)
+        last = [l for l in p.stdout.strip().splitlines()
+                if l.startswith("trial_run: outcome=")]
+        return (p.returncode, last[-1] if last else "", p.stdout,
+                p.stderr, td)
+
+
+# 1. Hard wall: a child that sleeps well past the wall is killed and
+#    the supervisor exits on its own (no restart, outcome reported).
+t0 = time.monotonic()
+rc, out, so, se, _ = run_trial(
+    ["--seconds", "3", "--", sys.executable, "-c",
+     "import time; time.sleep(60)"])
+check("wall: supervisor returns promptly",
+      3 <= time.monotonic() - t0 < 20)
+check("wall: outcome reports the wall", "wall reached" in out)
+check("wall: exit code 0 (supervised stop, no restart)", rc == 0)
+
+# 2. Request ceiling via the urllib shim: connection-refused calls
+#    still count; the trip fires and the supervisor kills the child.
+rc, out, so, se, _ = run_trial(
+    ["--seconds", "30", "--max-requests", "5", "--",
+     sys.executable, "-c",
+     "import time, urllib.request\n"
+     "for i in range(50):\n"
+     "    try: urllib.request.urlopen('http://127.0.0.1:9/', timeout=1)\n"
+     "    except Exception: pass\n"
+     "time.sleep(60)"])
+check("ceiling: outcome reports the trip", "trip" in out)
+check("ceiling: request count stops at ceiling+1",
+      "requests=6/5" in out)
+
+# 3. 429 via the urllib shim trips immediately (local stub server).
+server = os.path.join(tempfile.gettempdir(), "trial_429_server.py")
+with open(server, "w") as f:
+    f.write(
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(429); self.end_headers()\n"
+        "    def log_message(self, *a): pass\n"
+        "HTTPServer(('127.0.0.1', 0), H).serve_forever()\n")
+stub = subprocess.Popen([sys.executable, server],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    # discover the port is overkill; bind our own throwaway server instead
+    stub.kill()
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(429)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), H)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    rc, out, so, se, _ = run_trial(
+        ["--seconds", "30", "--max-requests", "100", "--",
+         sys.executable, "-c",
+         "import time, urllib.request\n"
+         "try: urllib.request.urlopen('http://127.0.0.1:%d/', timeout=5)\n"
+         "except Exception: pass\n"
+         "time.sleep(60)" % port])
+    check("429: outcome reports the trip", "trip" in out)
+finally:
+    try:
+        httpd.shutdown()
+    except Exception:
+        pass
+    stub.poll()
+
+# 4. curl shim: the PATH shim counts curl subprocess calls too and
+#    refuses past the ceiling before touching the network.
+curl = "/usr/bin/curl" if os.path.exists("/usr/bin/curl") else None
+if curl is None:
+    # find the real one the way trial_run does
+    for cand in ("/bin/curl",):
+        if os.path.exists(cand):
+            curl = cand
+check("curl available for shim test", curl is not None)
+if curl:
+    rc, out, so, se, _ = run_trial(
+        ["--seconds", "30", "--max-requests", "3", "--",
+         "/bin/sh", "-c",
+         "i=0; while [ $i -lt 10 ]; do curl -sS "
+         "http://127.0.0.1:9/ 2>/dev/null; i=$((i+1)); done; sleep 60"])
+    check("curl shim: outcome reports the trip", "trip" in out)
+    check("curl shim: request count stops at ceiling+1",
+          "requests=4/3" in out)
+
+# 5. A child that exits cleanly on its own reports completed.
+rc, out, so, se, _ = run_trial(
+    ["--seconds", "30", "--", sys.executable, "-c", "print('ok')"])
+check("clean child: outcome completed", "completed" in out and rc == 0)
+
+print("FAILURES: %d" % len(fails) if fails else "all checks passed")
+sys.exit(1 if fails else 0)

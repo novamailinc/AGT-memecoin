@@ -138,6 +138,9 @@ MAX_CLOSES = 500
 MAX_FIRE_AUDIT = 500
 MAX_SEEN_KEYS = 2000
 
+# NOTIONAL bookkeeping only (2026-11-23 labeling): the lane's own
+# pre-registered verdict-sample counter, NOT funded capital. Real cash
+# authority is the shared $10 paper account (paper_account.try_debit).
 BANKROLL_START = 100.00
 NOTIONAL_USD = 1.00       # the user's $1/shot rule
 
@@ -465,6 +468,14 @@ def _blank():
     return {
         "bankroll_start": BANKROLL_START,
         "bankroll": BANKROLL_START,
+        # NOTIONAL bookkeeping only (2026-11-23 labeling): this $100 is
+        # the lane's own pre-registered verdict-sample counter, NOT
+        # funded capital. Real cash authority is the shared $10 paper
+        # account (paper_account.try_debit); entries the shared
+        # account cannot fund never happen regardless of this number.
+        # Verdict math is frozen; this label changes nothing it
+        # computes.
+        "bankroll_kind": "notional-verdict-counter-unfunded",
         "positions": {},
         "closes": [],
         "created_ts": time.time(),

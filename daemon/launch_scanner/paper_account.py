@@ -282,6 +282,61 @@ def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
     return None
 
 
+# ---- Section 4.5 provider-health decision gate ----------------------
+# Operational memory informs the decision engine (request 4.5: "the
+# bot must know when its market information is incomplete and stop
+# treating uncertain information as reliable"). When
+# PROVIDER_HEALTH_GATE_ENABLED=1 (default OFF - gate activation stays
+# owner-owned), every entry debit consults the DURABLE acquisition
+# provider-health record before reserving stake. The providers the
+# decision depends on are named explicitly in
+# PROVIDER_HEALTH_GATE_PROVIDERS (comma-separated); an enabled gate
+# with no provider list is an incomplete configuration and fails
+# closed. Unknown, stale, degraded, down or unconfigured health for a
+# listed provider BLOCKS the entry. No thresholds are invented: the
+# durable record's own status classification is the only input. Never
+# raises: a gate error fails closed.
+
+def provider_health_gate_enabled() -> bool:
+    return os.environ.get("PROVIDER_HEALTH_GATE_ENABLED") == "1"
+
+
+def _provider_health_refusal() -> Optional[str]:
+    """None when the entry may proceed; the refusal reason otherwise.
+    Only consulted when provider_health_gate_enabled()."""
+    raw = os.environ.get("PROVIDER_HEALTH_GATE_PROVIDERS") or ""
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if not names:
+        return ("gate: provider-health gate enabled but "
+                "PROVIDER_HEALTH_GATE_PROVIDERS names no providers; "
+                "entry blocked fail-closed (incomplete configuration)")
+    try:
+        try:
+            from daemon.intelligence.acquisition import provider_health
+        except ImportError:
+            from intelligence.acquisition import provider_health
+        view = provider_health.read_durable_statuses()
+    except Exception as exc:
+        return ("gate: provider health unreadable (%s); entry blocked "
+                "fail-closed" % exc)
+    if view is None:
+        return ("gate: no durable provider-health record; market-data "
+                "reliability unknown, entry blocked fail-closed")
+    if view.get("stale"):
+        return ("gate: durable provider-health record is stale (age "
+                "%ss); entry blocked fail-closed" % view.get("age_s"))
+    statuses = view.get("providers") or {}
+    for name in names:
+        st = statuses.get(name)
+        if st is None:
+            return ("gate: no health record for provider %s; entry "
+                    "blocked fail-closed" % name)
+        if st != "ok":
+            return ("gate: provider %s %s; market information not "
+                    "reliable, entry blocked fail-closed" % (name, st))
+    return None
+
+
 def _new_ledger() -> Dict[str, Any]:
     now = time.time()
     return {
@@ -1039,6 +1094,10 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
             _update_baselines_locked(led, view)
             view.update(_gate_fields(led, view))
             refusal = _gate_check_locked(led, view, stake)
+            if refusal is not None:
+                return False, refusal, None
+        if provider_health_gate_enabled():
+            refusal = _provider_health_refusal()
             if refusal is not None:
                 return False, refusal, None
         led["seq"] = int(led.get("seq") or 0) + 1

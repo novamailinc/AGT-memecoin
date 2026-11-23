@@ -525,6 +525,8 @@ def _qualified_for_learning(rec):
             if value is None or not math.isfinite(value):
                 return False
             nums[key] = value
+        if str(rec.get("close_reason") or "") == "":
+            return False
         if nums["entry_ts"] < 0 or nums["close_ts"] < nums["entry_ts"] \
                 or nums["realized_mult"] < 0:
             return False

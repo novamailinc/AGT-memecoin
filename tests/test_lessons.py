@@ -558,6 +558,11 @@ with open(L.ledger_path("grad_select", _backfill_home), "w") as f:
 check("hygiene: ledger backfill preserves existing price provenance",
       L.decisions_from_ledger("grad_select", home=_backfill_home)[0]["exit_price_kind"]
       == "current_price_simulated_fill")
+check("hygiene: missing close reason excluded as incomplete",
+      L.generate_lessons("grad_select", [dict(hq[0], close_reason="")])["n_qualified"] == 0)
+check("hygiene: numeric-string PnL follows numeric schema",
+      L.generate_lessons("grad_select", [dict(hq[0], pnl_usd="2.5")])["n_qualified"] == 1)
+
 print()
 if fails:
     print("FAILURES: %d" % len(fails))

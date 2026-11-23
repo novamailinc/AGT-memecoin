@@ -3447,12 +3447,31 @@ class LaunchScanner(Daemon):
                         "t": o[0], "mcap_usd": o[1], "price_usd": o[2],
                         "vol5m_usd": o[3], "buys5m": int(o[4]),
                         "sells5m": int(o[5]), "liq_usd": o[6]})
-            # Window-truncation label (irrecoverable historical gap):
-            # the first retained snapshot postdates first detection.
+            # Completeness labels (audit F3, hardened): edge truncation
+            # (first retained snapshot postdates first detection, or
+            # only the in-memory window survived) AND middle gaps
+            # (missing intervals between retained observations) are
+            # surfaced separately. A record with EITHER never qualifies
+            # as a complete series; the missing data is irrecoverable,
+            # never reconstructed. Journal health failures are surfaced
+            # too - never-raises persistence is not silent success.
             first_ts = float(cand.get("first_ts") or 0)
             truncated = bool(snaps) and (
                 window_only or (first_ts > 0
                                 and float(snaps[0]["t"]) > first_ts + 1.0))
+            series_gaps = fingerprints.count_series_gaps(snaps)
+            jstatus = (tr.journal_status()
+                       if tr is not None and hasattr(tr, "journal_status")
+                       else {})
+            jfailures = sum(int(jstatus.get(k) or 0) for k in (
+                "write_failures", "read_failures",
+                "compaction_failures"))
+            series_source = ("journal" if series and not window_only
+                             else ("window" if series else "none"))
+            series_complete = (bool(snaps) and not truncated
+                               and series_gaps == 0
+                               and series_source == "journal"
+                               and jfailures == 0)
             saf = cand.get("safety") or {}
             if verdict == "confirm":
                 first = float(cand.get("first_mcap") or 0)
@@ -3479,6 +3498,10 @@ class LaunchScanner(Daemon):
                 # detection - the missing earlier observations are
                 # IRRECOVERABLE, never reconstructed.
                 "window_truncated": truncated,
+                "series_source": series_source,
+                "series_gaps": series_gaps,
+                "series_complete": series_complete,
+                "journal_failures": jfailures,
                 "mint": mint, "symbol": cand.get("symbol") or "",
                 "chain": cand.get("chain") or "",
                 "source": cand.get("source") or "",

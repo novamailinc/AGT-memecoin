@@ -222,7 +222,13 @@ class BacktestRecorderTest(unittest.TestCase):
         path = "/tmp/bt_test_%d.jsonl" % time.time_ns()
         self.addCleanup(lambda: os.path.exists(path)
                         and os.remove(path))
-        tr = fingerprints.FingerprintTracker(_degen())
+        # Private journal path: the default journal would accumulate
+        # entries across test runs and other suites.
+        jpath = "/tmp/fp_journal_test_%d.jsonl" % time.time_ns()
+        self.addCleanup(lambda: os.path.exists(jpath)
+                        and os.remove(jpath))
+        tr = fingerprints.FingerprintTracker(
+            _degen(fp_series_journal_path=jpath))
         self.sc._fp_tracker = tr
         stats = {"usd_market_cap": 50000.0, "price_usd": 0.001,
                  "vol_m5": 2000.0, "buys_m5": 10, "sells_m5": 4,
@@ -235,6 +241,11 @@ class BacktestRecorderTest(unittest.TestCase):
             rec = json.loads(fh.readline())
         self.assertEqual(len(rec["snapshots"]), 2)
         self.assertEqual(rec["snapshots"][0]["price_usd"], 0.001)
+        # Completeness labels are present and honest: journal-backed,
+        # but truncated because the first observation (t=1000) is at
+        # detection and there are no middle gaps.
+        self.assertEqual(rec["series_source"], "journal")
+        self.assertIn("series_complete", rec)
 
 
 class IntelCardTest(unittest.TestCase):

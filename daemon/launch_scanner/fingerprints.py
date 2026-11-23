@@ -28,6 +28,11 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+
+try:
+    import fcntl  # POSIX; concurrent-writer journal lock
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -39,11 +44,29 @@ MAX_TRACKED = 500
 # Durable series journal (2026-11-23, Stage A audit F3): every
 # observation is ALSO appended to a bounded jsonl journal so backtest
 # records can carry the FULL series from detection, not the truncated
-# in-memory deque. Bounded: entries older than the retention window
-# are compacted away; compaction runs at most every _COMPACT_EVERY
-# appends and only when the file exceeds _COMPACT_MIN_BYTES. Historical
-# data recorded before the journal existed is window-truncated and
-# irrecoverable - records flag it, never reconstruct it.
+# in-memory deque. Historical data recorded before the journal existed
+# is window-truncated and irrecoverable - records flag it, never
+# reconstruct it.
+#
+# ACTUAL RETENTION GUARANTEES (documented, tested):
+# - Retention is TIME-based, NOT a strict byte bound: an observation is
+#   durable from append until the first compaction run after it ages
+#   past fp_series_journal_retention_s (default 6h). Extreme poll
+#   volume within the retention window can grow the file arbitrarily.
+# - Compaction runs on the APPEND cadence (every _COMPACT_EVERY
+#   appends, only past _COMPACT_MIN_BYTES): an IDLE daemon never
+#   compacts, so aged data is retained, never silently lost - the safe
+#   direction.
+# - Compaction only ever DROPS aged-out lines; it never rewrites
+#   surviving entries (original raw evidence preserved verbatim), and
+#   swaps atomically via os.replace.
+# - Concurrent writers: appends and compaction hold an exclusive
+#   fcntl.flock on the file, so interleaved daemon/test writers cannot
+#   tear lines or lose entries to a compaction swap.
+# - Never-raises is NOT silent success: write/read/compaction failures
+#   increment journal_status() counters and record last_error; callers
+#   must surface them (the backtest recorder labels series_source and
+#   series_complete from this).
 _JOURNAL_RETENTION_S = 6 * 3600.0
 _COMPACT_EVERY = 256
 _COMPACT_MIN_BYTES = 1_000_000
@@ -98,6 +121,20 @@ class FingerprintTracker:
             getattr(cfg, "fp_series_journal_retention_s",
                     _JOURNAL_RETENTION_S))
         self._journal_appends = 0
+        self._journal_health: Dict[str, Any] = {
+            "write_failures": 0, "read_failures": 0,
+            "compaction_failures": 0, "compactions": 0,
+            "last_error": None,
+        }
+
+    def journal_status(self) -> Dict[str, Any]:
+        """Journal health: failure counters, never raises. A nonzero
+        failure count means recorded history may be incomplete - the
+        backtest recorder surfaces this via series labels."""
+        h = dict(self._journal_health)
+        h["enabled"] = self._journal_enabled
+        h["path"] = self._journal_path
+        return h
 
     # -- state hygiene ------------------------------------------------
     def prune(self, now: float) -> None:
@@ -142,13 +179,20 @@ class FingerprintTracker:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with open(self._journal_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"mint": mint, "obs": list(obs)})
-                         + "\n")
+                if fcntl is not None:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    fh.write(json.dumps({"mint": mint, "obs": list(obs)})
+                             + "\n")
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             self._journal_appends += 1
             if self._journal_appends % _COMPACT_EVERY == 0:
                 self._journal_compact(obs[0])
-        except Exception:
-            pass
+        except Exception as exc:
+            self._journal_health["write_failures"] += 1
+            self._journal_health["last_error"] = repr(exc)
 
     def _journal_compact(self, now: float) -> None:
         """Drop entries older than the retention window (bounded
@@ -160,23 +204,33 @@ class FingerprintTracker:
                 return
             cutoff = float(now) - self._journal_retention_s
             kept: List[str] = []
+            # Surviving entries are preserved VERBATIM (original raw
+            # evidence); only aged-out lines are dropped.
             with open(self._journal_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        if _f((rec.get("obs") or [0])[0]) >= cutoff:
-                            kept.append(line)
-                    except Exception:
-                        continue  # malformed line: drop on compaction
+                if fcntl is not None:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                            if _f((rec.get("obs") or [0])[0]) >= cutoff:
+                                kept.append(line)
+                        except Exception:
+                            continue  # malformed: drop on compaction
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             tmp = self._journal_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(kept) + ("\n" if kept else ""))
             os.replace(tmp, self._journal_path)
-        except Exception:
-            pass
+            self._journal_health["compactions"] += 1
+        except Exception as exc:
+            self._journal_health["compaction_failures"] += 1
+            self._journal_health["last_error"] = repr(exc)
 
     def journal_series(self, mint: str,
                        now: Optional[float] = None
@@ -205,7 +259,9 @@ class FingerprintTracker:
                         out.append(tuple(_f(v) if i != 7 or v is not None
                                          else None
                                          for i, v in enumerate(obs)))
-        except Exception:
+        except Exception as exc:
+            self._journal_health["read_failures"] += 1
+            self._journal_health["last_error"] = repr(exc)
             return None
         out.sort(key=lambda o: o[0])
         return out or None
@@ -283,3 +339,26 @@ class FingerprintTracker:
             "rising_buys": rising_buys,
             "polls": len(obs),
         }
+
+
+def count_series_gaps(snaps: List[Dict[str, Any]],
+                      max_gap_factor: float = 5.0,
+                      min_gap_s: float = 300.0) -> int:
+    """Count missing middle intervals in a snapshot series.
+
+    A gap is an interval larger than BOTH max_gap_factor x the median
+    interval and min_gap_s - i.e. polls that should exist between two
+    retained observations but don't. First/last-edge truncation is a
+    separate check (window_truncated); this catches holes in the
+    middle, which never-raises persistence must not hide.
+    """
+    ts = sorted(_f(s.get("t")) for s in snaps
+                if isinstance(s, dict) and _f(s.get("t")) > 0)
+    if len(ts) < 3:
+        return 0
+    intervals = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    if not intervals:
+        return 0
+    med = sorted(intervals)[len(intervals) // 2]
+    threshold = max(min_gap_s, max_gap_factor * med)
+    return sum(1 for iv in intervals if iv > threshold)

@@ -415,6 +415,9 @@ class BacktestEngine:
             # their missing earlier observations are IRRECOVERABLE, so
             # their entries are later than real detection would allow.
             "n_window_truncated_trades": 0,
+            # Trades whose series has missing middle intervals or
+            # journal failures: also NOT complete series.
+            "n_incomplete_series_trades": 0,
             "trades": [],
             # Stage A cost-model accounting (0 / absent when disabled).
             "costs_enabled": self.costs_enabled,
@@ -502,6 +505,9 @@ class BacktestEngine:
                 "failed_exit_attempts", 0)
             if hist.get("window_truncated"):
                 report["n_window_truncated_trades"] += 1
+            if (hist.get("window_truncated") or hist.get("series_gaps")
+                    or not hist.get("series_complete")):
+                report["n_incomplete_series_trades"] += 1
             pnl = trade["pnl_mult"]
             mult = trade["proceeds_mult"]
             report["n_trades"] += 1
@@ -543,6 +549,11 @@ class BacktestEngine:
                 "entry_t": trade.get("entry_t"),
                 "entry_price": trade.get("entry_price"),
                 "window_truncated": bool(hist.get("window_truncated")),
+                "series_gaps": int(hist.get("series_gaps") or 0),
+                "series_complete": bool(
+                    hist.get("series_complete")
+                    and not hist.get("window_truncated")
+                    and not hist.get("series_gaps")),
                 "proceeds_mult": round(mult, 4),
                 "pnl_mult": round(pnl, 4),
                 "exit_reason": trade["exit_reason"],

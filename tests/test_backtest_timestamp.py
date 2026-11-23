@@ -169,6 +169,39 @@ class TestRugProvenanceGuard(unittest.TestCase):
         self.assertEqual(rep["per_gate_blocked"].get("rug"), 1)
 
 
+class TestSeriesCompletenessLabels(unittest.TestCase):
+    def test_incomplete_series_surfaced_on_trades(self):
+        # A record with middle gaps / truncation can never qualify as a
+        # complete series: the engine flags the trade and counts it.
+        h = _hist(safety_eval_t=0.0)
+        h["series_gaps"] = 2
+        h["series_complete"] = False
+        rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
+        self.assertEqual(rep["n_trades"], 1)
+        self.assertEqual(rep["n_incomplete_series_trades"], 1)
+        self.assertFalse(rep["trades"][0]["series_complete"])
+        self.assertEqual(rep["trades"][0]["series_gaps"], 2)
+
+    def test_legacy_unlabeled_record_is_incomplete(self):
+        # Pre-journal records carry NO series labels: their history is
+        # window-truncated and irrecoverable - they must not qualify as
+        # complete by silence.
+        rep = _engine(backtest.REPLAY_MODEL_V2).run(
+            [_hist(safety_eval_t=0.0)])
+        self.assertEqual(rep["trades"][0]["series_complete"], False)
+        self.assertEqual(rep["n_incomplete_series_trades"], 1)
+
+    def test_complete_series_labeled(self):
+        h = _hist(safety_eval_t=0.0)
+        h["series_source"] = "journal"
+        h["series_gaps"] = 0
+        h["window_truncated"] = False
+        h["series_complete"] = True
+        rep = _engine(backtest.REPLAY_MODEL_V2).run([h])
+        self.assertTrue(rep["trades"][0]["series_complete"])
+        self.assertEqual(rep["n_incomplete_series_trades"], 0)
+
+
 class TestReplayModelVersioning(unittest.TestCase):
     def test_report_carries_replay_model(self):
         for model in backtest.REPLAY_MODELS:

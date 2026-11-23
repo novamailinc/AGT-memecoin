@@ -940,6 +940,45 @@ class MemecoinAdapter(BrokerAdapter):
             return {"book_id":binding["book_id"], "account_id":binding["account_id"],
                     "currency":"SOL", "mode":"shared-usd-sol-sizing-v1"}
 
+    def scanner_close_identity(self, ticket):
+        """Exact shared-book identity for a scanner recovery intent."""
+        self._ensure()
+        if self._shared_account is None:
+            return None
+        with self._state_lock():
+            self._refresh_locked()
+            binding = json.loads((self._data_dir / "shared_binding.json").read_text())
+            return {"book_id":binding["book_id"], "account_id":binding["account_id"],
+                    "currency":"SOL", "mode":"shared-usd-sol-sizing-v1", "ticket":int(ticket)}
+
+    def scanner_close_receipt(self, identity):
+        """Recover only an exact durable CLOSE, never infer it from absence."""
+        self._ensure()
+        with self._state_lock():
+            self._refresh_locked()
+            binding = json.loads((self._data_dir / "shared_binding.json").read_text())
+            expected = {"book_id":binding["book_id"], "account_id":binding["account_id"],
+                        "currency":"SOL", "mode":"shared-usd-sol-sizing-v1", "ticket":identity["ticket"]}
+            if expected != identity:
+                raise ValueError("scanner close book identity conflict")
+            entries = [json.loads(line) for line in self._fills_path().read_text().splitlines()
+                       if line.strip()] if self._fills_path().exists() else []
+            matches = [e for e in entries if e.get("kind") == "CLOSE"
+                       and e.get("ticket") == identity["ticket"]]
+            if len(matches) > 1:
+                raise ValueError("duplicate scanner CLOSE receipt")
+            if not matches:
+                return None
+            receipt = matches[0]
+            if str(identity["ticket"]) in self._positions or not receipt.get("native_op_id"):
+                raise ValueError("scanner CLOSE receipt conflicts with inventory")
+            if not math.isfinite(float(receipt["price_sol"])) or receipt["price_sol"] < 0:
+                raise ValueError("invalid scanner CLOSE receipt price")
+            with open(self._fills_path(), "rb") as fh:
+                os.fsync(fh.fileno())
+            _fsync_dir(self._data_dir)
+            return copy.deepcopy(receipt)
+
     def shared_account_snapshot(self):
         """USD reporting only. Never feed native SOL risk sizing."""
         self._ensure()

@@ -286,6 +286,7 @@ class LaunchScanner(Daemon):
             pass
 
         store = get_store()
+        self._close_store = store
         event_bus.configure(store=store)
         from daemon.common import state_load_ok
         state = get_daemon_state(store, self.name)
@@ -4956,6 +4957,25 @@ class LaunchScanner(Daemon):
         positions = state.get("degen_positions") or {}
         price_fn = getattr(adapter, "_price_sol_quiet", None)
         now = time.time()
+        # Shared native CLOSE recovery precedes new quote-dependent policy.
+        # A committed close must not wait for the sold token to quote again.
+        recovered = {}
+        pending_closes = {}
+        close_identity = getattr(adapter, "scanner_close_identity", None)
+        if callable(close_identity):
+            from daemon.launch_scanner import close_outbox
+            for key, position in list(positions.items()):
+                identity = close_identity(position.get("ticket"))
+                if identity is not None:
+                    store = getattr(self, "_close_store", None) or get_store()
+                    prior = close_outbox.load(store, identity)
+                    if prior is not None:
+                        pending_closes[key] = prior
+                        receipt = adapter.scanner_close_receipt(identity)
+                        if receipt is not None:
+                            close_outbox.commit(store, prior, receipt)
+                            positions.pop(key, None)
+                            recovered[key] = True
         # Price pre-pass: quotes for the exit checks below. A position
         # with no quote is only a dead pool (as opposed to a market-data
         # outage) when the feed is otherwise healthy — that distinction
@@ -4975,7 +4995,11 @@ class LaunchScanner(Daemon):
         # on a fresh adapter, so its quote is an independent feed check.
         # Feed down => outage => never mass-close positions at ~0.
         feed_healthy = market_alive
-        if not feed_healthy and price_fn is not None:
+        needs_feed_probe = bool(positions) or not recovered
+        if recovered and not positions:
+            # Skip network only for a truly flat recovered book, not orphans.
+            needs_feed_probe = bool(adapter.positions())
+        if needs_feed_probe and not feed_healthy and price_fn is not None:
             try:
                 sol_px = price_fn("SOL")
             except Exception:
@@ -4999,9 +5023,20 @@ class LaunchScanner(Daemon):
             # is specifically dead: honor the time stop at ~0
             # ("pool_gone"). On a feed outage the position waits — an
             # outage must never mass-close the book at ~0.
+            prior_close = pending_closes.get(mint)
             time_exit_due = age_h >= max_hold_h
             pool_gone_close = False
-            if time_exit_due and (not price or price <= 0):
+            if prior_close is not None:
+                # Retry the durable decision only while its safety premise holds.
+                pool_gone_close = prior_close["reason"] == "pool_gone"
+                if pool_gone_close and (not feed_healthy or (price and price > 0)):
+                    # Never resurrect a worthless-price assumption after a feed
+                    # outage or a pool recovery. Keep unresolved evidence instead.
+                    logger.error("scanner pool-gone intent needs reconciliation ticket %s", pos.get("ticket"))
+                    continue
+                if not pool_gone_close and (not price or price <= 0):
+                    continue
+            elif time_exit_due and (not price or price <= 0):
                 if feed_healthy:
                     pool_gone_close = True
                 else:
@@ -5023,7 +5058,9 @@ class LaunchScanner(Daemon):
             except Exception:
                 pass
             reason = None
-            if pool_gone_close:
+            if prior_close is not None:
+                reason = prior_close["reason"]
+            elif pool_gone_close:
                 reason = "pool_gone"
             elif price <= float(pos.get("sl", 0)):
                 reason = "stop_loss"
@@ -5048,6 +5085,14 @@ class LaunchScanner(Daemon):
             if not reason:
                 continue
             ticket = pos.get("ticket")
+            close_context = None
+            if callable(close_identity):
+                identity = close_identity(ticket)
+                if identity is not None:
+                    from daemon.launch_scanner import close_outbox
+                    store = getattr(self, "_close_store", None) or get_store()
+                    close_context = close_outbox.prepare(store, identity, pos, mint,
+                        reason, peak, now, state, float(degen.entry_sol))
             try:
                 with execution_scope():
                     if pool_gone_close:
@@ -5059,12 +5104,20 @@ class LaunchScanner(Daemon):
             except Exception as exc:
                 logger.warning("degen close failed ticket %s: %s", ticket, exc)
                 # Position may already be gone — drop it so we don't spin.
-                if "no open paper position" in str(exc):
+                if close_context is None and "no open paper position" in str(exc):
                     positions.pop(mint, None)
                 continue
             entry_px = float(pos.get("entry_price_sol") or close_px)
             vol = float(pos.get("volume_sol") or degen.entry_sol)
             pnl = vol * (close_px / entry_px - 1) if entry_px > 0 else 0.0
+            if close_context is not None:
+                receipt = adapter.scanner_close_receipt(identity)
+                if receipt is None or receipt["price_sol"] != close_px:
+                    raise ValueError("scanner close returned without exact durable receipt")
+                close_outbox.commit(store, close_context, receipt)
+                # Learning uses the same actual native economics, never stale scanner size.
+                pnl = float(receipt["realized_pnl_sol"])
+                entry_px = float(receipt["allocations"][0]["entry_price_sol"])
             positions.pop(mint, None)
             # Score the smart wallets that bought this runner.
             try:
@@ -5112,7 +5165,8 @@ class LaunchScanner(Daemon):
                     reason, pnl)
             except Exception:
                 logger.warning("exit-copy record failed", exc_info=True)
-            event_bus.publish({
+            if close_context is None:
+                event_bus.publish({
                 "event": "position.closed",
                 "ticket": ticket,
                 "symbol": symbol,

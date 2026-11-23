@@ -211,6 +211,60 @@ class Store:
             self._conn.commit()
             return cur.lastrowid
 
+    def scanner_close_context(self, event_id: str, context: dict) -> dict:
+        """Serialize competing context creators before any economic close."""
+        with self._lock, self._txn():
+            self._conn.execute("BEGIN IMMEDIATE")
+            rows = self._conn.execute(
+                "SELECT payload FROM journal WHERE kind='scanner_close_intent' AND symbol=?",
+                (event_id,)).fetchall()
+            if rows:
+                if len(rows) != 1:
+                    raise ValueError("duplicate scanner close context")
+                prior = json.loads(rows[0]["payload"])["detail"]
+                if prior["identity"] != context["identity"] or prior["position"] != context["position"]:
+                    raise ValueError("scanner close context position conflict")
+                self._conn.commit()
+                return prior
+            entry = {"kind":"scanner_close_intent", "symbol":event_id, "detail":context}
+            self._conn.execute("INSERT INTO journal(ts,kind,symbol,payload) VALUES (?,?,?,?)",
+                (_utcnow(),entry["kind"],event_id,json.dumps(entry)))
+            self._conn.commit()
+            return context
+
+    def scanner_close_event(self, event: dict, evidence: dict) -> bool:
+        """Atomic, exact-id close evidence + three event projections.
+
+        Uses the existing unique delivery-journal identity as the durable
+        dedup barrier, including after the destructive queue is consumed.
+        No external notification is retried here.
+        """
+        event_id = event["event_id"]
+        with self._lock, self._txn():
+            self._conn.execute("BEGIN IMMEDIATE")
+            prior = self._conn.execute(
+                "SELECT payload FROM event_journal WHERE event_id=?", (event_id,)).fetchone()
+            marker = self._conn.execute(
+                "SELECT payload FROM journal WHERE kind='scanner_close_committed' AND symbol=?",
+                (event_id,)).fetchall()
+            record = {"kind":"scanner_close_committed", "symbol":event_id, "detail":evidence}
+            if prior is not None or marker:
+                if (prior is None or json.loads(prior["payload"]) != event
+                        or len(marker) != 1 or json.loads(marker[0]["payload"]) != record):
+                    raise ValueError("scanner close event identity conflict")
+                self._conn.commit()
+                return False
+            ts = event["ts"]
+            self._conn.execute("INSERT INTO event_queue(ts,event) VALUES (?,?)", (ts,json.dumps(event)))
+            for entry in ({"kind":"event", "symbol":event.get("symbol"), "payload":event}, record):
+                self._conn.execute("INSERT INTO journal(ts,kind,symbol,payload) VALUES (?,?,?,?)",
+                    (ts,entry["kind"],entry.get("symbol"),json.dumps(entry)))
+            self._conn.execute(
+                "INSERT INTO event_journal(event_id,event,severity,ts,payload) VALUES (?,?,?,?,?)",
+                (event_id,event["event"],event["severity"],ts,json.dumps(event)))
+            self._conn.commit()
+            return True
+
     def dequeue_events(self, limit: int = 100) -> list:
         """Pop up to `limit` oldest events (FIFO). Each returned dict is the
         stored event plus "_queue_id" and "_ts" metadata keys."""

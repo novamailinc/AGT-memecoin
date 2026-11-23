@@ -205,6 +205,8 @@ class TestNativeSharedEntry:
         degen.trail_trigger_pct=50.
         degen.trail_drawdown_pct=30.
         published=[]
+        from storage.store import Store
+        scanner._close_store=Store(tmp_path/"scanner-close.db")
         from agent import events
         with patch.object(events,'publish',side_effect=published.append), \
                 patch.object(scanner,'_grade_deployer_close'), \
@@ -212,7 +214,8 @@ class TestNativeSharedEntry:
                 patch.object(scanner,'_backtest_record_paper_close'):
             scanner._manage_exits(SimpleNamespace(degen=degen),a,state)
         assert state['degen_positions']=={}
-        closes=[e for e in published if e.get('event')=='position.closed']
+        from daemon.launch_scanner import scoreboard as close_scoreboard
+        closes=[r['payload'] for r in scanner._close_store.journal_query(kind='event')]
         assert len(closes)==2
         assert {e['reason'] for e in closes}=={'degen_max_hold'}
         assert all(e['profit']==0. for e in closes)

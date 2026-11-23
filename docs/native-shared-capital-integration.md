@@ -55,3 +55,32 @@ positions. Existing per-lane and frozen qualification policies stay unchanged.
 The separate close_intents module demonstrates the project's current
 cross-ledger recovery pattern but is close-specific. Reusing it blindly for
 native entry intents would not establish entry recovery correctness.
+
+### Scanner close recovery boundary
+
+Shared native scanner closes now persist an immutable SQLite close context before
+calling the broker. Recovery binds account UUID, native book UUID and ticket,
+requires the actual durable native CLOSE receipt, and runs before token quotes.
+The event uses native realized SOL PnL and verifies its single ticket allocation.
+Scanner context is retained for provenance, not used as economic authority.
+The event queue, pollable log, delivery journal and committed evidence marker are
+one exact-id SQLite transaction. Repeated recovery does not duplicate them.
+Notification fanout after this commit is best effort, not guaranteed delivery.
+
+New committed shared closes remain in the scoreboard after the delivery queue is
+consumed. Legacy queue-only closes still use the old reader contract and remain
+subject to destructive consumption. No historical migration or reconstruction is
+performed. Existing intent retries preserve the original reason. A previously
+uncommitted pool-gone zero-price decision whose premise no longer holds waits for
+reconciliation instead of closing against a recovered quote or feed outage.
+
+The independent legacy learning writers are not an atomic part of this close
+transaction. Recovery does not blindly replay wallet increments or other learning
+side effects. Committed evidence labels that projection unverified. This boundary
+is not complete learning recovery, Stage A qualification, phone reboot proof,
+physical power-loss proof, market performance evidence, or activation authority.
+
+Offline checks include an abrupt fresh-interpreter exit immediately after native
+close followed by two fresh-interpreter recoveries, stale scanner-basis mismatch,
+SQLite projection rollback, repeated stale-state recovery, wrong-book refusal,
+legacy queue-only fallback and mixed durable/legacy deduplication.

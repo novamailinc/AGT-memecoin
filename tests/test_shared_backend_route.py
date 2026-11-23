@@ -52,6 +52,8 @@ class TestSharedBackendRoute:
         monkeypatch.setattr(veto,'veto_check',lambda *a,**k:{'passed':True,'vetoes':[]})
         monkeypatch.setattr(scoreboard,'load_degen_closes',lambda *a:[])
         scanner=LaunchScanner.__new__(LaunchScanner)
+        from storage.store import Store
+        scanner._close_store=Store(tmp_path/'scanner-close.db')
         state={'degen_positions':{}}
         card={'entry':None,'note':'','tier':'early','source':'pumpfun','extra':{'complete':True}}
         degen=SimpleNamespace(entry_sol=.04,stop_loss_pct=30.,take_profit_pct=200.,

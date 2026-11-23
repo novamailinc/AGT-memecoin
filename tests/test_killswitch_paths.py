@@ -40,6 +40,19 @@ sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 
 import killswitch
 
+# Bind the production storage latch path (storage.store.DEFAULT_DB_PATH
+# is resolved at storage.store import time) to a temp file BEFORE any
+# is_halted call, so the human-halt checks below - and every earlier
+# exercise's implicit latch read - never touch the repo's real
+# storage/local.db.
+sys.path.insert(0, REPO)
+import importlib as _il
+import storage.store as _store_mod
+os.environ["FOREX_AGENT_STORAGE"] = os.path.join(
+    TMPD, "storage", "local.db")
+os.makedirs(os.path.dirname(os.environ["FOREX_AGENT_STORAGE"]))
+_il.reload(_store_mod)
+
 fails = []
 
 
@@ -186,22 +199,24 @@ finally:
 
 # 4. Global human emergency stop (Telegram /halt -> storage
 #    kill_switch latch) halts every lane on top of per-lane state.
-#    Regression for the 2026-11-23 validator finding: /halt engaged
-#    the storage latch while grad.scan_once kept opening positions.
+#    Regression for the 2026-11-23 validator findings: /halt engaged
+#    the storage latch while grad.scan_once kept opening positions,
+#    and the first fix read HOME/forex.db - a path no production
+#    /halt writes. The latch path is resolved exactly as the
+#    production writer: storage.store.DEFAULT_DB_PATH, i.e.
+#    $FOREX_AGENT_STORAGE else <repo>/storage/local.db, bound at
+#    storage.store import time.
+PROD_DB = os.environ["FOREX_AGENT_STORAGE"]
+
 hh = fresh_dir("hh")
 ks = reload_with(state_dir=hh,
                  state_file=os.path.join(hh, "state.json"),
                  shadow_file=os.path.join(hh, "state.json.bak"),
                  lock_file=os.path.join(hh, "state.lock"))
-ks.HOME = TMPD  # forex.db lives under HOME
-try:
-    from storage.store import Store
-except ImportError:
-    sys.path.insert(0, REPO)
-    from storage.store import Store
-db = os.path.join(TMPD, "forex.db")
-store = Store(db)
-store.set_kill_switch(True, "regression-probe")
+store = _store_mod.Store()  # exactly what the production backend builds
+check("test setup: store path is the production resolver path",
+      os.path.realpath(str(store.path)) == os.path.realpath(PROD_DB))
+store.set_kill_switch(True, "telegram")  # what /halt persists
 check("human halt: is_halted True with clean lane state",
       ks.is_halted("main"))
 check("human halt: gate False", not ks.gate("main"))
@@ -220,20 +235,26 @@ check("resume: lane tradeable again", not ks.is_halted("main"))
 check("resume: gate open", ks.gate("main"))
 
 # 5. Unreadable latch fails CLOSED (a stop command we cannot read
-#    is treated as given): make forex.db unopenable.
-os.unlink(db)
-os.makedirs(db)
+#    is treated as given): replace the DB file with a directory.
+store_path = str(store.path)
+del store
+os.unlink(PROD_DB)
+os.makedirs(PROD_DB)
 try:
     check("unreadable latch: is_halted True", ks.is_halted("main"))
     check("unreadable latch: gate False", not ks.gate("main"))
 finally:
-    os.rmdir(os.path.join(TMPD, "forex.db"))
+    os.rmdir(PROD_DB)
 
-# 6. Fresh environment (no forex.db at all) reads as NOT engaged.
-ks.HOME = fresh_dir("fresh-home")
-reload_with()
-ks.HOME = fresh_dir("fresh-home2")
-check("no forex.db: not halted", not ks.is_halted("main"))
+# 6. Fresh environment (latch DB does not exist) reads as NOT
+#    engaged, and the read must NOT create the production DB.
+NEW_DB = os.path.join(TMPD, "storage", "fresh", "local.db")
+os.makedirs(os.path.dirname(NEW_DB))
+os.environ["FOREX_AGENT_STORAGE"] = NEW_DB
+importlib.reload(_store_mod)
+check("no latch DB: not halted", not ks.is_halted("main"))
+check("no latch DB: read does not create the DB",
+      not os.path.exists(NEW_DB))
 
 print()
 if fails:

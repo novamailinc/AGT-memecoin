@@ -268,3 +268,57 @@ class HealthMonitor:
             logger.warning("could not write public-fallback alert file")
         logger.warning("PUBLIC-FALLBACK-ONLY: %s", alert["message"])
         return alert
+
+
+def read_durable_statuses(home=None, max_age_s=900):
+    """Read-only health view for OTHER processes (request section 4.5:
+    operational memory must inform the decision engine).
+
+    Returns a dict {provider: status} plus metadata, or None when no
+    durable health file exists. The honest contract:
+
+    * File missing  -> None: health is UNKNOWN, never reported "ok".
+    * File stale (older than max_age_s, default 15 min) -> the
+      statuses are returned with "stale": True and the file age, so
+      the caller can journal "last known" rather than "current".
+    * Corrupt file  -> None (unknown), same as missing.
+
+    This never gates anything by itself; it exists so decision-path
+    records can carry their data-quality context instead of treating
+    unread information as reliable.
+    """
+    home = home or os.environ.get("FOREX_AGENT_HOME") \
+        or os.path.expanduser("~/.forex-agent")
+    path = os.path.join(home, HEALTH_FILE)
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    ts = data.get("ts")
+    try:
+        age = time.time() - float(ts)
+    except (TypeError, ValueError):
+        age = None
+    statuses = {}
+    for name, rec in providers.items():
+        if not isinstance(rec, dict):
+            continue
+        p = ProviderHealth(name)
+        p.configured = bool(rec.get("configured", False))
+        p.calls = int(rec.get("calls") or 0)
+        p.errors = int(rec.get("errors") or 0)
+        p.rpc_429s = int(rec.get("rpc_429s") or 0)
+        p.wss_handshake_429s = int(rec.get("wss_handshake_429s") or 0)
+        p.timeouts = int(rec.get("timeouts") or 0)
+        p.monthly_quota_down = bool(rec.get("monthly_quota_down"))
+        statuses[name] = p.status()
+    return {"providers": statuses,
+            "ts": ts,
+            "age_s": round(age, 1) if age is not None else None,
+            "stale": age is None or age > max_age_s}

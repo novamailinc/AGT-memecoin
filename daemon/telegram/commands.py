@@ -613,13 +613,59 @@ def _cmd_status(ctx, chat_id, user_id, update_id, args):
         ctx.send(chat_id, "⚠️ health read failed: %s" % exc, None)
         return
     lines = ["🟢 Status"] + _status_mode_lines()
+    # Memecoin lane gate state (2026-11-23, validator finding): the
+    # forex health block below shows the forex facade's latch, NOT
+    # the memecoin lanes' actual gate state. Show the real gates:
+    # the global human halt latch plus per-lane killswitch halts.
+    # Unknown is reported as unknown, never as clear.
+    lines.append("Memecoin lanes:")
+    lines.extend("  " + s for s in _memecoin_gate_lines())
+    forex = ["forex (legacy facade):"]
     for key in ("mode", "kill_switch", "daemons", "queue", "storage"):
         if key in health:
-            lines.append("%s: %s" % (key, health[key]))
+            forex.append("  %s: %s" % (key, health[key]))
     if "checks" in health and isinstance(health["checks"], dict):
         bad = [k for k, v in health["checks"].items() if not v]
-        lines.append("checks failing: %s" % (", ".join(bad) if bad else "none"))
+        forex.append("  checks failing: %s"
+                     % (", ".join(bad) if bad else "none"))
+    lines.extend(forex)
     ctx.send(chat_id, "\n".join(lines), None)
+
+
+def _memecoin_gate_lines():
+    """Actual memecoin lane gate state for /status: the global human
+    halt latch (/halt) plus per-lane killswitch verdict halts. Never
+    raises; unknown is reported as unknown, never as clear."""
+    try:
+        from daemon.launch_scanner import killswitch as ks
+    except Exception:
+        try:
+            import killswitch as ks
+        except Exception:
+            return ["gate state: unavailable (killswitch unreadable)"]
+    lines = []
+    try:
+        engaged = ks._human_halt_engaged()
+    except Exception:
+        engaged = None
+    lines.append("human halt (/halt): %s" % (
+        "ENGAGED" if engaged is True
+        else "not engaged" if engaged is False else "unknown"))
+    try:
+        st = ks.status()
+    except Exception:
+        st = None
+    if not isinstance(st, dict):
+        lines.append("lane gates: unknown (status read failed)")
+    elif st.get("state_error"):
+        lines.append("lane gates: unknown (state unreadable - "
+                     "fail-closed treats every lane as halted)")
+    else:
+        halted = sorted(n for n, v in st.items()
+                        if isinstance(v, dict) and v.get("halted"))
+        lines.append("lane gates halted: %s"
+                     % (", ".join(halted) if halted else "none"))
+    return lines
 
 
 def _cmd_signals(ctx, chat_id, user_id, update_id, args):
@@ -764,17 +810,65 @@ def _cmd_account(ctx, chat_id, user_id, update_id, args):
 
 
 def _cmd_perf(ctx, chat_id, user_id, update_id, args):
-    try:
-        days = int(args[0]) if args else 30
-    except ValueError:
-        ctx.send(chat_id, "Usage: /perf [days]", None)
-        return
-    try:
-        res = ctx.tools.forex_get_performance(lookback_days=days)
-    except Exception as exc:
-        ctx.send(chat_id, "⚠️ performance read failed: %s" % exc, None)
-        return
-    ctx.send(chat_id, "📈 Performance (%dd): %s" % (days, res), None)
+    """/perf [demo|forex] [days] - explicit account selection; with no
+    account argument BOTH books are shown, each labeled (2026-11-23,
+    validator finding: /perf used to read ONLY the forex facade's
+    broker history and report zero closed trades while the memecoin
+    paper account had realized results). Demo = shared memecoin
+    simulated account's own ledger (realized P/L and close counts;
+    the ledger keeps no per-day windows, so demo figures are
+    all-time, stated as such). Forex = legacy facade lookback.
+    Neither silently replaces the other; an unreadable demo ledger
+    reports unavailable, never zero."""
+    sel = ""
+    days = 30
+    for a in args:
+        al = a.lower()
+        if al in ("demo", "forex"):
+            sel = al
+            continue
+        try:
+            days = int(a)
+        except ValueError:
+            ctx.send(chat_id, "Usage: /perf [demo|forex] [days]", None)
+            return
+    sections = []
+    if sel in ("", "demo"):
+        snap = _demo_snapshot()
+        if snap is None:
+            sections.append(
+                "🧪 Demo performance (simulated): no demo account "
+                "ledger found - memecoin paper results unavailable, "
+                "NOT zero.")
+        else:
+            lanes = snap.get("lanes") or {}
+            n_closes = sum(int(st.get("n_closes") or 0)
+                           for st in lanes.values()
+                           if isinstance(st, dict))
+            lines = ["🧪 Demo performance (SIMULATED, shared memecoin "
+                     "account, all-time):",
+                     "Realized P/L: %s"
+                     % _fmt_money(snap.get("realized_pnl")),
+                     "Closed trades: %d" % n_closes]
+            for name, st in sorted(lanes.items()):
+                if not isinstance(st, dict):
+                    continue
+                if (st.get("n_closes") or 0) or (st.get("n_entries") or 0):
+                    lines.append("• %s: %d closes, realized %s" % (
+                        name, st.get("n_closes") or 0,
+                        _fmt_money(st.get("realized_pnl"))))
+            lines.append("(Demo ledger keeps no per-day windows; "
+                         "figures are all-time, not %dd.)" % days)
+            sections.append("\n".join(lines))
+    if sel in ("", "forex"):
+        try:
+            res = ctx.tools.forex_get_performance(lookback_days=days)
+        except Exception as exc:
+            sections.append("📊 Forex performance: read failed: %s" % exc)
+        else:
+            sections.append("📊 Forex performance (%dd, legacy "
+                            "facade): %s" % (days, res))
+    ctx.send(chat_id, "\n\n".join(sections), None)
 
 
 def _cmd_smartadd(ctx, chat_id, user_id, update_id, args):

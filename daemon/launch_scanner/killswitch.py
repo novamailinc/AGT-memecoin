@@ -534,20 +534,30 @@ def _human_halt_engaged() -> bool:
     Engaged = every lane halted, IN ADDITION to per-lane halts.
     /resume releases it; per-lane halts stay human-only via
     reenable(). Fail-closed: an unreadable latch counts as ENGAGED -
-    a stop command we cannot read is treated as given. A fresh
-    environment with no forex.db reads as not engaged (the Store
-    creates the DB on open; no row means never halted)."""
+    a stop command we cannot read is treated as given.
+
+    The latch path resolves EXACTLY as the production writer does
+    (storage.store.DEFAULT_DB_PATH: $FOREX_AGENT_STORAGE else
+    <repo>/storage/local.db, resolved at storage.store import time) -
+    the first version of this check read HOME/forex.db, which no
+    production /halt ever writes (validator retest 2026-11-23).
+    The DB is opened only when the file already exists: this reader
+    never CREATES the production database as a side effect. No file
+    = no halt was ever written = not engaged."""
     try:
         try:
-            from storage.store import Store
+            from storage.store import Store, DEFAULT_DB_PATH
         except ImportError:
             import sys as _sys
             _repo = os.path.dirname(os.path.dirname(
                 os.path.dirname(os.path.abspath(__file__))))
             if _repo not in _sys.path:
                 _sys.path.insert(0, _repo)
-            from storage.store import Store
-        st = Store(os.path.join(HOME, "forex.db"))
+            from storage.store import Store, DEFAULT_DB_PATH
+        path = str(DEFAULT_DB_PATH)
+        if not os.path.exists(path):
+            return False
+        st = Store(path)
         try:
             rec = st.get_kill_switch()
         finally:

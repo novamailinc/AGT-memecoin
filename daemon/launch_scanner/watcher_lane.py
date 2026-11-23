@@ -92,6 +92,7 @@ try:
     from daemon.launch_scanner import safety as _safety
     from daemon.launch_scanner import sources as _sources
     from daemon.launch_scanner import signal_bus as _bus
+    from daemon.launch_scanner import toxicity as _toxicity
     _HAS_DEPS = True
 except Exception:
     try:
@@ -101,6 +102,7 @@ except Exception:
         import safety as _safety
         import sources as _sources
         import signal_bus as _bus
+        import toxicity as _toxicity
         _HAS_DEPS = True
     except Exception:
         _HAS_DEPS = False
@@ -826,6 +828,23 @@ def _liq_gate(chain, mint):
     return True, "", st
 
 
+def _tox_info_from_tape(st):
+    """Map the fresh tape dict to the enrich()-shaped info the
+    toxicity fingerprints expect. Unknown fields stay ABSENT (the
+    coverage labels then read 'unverifiable', never clean): GT
+    fallback tapes carry None txn/volume fields, and pair creation
+    is only present on dexscreener tapes (pair_created_ms,
+    2026-11-23)."""
+    st = st or {}
+    info = {"txns": {"m5": {"buys": st.get("buys_m5"),
+                            "sells": st.get("sells_m5")},
+                     "h1": {"buys": st.get("buys_h1"),
+                            "sells": st.get("sells_h1")}},
+            "volume": {"m5": st.get("vol_m5")},
+            "pairCreatedAt": st.get("pair_created_ms")}
+    return info
+
+
 def _safety_ok(chain, mint):
     """(ok, why, report, transient). Fail-closed via
     safety.check_token — unknown = no entry (transient), hard fail
@@ -953,6 +972,30 @@ def _consider_fire(sig, now):
         if not transient:
             _mark_dead(mint, "safety: " + why)
         return _skip(mint, "safety: " + why, not transient)
+
+    # Manipulation veto AT ENTRY (2026-11-23, forge-probe fix): the
+    # bus is a local convention - a record labeled "smart-watcher"
+    # proves nothing about the upstream gate stack having run (a
+    # hand-published record with the right label and convergence
+    # evidence opened positions in the validator's probe). The lane
+    # now re-runs the same toxicity fingerprints on its OWN fresh
+    # tape: veto -> final skip; any fingerprint UNVERIFIABLE on this
+    # tape -> fail-closed transient skip (retried while the fire
+    # lives, then dropped with its reason). The lane never trades a
+    # mint whose manipulation checks did not actually run.
+    tox_info = _tox_info_from_tape(st)
+    toxic, tox_reason, tox_cov = _toxicity.check_toxicity_detailed(
+        tox_info)
+    if toxic:
+        logger.warning("watcher %s: TOXIC BLOCK at entry: %s",
+                       mint[:8], tox_reason)
+        _mark_dead(mint, "toxicity: " + tox_reason)
+        return _skip(mint, "toxicity: " + tox_reason, True)
+    unver = sorted("%s=%s" % kv for kv in tox_cov.items()
+                   if str(kv[1]).startswith("unverifiable"))
+    if unver:
+        return _skip(mint, "toxicity unverifiable (%s)"
+                     % "; ".join(unver), False)
 
     gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD,
                                 venue=fee_venue or None)

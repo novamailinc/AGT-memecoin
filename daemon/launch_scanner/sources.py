@@ -285,6 +285,13 @@ def _pair_to_stats(top: Dict[str, Any]) -> Dict[str, Any]:
         "sells_h1": int(txns_h1.get("sells") or 0),
         "chg_m5": _f(_chg.get("m5")),
         "chg_h1": _f(_chg.get("h1")),
+        # pair_created_ms (2026-11-23): pair creation time from the
+        # DexScreener payload, needed by the entry-time manipulation
+        # veto (bot-swarm fingerprint). None when the payload lacks
+        # it - never guessed.
+        "pair_created_ms": (_f(top.get("pairCreatedAt"))
+                            if top.get("pairCreatedAt") is not None
+                            else None),
         "url": ("https://dexscreener.com/%s/%s" % (chain, pair_addr)
                 if chain and pair_addr else ""),
         "dex": dex,
@@ -460,6 +467,9 @@ def _gt_token_to_stats(token: Dict[str, Any], chain: str,
                              or attrs.get("fdv_usd")),
         "price_usd": price if price > 0 else None,
         "vol_m5": None,
+        # pair_created_ms: GT's token payload carries no pair creation
+        # time here - None (unknown), never guessed.
+        "pair_created_ms": None,
         "buys_m5": None,
         "sells_m5": None,
         "vol_h1": None,

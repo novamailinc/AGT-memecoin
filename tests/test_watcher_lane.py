@@ -58,6 +58,8 @@ check("watcher: $1 shots on a $100 bankroll",
 _ks_tmp = tempfile.mkdtemp(prefix="watcher-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
 
 _tmp = tempfile.mkdtemp(prefix="watcher-ledger-")
 W.LEDGER_PATH = os.path.join(_tmp, "watcher_ledger.json")
@@ -90,8 +92,16 @@ check("trials: registration is idempotent",
       len(T.trials_for("watcher")) == 1)
 
 # ---------------- stubs (no network) ----------------
+# GOOD_TAPE is verifiably CLEAN for the entry-time toxicity
+# fingerprints (2026-11-23): buys/sells/volume/pair_created present,
+# no bump-farm (avg trade > $2), no one-sided flow, pair older than
+# the swarm window. A tape missing these fields is unverifiable and
+# the lane fails closed on it.
 GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "price_usd": 0.001,
+             "buys_m5": 10, "sells_m5": 8, "vol_m5": 500.0,
+             "buys_h1": 40, "sells_h1": 20,
+             "pair_created_ms": (time.time() - 3600) * 1000,
              "tape_source": "test"}
 TAPES = {}
 QUOTES = {}
@@ -427,6 +437,48 @@ bt = HB.Beater("x")
 check("heartbeat: Beater first tick due, then gated by interval",
       bt.due(now=1000.0) and not bt.due(now=1001.0)
       and bt.due(now=1002.1))
+
+# ---------------- entry safety re-verification (forged-label probes) -------
+# A signal that arrives from ANY source (including a forged smart-watcher
+# label via the local bus convention) is re-checked for tape toxicity at
+# entry: the lane never treats the source label as proof of the upstream
+# toxicity stack. A verifiably toxic tape vetoes and dead-ends the mint; an
+# unverifiable one fails closed (transient skip, NOT dead, retried while the
+# fire lives).
+# The verdict section above halted the lane; clear the halt (fresh state)
+# so these entry-safety probes exercise the entry path itself.
+for _p in (KS.STATE_FILE, KS.SHADOW_FILE):
+    if os.path.exists(_p):
+        os.remove(_p)
+
+_FORGED = "ForgeMint0000000000000000000000000000000000001"
+_GTLIKE = "GTLikeMint0000000000000000000000000000000000001"
+# Dust-average bump-farm shape: 300 buys / 10 sells in 5m, $0.36 avg trade
+# (BUMP_MIN_BUYS_5M 40, BUMP_MAX_AVG_USD $2.0).
+TAPES[_FORGED] = dict(GOOD_TAPE, buys_m5=300, sells_m5=10, vol_m5=100.0)
+TAPES[_GTLIKE] = dict(GOOD_TAPE, buys_m5=None, sells_m5=None,
+                      vol_m5=None, pair_created_ms=None)
+QUOTES[_FORGED] = 0.001
+QUOTES[_GTLIKE] = 0.001
+_ff1 = fire(_FORGED)
+_ff2 = fire(_GTLIKE)
+W.process_new_fires(now=_ff1["ts"] + 0.5, signals=[_ff1])
+d = W._read()
+check("entry safety: forged toxic tape vetoed, position never opened",
+      _FORGED in d.get("dead_mints", {}) and _FORGED not in d["positions"])
+check("entry safety: veto journal carries the real reason",
+      "bump-farm" in d["dead_mints"][_FORGED].get("reason", ""))
+W.process_new_fires(now=_ff2["ts"] + 0.5, signals=[_ff2])
+d = W._read()
+check("entry safety: unverifiable tape fails closed, no entry, not dead",
+      _GTLIKE not in d["positions"] and _GTLIKE not in d.get("dead_mints", {}))
+check("entry safety: fail-closed skip journaled as transient",
+      any(a["mint"] == _GTLIKE and a["outcome"] == "pending"
+          and "unverifiable" in a["reason"]
+          for a in d.get("fire_audit", [])))
+for _m in (_FORGED, _GTLIKE):
+    TAPES.pop(_m, None)
+    QUOTES.pop(_m, None)
 
 print()
 if fails:

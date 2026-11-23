@@ -1,0 +1,95 @@
+# Request audit — sections 4/5/6
+
+Audit of the repo against the engineering request (26-section AGT trading-system
+brief), sections 4 (intelligence/memory), 5 (early discovery), 6 (market
+intelligence). Status vocabulary: IMPLEMENTED (code evidence cited) / PARTIAL /
+MISSING / PENDING (not yet verified). Repo baseline: 4226728 (main, 2026-11-23).
+Items marked FIXED name the landing commit.
+
+## 5. Early token discovery
+
+- On-chain discovery via program subscriptions: IMPLEMENTED — daemon/intelligence/acquisition
+  (websocket_manager.py, subscription_manager.py, helius_streams.py, providers/),
+  decoders for pump.fun + PumpSwap + token program (daemon/intelligence/decoders/).
+  PENDING: verify Pump.fun V2 coverage claim, pool-creation and liquidity-initialization
+  event coverage.
+- Every discovery event has timestamp/slot/tx-sig/program/provenance/validation/confidence:
+  IMPLEMENTED — LogicalEvent (daemon/intelligence/events/event_models.py) carries
+  signature, slot, block_time, per-field provenance, verification_status
+  (verified/unverified/conflicting), lifecycle_status, providers, decoder_version.
+  FIXED (b45ad4a): (a) the event record now carries an explicit program-identity
+  field with merge semantics; (b) confidence/completeness remain categorical
+  (verification_status) — no invented numeric scores; documented as the chosen
+  representation.
+- Discovery latency measurement: IMPLEMENTED — daemon/launch_scanner/latency.py
+  measures first_seen_ts -> first_card_ts (discovery-to-signal), persisted,
+  median/p90 surfaced. FIXED (b45ad4a): LogicalEvent now carries
+  recognition_latency_s (on-chain event block_time -> bot recognition) with merge
+  semantics. REMAINING: acquisition/benchmark.py receipt-vs-decision harness is a
+  keyed live benchmark, currently blocked (keyed VM run held); not continuous
+  production measurement.
+- "Do not confuse fast discovery with good opportunity": design posture present
+  (measurement-only module, never trades/gates).
+
+## 4. Intelligence and memory
+
+- 4.1 Market memory: PARTIAL — dossiers.py (per-mint birth dossiers, 24h TTL),
+  regime.py (regime tagging), backtest REGIME_RULES (contemporaneous-only),
+  fingerprints.py (durable fp_series_journal). GAP: TTL'd dossiers are not long-term
+  memory of launches/patterns; "remember failed launches, liquidity collapses,
+  historical signal outcomes" partially via verdict_ledger/lessons; depth check PENDING.
+- 4.2 Wallet memory: IMPLEMENTED (measurement posture) — wallet_grader.py
+  (statistical gates), funding_clusters.py (union-find funder clustering, explicitly
+  non-gating), deployer_tracker.py / deployers.py, smartmoney.py, follower_grader.py.
+  PENDING: persistence depth per wallet over time.
+- 4.3 Trading memory: IMPLEMENTED — recorder.py, tap_journal.py, decision_journal.py
+  (daemon/intelligence/signals/), verdict_ledger.py, exit_provenance.py, paper_account
+  ledgers. decision journal + lessons.py settle records with outcomes.
+- 4.4 Strategy memory: IMPLEMENTED (advisory) — lessons.py (per-lane JSONL decision
+  memory, templated lessons, ADVISORY ONLY v1), winner_model.py, win_classifier.py,
+  lane_bandit.py (Thompson sampling, PNL-scaled, time decay).
+- 4.5 Operational memory: IMPLEMENTED — acquisition/provider_health.py
+  (ok/degraded/down/unconfigured, latency/error/429 surfacing, public-fallback-only
+  alert), health_monitor.py, event_recovery.py, helius_ratelimit.py,
+  provider_health.read_durable_statuses (cross-process read-only view; missing file =
+  unknown, never "ok"). FIXED (10cc2d7): the "operational memory must inform the
+  decision engine" requirement is now wired — paper_account's entry debit consults
+  the durable health record when PROVIDER_HEALTH_GATE_ENABLED=1 (default OFF;
+  activation and the PROVIDER_HEALTH_GATE_PROVIDERS list stay owner-owned). Enabled
+  with an incomplete provider list, a missing/corrupt/stale record, or any listed
+  provider not "ok" blocks the entry fail-closed: uncertain market information is
+  never treated as reliable. Exits never gated. tests/test_provider_health_gate.py
+  (12 checks).
+- 4.6 Controlled learning: posture matches — lessons advisory-only, lane_bandit
+  bounded, no silent safety-limit rewrites found. PENDING: verify no module
+  auto-promotes untested strategies; walk_forward.py exists for offline evaluation.
+
+## 6. Advanced market intelligence
+
+- 6.1 Launch intelligence: IMPLEMENTED (partial depth) — safety.py (RugCheck +
+  instant_safety on-chain fallback: authorities, freeze, mint characteristics),
+  dossiers.py, lp_lock.py, locked_liq.py. PENDING: Token-2022 extension checks.
+- 6.2 Liquidity intelligence: IMPLEMENTED — reserves.py, reserves_curve_price.py,
+  curve_cache.py, liquidity_mirage.py, exit_liquidity_clock.py, price-impact modeling
+  in backtest.py. PENDING: continuous pool-reserve monitoring + migration/abnormal-
+  movement detection coverage.
+- 6.3 Wallet intelligence: see 4.2 + insiders.py, holder_tracker.py, holder_quality.py,
+  dust_holders.py, anticrowd.py, funding_clusters.py.
+- 6.4 Trading intelligence: IMPLEMENTED — momentum.py, smartgrade.py, fusion.py
+  (daemon/intelligence/signals/), saturation.py, spoof_walls.py. PENDING: multi-window
+  evaluation + double-counting guard verification.
+- 6.5 Manipulation intelligence: IMPLEMENTED — toxicity.py (BUMP_FARM, WASH_SKEW,
+  BOT_SWARM), bundle.py, insiders.py, funding_clusters.py, spoof_walls.py.
+  FIXED (b45ad4a): check_toxicity_detailed now returns per-fingerprint coverage
+  labels (clear/veto/unverifiable with reasons); the smart-watcher journals
+  toxicity_coverage with every card, so each veto carries its evidence and every
+  "clear" is distinguishable from "did not run". Legacy veto outcomes preserved.
+  FIXED (18b2c6d): watcher_lane re-runs the same fingerprints on its own fresh tape
+  at entry — the bus label is not proof the upstream stack ran; veto = final skip,
+  unverifiable = fail-closed transient skip (regression tests in test_watcher_lane;
+  validator forge probe opens 0 positions).
+
+## Remaining verification work
+1. Each PENDING item above (depth checks, not docstring trust).
+2. Keyed live benchmark run (acquisition/benchmark.py) — held pending account facts.
+3. Anything requiring live mainnet data stays labeled unverifiable until a keyed run.

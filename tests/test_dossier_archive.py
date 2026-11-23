@@ -305,6 +305,10 @@ def test_outcome_linkage_via_verdict_ledger_close():
                   and outs[0].get("lane") == "grad"
                   and outs[0].get("realized_mult") == 2.0
                   and outs[0].get("closed_reason") == "trail")
+            check("outcome: simulated provenance travels with the "
+                  "record, never masquerades as verified",
+                  outs[0].get("provenance") == "simulated"
+                  and outs[0].get("qualified") is False)
             mem = dossiers.launch_memory("MINT-OC")
             check("outcome: launch_memory joins outcomes + lanes",
                   mem is not None
@@ -411,7 +415,178 @@ def test_concurrent_appends_never_interleave():
               ok == 100 and len(lines) == 100)
 
 
+def test_missing_archive_with_existing_history_is_unavailable():
+    with _Ctx() as c:
+        # The bot HAS closed trades before (verdict ledger exists)
+        # but the archive is gone: lost history, not first use.
+        vdir = os.path.join(c.home, "verdict_ledger")
+        os.makedirs(vdir, exist_ok=True)
+        with open(os.path.join(vdir, "events.jsonl"), "w") as f:
+            f.write(json.dumps({"seq": 1}) + "\n")
+        st = dossiers.archive_status()
+        check("status: missing archive + existing ledger = lost "
+              "history, unavailable",
+              st.get("available") is False
+              and st.get("error")
+              == "archive_missing_with_existing_history")
+
+
+def test_torn_tail_marks_history_partial():
+    with _Ctx() as c:
+        now = time.time()
+        c.write_dossier("MINT-P", now - 25 * 3600, deployer="DEP-1",
+                        safety={"ts": now,
+                                "report": {"unknown": False,
+                                           "source": "rugcheck"}})
+        dossiers._sweep(now)
+        # Simulate a crash mid-append: a torn final line.
+        with open(dossiers.ARCHIVE_FILE, "a") as f:
+            f.write('{"v": 1, "mint": "TORN')
+        st = dossiers.archive_status()
+        check("partial: torn line counted, archive still readable",
+              st.get("available") is True
+              and st.get("unreadable_lines") == 1)
+        mem = dossiers.launch_memory("MINT-P", now=now + 5)
+        check("partial: launch_memory labels partial history",
+              mem is not None and mem.get("partial") is True)
+
+
+def test_compaction_never_discards_concurrent_append():
+    import threading
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        dossiers.ARCHIVE_MAX_BYTES = 2000
+        try:
+            for i in range(30):
+                dossiers.record_outcome("MINT-R", "grad", ts=now + i,
+                                        realized_mult=1.0,
+                                        closed_reason="t")
+            # Hold the write lock, start a racing append (it
+            # blocks), then run compaction in a second thread
+            # (also blocks). Release: both must serialize and the
+            # appended record must SURVIVE the rename.
+            lock = dossiers._archive_write_lock()
+            lock.__enter__()
+            results = {}
+
+            def racer():
+                results["appended"] = dossiers.record_outcome(
+                    "MINT-RACER", "grad", ts=now + 999,
+                    realized_mult=2.0, closed_reason="race")
+
+            def compactor():
+                dossiers._maybe_compact_archive(now + 1000)
+                results["compacted"] = True
+
+            t1 = threading.Thread(target=racer)
+            t2 = threading.Thread(target=compactor)
+            t1.start()
+            t2.start()
+            time.sleep(0.3)
+            lock.__exit__(None, None, None)
+            t1.join(timeout=30)
+            t2.join(timeout=30)
+            check("race: racing append and compaction both finished",
+                  results.get("appended") is True
+                  and results.get("compacted") is True)
+            survivors = [r.get("mint") for r in
+                         dossiers.outcome_records()]
+            check("race: racing append survived compaction",
+                  "MINT-RACER" in survivors)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+
+
+def test_cross_process_appends_never_interleave():
+    """Real separate PROCESSES (threads are not cross-process
+    proof): four children append concurrently; every line must
+    stay intact."""
+    import subprocess
+    with _Ctx() as c:
+        child = (
+            "import sys, time;"
+            "sys.path.insert(0, %r);"
+            "from daemon.launch_scanner import dossiers;"
+            "dossiers.ARCHIVE_FILE = %r;"
+            "[dossiers.record_outcome('MINT-X', 'p%%d' %% int(sys.argv[1]),"
+            " ts=%f + i, realized_mult=1.0, closed_reason='x')"
+            " for i in range(25)]"
+            % (os.path.join(os.path.dirname(__file__), ".."),
+               dossiers.ARCHIVE_FILE, time.time()))
+        procs = [subprocess.Popen(
+            [sys.executable, "-c", child, str(n)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for n in range(4)]
+        for p in procs:
+            p.wait(timeout=60)
+        with open(dossiers.ARCHIVE_FILE) as f:
+            lines = [l for l in f if l.strip()]
+        ok = 0
+        for l in lines:
+            try:
+                json.loads(l)
+                ok += 1
+            except Exception:
+                pass
+        check("cross-process: 4 processes x 25 appends all intact",
+              ok == 100 and len(lines) == 100)
+
+
+def test_rollup_records_survive_compaction_and_merge():
+    with _Ctx() as c:
+        now = time.time()
+        real_cap = dossiers.ARCHIVE_MAX_BYTES
+        real_raw = dossiers.OUTCOME_RAW_S
+        dossiers.ARCHIVE_MAX_BYTES = 2000
+        dossiers.OUTCOME_RAW_S = 100  # roll up anything older
+        try:
+            for i in range(30):
+                dossiers.record_outcome(
+                    "MINT-OLD", "grad", ts=now - 1000 - i,
+                    realized_mult=2.0 if i % 2 else 0.5,
+                    closed_reason="trail")
+            dossiers._last_sweep = 0.0
+            dossiers._sweep(now)
+            with open(dossiers.ARCHIVE_FILE) as f:
+                lines = [json.loads(l) for l in f if l.strip()]
+            rollups = [l for l in lines
+                       if l.get("record_type") == "outcome_rollup"]
+            check("rollup: old outcomes aggregated per lane-year",
+                  len(rollups) == 1
+                  and rollups[0].get("count") == 30
+                  and rollups[0].get("wins") == 15
+                  and rollups[0].get("losses") == 15
+                  and rollups[0].get("provenance") == "simulated"
+                  and rollups[0].get("qualified") is False)
+            # A second compaction merges the existing rollup
+            # instead of duplicating it. (Compaction only runs
+            # past the cap, so drop the cap to force it.)
+            dossiers.record_outcome("MINT-OLD2", "grad",
+                                    ts=now - 2000,
+                                    realized_mult=3.0,
+                                    closed_reason="trail")
+            dossiers.ARCHIVE_MAX_BYTES = 100
+            dossiers._maybe_compact_archive(now + 1)
+            with open(dossiers.ARCHIVE_FILE) as f:
+                lines = [json.loads(l) for l in f if l.strip()]
+            rollups = [l for l in lines
+                       if l.get("record_type") == "outcome_rollup"]
+            check("rollup: second compaction merges, no duplicate",
+                  len(rollups) == 1
+                  and rollups[0].get("count") == 31
+                  and rollups[0].get("wins") == 16)
+        finally:
+            dossiers.ARCHIVE_MAX_BYTES = real_cap
+            dossiers.OUTCOME_RAW_S = real_raw
+
+
 def main():
+    test_missing_archive_with_existing_history_is_unavailable()
+    test_torn_tail_marks_history_partial()
+    test_compaction_never_discards_concurrent_append()
+    test_cross_process_appends_never_interleave()
+    test_rollup_records_survive_compaction_and_merge()
     test_eviction_suppressed_when_archive_write_fails()
     test_archive_status_distinguishes_empty_from_unavailable()
     test_outcome_linkage_via_verdict_ledger_close()

@@ -82,14 +82,23 @@ ARCHIVE_FILE = os.path.join(HOME, "memory", "launch_archive.jsonl")
 # - durability: a dossier is only evicted after its archive write
 #   SUCCEEDS; writers append under an exclusive flock so
 #   concurrent daemons never interleave a line;
-# - retention: the file is append-only but NOT unbounded - past
-#   ARCHIVE_MAX_BYTES the sweep compacts it (latest launch record
-#   per mint + all outcome records + a compaction anchor naming
-#   how many records were dropped). Retrieval stays a bounded
-#   scan; a real index is a future slice if volume outgrows it.
+# - retention: launch records collapse to one per mint under
+#   compaction, but OUTCOME history is kept raw for a year and
+#   then rolled into per-lane-per-year summary records
+#   (outcome_rollup), so neither file size nor scan cost grows
+#   without bound. While the retained set fits under
+#   ARCHIVE_MAX_BYTES the cap bounds the file outright; past
+#   that, compaction rewrites to the bounded kept set. Retrieval
+#   is a full scan of that bounded file; a real index is a
+#   future slice if volume outgrows scanning;
+# - outcome provenance: today's closes come from SIMULATED paper
+#   lanes. Every outcome record carries provenance; rollups
+#   count them as simulated wins/losses, never as verified
+#   real-money results.
 ARCHIVE_SCHEMA_V = 1
 ARCHIVE_STALE_S = 30 * 86400
 ARCHIVE_MAX_BYTES = 8 * 1024 * 1024
+OUTCOME_RAW_S = 365 * 86400  # raw outcomes kept a year, then rolled up
 
 
 def _archive_lock_path():
@@ -272,8 +281,24 @@ def record_outcome(mint, lane, ts=None, pnl_usd=None,
             "pnl_usd": pnl_usd,
             "realized_mult": realized_mult,
             "closed_reason": closed_reason,
+            # Today's closes are simulated paper-lane results.
+            # The label travels with the record so no consumer
+            # can mistake it for a verified real-money outcome.
+            "provenance": "simulated",
+            "qualified": False,
         }
         return _archive_append(rec)
+    except Exception:
+        return False
+
+
+def _verdict_ledger_has_history():
+    """True when the verdict ledger holds records, meaning the
+    bot HAS traded/closed before - so a missing archive is lost
+    history, not genuine first use. Never raises."""
+    try:
+        p = os.path.join(HOME, "verdict_ledger", "events.jsonl")
+        return os.path.exists(p) and os.path.getsize(p) > 0
     except Exception:
         return False
 
@@ -283,15 +308,21 @@ def archive_status():
     consumer ever mistakes a corrupt store for a clean empty
     history. Never raises.
 
-    available=False means the memory cannot be read (present but
-    unreadable/foreign): consumers must treat history as
-    UNKNOWN, never as zero. A missing file is available=True
-    with records=0: nothing has been archived yet - a genuine
-    zero history."""
+    available=False means the memory cannot be read or is known
+    to be incomplete: consumers must treat history as UNKNOWN,
+    never as zero. A missing file is available=True with
+    records=0 ONLY when the verdict ledger is also empty
+    (genuine first use); a missing archive alongside an existing
+    ledger is lost history -> available=False. unreadable_lines
+    > 0 means the history is PARTIAL: torn/corrupt records were
+    skipped, so what remains is not the complete record."""
     st = {"available": True, "records": 0, "unreadable_lines": 0,
           "error": None}
     try:
         if not os.path.exists(ARCHIVE_FILE):
+            if _verdict_ledger_has_history():
+                st["available"] = False
+                st["error"] = "archive_missing_with_existing_history"
             return st
         with open(ARCHIVE_FILE) as f:
             for line in f:
@@ -367,6 +398,7 @@ def launch_memory(mint, now=None):
             # history: say so explicitly.
             return {"unavailable": True,
                     "error": st.get("error") or "unreadable"}
+        partial = st.get("unreadable_lines", 0) > 0
         recs = [r for r in launch_archive(mint=mint, limit=1000)
                 if r.get("record_type", "launch") == "launch"]
         outcomes = outcome_records(mint=mint)
@@ -391,6 +423,9 @@ def launch_memory(mint, now=None):
             out = {"mint": mint, "entries": 0, "conflict": False,
                    "age_s": int(max(0.0, age)),
                    "stale": age > ARCHIVE_STALE_S}
+        # Skipped torn/corrupt lines mean this history is PARTIAL,
+        # never a complete clean record.
+        out["partial"] = partial
         out["outcomes"] = outcomes
         out["resolved_lanes"] = sorted(
             {str(o.get("lane")) for o in outcomes if o.get("lane")})
@@ -467,46 +502,94 @@ def _sweep(now):
 
 def _maybe_compact_archive(now):
     """Bounded retention: past ARCHIVE_MAX_BYTES, rewrite the
-    archive keeping the latest launch record per mint, ALL
-    outcome records (low volume, the actual track record), and a
-    compaction anchor naming how many records were dropped.
-    Best-effort under the write lock; never raises."""
+    archive keeping the latest launch record per mint, outcomes
+    younger than OUTCOME_RAW_S raw, older outcomes aggregated
+    into per-lane-per-year outcome_rollup records, and a
+    compaction anchor naming what was dropped. The WHOLE
+    read+rewrite runs under the write lock, so a concurrent
+    append can never be silently discarded by the rename.
+    Best-effort; never raises."""
     try:
         if not os.path.exists(ARCHIVE_FILE):
             return
         if os.path.getsize(ARCHIVE_FILE) <= ARCHIVE_MAX_BYTES:
             return
-        launches, outcomes, other, dropped = {}, [], 0, 0
-        with open(ARCHIVE_FILE) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    dropped += 1
-                    continue
-                if not isinstance(rec, dict) \
-                        or rec.get("v") != ARCHIVE_SCHEMA_V:
-                    dropped += 1
-                    continue
-                rtype = rec.get("record_type", "launch")
-                if rtype == "outcome":
-                    outcomes.append(rec)
-                elif rtype == "launch" and rec.get("mint"):
-                    launches[rec["mint"]] = rec  # newest wins
-                else:
-                    other += 1
-                    dropped += 1
-        kept = list(launches.values()) + outcomes
-        anchor = {"v": ARCHIVE_SCHEMA_V,
-                  "record_type": "compaction_anchor",
-                  "archived_ts": now,
-                  "dropped_records": dropped + other * 0,
-                  "kept_records": len(kept)}
         tmp = ARCHIVE_FILE + ".compact-tmp"
+        # Lock across read AND rename: an append landing between
+        # the read and the rename would otherwise be silently
+        # discarded. The lock is the same one _archive_append
+        # takes, so appends queue behind the compaction.
         with _archive_write_lock():
+            launches, outcomes, rollups = {}, [], {}
+            dropped = 0
+            with open(ARCHIVE_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        dropped += 1
+                        continue
+                    if not isinstance(rec, dict) \
+                            or rec.get("v") != ARCHIVE_SCHEMA_V:
+                        dropped += 1
+                        continue
+                    rtype = rec.get("record_type", "launch")
+                    if rtype == "outcome":
+                        try:
+                            age = now - float(
+                                rec.get("archived_ts") or 0)
+                        except Exception:
+                            age = 0.0
+                        if age > OUTCOME_RAW_S:
+                            year = time.strftime(
+                                "%Y", time.gmtime(float(
+                                    rec.get("archived_ts") or 0)))
+                            key = (str(rec.get("lane") or ""), year)
+                            ru = rollups.setdefault(key, {
+                                "v": ARCHIVE_SCHEMA_V,
+                                "record_type": "outcome_rollup",
+                                "lane": key[0], "year": key[1],
+                                "count": 0, "wins": 0, "losses": 0,
+                                "provenance": "simulated",
+                                "qualified": False})
+                            ru["count"] += 1
+                            m = rec.get("realized_mult")
+                            if isinstance(m, (int, float)):
+                                if m > 1.0:
+                                    ru["wins"] += 1
+                                else:
+                                    ru["losses"] += 1
+                        else:
+                            outcomes.append(rec)
+                    elif rtype == "outcome_rollup":
+                        key = (str(rec.get("lane") or ""),
+                               str(rec.get("year") or ""))
+                        ru = rollups.setdefault(key, {
+                            "v": ARCHIVE_SCHEMA_V,
+                            "record_type": "outcome_rollup",
+                            "lane": key[0], "year": key[1],
+                            "count": 0, "wins": 0, "losses": 0,
+                            "provenance": "simulated",
+                            "qualified": False})
+                        for k in ("count", "wins", "losses"):
+                            try:
+                                ru[k] += int(rec.get(k) or 0)
+                            except Exception:
+                                pass
+                    elif rtype == "launch" and rec.get("mint"):
+                        launches[rec["mint"]] = rec  # newest wins
+                    else:
+                        dropped += 1
+            kept = list(launches.values()) + outcomes \
+                + list(rollups.values())
+            anchor = {"v": ARCHIVE_SCHEMA_V,
+                      "record_type": "compaction_anchor",
+                      "archived_ts": now,
+                      "dropped_records": dropped,
+                      "kept_records": len(kept)}
             with open(tmp, "w") as f:
                 f.write(json.dumps(anchor, sort_keys=True) + "\n")
                 for rec in kept:
@@ -613,10 +696,21 @@ def _intel_fields(deployer):
                             1 for r in launches
                             if r.get("safety_verdict") == "unknown"),
                         "outcomes": len(outcomes),
-                        # win/loss by recorded realized multiple,
-                        # code-defined: > 1.0 is a win.
-                        "wins": sum(1 for m in mults if m > 1.0),
-                        "losses": sum(1 for m in mults if m <= 1.0),
+                        # Today's outcomes are SIMULATED paper-lane
+                        # results: counted and labeled as such,
+                        # never presented as verified real-money
+                        # wins/losses. Code-defined: recorded
+                        # realized multiple > 1.0 is a win.
+                        "simulated_wins": sum(
+                            1 for m in mults if m > 1.0),
+                        "simulated_losses": sum(
+                            1 for m in mults if m <= 1.0),
+                        "outcomes_provenance": "simulated",
+                        "outcomes_qualified": False,
+                        # Partial memory (skipped torn lines) or
+                        # rolled-up older history: labeled, never
+                        # shown as a complete clean record.
+                        "partial": st.get("unreadable_lines", 0) > 0,
                     }
             # unavailable -> field omitted: unknown history is
             # never shown as zero history.

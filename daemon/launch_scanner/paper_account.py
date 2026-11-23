@@ -260,6 +260,15 @@ def _new_ledger() -> Dict[str, Any]:
         # zero, cost preserved for later evidence-led resolution
         # (design v4 Stage B). Never re-sellable.
         "unresolved": {},
+        # op_id -> {pos_id, lane, mint, qty, basis, proceeds, fee,
+        #           price_kind, ts, status}: units the lane recorded
+        # as sold under an UNVERIFIED price (any non-spendable
+        # price_kind). The proceeds sit quarantined in
+        # cash_estimated; the units are neither open nor
+        # held_unresolved - they are assumed_sold_unverified
+        # (design v4 Stage C). Permanently quarantined absent a
+        # timestamp-correct fill model; no promotion path exists.
+        "assumed_sold": {},
         "realized_pnl": 0.0,
         "day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "day_realized_pnl": 0.0,
@@ -461,7 +470,10 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
 def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
                   qty_sold: Optional[float], net: float, fee: float,
                   final: bool,
-                  price_kind: Optional[str] = None
+                  price_kind: Optional[str] = None,
+                  op_id: Optional[str] = None,
+                  ts: Optional[float] = None,
+                  pos_id: Optional[str] = None
                   ) -> Tuple[Optional[float], str]:
     """Shared credit mutation. Returns (realized_delta, "") or
     (None, reason) leaving state untouched. Average-cost
@@ -473,10 +485,12 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
         return None, "no open position"
     basis = _pos_basis(pos)
     have_qty = _pos_qty(pos)
+    disposed = qty_sold
     if final or qty_sold is None:
         if qty_sold is not None and have_qty is not None \
                 and qty_sold < have_qty - _EPS:
             return None, "qty under remaining: not final"
+        disposed = have_qty
         alloc = basis
         realized = round(net - alloc, 6)
         st["open"].pop(mint)
@@ -498,6 +512,7 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
             # remaining basis — the same accounting as an explicit
             # final close. A tranche that left dust units behind
             # would strand their basis in a zombie position.
+            disposed = have_qty
             alloc = basis
             realized = round(net - alloc, 6)
             st["open"].pop(mint)
@@ -531,6 +546,24 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
         float(st["realized_pnl"]) + realized, 6)
     if closed:
         st["n_closes"] += 1
+    if price_kind not in _SPENDABLE_KINDS:
+        # Unit-state bookkeeping (design v4 Stage C): the disposed
+        # units are ASSUMED SOLD, proceeds UNVERIFIED - recorded so
+        # every unit is in exactly one economic state and the
+        # original-cost conservation track stays auditable. The
+        # proceeds are already quarantined in cash_estimated above.
+        reg = led.setdefault("assumed_sold", {})
+        reg[op_id or "%s:%s:%s" % (lane, mint, pos_id)] = {
+            "pos_id": pos_id,
+            "lane": lane, "mint": mint,
+            "qty": disposed,
+            "basis": alloc,
+            "proceeds": net,
+            "fee": fee,
+            "price_kind": price_kind or "unknown",
+            "ts": ts or time.time(),
+            "status": "assumed_sold_unverified",
+        }
     return realized, ""
 
 
@@ -636,7 +669,8 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                             - float(ev.get("fee") or 0))),
                 float(ev.get("fee") or 0),
                 bool(ev.get("final", True)),
-                price_kind=ev.get("price_kind"))
+                price_kind=ev.get("price_kind"),
+                op_id=op_id, ts=ev.get("ts"), pos_id=pid)
             if realized is None:
                 return led, ("replay cannot apply credit %s/%s: %s"
                              % (lane, mint, why))
@@ -733,7 +767,9 @@ def _derive_buckets_locked(led: Dict[str, Any],
                             - float(ev.get("fee") or 0))),
                 float(ev.get("fee") or 0),
                 bool(ev.get("final", True)),
-                price_kind=ev.get("price_kind"))
+                price_kind=ev.get("price_kind"),
+                op_id=ev.get("op_id"), ts=ev.get("ts"),
+                pos_id=ev.get("pos_id"))
             if realized is None:
                 return led, ("cash-split migration: credit %s: %s"
                              % (ev.get("op_id"), why))
@@ -754,6 +790,8 @@ def _derive_buckets_locked(led: Dict[str, Any],
                          "reconciliation required" % lane)
     led["cash_spendable"] = gen["cash_spendable"]
     led["cash_estimated"] = gen["cash_estimated"]
+    # The unit-state register is derived by the same replay.
+    led["assumed_sold"] = gen.get("assumed_sold") or {}
     logger.warning("paper_account: cash split derived from journal "
                    "replay: spendable $%.6f, estimated $%.6f",
                    gen["cash_spendable"], gen["cash_estimated"])
@@ -1070,7 +1108,8 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         pid = pos.get("pos_id")
         realized, why = _apply_credit(led, lane, mint, qty, net,
                                       fee, qty is None,
-                                      price_kind=price_kind)
+                                      price_kind=price_kind,
+                                      op_id=op_id, ts=ts, pos_id=pid)
         if realized is None:
             _journal({"event": "credit_orphan", "lane": lane,
                       "mint": mint, "proceeds": proceeds,
@@ -1385,6 +1424,16 @@ def _view_locked(led: Dict[str, Any],
         "unresolved_cost": round(sum(
             float(v.get("basis") or 0.0)
             for v in (led.get("unresolved") or {}).values()), 6),
+        "assumed_sold": sorted(
+            (dict(v) for v in (led.get("assumed_sold")
+                               or {}).values()),
+            key=lambda v: v.get("ts") or 0),
+        "assumed_sold_cost": round(sum(
+            float(v.get("basis") or 0.0)
+            for v in (led.get("assumed_sold") or {}).values()), 6),
+        "assumed_sold_proceeds": round(sum(
+            float(v.get("proceeds") or 0.0)
+            for v in (led.get("assumed_sold") or {}).values()), 6),
         "cash_spendable": round(float(led.get("cash_spendable")
                                       or 0.0), 6),
         "cash_estimated": round(float(led.get("cash_estimated")

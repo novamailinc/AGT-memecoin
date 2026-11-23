@@ -1023,30 +1023,51 @@ def parse_bonding_curve(data):
         return None
 
 
-def curve_price_usd(mint, exempt=False):
-    """(price_usd, detail) from the bonding curve's VIRTUAL reserves
-    (the curve's own pricing inputs). (0.0, why) on failure."""
+def _curve_price_impl(mint, exempt=False):
+    """(price_usd, observed_ts, detail). observed_ts is the OLDEST
+    observation behind the number: the curve read happens at call
+    time, but the SOL/USD conversion may come from the 30s cache —
+    and, when both SOL fetches fail, from an arbitrarily old cache
+    entry. A caller that stamps freshness (account marks) must use
+    observed_ts, never the wrap time."""
+    read_ts = time.time()
     try:
         pda = derive_curve_pda(mint)
         if not pda:
-            return 0.0, "no curve pda"
+            return 0.0, read_ts, "no curve pda"
         _owner, data = get_account(pda, exempt=exempt)
         c = parse_bonding_curve(data)
         if not c or not c["v_token"]:
-            return 0.0, "curve unreadable"
+            return 0.0, read_ts, "curve unreadable"
         if c["complete"]:
-            return 0.0, "curve complete (graduated)"
+            return 0.0, read_ts, "curve complete (graduated)"
         dec = mint_decimals(mint, exempt=exempt)
         if dec is None:
-            return 0.0, "decimals unknown"
+            return 0.0, read_ts, "decimals unknown"
         sol = sol_usd_price()
         if not sol:
-            return 0.0, "no sol/usd"
+            return 0.0, read_ts, "no sol/usd"
+        sol_ts = _SOL_CACHE.get("ts") or read_ts
+        obs_ts = min(read_ts, sol_ts)
         price_sol = (c["v_sol"] / 1e9) / (c["v_token"] /
                                           (10 ** dec))
-        return price_sol * sol, "bonding curve %s" % pda[:8]
+        return price_sol * sol, obs_ts, "bonding curve %s" % pda[:8]
     except Exception as e:
-        return 0.0, "curve error: %s" % e
+        return 0.0, read_ts, "curve error: %s" % e
+
+
+def curve_price_usd(mint, exempt=False):
+    """(price_usd, detail) from the bonding curve's VIRTUAL reserves
+    (the curve's own pricing inputs). (0.0, why) on failure."""
+    px, _obs_ts, detail = _curve_price_impl(mint, exempt=exempt)
+    return px, detail
+
+
+def curve_price_observed(mint, exempt=False):
+    """(price_usd, observed_ts, detail) — curve_price_usd with the
+    true observation time of its oldest input (see _curve_price_impl).
+    (0.0, read_ts, why) on failure."""
+    return _curve_price_impl(mint, exempt=exempt)
 
 
 # ---- SOL/USD ----------------------------------------------------------------

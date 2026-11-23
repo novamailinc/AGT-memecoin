@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
@@ -155,6 +156,56 @@ for bad, label in [(0.0, "zero"), (-2.0, "negative"),
                          curve_price_fn=lambda mint, b=bad: (b, "x"))
     check("bad curve price dropped (%s)" % label, m == {})
 
+# ---------------- freshness is the OBSERVATION time ----------------
+# A cached price must not masquerade as just-observed: sources that
+# report their observation time get it propagated into the mark's
+# ts, and the account's TTL then rejects what it must.
+H = tempfile.mkdtemp(prefix="marks-obs-")
+pa, am = fresh(H)
+pa.try_debit("grad", "OBS1", 1.0, 1000.0, "am-o1")
+old = time.time() - 300.0   # older than the default 120s TTL
+m = am.collect_marks(price_fn=lambda mints: {"OBS1": (0.003, old)})
+mk = m["grad"]["OBS1"]
+check("jup observation ts propagated, not the wrap time",
+      abs(mk["ts"] - old) < 1e-9)
+check("stale-observed jup mark: view rejects as stale",
+      "stale" in pa.snapshot(marks=m)["marks_status"])
+m = am.collect_marks(price_fn=lambda mints: {},
+                     curve_price_fn=lambda mint: (0.004, old, "c"))
+check("curve observation ts propagated (SOL/cache-age aware)",
+      abs(m["grad"]["OBS1"]["ts"] - old) < 1e-9)
+check("stale-observed curve mark: view rejects as stale",
+      "stale" in pa.snapshot(marks=m)["marks_status"])
+
+# ---------------- marks bind to the position's qty -----------------
+mk = am.collect_marks(price_fn=lambda mints: {"OBS1": 0.003})
+check("collected marks carry the remaining-unit binding",
+      mk["grad"]["OBS1"]["qty"] == 1000.0)
+snap = pa.snapshot(marks={"grad": {"OBS1": {
+    "value": 3.0, "ts": time.time(), "source": "test",
+    "qty": 9999.0}}})
+check("wrong-qty mark rejected as qty drift",
+      "qty drift" in snap["marks_status"]
+      and snap["marked_equity"] is None)
+snap = pa.snapshot(marks={"grad": {"OBS1": {
+    "value": 3.0, "ts": time.time(), "source": "test"}}})
+check("mark without a qty binding rejected",
+      "no qty binding" in snap["marks_status"])
+
+# ---------------- per-source equity split ---------------------------
+H = tempfile.mkdtemp(prefix="marks-src-")
+pa, am = fresh(H)
+pa.try_debit("grad", "LISTED", 1.0, 1000.0, "am-s1")
+pa.try_debit("watcher", "CURVED", 1.0, 500.0, "am-s2")
+m = am.collect_marks(price_fn=lambda mints: {"LISTED": 0.003},
+                     curve_price_fn=lambda mint: (0.004, "c"))
+snap = pa.snapshot(marks=m)
+check("mixed-source account fully marked",
+      snap["marks_status"] == "ok")
+check("marked_by_source splits jup vs curve value (3.0 / 2.0)",
+      snap["marked_by_source"] == {"jup-v3": 3.0,
+                                   "reserves:curve": 2.0})
+
 # ---------------- auto-marks inside try_debit ----------------------
 # With gates enabled and no caller-supplied marks, try_debit
 # collects centrally pre-lock: valid marks admit, an empty collect
@@ -166,11 +217,9 @@ pa, am = fresh(H)
 ok, why, pid = pa.try_debit("grad", "MINTA", 2.0, 1000.0, "g-1")
 check("gated first entry on an empty account passes", ok)
 
-import time  # noqa: E402  (used by the patched collects below)
-
 am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
     now=None: {"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
-                                  "source": "test"}}}
+                                  "source": "test", "qty": 1000.0}}}
 ok, why, pid2 = pa.try_debit("ceo", "MINTB", 1.0, 100.0, "g-2")
 check("gated second entry: central marks admit", ok)
 
@@ -183,15 +232,15 @@ check("gated entry with an empty collect: blocked fail-closed",
 # Caller-supplied marks still win over the central collect.
 am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
     now=None: {"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
-                                  "source": "test"}},
+                                  "source": "test", "qty": 1000.0}},
                "ceo": {"MINTB": {"value": 1.0, "ts": time.time(),
-                                 "source": "test"}}}
+                                 "source": "test", "qty": 100.0}}}
 ok, why, _ = pa.try_debit(
     "watcher", "MINTC", 1.0, 100.0, "g-4",
     marks={"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
-                              "source": "test"}},
+                              "source": "test", "qty": 1000.0}},
            "ceo": {"MINTB": {"value": 1.0, "ts": time.time(),
-                             "source": "test"}}})
+                             "source": "test", "qty": 100.0}}})
 check("caller-supplied marks still accepted", ok)
 os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED")
 

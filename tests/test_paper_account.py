@@ -64,9 +64,11 @@ def fresh(home, start=None, cap=None):
     return importlib.reload(pa)
 
 
-def mark(value, age_s=0.0):
+def mark(value, age_s=0.0, qty=5.0):
+    # qty must bind to the position's CURRENT remaining units;
+    # DOWN1 was debited with qty 5.0 and is never tranched here.
     return {"value": value, "ts": time.time() - age_s,
-            "source": "test-harness"}
+            "source": "test-harness", "qty": qty}
 
 
 HOME = tempfile.mkdtemp(prefix="paper-account-test-")

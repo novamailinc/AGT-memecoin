@@ -32,8 +32,15 @@ pacer token per unpriced mint per collect.
 
 Mark contract (validated by paper_account._mark_value):
     {"value": <remaining qty x price, finite, >= 0>,
-     "ts": <unix seconds at pricing>,
-     "source": "jup-v3" | "reserves:curve"}
+     "ts": <OBSERVATION time of the oldest input: the jup cache's
+           fetched_ts for a cache hit, or min(curve read, SOL/USD
+           cache ts) for a curve mark - never the time this module
+           wrapped a cached number>,
+     "source": "jup-v3" | "reserves:curve",
+     "qty": <remaining units the value was computed from; the
+            account re-checks this against the CURRENT position
+            under its lock, so a mark collected before a tranche
+            close or reopen is rejected as qty drift>}
 
 Paper only. Nothing here touches real money, keys, or wallets.
 """
@@ -65,25 +72,28 @@ def _ok_price(px) -> bool:
 
 
 def _default_curve_price(mint):
-    """(price, detail) from the bonding curve, (0.0, why) when
-    unavailable. Isolated so a reserves failure can never propagate
-    into the marker."""
+    """(price, observed_ts, detail) from the bonding curve,
+    (0.0, now, why) when unavailable. Isolated so a reserves
+    failure can never propagate into the marker."""
     if _reserves is None:
-        return 0.0, "reserves module unavailable"
-    return _reserves.curve_price_usd(mint)
+        return 0.0, time.time(), "reserves module unavailable"
+    return _reserves.curve_price_observed(mint)
 
 
 def collect_marks(price_fn=None, curve_price_fn=None, now=None):
     """{lane: {mint: mark}} for every open account position.
 
-    price_fn(mints) -> {mint: usd_price} and
-    curve_price_fn(mint) -> (usd_price, detail) are injectable for
-    tests; the defaults are jup_price.get_prices (cached, batched,
-    never raises) and reserves.curve_price_usd. Jupiter prices win;
-    the curve is only consulted for mints Jupiter omitted.
-    Positions no source can price are absent, so the downstream
-    gate fails closed on them. Never raises: a broken marker must
-    degrade the account to fail-closed, not crash lanes.
+    price_fn(mints) -> {mint: usd_price | (usd_price, obs_ts)} and
+    curve_price_fn(mint) -> (usd_price, detail) |
+    (usd_price, obs_ts, detail) are injectable for tests; the
+    defaults are jup_price.get_prices_observed and
+    reserves.curve_price_observed, whose observation timestamps
+    become the mark's ts (a bare injected price is treated as
+    observed at `now`). Jupiter prices win; the curve is only
+    consulted for mints Jupiter omitted. Positions no source can
+    price are absent, so the downstream gate fails closed on them.
+    Never raises: a broken marker must degrade the account to
+    fail-closed, not crash lanes.
     """
     now = time.time() if now is None else now
     try:
@@ -113,13 +123,21 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
     if not wanted:
         return {}
     try:
-        prices = (price_fn or jup_price.get_prices)(mints)
-        if not isinstance(prices, dict):
-            prices = {}
+        raw = (price_fn or jup_price.get_prices_observed)(mints)
+        if not isinstance(raw, dict):
+            raw = {}
     except Exception as e:
         logger.warning("account marks: price source failed: %s",
                        type(e).__name__)
-        prices = {}
+        raw = {}
+    # Normalize to {mint: (price, obs_ts)}; a bare price is treated
+    # as observed at `now` (test injections, legacy call shapes).
+    prices = {}
+    for mint, entry in raw.items():
+        if isinstance(entry, (tuple, list)) and len(entry) == 2:
+            prices[mint] = (entry[0], entry[1])
+        else:
+            prices[mint] = (entry, now)
     # Jupiter's omissions are the pre-graduation holdings: price
     # them from the bonding curve. One call per unpriced mint; a
     # curve failure or a completed (graduated) curve leaves the
@@ -127,28 +145,41 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
     curve_px = {}
     cfn = curve_price_fn or _default_curve_price
     for mint in mints:
-        if _ok_price(prices.get(mint)):
+        if _ok_price(prices.get(mint, (None,))[0]):
             continue
         try:
-            px, _detail = cfn(mint)
-            if _ok_price(px):
-                curve_px[mint] = float(px)
+            res = cfn(mint)
+            if isinstance(res, (tuple, list)) and len(res) == 3:
+                px, obs, _detail = res
+            else:
+                px, _detail = res
+                obs = now
+            if _ok_price(px) and isinstance(obs, (int, float)) \
+                    and not isinstance(obs, bool) \
+                    and math.isfinite(obs):
+                curve_px[mint] = (float(px), min(float(obs), now))
         except Exception as e:
             logger.warning("account marks: curve %s failed: %s",
                            mint[:8], type(e).__name__)
     marks = {}
     for lane, mint, qty in wanted:
         try:
-            if _ok_price(prices.get(mint)):
-                px, source = float(prices[mint]), SOURCE
+            jpx, jts = prices.get(mint, (None, None))
+            if _ok_price(jpx):
+                px, source, ots = float(jpx), SOURCE, jts
             elif mint in curve_px:
-                px, source = curve_px[mint], CURVE_SOURCE
+                px, ots = curve_px[mint]
+                source = CURVE_SOURCE
             else:
                 continue   # no trustworthy price: absent -> fail closed
+            if not isinstance(ots, (int, float)) \
+                    or isinstance(ots, bool) or not math.isfinite(ots):
+                ots = now
             marks.setdefault(lane, {})[mint] = {
                 "value": round(qty * px, 6),
-                "ts": now,
+                "ts": min(float(ots), now),
                 "source": source,
+                "qty": qty,
             }
         except Exception as e:
             logger.warning("account marks: %s/%s skipped: %s",

@@ -948,16 +948,21 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         return True, "ok"
 
 
-def _mark_value(mark: Any, now: float, ttl: float
+def _mark_value(mark: Any, now: float, ttl: float,
+                want_qty: Optional[float]
                 ) -> Tuple[Optional[float], Optional[str]]:
-    """Validate one mark: {value, ts, source} with a finite,
-    nonnegative value and a timestamp within the TTL. The value is
-    the liquidation value of the position's REMAINING units (net
-    proceeds of past tranches are already in cash). Returns
-    (value, None) or (None, problem). A mark that cannot prove it
-    is fresh and well-formed is not a mark."""
+    """Validate one mark: {value, ts, source, qty} with a finite,
+    nonnegative value, a timestamp within the TTL, and a qty that
+    matches the position's CURRENT remaining units (the mark is
+    collected before the account lock; a tranche close or reopen
+    between collection and evaluation must not let a stale-sized
+    value through). ts is the source's observation time, so a
+    cached price older than the TTL is stale even when the marker
+    just wrapped it. Returns (value, None) or (None, problem).
+    A mark that cannot prove it is fresh, well-formed and sized to
+    the current position is not a mark."""
     if not isinstance(mark, dict):
-        return None, "malformed (need {value, ts, source})"
+        return None, "malformed (need {value, ts, source, qty})"
     v = mark.get("value")
     if (not isinstance(v, (int, float)) or isinstance(v, bool)
             or not math.isfinite(v) or v < 0):
@@ -970,6 +975,16 @@ def _mark_value(mark: Any, now: float, ttl: float
         return None, "no provenance"
     if abs(now - mts) > ttl:
         return None, "stale (%.0fs old, ttl %.0fs)" % (now - mts, ttl)
+    if want_qty is None:
+        return None, "position qty unknown (cannot bind mark)"
+    mq = mark.get("qty")
+    if (not isinstance(mq, (int, float)) or isinstance(mq, bool)
+            or not math.isfinite(mq) or mq < 0):
+        return None, "no qty binding"
+    if abs(float(mq) - want_qty) > 1e-6 * max(1.0, abs(want_qty)):
+        return None, ("qty drift (mark %.8g vs current %.8g - "
+                      "position changed since collection)"
+                      % (float(mq), want_qty))
     return float(v), None
 
 
@@ -989,7 +1004,7 @@ def _view_locked(led: Dict[str, Any],
         for mint, p in st.get("open", {}).items():
             pb = _pos_basis(p)
             basis += pb
-            open_positions.append((name, mint))
+            open_positions.append((name, mint, _pos_qty(p)))
             positions.append({"mint": mint, "qty": _pos_qty(p),
                               "basis": round(pb, 6)})
         exposure += basis
@@ -1015,28 +1030,39 @@ def _view_locked(led: Dict[str, Any],
     }
     marked = None
     problems = []
+    by_source: Dict[str, float] = {}
     if not open_positions:
         # Nothing to mark: equity is exactly cash, fully trusted.
         marked = 0.0
     elif marks:
         total = 0.0
+        by_source: Dict[str, float] = {}
         now = time.time()
         ttl = mark_ttl_s()
-        for lane, mint in open_positions:
+        for lane, mint, want_qty in open_positions:
             m = (marks.get(lane) or {}).get(mint)
             if m is None:
                 problems.append("%s/%s: no mark" % (lane, mint))
                 continue
-            v, problem = _mark_value(m, now, ttl)
+            v, problem = _mark_value(m, now, ttl, want_qty)
             if problem is not None:
                 problems.append("%s/%s: %s" % (lane, mint, problem))
             else:
                 total += v  # type: ignore[operator]
+                src = str(m.get("source"))
+                by_source[src] = round(by_source.get(src, 0.0) + v,
+                                       6)
         if not problems:
             marked = round(total, 6)
     if marked is not None:
         out["marks_status"] = "ok"
         out["marked_exposure"] = marked
+        # Per-source split of the trusted marked value, so risk
+        # evidence shows how much of "equity" is a curve SPOT
+        # estimate (not a conservative liquidation value: it
+        # ignores the price impact of selling the position back
+        # into the curve) versus a Jupiter-listed price.
+        out["marked_by_source"] = by_source
         out["marked_equity"] = round(cash + marked, 6)
         out["unrealized_pnl"] = round(marked - exposure, 6)
     elif marks or open_positions:

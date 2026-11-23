@@ -97,13 +97,15 @@ def _fetch_batch(mints):
         return {}
 
 
-def get_prices(mints, now=None):
-    """{mint: usdPrice} for the requested mints. Never raises.
+def get_prices_observed(mints, now=None):
+    """{mint: (usdPrice, observed_ts)} for the requested mints.
+    Never raises.
 
-    Fresh cache entries (<= CACHE_TTL_S old) are served without HTTP;
-    only stale/missing mints are fetched, in MAX_BATCH chunks. A mint
-    the API has no entry for (e.g. a pre-graduation curve token) is
-    simply absent — the caller falls back to its existing source.
+    Same cache/fetch behavior as get_prices, but each price carries
+    its ACTUAL observation time: the cache's fetched_ts for a cache
+    hit, the fetch time for a fresh read. A caller that stamps
+    freshness (account marks) must use this so a cached price can
+    never masquerade as just-observed.
     """
     now = time.time() if now is None else now
     out = {}
@@ -117,17 +119,29 @@ def get_prices(mints, now=None):
             hit = _cache.get(m)
             if hit is not None and now - hit[1] <= CACHE_TTL_S \
                     and hit[0] > 0:
-                out[m] = hit[0]
+                out[m] = (hit[0], hit[1])
             else:
                 missing.append(m)
         for i in range(0, len(missing), MAX_BATCH):
             fresh = _fetch_batch(missing[i:i + MAX_BATCH])
             for m, px in fresh.items():
                 _cache[m] = (px, now)
-                out[m] = px
+                out[m] = (px, now)
     except Exception:
         pass
     return out
+
+
+def get_prices(mints, now=None):
+    """{mint: usdPrice} for the requested mints. Never raises.
+
+    Fresh cache entries (<= CACHE_TTL_S old) are served without HTTP;
+    only stale/missing mints are fetched, in MAX_BATCH chunks. A mint
+    the API has no entry for (e.g. a pre-graduation curve token) is
+    simply absent — the caller falls back to its existing source.
+    """
+    return {m: px for m, (px, _ts)
+            in get_prices_observed(mints, now=now).items()}
 
 
 def get_price(mint, now=None):

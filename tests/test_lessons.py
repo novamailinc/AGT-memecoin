@@ -560,6 +560,8 @@ check("hygiene: ledger backfill preserves existing price provenance",
       == "current_price_simulated_fill")
 check("hygiene: missing close reason excluded as incomplete",
       L.generate_lessons("grad_select", [dict(hq[0], close_reason="")])["n_qualified"] == 0)
+check("hygiene: whitespace close reason excluded as incomplete",
+      L.generate_lessons("grad_select", [dict(hq[0], close_reason=" ")])["n_qualified"] == 0)
 check("hygiene: numeric-string PnL follows numeric schema",
       L.generate_lessons("grad_select", [dict(hq[0], pnl_usd="2.5")])["n_qualified"] == 1)
 

@@ -514,23 +514,96 @@ def _cmd_help(ctx, chat_id, user_id, update_id, args):
     ctx.send(chat_id, HELP_TEXT, None)
 
 
-def _trading_mode_line():
+def _status_mode_lines():
     """Request section 16: the control room must NEVER make the operating
-    mode ambiguous. This tree has no mainnet signing path at all and
-    Telegram can never enable one (the hard refusal in security.py), so
-    mainnet is reported DISABLED, not merely off. Live-market demo
-    activity is detected from the shared paper-account ledger under
-    FOREX_AGENT_HOME, which every demo lane writes through
-    paper_account; with no ledger the bot is in historical/offline work
-    only."""
+    mode ambiguous. Every claim below comes from explicit, checked
+    runtime evidence - configured state, runtime freshness, and the
+    enforced mainnet gates - and conflicting or missing evidence reports
+    UNKNOWN instead of an inferred mode. Ledger files alone never
+    establish a live-market demo: offline genesis and tests create them
+    too.
+
+    Mainnet status reflects the ENFORCED gates in
+    broker.memecoin.execution.mainnet_executor: the live executor
+    refuses to run without a deployment marker naming this machine,
+    sends stay dry-run unless the marker carries "armed": true, and no
+    Telegram command can create or arm it (security.py hard-refuses the
+    words). It is NOT a claim that mainnet code is absent - the
+    MainnetExecutor signing path exists and is gated."""
     home = os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser(
         "~/.forex-agent")
-    ledger = os.path.join(home, "paper_account", "ledger.json")
-    if os.path.exists(ledger):
-        return ("Mode: LIVE-MARKET DEMO (simulated capital; no real "
-                "transactions) | Mainnet: DISABLED")
-    return ("Mode: HISTORICAL/OFFLINE (no live-market demo activity) | "
-            "Mainnet: DISABLED")
+    lines = []
+
+    # --- mainnet: read the enforced deployment/arm gates --------------
+    marker = None
+    try:
+        with open(os.path.join(home, "live", "deployment.json"),
+                  encoding="utf-8") as f:
+            marker = json.load(f)
+        if not isinstance(marker, dict):
+            marker = None
+    except Exception:
+        marker = None
+    armed = bool(marker and marker.get("armed") is True)
+    if armed:
+        lines.append("Mainnet: ARMED (deployment marker carries "
+                     "armed:true) - unexpected here; investigate")
+    elif marker:
+        lines.append("Mainnet: DISABLED (deployment marker present, not "
+                     "armed; executor dry-run; Telegram cannot arm)")
+    else:
+        lines.append("Mainnet: DISABLED (no deployment marker; live "
+                     "executor refuses to run here; Telegram cannot arm)")
+
+    # --- demo account: simulated capital only, presence not liveness --
+    demo_present = False
+    try:
+        with open(os.path.join(home, "paper_account", "ledger.json"),
+                  encoding="utf-8") as f:
+            demo_present = isinstance(json.load(f), dict)
+    except Exception:
+        demo_present = False
+    lines.append("Demo account: %s (simulated capital; no real funds)"
+                 % ("present" if demo_present else "none found"))
+
+    # --- runtime + cycle freshness from the scanner's saved state -----
+    runtime, age = "unknown", None
+    try:
+        from daemon.common import get_daemon_state, get_store  # noqa: PLC0415
+        st = get_daemon_state(get_store(), "launch_scanner") or {}
+        ts = float(st.get("_state_saved_ts") or 0)
+        if ts > 0:
+            age = time.time() - ts
+            # scanner persists on a throttled 300s interval
+            runtime = "running" if age < 600 else "stopped"
+    except Exception:
+        runtime, age = "unknown", None
+    lines.append("Scanner runtime: %s%s" % (
+        runtime, "" if age is None else " (last cycle state %ds ago)"
+        % int(age)))
+    lines.append("Data freshness: %s" % (
+        "unknown (no scanner state)" if age is None else
+        "scanner cycle %ds ago (market-feed freshness not separately "
+        "tracked)" % int(age)))
+
+    # --- mode verdict: only on consistent evidence --------------------
+    if armed:
+        lines.append("Mode: UNKNOWN/CONFLICT (mainnet marker armed; "
+                     "verify immediately)")
+    elif demo_present and runtime == "running":
+        lines.append("Mode: LIVE-MARKET DEMO (simulated capital; no real "
+                     "transactions)")
+    elif demo_present and runtime == "stopped":
+        lines.append("Mode: DEMO CONFIGURED, STOPPED (simulated capital)")
+    elif demo_present:
+        lines.append("Mode: UNKNOWN (demo ledger exists but scanner "
+                     "runtime unreadable)")
+    elif runtime == "running":
+        lines.append("Mode: SCANNING ONLY (no demo account ledger)")
+    else:
+        lines.append("Mode: HISTORICAL/OFFLINE (no demo account, no "
+                     "live-market runtime detected)")
+    return lines
 
 
 def _cmd_status(ctx, chat_id, user_id, update_id, args):
@@ -539,7 +612,7 @@ def _cmd_status(ctx, chat_id, user_id, update_id, args):
     except Exception as exc:
         ctx.send(chat_id, "⚠️ health read failed: %s" % exc, None)
         return
-    lines = ["🟢 Status", _trading_mode_line()]
+    lines = ["🟢 Status"] + _status_mode_lines()
     for key in ("mode", "kill_switch", "daemons", "queue", "storage"):
         if key in health:
             lines.append("%s: %s" % (key, health[key]))

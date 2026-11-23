@@ -297,28 +297,72 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(any("Status" in text for _, text, _ in client.sent))
 
     def test_status_mode_never_ambiguous(self):
-        # Section 16: the control room must always show an unambiguous
-        # operating mode, and mainnet is always reported DISABLED (this
-        # tree has no signing path and Telegram can never enable one).
+        # Section 16: unambiguous mode from explicit evidence only.
+        # Ledger existence alone must NEVER establish LIVE-MARKET DEMO
+        # (offline genesis/tests create it too); conflicting or missing
+        # evidence reports UNKNOWN. Mainnet status reflects the enforced
+        # deployment-marker/arm gates, not code absence.
+        import daemon.common as common
         client, ctx, sec, published, audit = self._paired()
         tmp = tempfile.mkdtemp()
+
+        def status_text(uid):
+            client.sent.clear()
+            tg_commands.handle_message(ctx, CHAT, USER, uid, "/status")
+            return "\n".join(t for _, t, _ in client.sent)
+
         try:
             with patch.dict(os.environ, {"FOREX_AGENT_HOME": tmp}):
-                client.sent.clear()
-                tg_commands.handle_message(ctx, CHAT, USER, 2, "/status")
-                text = "\n".join(t for _, t, _ in client.sent)
+                # 1. nothing at all: historical/offline, mainnet gate absent
+                with patch.object(common, "get_store", return_value=object()), \
+                     patch.object(common, "get_daemon_state", return_value={}):
+                    text = status_text(2)
                 self.assertIn("Mode: HISTORICAL/OFFLINE", text)
-                self.assertIn("Mainnet: DISABLED", text)
+                self.assertIn("Mainnet: DISABLED (no deployment marker", text)
+                self.assertIn("Scanner runtime: unknown", text)
+
+                # 2. demo ledger alone (e.g. after offline genesis): NOT live
                 os.makedirs(os.path.join(tmp, "paper_account"))
                 with open(os.path.join(tmp, "paper_account",
                                        "ledger.json"), "w") as f:
                     f.write("{}")
-                client.sent.clear()
-                tg_commands.handle_message(ctx, CHAT, USER, 3, "/status")
-                text = "\n".join(t for _, t, _ in client.sent)
+                with patch.object(common, "get_store", return_value=object()), \
+                     patch.object(common, "get_daemon_state", return_value={}):
+                    text = status_text(3)
+                self.assertIn("Mode: UNKNOWN", text)
+                self.assertNotIn("Mode: LIVE-MARKET DEMO", text)
+                self.assertIn("Demo account: present (simulated capital", text)
+
+                # 3. ledger + stale scanner state: configured but stopped
+                with patch.object(common, "get_store", return_value=object()), \
+                     patch.object(common, "get_daemon_state",
+                                  return_value={"_state_saved_ts":
+                                                time.time() - 7200}):
+                    text = status_text(4)
+                self.assertIn("Mode: DEMO CONFIGURED, STOPPED", text)
+
+                # 4. ledger + fresh scanner state: live-market demo
+                with patch.object(common, "get_store", return_value=object()), \
+                     patch.object(common, "get_daemon_state",
+                                  return_value={"_state_saved_ts":
+                                                time.time()}):
+                    text = status_text(5)
                 self.assertIn("Mode: LIVE-MARKET DEMO", text)
                 self.assertIn("simulated capital", text)
                 self.assertIn("Mainnet: DISABLED", text)
+
+                # 5. armed deployment marker: conflict, never a clean mode
+                os.makedirs(os.path.join(tmp, "live"))
+                with open(os.path.join(tmp, "live", "deployment.json"),
+                          "w") as f:
+                    f.write('{"machine": "phone", "armed": true}')
+                with patch.object(common, "get_store", return_value=object()), \
+                     patch.object(common, "get_daemon_state",
+                                  return_value={"_state_saved_ts":
+                                                time.time()}):
+                    text = status_text(6)
+                self.assertIn("Mode: UNKNOWN/CONFLICT", text)
+                self.assertIn("Mainnet: ARMED", text)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

@@ -119,6 +119,14 @@ DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
 _MUTATION_EVENTS = ("debit", "credit")
+
+# Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
+# spendable ONLY when the tranche's exit price was a current observed
+# quote (exit_provenance.CURRENT). Stale-price estimates, write-downs,
+# mixed closes and unknown/legacy kinds are QUARANTINED in
+# cash_estimated: visible, reported, never spendable for new entries.
+# Unknown kinds fail closed into the estimated bucket.
+_SPENDABLE_KINDS = frozenset({"current_price_simulated_fill"})
 _EPS = 1e-9
 
 
@@ -243,6 +251,8 @@ def _new_ledger() -> Dict[str, Any]:
         "seq": 0,
         "start_balance": start_balance(),
         "cash": start_balance(),
+        "cash_spendable": start_balance(),
+        "cash_estimated": 0.0,
         "realized_pnl": 0.0,
         "day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "day_realized_pnl": 0.0,
@@ -423,6 +433,9 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
     """Shared debit mutation. Caller holds the lock and has
     validated input and cash."""
     led["cash"] = round(float(led["cash"]) - stake, 6)
+    led["cash_spendable"] = round(
+        float(led.get("cash_spendable", led["cash"] + stake))
+        - stake, 6)
     st = _lane(led, lane)
     st["open"][mint] = {
         "pos_id": pid,
@@ -440,7 +453,9 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
 
 def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
                   qty_sold: Optional[float], net: float, fee: float,
-                  final: bool) -> Tuple[Optional[float], str]:
+                  final: bool,
+                  price_kind: Optional[str] = None
+                  ) -> Tuple[Optional[float], str]:
     """Shared credit mutation. Returns (realized_delta, "") or
     (None, reason) leaving state untouched. Average-cost
     allocation; a partial sale realizes P/L against the allocated
@@ -495,6 +510,12 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
         float(pos.get("proceeds") or 0.0) + net, 6)
     pos["fees"] = round(float(pos.get("fees") or 0.0) + fee, 6)
     led["cash"] = round(float(led["cash"]) + net, 6)
+    if price_kind in _SPENDABLE_KINDS:
+        led["cash_spendable"] = round(
+            float(led.get("cash_spendable") or 0.0) + net, 6)
+    else:
+        led["cash_estimated"] = round(
+            float(led.get("cash_estimated") or 0.0) + net, 6)
     led["realized_pnl"] = round(
         float(led["realized_pnl"]) + realized, 6)
     led["day_realized_pnl"] = round(
@@ -607,7 +628,8 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                       else (float(ev.get("proceeds") or 0)
                             - float(ev.get("fee") or 0))),
                 float(ev.get("fee") or 0),
-                bool(ev.get("final", True)))
+                bool(ev.get("final", True)),
+                price_kind=ev.get("price_kind"))
             if realized is None:
                 return led, ("replay cannot apply credit %s/%s: %s"
                              % (lane, mint, why))
@@ -625,6 +647,89 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         logger.warning("paper_account: reconciled %d journaled "
                        "mutation(s) the ledger had not reached",
                        replayed)
+    return led, None
+
+
+def _derive_buckets_locked(led: Dict[str, Any],
+                           entries: List[Dict[str, Any]]
+                           ) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Derive the spendable/estimated cash split for a ledger that
+    predates it, by replaying the journal from genesis (design v4
+    Stage A). EXACT OR FROZEN: a seq-less mutation, a genesis debit
+    the verified bucket could not have funded, an unreconstructable
+    position, or any mismatch against the stored state leaves the
+    account DEGRADED (entries refused, credits journaled-only)
+    rather than clamping the inconsistency into an apparently
+    usable balance. Credits journaled without a price_kind route to
+    the ESTIMATED bucket (conservative)."""
+    unseq = [ev for ev in entries
+             if ev.get("event") in _MUTATION_EVENTS
+             and not isinstance(ev.get("seq"), int)]
+    if unseq:
+        return led, ("cash-split migration: %d journaled mutations "
+                     "predate the seq scheme; manual reconciliation "
+                     "required" % len(unseq))
+    gen = _new_ledger()
+    gen["start_balance"] = float(led.get("start_balance")
+                                 or gen["start_balance"])
+    gen["cash"] = gen["cash_spendable"] = gen["start_balance"]
+    gen["cash_estimated"] = 0.0
+    seqd = sorted((ev for ev in entries
+                   if ev.get("event") in _MUTATION_EVENTS),
+                  key=lambda e: e["seq"])
+    for ev in seqd:
+        lane, mint = ev.get("lane"), ev.get("mint")
+        if ev["event"] == "debit":
+            stake = float(ev.get("stake") or 0)
+            if (stake <= 0
+                    or float(gen["cash_spendable"]) < stake - _EPS):
+                return led, ("cash-split migration: genesis debit "
+                             "%s exceeds verified cash (history "
+                             "financed by estimated proceeds); "
+                             "manual reconciliation required"
+                             % ev.get("op_id"))
+            _apply_debit(gen, lane, mint, stake, ev.get("qty"),
+                         ev.get("pos_id")
+                         or _pos_id(lane, mint, int(ev["seq"])),
+                         ev.get("ts"))
+        else:  # credit
+            pos = _lane(gen, lane)["open"].get(mint)
+            if pos is None:
+                return led, ("cash-split migration: orphan credit "
+                             "%s (position not open in genesis "
+                             "replay); manual reconciliation "
+                             "required" % ev.get("op_id"))
+            realized, why = _apply_credit(
+                gen, lane, mint, ev.get("qty"),
+                float(ev.get("net") if ev.get("net") is not None
+                      else (float(ev.get("proceeds") or 0)
+                            - float(ev.get("fee") or 0))),
+                float(ev.get("fee") or 0),
+                bool(ev.get("final", True)),
+                price_kind=ev.get("price_kind"))
+            if realized is None:
+                return led, ("cash-split migration: credit %s: %s"
+                             % (ev.get("op_id"), why))
+    if abs(float(gen["cash"]) - float(led["cash"])) > 1e-6:
+        return led, ("cash-split migration: replayed cash $%.6f "
+                     "!= stored $%.6f; manual reconciliation "
+                     "required" % (float(gen["cash"]),
+                                   float(led["cash"])))
+    for lane in set(list((gen.get("lanes") or {}).keys())
+                    + list((led.get("lanes") or {}).keys())):
+        g = set(((gen["lanes"].get(lane) or {}).get("open")
+                 or {}).keys())
+        s = set(((led["lanes"].get(lane) or {}).get("open")
+                 or {}).keys())
+        if g != s:
+            return led, ("cash-split migration: open positions "
+                         "diverge in lane %s; manual "
+                         "reconciliation required" % lane)
+    led["cash_spendable"] = gen["cash_spendable"]
+    led["cash_estimated"] = gen["cash_estimated"]
+    logger.warning("paper_account: cash split derived from journal "
+                   "replay: spendable $%.6f, estimated $%.6f",
+                   gen["cash_spendable"], gen["cash_estimated"])
     return led, None
 
 
@@ -694,6 +799,14 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
             # partial replay up to the offending entry is valid
             # and is kept.
             _save_locked(led)
+    if degraded is None and "cash_spendable" not in led:
+        # Bucket migration (design v4 Stage A): derive the split
+        # from a genesis journal replay; exact or frozen.
+        led, degraded = _derive_buckets_locked(led, entries)
+        if degraded is None:
+            _save_locked(led)
+        else:
+            logger.error("paper_account: %s", degraded)
     # Day rollover: reset the daily counter, keep the cumulative.
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if led.get("day") != today:
@@ -800,9 +913,12 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
         if rec is not None:
             return True, "ok (retry of applied op)", rec["pos_id"]
         cash = float(led["cash"])
-        if cash < stake:
-            return (False, ("account cash $%.2f < stake $%.2f"
-                            % (cash, stake)), None)
+        spendable = float(led.get("cash_spendable", 0.0))
+        if spendable < stake:
+            return (False, ("account spendable cash $%.2f < stake "
+                            "$%.2f (total $%.2f incl. quarantined "
+                            "estimated proceeds)"
+                            % (spendable, stake, cash)), None)
         st = _lane(led, lane)
         if mint in st["open"]:
             return (False, ("%s already has an open %s position"
@@ -839,7 +955,8 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
 
 def credit(lane: str, mint: str, proceeds: float, op_id: str,
            ts: Optional[float] = None, pos_id: Optional[str] = None,
-           qty: Optional[float] = None, fee: float = 0.0
+           qty: Optional[float] = None, fee: float = 0.0,
+           price_kind: Optional[str] = None
            ) -> Tuple[bool, str]:
     """Settle a sale of `qty` units of `mint` (None = ALL remaining
     units, i.e. a full close) for `proceeds` gross paper dollars
@@ -925,7 +1042,8 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                            % (pos_id, mint, pos["pos_id"]))
         pid = pos.get("pos_id")
         realized, why = _apply_credit(led, lane, mint, qty, net,
-                                      fee, qty is None)
+                                      fee, qty is None,
+                                      price_kind=price_kind)
         if realized is None:
             _journal({"event": "credit_orphan", "lane": lane,
                       "mint": mint, "proceeds": proceeds,
@@ -943,6 +1061,7 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                   "net": net, "realized": realized,
                   "final": mint not in st["open"],
                   "cash_after": led["cash"],
+                  "price_kind": price_kind,
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
         return True, "ok"
@@ -1034,6 +1153,10 @@ def _view_locked(led: Dict[str, Any],
     out = {
         "start_balance": led["start_balance"],
         "cash": round(cash, 6),
+        "cash_spendable": round(float(led.get("cash_spendable")
+                                      or 0.0), 6),
+        "cash_estimated": round(float(led.get("cash_estimated")
+                                      or 0.0), 6),
         "cost_exposure": round(exposure, 6),
         "book_value": round(cash + exposure, 6),
         "realized_pnl": led.get("realized_pnl", 0.0),

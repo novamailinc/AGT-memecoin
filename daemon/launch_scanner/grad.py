@@ -1540,15 +1540,25 @@ def _finalize(d, mint, pos, closed_reason):
     # close credits the exact proceeds the lane books. A failure
     # (e.g. a position that predates the flag) is journaled by the
     # account module and never blocks the lane's own settle.
+    _close_kinds = [v.get("exit_price_kind")
+                    for v in pos["legs"].values() if v.get("done")]
+    _close_kinds += list((pos.get("twap") or {}).get("price_kinds")
+                         or [])
+    _close_kind = (_pk.aggregate(_close_kinds)
+                   if _pk is not None else "unknown")
     _pa = _paper_account()
     if _pa is not None:
         # Full close (qty=None settles all remaining units); op_id
         # is stable per position instance so a retried close after
-        # an uncertain response cannot double-credit.
+        # an uncertain response cannot double-credit. A mixed or
+        # non-current kind routes the WHOLE credit to the
+        # quarantined estimated bucket (grad settles per position,
+        # unlike the ladder lanes' per-tranche settles).
         _op = "%s:close:%s:%s" % (LANE, mint,
                                   pos.get("pa_pos_id") or "legacy")
         _ok, _why = _pa.credit(LANE, mint, realized, _op,
-                               pos_id=pos.get("pa_pos_id"))
+                               pos_id=pos.get("pa_pos_id"),
+                               price_kind=_close_kind)
         if not _ok:
             logger.warning("grad: shared paper account credit "
                            "for %s failed: %s (journaled)", mint, _why)
@@ -1604,11 +1614,7 @@ def _finalize(d, mint, pos, closed_reason):
         rec["legs"] = {}
         rec["twap"] = dict(pos["twap"])
     rec.update(_peak_fields(pos))
-    _pkinds = [v.get("exit_price_kind")
-               for v in pos["legs"].values() if v.get("done")]
-    _pkinds += list((pos.get("twap") or {}).get("price_kinds") or [])
-    rec["exit_price_kind"] = (_pk.aggregate(_pkinds)
-                              if _pk is not None else "unknown")
+    rec["exit_price_kind"] = _close_kind
     # F2 stamp (2026-10-23): pos["_f2"] is set ONLY by the F2 exit
     # branch, immediately before _close_remaining/_finalize — its
     # presence is the unmistakable marker. Copied into the close

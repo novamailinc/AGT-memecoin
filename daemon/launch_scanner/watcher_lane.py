@@ -165,7 +165,7 @@ def _paper_account():
         return None
 
 
-def _pa_settle(pos, qty, gross, fee, suffix):
+def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
     """Credit the shared account for one settlement tranche, when
     this position was opened through it. Same contract as ceo's:
     net proceeds land in shared cash immediately, average-cost
@@ -184,7 +184,7 @@ def _pa_settle(pos, qty, gross, fee, suffix):
     mint = pos["mint"]
     _op = "%s:%s:%s:%s" % (LANE, suffix, mint, pa_pos_id)
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
-                           qty=qty, fee=fee)
+                           qty=qty, fee=fee, price_kind=price_kind)
     if not _ok:
         logger.warning("watcher: shared paper account credit for %s "
                        "(%s) failed: %s (journaled)", mint, suffix,
@@ -1005,11 +1005,13 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     gross = leg_tokens * filled_exit
     gas_out = _costs.tx_cost_usd(pos["chain"], gross)
     net = gross - gas_out
+    _kind = _pkind(reason, pkind)
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
-               exit_price_kind=_pkind(reason, pkind))
+               exit_price_kind=_kind)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
-    _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key)
+    _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key,
+               price_kind=_kind)
     return net
 
 
@@ -1032,16 +1034,17 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     gross = total_tokens * filled_exit
     gas_out = _costs.tx_cost_usd(pos["chain"], gross)
     net = gross - gas_out
+    _kind = _pkind(reason, pkind)
     for key in open_legs:
         leg = pos["legs"][key]
         share = (pos["tokens"] * leg["frac"]) / total_tokens \
             if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason,
-                   exit_price_kind=_pkind(reason, pkind))
+                   exit_price_kind=_kind)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
     _pa_settle(pos, total_tokens, gross, gas_out,
-               "remaining:%s" % "".join(open_legs))
+               "remaining:%s" % "".join(open_legs), price_kind=_kind)
     return net
 
 

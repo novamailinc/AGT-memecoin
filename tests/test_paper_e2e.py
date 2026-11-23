@@ -16,6 +16,13 @@ honest about current behavior, they force this file to be updated when
 the quarantine/accounting repair lands, and they are the activation
 blockers - not inventions to make the suite pass.
 
+Stage A of that repair LANDED (2026-11-22): the F2 stale-estimate
+proceeds are quarantined in cash_estimated and cannot finance new
+entries - the former FINDINGS 1-2 are now hard impossibility
+assertions. FINDINGS 3-5 (write-down fee on a non-sale, write-down
+lane/account divergence, verdict math ingesting estimates) remain
+asserted PRESENT until Stages B-D land.
+
 Run: python3 tests/test_paper_e2e.py   (never pytest)
 """
 import importlib
@@ -160,20 +167,34 @@ rec = closes[0]
 check("F2 close is labeled mixed current+stale",
       rec.get("exit_price_kind")
       == "mixed:%s,%s" % (PK.CURRENT, PK.STALE))
-cash_after_f2 = PA.snapshot()["cash"]
+snap_f2 = PA.snapshot()
 est = rec["realized_usd"] - leg_a_cash
-if est > 0 and cash_after_f2 > 1.0:
-    finding("stale-estimate proceeds are spendable shared cash",
-            "F2 remainder credited %.4f at an unobserved price; "
-            "cash now %.4f" % (est, cash_after_f2))
-    # prove it finances a new simulated entry end-to-end
-    opened2, _, _ = W.consider_fire(fire(M(2)), time.time())
-    if opened2:
-        finding("stale-estimate cash financed a new entry",
-                "M(2) opened; cash after debit %.4f"
-                % PA.snapshot()["cash"])
-    check("contamination demonstrated (activation blocker)",
-          opened2 and est > 0)
+# STAGE A REPAIR (was FINDINGS 1-2): the F2 remainder is priced on
+# a stale estimate, so it must be QUARANTINED in cash_estimated and
+# must never finance a new entry. These are impossibility
+# assertions: a failure here is a hard FAIL, not a finding.
+check("F2 remainder quarantined in estimated cash",
+      abs(snap_f2["cash_estimated"] - est) < 1e-6)
+check("F2 remainder did not touch spendable cash",
+      abs(snap_f2["cash_spendable"] - (1.0 + leg_a_cash)) < 1e-6)
+# entry 1 debited start(2.0) -> cash 1.0, so its stake was 1.0;
+stake2 = float(os.environ["PAPER_ACCOUNT_START"]) - 1.0
+spend_before = snap_f2["cash_spendable"]
+opened2, why2, _ = W.consider_fire(fire(M(2)), time.time())
+if spend_before < stake2:
+    check("entry REFUSED when spendable < stake even with "
+          "estimated cash present",
+          not opened2 and "spendable" in (why2 or "").lower())
+else:
+    # financed ONLY by the verified leg-A cash: the estimated
+    # bucket must be untouched by the debit
+    snap2 = PA.snapshot()
+    check("new entry financed by verified cash only",
+          opened2
+          and abs(snap2["cash_estimated"]
+                  - snap_f2["cash_estimated"]) < 1e-9
+          and abs(snap2["cash_spendable"]
+                  - (spend_before - stake2)) < 1e-6)
 
 # ---------- 5. write-down: no sale, but a fee is booked ------------
 opened3, why3, _ = W.consider_fire(fire(M(3)), time.time())

@@ -533,10 +533,13 @@ def test_accounts():
     # Cross-check vs the existing in-repo parser on the same bytes.
     legacy = reserves.parse_bonding_curve(curve_raw)
     check("curve agrees with reserves.parse_bonding_curve",
-          legacy == {"complete": True, "v_sol": 0, "v_token": 0}
+          legacy is not None
           and legacy["complete"] == curve["complete"]
           and legacy["v_sol"] == curve["virtual_quote_reserves"]
-          and legacy["v_token"] == curve["virtual_token_reserves"])
+          and legacy["v_token"] == curve["virtual_token_reserves"]
+          and legacy["r_sol"] == curve["real_quote_reserves"]
+          and legacy["supply"] == curve["token_total_supply"]
+          and legacy["quote_mint"] == curve["quote_mint"])
     check("is_graduated True for the migrated curve",
           pf.is_graduated(curve) is True)
     prog = pf.curve_progress(curve)

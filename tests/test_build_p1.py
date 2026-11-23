@@ -89,10 +89,14 @@ check("amounts_price: empty base -> None",
       R.amounts_price(0, 5, 6) is None)
 
 # bonding curve parse + PDA
-curve = bytearray(64)
+curve = bytearray(166)  # current quote-aware schema (>= 115)
+curve[:8] = bytes.fromhex("17b7f83760d8ac60")
 struct.pack_into("<Q", curve, 8, 1_000_000_000_000)   # v_token raw
-struct.pack_into("<Q", curve, 16, 85_000_000_000)     # v_sol lamports
+struct.pack_into("<Q", curve, 16, 85_000_000_000)     # v_quote (SOL)
 curve[48] = 0
+curve[83:115] = bytes([6, 155, 136, 87, 254, 171, 129, 132, 251, 104,
+                       127, 99, 70, 24, 192, 53, 218, 196, 57, 220,
+                       26, 235, 59, 85, 152, 160, 240, 0, 0, 0, 0, 1])
 c = R.parse_bonding_curve(bytes(curve))
 check("curve parse", c["v_token"] == 1_000_000_000_000
       and c["v_sol"] == 85_000_000_000 and c["complete"] is False)

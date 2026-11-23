@@ -29,6 +29,11 @@ sys.path.insert(0, REPO)
 from daemon.launch_scanner import dossiers as D
 from daemon.launch_scanner.reserves import parse_bonding_curve
 
+# WSOL mint bytes (So111...1112)
+_WSOL_B = bytes([6, 155, 136, 87, 254, 171, 129, 132, 251, 104, 127,
+                99, 70, 24, 192, 53, 218, 196, 57, 220, 26, 235, 59,
+                85, 152, 160, 240, 0, 0, 0, 0, 1])
+
 fails = []
 
 
@@ -53,9 +58,11 @@ class FakeRes:
 
     def get_account(self, pda):
         self.get_account_calls += 1
-        data = bytearray(64)
+        data = bytearray(166)  # current quote-aware schema (>= 115)
+        data[:8] = bytes.fromhex("17b7f83760d8ac60")
         struct.pack_into("<Q", data, 8, 1_000_000_000)   # v_token
-        struct.pack_into("<Q", data, 16, 5_000_000_000)  # v_sol
+        struct.pack_into("<Q", data, 16, 5_000_000_000)  # v_quote
+        data[83:115] = _WSOL_B                       # quote = WSOL
         data[48] = 0
         return "owner", bytes(data)
 

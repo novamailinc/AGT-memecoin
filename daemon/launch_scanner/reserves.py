@@ -22,9 +22,20 @@ offset parse fails a getProgramAccounts scan by vault-owner finds
 them layout-free.
 
 Bonding curve (pre-graduation): PDA seeds ["bonding-curve", mint]
-under the pump program; layout: virtual_token_reserves u64 @8,
-virtual_sol_reserves u64 @16, real_token_reserves @24,
-real_sol_reserves @32, token_total_supply @40, complete bool @48.
+under the pump program. Authoritative layout = the pump-public-docs
+IDL (idl/pump.json): virtual_token_reserves u64 @8,
+virtual_QUOTE_reserves u64 @16, real_token_reserves @24,
+real_quote_reserves @32, token_total_supply @40, complete bool @48,
+creator pubkey @49, is_mayhem_mode @81, is_cashback_coin @82,
+quote_mint pubkey @83 (so the schema needs >= 115 bytes; live
+accounts observed 166 bytes with trailing fields the IDL does not
+document — documented offsets only are parsed). The quote asset is
+NOT always SOL: quote control mints are a program feature and live
+PUMP-quoted curves exist (verified 2026-11-22). The repo's older
+"virtual_sol_reserves / 81-byte" docstring was never the documented
+layout (every pump-public-docs IDL since >= 2026-05-18 is
+quote-aware); short accounts match no supported layout and are
+refused.
 
 Free-only: Helius RPC (discovery key first, main key fallback, then
 public mainnet-beta). SOL/USD from DexScreener's SOL pairs (cached
@@ -1012,71 +1023,149 @@ def derive_curve_pda(mint):
 
 
 def parse_bonding_curve(data):
-    """{v_token, v_sol, complete} from curve account bytes."""
+    """{v_token, v_sol, r_token, r_sol, supply, complete, quote_mint}
+    from curve account bytes, per the authoritative pump-public-docs
+    IDL (quote-aware schema: quote_mint pubkey @83, so the account
+    must be >= 115 bytes). `v_sol`/`r_sol` are the virtual/real
+    QUOTE reserves, kept under the legacy key names for existing
+    consumers — they are denominated in `quote_mint`, not always
+    SOL. Accounts shorter than the documented schema match no
+    supported layout and are refused (None) rather than priced from
+    an assumed one."""
     try:
-        if not data or len(data) < 49:
+        if not data or len(data) < 115:
             return None
         return {"v_token": struct.unpack_from("<Q", data, 8)[0],
                 "v_sol": struct.unpack_from("<Q", data, 16)[0],
-                "complete": bool(data[48])}
+                "r_token": struct.unpack_from("<Q", data, 24)[0],
+                "r_sol": struct.unpack_from("<Q", data, 32)[0],
+                "supply": struct.unpack_from("<Q", data, 40)[0],
+                "complete": bool(data[48]),
+                "quote_mint": b58encode(data[83:115])}
     except Exception:
         return None
+
+
+def quote_usd_price(quote_mint, now=None):
+    """(usd_price, observed_ts) of a curve's quote asset. WSOL maps
+    to the SOL cache; any other quote mint is priced from
+    DexScreener's token endpoint (deepest pair), cached 30s. Quote
+    mints are configurable on-chain (QuoteControl), so there is no
+    hardcoded allowlist — but a quote asset whose price cannot be
+    established fails EXPLICITLY ((0.0, now)), never guessed."""
+    now = time.time() if now is None else now
+    if quote_mint == WSOL:
+        return sol_usd_price(now), (_SOL_CACHE.get("ts") or now)
+    ent = _QUOTE_USD_CACHE.get(quote_mint)
+    if ent and ent["px"] > 0 and now - ent["ts"] < SOL_TTL_S:
+        return ent["px"], ent["ts"]
+    px = 0.0
+    try:
+        url = ("https://api.dexscreener.com/tokens/v1/solana/"
+               + quote_mint)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "agt-reserves"})
+        arr = json.loads(urllib.request.urlopen(req, timeout=8).read())
+        best_liq = 0.0
+        for pair in arr or []:
+            try:
+                p = float(pair.get("priceUsd") or 0)
+                liq = float(((pair.get("liquidity") or {})
+                             .get("usd")) or 0)
+            except Exception:
+                continue
+            if p > 0 and liq > best_liq:
+                best_liq, px = liq, p
+    except Exception as e:
+        logger.info("quote_usd_price %s failed: %s", quote_mint[:8], e)
+    if px > 0:
+        _QUOTE_USD_CACHE[quote_mint] = {"px": px, "ts": now}
+    return px, now
+
+
+# Quote-mint -> decimals cache: decimals are mint-immutable, so no
+# TTL, but a lookup failure is NOT cached (retry next call).
+_QUOTE_DEC_CACHE = {}
+
+
+def quote_decimals(quote_mint, exempt=False):
+    """Decimals of the quote asset: WSOL is canonically 9; other
+    quote mints read their mint account (never assumed). None =
+    unknown -> the caller refuses to price."""
+    if quote_mint == WSOL:
+        return 9
+    if quote_mint in _QUOTE_DEC_CACHE:
+        return _QUOTE_DEC_CACHE[quote_mint]
+    dec = mint_decimals(quote_mint, exempt=exempt)
+    if dec is not None:
+        _QUOTE_DEC_CACHE[quote_mint] = dec
+    return dec
 
 
 def _curve_price_impl(mint, exempt=False):
     """(price_usd, observed_ts, detail). observed_ts is the OLDEST
     observation behind the number: the curve read happens at call
-    time, but the SOL/USD conversion may come from the 30s cache —
-    and, when both SOL fetches fail, from an arbitrarily old cache
-    entry. A caller that stamps freshness (account marks) must use
-    observed_ts, never the wrap time."""
+    time, but the quote-asset/USD conversion may come from a 30s
+    cache — and, when its fetches fail, from an arbitrarily old
+    cache entry. A caller that stamps freshness (account marks)
+    must use observed_ts, never the wrap time."""
     read_ts = time.time()
     try:
         pda = derive_curve_pda(mint)
         if not pda:
             return 0.0, read_ts, "no curve pda"
-        _owner, data = get_account(pda, exempt=exempt)
+        owner, data = get_account(pda, exempt=exempt)
+        if owner != PUMP_PROGRAM:
+            return 0.0, read_ts, ("curve account owner %s not the pump "
+                                  "program; schema unverified"
+                                  % str(owner)[:8])
         c = parse_bonding_curve(data)
         if not c or not c["v_token"]:
-            return 0.0, read_ts, "curve unreadable"
+            return 0.0, read_ts, ("curve unreadable or unsupported "
+                                  "layout (schema needs >= 115 bytes "
+                                  "with quote_mint @83)")
         if c["complete"]:
             return 0.0, read_ts, "curve complete (graduated)"
         dec = mint_decimals(mint, exempt=exempt)
         if dec is None:
             return 0.0, read_ts, "decimals unknown"
-        sol = sol_usd_price()
-        if not sol:
-            return 0.0, read_ts, "no sol/usd"
-        sol_ts = _SOL_CACHE.get("ts") or read_ts
-        obs_ts = min(read_ts, sol_ts)
-        price_sol = (c["v_sol"]/1e9) / (c["v_token"] / (10 ** dec))
-        # Plausibility band (2026-11-22 live verification): the
-        # standard pump.fun curve's spot price lives between its
-        # creation ratio (~2.8e-8 SOL) and its graduation ratio
-        # (~4e-7 SOL); [1e-8, 1.5e-6] leaves generous margin. A
-        # value outside the band means the offsets do not describe
-        # this account — len-166 curve accounts read 27x-inflated
-        # "reserves" under the documented 2026-10-23 layout — and
-        # the only safe answer is no price (fail-closed), for exit
-        # pricing and account marks alike. If pump.fun legitimately
-        # changes curve parameters this band must be re-derived
-        # from chain evidence, not widened on faith.
-        if not (CURVE_PRICE_MIN_SOL <= price_sol <= CURVE_PRICE_MAX_SOL):
-            return 0.0, read_ts, ("implausible curve price %.3g SOL "
-                                  "(band %.0g..%.0g); account layout "
-                                  "not trusted" % (price_sol,
-                                                   CURVE_PRICE_MIN_SOL,
-                                                   CURVE_PRICE_MAX_SOL))
-        return price_sol * sol, obs_ts, "bonding curve %s" % pda[:8]
+        quote_mint = c["quote_mint"]
+        qpx, qts = quote_usd_price(quote_mint)
+        if not qpx:
+            return 0.0, read_ts, ("no %s/usd (quote asset unpriceable; "
+                                  "refusing to guess)" % quote_mint[:8])
+        qdec = quote_decimals(quote_mint, exempt=exempt)
+        if qdec is None:
+            return 0.0, read_ts, ("quote asset %s decimals unknown; "
+                                  "refusing to assume" % quote_mint[:8])
+        price_usd = ((c["v_sol"] / (10 ** qdec))
+                     / (c["v_token"] / (10 ** dec))) * qpx
+        obs_ts = min(read_ts, qts)
+        # Plausibility band, SECONDARY to the schema gate above (a
+        # band cannot validate an unknown layout — 2026-11-22 live
+        # evidence: a PUMP-quoted curve read as SOL-quoted landed
+        # inside any reasonable SOL band while being ~27,778x off).
+        # USD-denominated, generous: pump.fun spot prices run from
+        # ~3e-6 USD at creation to ~7e-5 USD at graduation; the band
+        # catches garbage decodes (zero/huge/negative), not wrong
+        # layouts.
+        if not (CURVE_PRICE_MIN_USD <= price_usd <= CURVE_PRICE_MAX_USD):
+            return 0.0, read_ts, ("implausible curve price %.3g USD "
+                                  "(band %.0g..%.0g); decode not "
+                                  "trusted" % (price_usd,
+                                               CURVE_PRICE_MIN_USD,
+                                               CURVE_PRICE_MAX_USD))
+        return price_usd, obs_ts, ("bonding curve %s quote=%s"
+                                   % (pda[:8], quote_mint[:8]))
     except Exception as e:
         return 0.0, read_ts, "curve error: %s" % e
 
 
-# Plausibility band for the curve spot price in SOL (see
-# _curve_price_impl): derived from the standard pump.fun curve's
-# creation and graduation price ratios with generous margin.
-CURVE_PRICE_MIN_SOL = 1e-8
-CURVE_PRICE_MAX_SOL = 1.5e-6
+# Plausibility band for the curve spot price in USD (secondary to
+# the schema gate; see _curve_price_impl): derived from the pump.fun
+# creation/graduation price range with generous margin.
+CURVE_PRICE_MIN_USD = 1e-9
+CURVE_PRICE_MAX_USD = 1e-1
 
 
 def curve_price_usd(mint, exempt=False):
@@ -1096,6 +1185,8 @@ def curve_price_observed(mint, exempt=False):
 # ---- SOL/USD ----------------------------------------------------------------
 
 _SOL_CACHE = {"px": 0.0, "ts": 0.0}
+# quote-mint -> {"px", "ts"}; same TTL as the SOL cache
+_QUOTE_USD_CACHE = {}
 SOL_TTL_S = 30.0
 
 

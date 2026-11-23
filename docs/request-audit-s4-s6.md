@@ -52,13 +52,21 @@ Items marked FIXED name the landing commit.
   non-gating), deployer_tracker.py / deployers.py, smartmoney.py, follower_grader.py.
   FIXED (persistence depth): deployers.py now archives an entry before registry
   eviction (append-only deployer_archive.jsonl under flock; eviction only after a
-  successful append - failed archives keep the entry, never a silent drop),
-  per-outcome bounded timestamps (outcome_ts) alongside the bounded launch_ts,
-  compaction keeps the latest record per deployer past the byte cap (bounded in
-  practice by cardinality, no enforceable-constant claim), and deployer_archive()
-  reports availability honestly (missing = zero history, unreadable lines counted).
-  Archived counters/timestamps are labeled recorded values, not verified skill;
-  advisory memory only, no gate/entry/exit reads it (tests in test_deployers.py).
+  successful append - failed archives keep the entry, never a silent drop; torn
+  tails repaired under lock before append and counted), per-outcome bounded
+  timestamps (outcome_ts) alongside the bounded launch_ts, and segments with
+  stable ids (deployer + registry first_seen): a re-appearing deployer's later
+  segment never erases an earlier one - reads and compaction MERGE segments per
+  deployer, summing counters only over verifiable values (corrupt counters mark
+  the row partial) and linking segment ids; duplicate appends dedupe by segment
+  id; live risk counters are never rehydrated from the archive. Compaction past
+  the byte cap merges as above (bounded in practice by cardinality, no
+  enforceable-constant claim); dropped corrupt lines, compaction failures and
+  torn-tail repairs persist in a sidecar meta file surfaced by
+  deployer_archive() (missing file = unknown_missing, absence cannot prove zero
+  history). Archived counters/timestamps are labeled recorded values, not
+  verified skill; advisory memory only, no gate/entry/exit reads it (tests in
+  test_deployers.py).
 - 4.3 Trading memory: IMPLEMENTED — recorder.py, tap_journal.py, decision_journal.py
   (daemon/intelligence/signals/), verdict_ledger.py, exit_provenance.py, paper_account
   ledgers. decision journal + lessons.py settle records with outcomes.

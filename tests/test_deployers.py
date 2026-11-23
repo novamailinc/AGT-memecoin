@@ -325,9 +325,11 @@ class DeployerArchiveTest(unittest.TestCase):
         self.reg = self.tmp / "deployer_history.json"
         self.arc = self.tmp / "deployer_archive.jsonl"
         self.lock = self.tmp / "deployer_archive.lock"
+        self.meta = self.tmp / "deployer_archive_meta.json"
         for name, val in (("_REGISTRY_FILE", self.reg),
                           ("_ARCHIVE_FILE", self.arc),
                           ("_ARCHIVE_LOCK_FILE", self.lock),
+                          ("_ARCHIVE_META_FILE", self.meta),
                           ("_MAX_REGISTRY", 2)):
             p = patch.object(deployers, name, val)
             p.start()
@@ -354,6 +356,119 @@ class DeployerArchiveTest(unittest.TestCase):
             rec["memory_provenance"],
             "recorded_counters_and_bounded_timestamps_not_verified_skill")
         self.assertGreater(rec["archived_ts"], 0)
+        self.assertEqual(rec["segments_merged"], 1)
+
+    def test_reappearing_deployer_segments_merged_never_erased(self):
+        deployers.record_launch(DEP1)
+        deployers.record_outcome("m1", DEP1, "rug")
+        deployers.record_launch(DEP2)
+        deployers.record_launch(DEP3)  # over cap: evicts DEP1 (seg 1)
+        deployers.record_launch(DEP1)  # reappears, fresh entry (evicts DEP2)
+        deployers.record_outcome("m2", DEP1, "hit_2x")
+        deployers.record_launch(DEP2)  # evicts DEP3
+        deployers.record_launch(DEP3)  # evicts DEP1 again (seg 2)
+        out = deployers.deployer_archive(DEP1)
+        self.assertEqual(len(out["records"]), 1)
+        rec = out["records"][0]
+        # Earlier segment NOT erased by the later one.
+        self.assertEqual(rec["launches_seen"], 2)
+        self.assertEqual(rec["rugs"], 1)
+        self.assertEqual(rec["hits_2x"], 1)
+        self.assertEqual(rec["segments_merged"], 2)
+        self.assertEqual(len(rec["segment_ids"]), 2)
+        # Live counters were never rehydrated from the archive.
+        self.assertNotIn(DEP1, deployers.load_registry())
+
+    def test_duplicate_segment_deduped(self):
+        entry = {"first_seen": 100.0, "last_seen": 200.0,
+                 "launches_seen": 3, "hits_2x": 1, "rugs": 0, "dead": 0}
+        self.assertTrue(deployers._archive_deployer(DEP1, entry, 300.0))
+        # Eviction retried after a registry-save failure: same segment.
+        self.assertTrue(deployers._archive_deployer(DEP1, entry, 301.0))
+        with open(self.arc) as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 1)
+        out = deployers.deployer_archive(DEP1)
+        self.assertEqual(out["records"][0]["launches_seen"], 3)
+        self.assertEqual(out["records"][0]["segments_merged"], 1)
+
+    def test_torn_tail_repaired_under_lock_before_append(self):
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "segment_id": "x:1", "deployer": DEP2,
+                        "archived_ts": 5, "launches_seen": 2})
+            + "\n{\"partial\"")  # crash mid-append, no newline
+        self.assertTrue(deployers._archive_deployer(
+            DEP1, {"first_seen": 1.0, "launches_seen": 1}, 10.0))
+        out = deployers.deployer_archive()
+        self.assertEqual(len(out["records"]), 2)
+        self.assertEqual(
+            out["archive_status"].get("torn_tail_repairs"), 1)
+        self.assertEqual(out["archive_status"]["unreadable_lines"], 0)
+
+    def test_compaction_merges_and_counts_dropped_corruption(self):
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "segment_id": "a:1", "deployer": DEP1,
+                        "archived_ts": 100.0, "launches_seen": 5,
+                        "hits_2x": 0, "rugs": 0, "dead": 0})
+            + "\ngarbage-line\n")
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            deployers._archive_deployer(
+                DEP1, {"first_seen": 200.0, "launches_seen": 1,
+                       "hits_2x": 1, "rugs": 0, "dead": 0}, 300.0)
+        out = deployers.deployer_archive(DEP1)
+        rec = out["records"][0]
+        self.assertEqual(rec["launches_seen"], 6)  # merged, not erased
+        self.assertEqual(rec["segments_merged"], 2)
+        self.assertEqual(
+            out["archive_status"].get("dropped_unreadable_total"), 1)
+        self.assertEqual(out["archive_status"]["unreadable_lines"], 0)
+
+    def test_compaction_failure_visible_in_status(self):
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "segment_id": "a:1", "deployer": DEP1,
+                        "archived_ts": 100.0, "launches_seen": 5})
+            + "\n")
+        real_replace = os.replace
+
+        def boom(src, dst):
+            if str(dst) == str(self.arc):
+                raise OSError("simulated compaction failure")
+            return real_replace(src, dst)
+
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10), \
+                patch.object(deployers.os, "replace", side_effect=boom):
+            self.assertTrue(deployers._archive_deployer(
+                DEP2, {"first_seen": 1.0, "launches_seen": 1}, 10.0))
+        out = deployers.deployer_archive()
+        self.assertEqual(
+            out["archive_status"].get("compaction_failures"), 1)
+        # The appended record is still durable despite the failure.
+        self.assertTrue(out["archive_status"]["available"])
+
+    def test_concurrent_appenders_all_durable(self):
+        import threading
+        errors = []
+
+        def work(i):
+            try:
+                deployers._archive_deployer(
+                    "DepT%d" % i, {"first_seen": float(i),
+                                   "launches_seen": 1}, 100.0 + i)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work, args=(i,))
+                   for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        out = deployers.deployer_archive()
+        self.assertEqual(len(out["records"]), 8)
 
     def test_eviction_fail_closed_when_archive_fails(self):
         deployers.record_launch(DEP1)
@@ -373,24 +488,40 @@ class DeployerArchiveTest(unittest.TestCase):
         out = deployers.deployer_archive()
         self.assertEqual(len(out["records"]), 1)
         self.assertEqual(out["archive_status"]["unreadable_lines"], 1)
-        # Missing file = genuine zero history.
+        # Missing file cannot prove zero history: labeled unknown.
         self.arc.unlink()
         out2 = deployers.deployer_archive()
         self.assertEqual(out2["records"], [])
         self.assertFalse(out2["archive_status"]["available"])
-        self.assertEqual(out2["archive_status"]["reason"], "missing")
+        self.assertEqual(out2["archive_status"]["reason"],
+                         "unknown_missing")
 
-    def test_compaction_keeps_latest_per_deployer(self):
+    def test_compaction_merges_segments_per_deployer(self):
         with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
-            deployers._archive_deployer(DEP1, {"launches_seen": 1}, 100.0)
             deployers._archive_deployer(
-                DEP1, {"launches_seen": 9, "rugs": 2}, 200.0)
-            deployers._archive_deployer(DEP2, {"launches_seen": 3}, 150.0)
+                DEP1, {"first_seen": 1.0, "launches_seen": 1}, 100.0)
+            deployers._archive_deployer(
+                DEP1, {"first_seen": 50.0, "launches_seen": 9,
+                       "rugs": 2}, 200.0)
+            deployers._archive_deployer(
+                DEP2, {"first_seen": 2.0, "launches_seen": 3}, 150.0)
         out = deployers.deployer_archive()
         self.assertEqual(len(out["records"]), 2)
         by_dep = {r["deployer"]: r for r in out["records"]}
-        self.assertEqual(by_dep[DEP1]["launches_seen"], 9)
+        self.assertEqual(by_dep[DEP1]["launches_seen"], 10)
+        self.assertEqual(by_dep[DEP1]["segments_merged"], 2)
         self.assertEqual(by_dep[DEP1]["archived_ts"], 200.0)
+        # Corrupt counter segment: merged row marked partial.
+        self.arc.write_text(
+            json.dumps({"v": 1, "record_type": "deployer_archive",
+                        "segment_id": "a:1", "deployer": DEP1,
+                        "archived_ts": 100.0, "launches_seen": "bad"})
+            + "\n")
+        with patch.object(deployers, "_ARCHIVE_MAX_BYTES", 10):
+            deployers._archive_deployer(
+                DEP1, {"first_seen": 9.0, "launches_seen": 2}, 300.0)
+        out2 = deployers.deployer_archive(DEP1)
+        self.assertTrue(out2["records"][0]["partial"])
 
     def test_outcome_ts_bounded_history(self):
         deployers.record_launch(DEP1)

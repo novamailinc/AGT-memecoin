@@ -1560,24 +1560,69 @@ def _finalize(d, mint, pos, closed_reason):
                          or [])
     _close_kind = (_pk.aggregate(_close_kinds)
                    if _pk is not None else "unknown")
+    # Unit split (parent review 2026-11-22): written-down units are
+    # NOT sold, so a mixed close must settle the sold units as a
+    # sale AND move the written-down units + their cost to the
+    # unresolved register - never route the entire close as a sale.
+    _WD = "write_down_zero"
+    _sold_qty = 0.0
+    _wd_qty = 0.0
+    _sold_kinds = []
+    if pos.get("twap") is not None:
+        _sold_qty += float((pos["twap"] or {}).get("sold_tokens")
+                           or 0)
+        _rem = (pos["twap"] or {}).get("remainder") or {}
+        if _rem.get("exit_price_kind") == _WD:
+            _wd_qty += float(_rem.get("tokens") or 0)
+        _sold_kinds += [k for k in ((pos["twap"] or {})
+                                    .get("price_kinds") or [])
+                        if k != _WD]
+    else:
+        for _lk, _lv in pos["legs"].items():
+            if not _lv.get("done"):
+                continue
+            _lq = pos["tokens"] * _lv["frac"]
+            if _lv.get("exit_price_kind") == _WD:
+                _wd_qty += _lq
+            else:
+                _sold_qty += _lq
+                _sold_kinds.append(_lv.get("exit_price_kind"))
+    _sold_kind = (_pk.aggregate(_sold_kinds)
+                  if (_pk is not None and _sold_kinds) else None)
     _pa = _paper_account()
     if _pa is not None:
-        # Full close (qty=None settles all remaining units); op_id
-        # is stable per position instance so a retried close after
-        # an uncertain response cannot double-credit. A mixed or
-        # non-current kind routes the WHOLE credit to the
-        # quarantined estimated bucket (grad settles per position,
-        # unlike the ladder lanes' per-tranche settles).
+        # op_ids are stable per position instance so a retried
+        # close after an uncertain response cannot double-settle.
         _op = "%s:close:%s:%s" % (LANE, mint,
                                   pos.get("pa_pos_id") or "legacy")
-        if _close_kind == "write_down_zero":
+        _ok, _why = True, ""
+        if _sold_qty <= 0 and _wd_qty > 0:
             # Pure write-down: no sale happened, so the units +
             # original cost move to the unresolved register
             # (design v4 Stage B), never a zero/negative credit.
             _ok, _why = _pa.write_down(
                 LANE, mint, _op, pos_id=pos.get("pa_pos_id"),
                 reason=closed_reason)
+        elif _wd_qty > 0:
+            # Mixed close: priced portion settles as a sale of the
+            # SOLD units; the unquotable remainder moves to the
+            # unresolved register with its original cost.
+            _ok, _why = _pa.credit(LANE, mint, realized, _op,
+                                   pos_id=pos.get("pa_pos_id"),
+                                   qty=_sold_qty,
+                                   price_kind=_sold_kind)
+            if _ok:
+                # qty=None moves ALL remaining account units: the
+                # close is final, and grad leg fractions can leave
+                # dust the per-leg qty would strand.
+                _ok, _why = _pa.write_down(
+                    LANE, mint, _op + ":wd",
+                    pos_id=pos.get("pa_pos_id"),
+                    reason=closed_reason)
         else:
+            # Full close (qty=None settles all remaining units).
+            # A non-current aggregate kind routes the WHOLE credit
+            # to the quarantined estimated bucket.
             _ok, _why = _pa.credit(LANE, mint, realized, _op,
                                    pos_id=pos.get("pa_pos_id"),
                                    price_kind=_close_kind)

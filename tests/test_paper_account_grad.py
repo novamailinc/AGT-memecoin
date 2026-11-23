@@ -237,3 +237,54 @@ check("grad written-down units held in the unresolved register "
 check("grad write-down left no open account position",
       not snap1["lanes"].get("grad", {}).get("positions"))
 _unpatch(ps)
+
+
+# ---- grad MIXED close: priced tranche + unquotable remainder ----
+# The sold units settle as a sale; the written-down units + their
+# original cost move to the unresolved register (parent 2026-11-22).
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+importlib.reload(PA)
+for _f2 in (PA.LEDGER_PATH, PA.LEDGER_PATH + ".bak",
+            PA.JOURNAL_PATH):
+    if os.path.exists(_f2):
+        os.remove(_f2)
+importlib.reload(PA)
+ps, _mv, _ms = _fresh()
+opened, why, _f = G.consider_candidate(_cand(mint="MIX111pump"))
+check("mix fixture: entry opened (%s)" % (why or ""), opened)
+snap0 = PA.snapshot()
+cash0 = snap0["cash"]
+with G._ledger_lock():
+    d = G._read()
+    pos = d["positions"]["MIX111pump"]
+    toks = pos["tokens"]
+    frac_a = pos["legs"]["a"]["frac"]
+    G._close_leg(pos, "a", pos["entry_price"] * 2.0, "test")
+    G._close_remaining(pos, 0.0, "time_stop_24h_unquotable",
+                       pkind="write_down_zero")
+    rec_mix = G._finalize(d, "MIX111pump", pos,
+                          "time_stop_24h_unquotable")
+    G._write(d)
+check("mixed close labeled mixed", rec_mix
+      and str(rec_mix.get("exit_price_kind") or "").startswith(
+          "mixed:"))
+snap1 = PA.snapshot()
+un = [u for u in snap1.get("unresolved") or []
+      if u["mint"] == "MIX111pump"]
+check("mixed close: written-down units in the register",
+      len(un) == 1 and abs(float(un[0]["qty"])
+                           - toks * (1 - frac_a)) / toks < 0.02)
+check("mixed close: register keeps the written-down cost",
+      len(un) == 1
+      and abs(float(un[0]["basis"]) - (1 - frac_a)) < 0.02)
+check("mixed close: priced tranche credited",
+      snap1["cash"] > cash0)
+if snap1["lanes"].get("grad", {}).get("positions"):
+    print("DEBUG positions:", snap1["lanes"]["grad"]["positions"])
+    print("DEBUG journal:", open(PA.JOURNAL_PATH).read()[-800:])
+check("mixed close: nothing left open in the account",
+      not snap1["lanes"].get("grad", {}).get("positions"))
+check("mixed close: credited proceeds quarantine-checked by kind",
+      abs(snap1["cash_spendable"] - snap1["cash"]) < 1e-9
+      or snap1["cash_estimated"] > 0)
+_unpatch(ps)

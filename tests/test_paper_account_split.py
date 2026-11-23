@@ -386,6 +386,72 @@ def partial_write_down_conservation():
 partial_write_down_conservation()
 
 
+def impairment_hits_conservative_equity():
+    """Parent 2026-11-22: unresolved basis must reduce conservative
+    equity IMMEDIATELY and stay visible as impairment - numeric
+    daily-loss / drawdown checks after partial and full
+    write-downs, with PREEXISTING persisted day-start/peak
+    baselines, including a restart."""
+    home = tempfile.mkdtemp()
+    pa = fresh(home)
+    ok, _, pid = pa.try_debit("watcher", "I", 2.0, qty=100.0,
+                              op_id="watcher:buy:I:1")
+    check("i entry ok", ok)
+
+    def marks(qty, value):
+        return {"watcher": {"I": {"value": value, "ts": time.time(),
+                                  "source": "test", "qty": qty,
+                                  "pos_id": pid}}}
+
+    # persisted baselines: day-start AND peak at 10.0
+    snap = pa.snapshot(marks=marks(100.0, 2.0))
+    check("i baselines captured",
+          abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9
+          and abs(snap["peak_equity"]["value"] - 10.0) < 1e-9)
+    # PARTIAL write-down of 50 of 100 units (cost 1.00); the
+    # remaining 50 units mark at $1.00 -> conservative equity 9.0
+    ok, _ = pa.write_down("watcher", "I", "watcher:wd:I:1",
+                          pos_id=pid, reason="r", qty=50.0)
+    check("i partial wd ok", ok)
+    snap = pa.snapshot(marks=marks(50.0, 1.0))
+    check("partial wd: daily loss recognizes impairment at once",
+          snap["daily_loss"] is not None
+          and abs(snap["daily_loss"] - 1.0) < 1e-6)
+    check("partial wd: drawdown recognizes impairment at once",
+          snap["drawdown_pct"] is not None
+          and abs(snap["drawdown_pct"] - 10.0) < 1e-6)
+    check("partial wd: impairment visible in the register",
+          abs(snap["unresolved_cost"] - 1.0) < 1e-9)
+    # FULL write-down of the rest: no open positions -> equity is
+    # exactly spendable cash (8.0); the full $2 impairment shows
+    ok, _ = pa.write_down("watcher", "I", "watcher:wd:I:2",
+                          pos_id=pid, reason="r")
+    check("i full wd ok", ok)
+    snap = pa.snapshot()
+    check("full wd: daily loss is the full impairment",
+          snap["daily_loss"] is not None
+          and abs(snap["daily_loss"] - 2.0) < 1e-6)
+    check("full wd: drawdown is the full impairment",
+          snap["drawdown_pct"] is not None
+          and abs(snap["drawdown_pct"] - 20.0) < 1e-6)
+    check("full wd: register carries the whole original cost",
+          abs(snap["unresolved_cost"] - 2.0) < 1e-9)
+    check("full wd: spendable untouched by the write-down",
+          abs(snap["cash_spendable"] - 8.0) < 1e-9)
+    # restart: persisted baselines + register still recognize it
+    import daemon.launch_scanner.paper_account as pa2
+    pa2 = importlib.reload(pa2)
+    snap = pa2.snapshot()
+    check("after restart: impairment still recognized",
+          snap["daily_loss"] is not None
+          and abs(snap["daily_loss"] - 2.0) < 1e-6
+          and abs(snap["drawdown_pct"] - 20.0) < 1e-6
+          and abs(snap["unresolved_cost"] - 2.0) < 1e-9)
+
+
+impairment_hits_conservative_equity()
+
+
 def mirror_exclusion_explicit():
     """mirror is deliberately UNWIRED from the shared account
     (design decision pending review). Keep that exclusion

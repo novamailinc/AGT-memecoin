@@ -182,3 +182,41 @@ class TestNativeSharedRisk:
         with pytest.raises(BrokerError,match='token USD observation'):
             a.submit_order(_req('BONK','BUY',.02,'a'))
         assert pa.snapshot()['cash']==10. and not a._positions
+
+    @pytest.mark.parametrize('failure',['read','write','visible-write'])
+    def test_existing_losing_history_survives_fault_and_sqlite_restart(self, account, tmp_path, monkeypatch, failure):
+        from storage.store import Store
+        from datetime import date
+        path=str(tmp_path/'risk.db')
+        a=_adapter(str(tmp_path/'native'),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+             fx_observer=lambda:{'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},
+             shared_mark_observer=lambda:{})
+        a.connect({})
+        store=Store(path)
+        # Same bound account's real historical losing baseline/outcomes.
+        history={'risk_account_identity':a.risk_state_identity(),
+                 'day':date.today().isoformat(),'start_of_day_equity':.2,
+                 'recent_outcomes':[True,False,False,False,False]}
+        store.set_risk_state(history)
+        signal=Signal(symbol='BONK',timeframe='M1',direction='BUY',entry_price=.000001,
+              stop_loss=.000000999,take_profit=.000002,ema_fast=0.,ema_slow=0.,rsi_value=0.,
+              atr_value=0.,candle_time=datetime.now(timezone.utc),trigger='fixture')
+        manager=RiskManager(RiskConfig(),store=store)
+        original=store.set_risk_state
+        def failwrite(patch):
+            if failure=='visible-write': original(patch)
+            raise OSError('uncertain history update')
+        if failure=='read':
+            monkeypatch.setattr(store,'get_risk_state',lambda: (_ for _ in ()).throw(OSError('read')))
+            with pytest.raises(BrokerError): manager.check(signal,a)
+        else:
+            # First binds strict shared mode while preserving a rejected loss.
+            assert not manager.check(signal,a).allowed
+            monkeypatch.setattr(store,'set_risk_state',failwrite)
+            with pytest.raises(BrokerError): manager.sync_outcomes(history['recent_outcomes'])
+        reopened=Store(path)
+        assert reopened.get_risk_state()==history
+        result=RiskManager(RiskConfig(),store=reopened).check(signal,a)
+        assert not result.allowed and 'Daily loss' in result.reason
+        assert reopened.get_risk_state()==history
+        assert pa.snapshot()['cash']==10.

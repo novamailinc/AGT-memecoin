@@ -687,6 +687,16 @@ class MemecoinAdapter(BrokerAdapter):
                 if pos["symbol"] == symbol and pos.get("shared_mint") != mint:
                     raise BrokerError(INVALID_ORDER, "symbol mapping differs from immutable entry mint")
 
+    def _shared_price_sol(self, symbol):
+        self._verify_position_mints(symbol)
+        fx = self._observe_entry_fx()
+        quote = self._market.get_quote(symbol)
+        usd = quote.get("price_usd") if isinstance(quote,dict) else None
+        if (isinstance(usd,bool) or not isinstance(usd,(int,float))
+                or not math.isfinite(usd) or usd <= 0):
+            raise BrokerError(BROKER_UNAVAILABLE,"shared native token price unavailable")
+        return usd/fx["usd_per_sol"]
+
     def _price_sol(self, symbol: str) -> float:
         """Token price in SOL, via USD legs. Raises BROKER_UNAVAILABLE
         when market data is unreachable — paper fills are never priced
@@ -701,6 +711,8 @@ class MemecoinAdapter(BrokerAdapter):
 
     def _price_sol_quiet(self, symbol: str) -> Optional[float]:
         try:
+            if self._shared_account is not None:
+                return self._shared_price_sol(symbol)
             return self._price_sol(symbol)
         except BrokerError:
             return None
@@ -1087,6 +1099,8 @@ class MemecoinAdapter(BrokerAdapter):
                     or not math.isfinite(usd) or usd <= 0):
                 raise BrokerError(BROKER_UNAVAILABLE, "native entry token price unavailable")
             price_sol = usd / self._entry_pricing_fx["usd_per_sol"]
+        elif self._shared_account is not None:
+            price_sol = self._shared_price_sol(symbol)
         else:
             price_sol = self._price_sol(symbol)  # raises when blind
 
@@ -1332,7 +1346,8 @@ class MemecoinAdapter(BrokerAdapter):
                     f"no open paper position with ticket {ticket}")
             # Price FIRST: if the quote fails the position stays untouched.
             self._verify_position_mints(p["symbol"])
-            price_sol = self._price_sol(p["symbol"])
+            price_sol = (self._shared_price_sol(p["symbol"]) if self._shared_account is not None
+                         else self._price_sol(p["symbol"]))
             del self._positions[str(ticket)]
             proceeds = p["tokens"] * price_sol
             realized = (price_sol - p["entry_price_sol"]) * p["tokens"]

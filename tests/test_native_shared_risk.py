@@ -29,7 +29,8 @@ class TestNativeSharedRisk:
                       stop_loss=.000000999,take_profit=.000002,ema_fast=0.,ema_slow=0.,
                       rsi_value=0.,atr_value=0.,candle_time=datetime.now(timezone.utc),trigger='fixture')
         # Same real risk code/config/tick contract sees equal .1 SOL equity.
-        left=RiskManager(config,store=object()).check(signal,shared)
+        from storage.store import Store
+        left=RiskManager(config,store=Store(str(tmp_path/'first-risk.db'))).check(signal,shared)
         right=RiskManager(config,store=object()).check(signal,native)
         assert left.allowed==right.allowed and left.lot_size==right.lot_size
         assert left.lot_size==.001
@@ -115,3 +116,40 @@ class TestNativeSharedRisk:
             a.submit_order(_req('BONK','BUY',.01,'after-epoch'))
         assert a._state_path().read_bytes()==before
         assert pa.snapshot()['cash']==0.
+
+    @pytest.mark.parametrize('failure',['read','write','visible-write'])
+    def test_real_sqlite_history_errors_never_admit(self, account, tmp_path, monkeypatch, failure):
+        from storage.store import Store
+        store=Store(str(tmp_path/'risk.db'))
+        a=_adapter(str(tmp_path/'native'),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+             fx_observer=lambda:{'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},
+             shared_mark_observer=lambda:{})
+        a.connect({})
+        signal=Signal(symbol='BONK',timeframe='M1',direction='BUY',entry_price=.000001,
+              stop_loss=.000000999,take_profit=.000002,ema_fast=0.,ema_slow=0.,rsi_value=0.,
+              atr_value=0.,candle_time=datetime.now(timezone.utc),trigger='fixture')
+        original=store.set_risk_state
+        def write(patch):
+            if failure=='visible-write': original(patch)
+            raise OSError('SQLite write uncertain')
+        if failure=='read':
+            monkeypatch.setattr(store,'get_risk_state',lambda: (_ for _ in ()).throw(OSError('read')))
+        else:
+            monkeypatch.setattr(store,'set_risk_state',write)
+        with pytest.raises(BrokerError,match='Shared risk history'):
+            RiskManager(RiskConfig(),store=store).check(signal,a)
+        assert pa.snapshot()['cash']==10.
+
+    def test_old_sol_cache_cannot_manufacture_exit_proceeds(self, account, tmp_path):
+        rate=[100.]
+        a=_adapter(str(tmp_path),FakeMarket({'SOL':100.,'BONK':.0001}),shared_account=pa,
+             fx_observer=lambda:{'usd_per_sol':rate[0],'observed_at':time.time(),'source':'fixture'},
+             shared_mark_observer=lambda:{})
+        a.connect({});a._sol_price_usd()
+        rate[0]=200.
+        a.submit_order(_req('BONK','BUY',.02,'a'))
+        assert pa.snapshot()['cash']==6.
+        a.close_position(1)
+        assert pa.snapshot()['pending_sol'][0]['proceeds_sol']==pytest.approx(.02)
+        a.settle_pending_usd({'usd_per_sol':200.,'observed_at':time.time(),'source':'fixture'})
+        assert pa.snapshot()['cash']==10.

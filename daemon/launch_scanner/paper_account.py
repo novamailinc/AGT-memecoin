@@ -157,6 +157,26 @@ def gates_enabled() -> bool:
     return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
 
 
+def _central_marks() -> Dict[str, Dict[str, Any]]:
+    """Marks from the central marker (account_marks.collect_marks),
+    collected by try_debit BEFORE the account lock when the caller
+    supplies none. Caller-supplied marks always win; this is only
+    the default. Any failure returns an empty map, which the view
+    treats as untrusted whenever positions are open (fail-closed)
+    and as fully marked on an empty account. Never raises: a broken
+    marker must degrade gating, not crash a lane's entry path.
+    """
+    try:
+        try:
+            from daemon.launch_scanner import account_marks
+        except ImportError:
+            import account_marks  # sibling import context (scripts)
+        marks = account_marks.collect_marks()
+        return marks if isinstance(marks, dict) else {}
+    except Exception:
+        return {}
+
+
 def max_daily_loss_usd() -> float:
     return _env_f("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", 5.00)  # provisional
 
@@ -749,7 +769,10 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
     the account-level risk gates run INSIDE the same lock as the
     reservation (see _gate_check_locked): evaluation and debit are
     one atomic section, so two lanes cannot each pass on the same
-    available capacity.
+    available capacity. When `marks` is None and gates are enabled,
+    the account collects them centrally (account_marks) BEFORE
+    taking the lock; a position it cannot price blocks further
+    entries fail-closed.
     """
     if not _valid_amount(stake) or stake <= 0:
         return False, "stake must be a positive finite number", None
@@ -761,6 +784,8 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
         return False, "lane and mint are required", None
     if not op_id or not isinstance(op_id, str):
         return False, "caller op_id is required", None
+    if gates_enabled() and marks is None:
+        marks = _central_marks()
     with _lock():
         led, healthy, degraded = _load_locked()
         if not healthy or led is None:

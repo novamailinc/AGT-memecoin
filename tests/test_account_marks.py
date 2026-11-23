@@ -96,6 +96,105 @@ check("full coverage: equity 7 + 4 + 1 = 12",
       snap["marks_status"] == "ok"
       and abs(snap["marked_equity"] - 12.0) < 1e-9)
 
+# ---------------- curve fallback (pre-graduation coverage) -------
+# A mint Jupiter omits is priced from the bonding curve; the mark
+# carries reserves:curve provenance and the same {value,ts,source}
+# contract.
+H = tempfile.mkdtemp(prefix="marks-curve-")
+pa, am = fresh(H)
+pa.try_debit("watcher", "CURVEMINT", 1.0, 500.0, "am-c1")
+curve_calls = []
+
+
+def curve_stub(mint):
+    curve_calls.append(mint)
+    return 0.004, "bonding curve abc123"
+
+
+m = am.collect_marks(price_fn=lambda mints: {},
+                     curve_price_fn=curve_stub)
+mk = m.get("watcher", {}).get("CURVEMINT")
+check("curve fallback: jup-missing mint marked from the curve",
+      mk is not None and abs(mk["value"] - 2.0) < 1e-9)
+check("curve fallback: provenance is reserves:curve",
+      mk is not None and mk["source"] == "reserves:curve"
+      and isinstance(mk["ts"], (int, float)))
+check("curve fallback: view accepts the mark (equity 9 + 2 = 11)",
+      pa.snapshot(marks=m)["marks_status"] == "ok")
+
+# Jupiter wins: a priced mint never costs a curve call.
+curve_calls[:] = []
+m = am.collect_marks(price_fn=lambda mints: {"CURVEMINT": 0.01},
+                     curve_price_fn=curve_stub)
+check("jup-priced mint: no curve call, jup provenance kept",
+      curve_calls == []
+      and m["watcher"]["CURVEMINT"]["source"] == "jup-v3")
+
+# Graduated-but-jup-missing: the curve reports complete -> absent,
+# fail-closed (the marker has no pool address to read vaults from).
+m = am.collect_marks(price_fn=lambda mints: {},
+                     curve_price_fn=lambda mint: (0.0,
+                                                  "curve complete"))
+check("completed curve: absent, never coerced", m == {})
+check("completed curve: view fails closed",
+      pa.snapshot(marks=m)["marked_equity"] is None)
+
+# A raising curve source: absent, marker never raises.
+def curve_boom(mint):
+    raise RuntimeError("rpc down")
+
+
+m = am.collect_marks(price_fn=lambda mints: {},
+                     curve_price_fn=curve_boom)
+check("raising curve source: empty map, no exception", m == {})
+
+# Garbage curve prices are dropped.
+for bad, label in [(0.0, "zero"), (-2.0, "negative"),
+                   (float("nan"), "NaN"), ("0.004", "string")]:
+    m = am.collect_marks(price_fn=lambda mints: {},
+                         curve_price_fn=lambda mint, b=bad: (b, "x"))
+    check("bad curve price dropped (%s)" % label, m == {})
+
+# ---------------- auto-marks inside try_debit ----------------------
+# With gates enabled and no caller-supplied marks, try_debit
+# collects centrally pre-lock: valid marks admit, an empty collect
+# blocks fail-closed. Gates stay default-OFF; this proves the
+# wiring for when the owner enables them.
+os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"
+H = tempfile.mkdtemp(prefix="marks-auto-")
+pa, am = fresh(H)
+ok, why, pid = pa.try_debit("grad", "MINTA", 2.0, 1000.0, "g-1")
+check("gated first entry on an empty account passes", ok)
+
+import time  # noqa: E402  (used by the patched collects below)
+
+am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
+    now=None: {"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
+                                  "source": "test"}}}
+ok, why, pid2 = pa.try_debit("ceo", "MINTB", 1.0, 100.0, "g-2")
+check("gated second entry: central marks admit", ok)
+
+am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
+    now=None: {}
+ok, why, _ = pa.try_debit("watcher", "MINTC", 1.0, 100.0, "g-3")
+check("gated entry with an empty collect: blocked fail-closed",
+      not ok and "marks not trustworthy" in why)
+
+# Caller-supplied marks still win over the central collect.
+am.collect_marks = lambda price_fn=None, curve_price_fn=None, \
+    now=None: {"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
+                                  "source": "test"}},
+               "ceo": {"MINTB": {"value": 1.0, "ts": time.time(),
+                                 "source": "test"}}}
+ok, why, _ = pa.try_debit(
+    "watcher", "MINTC", 1.0, 100.0, "g-4",
+    marks={"grad": {"MINTA": {"value": 3.0, "ts": time.time(),
+                              "source": "test"}},
+           "ceo": {"MINTB": {"value": 1.0, "ts": time.time(),
+                             "source": "test"}}})
+check("caller-supplied marks still accepted", ok)
+os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED")
+
 if FAILURES:
     print("\nFAILURES: %s" % FAILURES)
     sys.exit(1)

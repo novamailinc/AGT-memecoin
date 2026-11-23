@@ -27,6 +27,14 @@ present in the source data — never inferred, never invented:
      data (overwhelmingly "safety: rugcheck danger: ...") count.
   3. deployer_tracker.json launch entries (when the file exists)
      carrying an explicit truthy `rugged` / `dead` / `rug` flag.
+  4. memory/launch_archive.jsonl (dossiers.py durable launch
+     memory): the SAME mint->deployer join and launch census as
+     the live dossiers, hardened against the 24h dossier TTL.
+     Launch records join dead_mints to their deployer and count
+     toward the launch census; launch_rollup rows contribute
+     their aggregated per-year launch counts. Outcome records
+     are NOT read here: simulated closes are not dead/rug
+     evidence. The flag rule and thresholds are unchanged.
 
 The reported `dead` is the CONSERVATIVE lower bound
 max(counter_dead, distinct mint-level dead) so the two pipelines
@@ -224,6 +232,57 @@ def _evidence(home):
         s = slot(dep)
         s["launches"] = max(s["launches"], len(mints))
         s["sources"].add("dossiers")
+
+    # 4. Durable launch archive: the same joins as the live
+    # dossiers above, still valid after those dossiers expire.
+    # Read-only; a missing/corrupt archive contributes nothing
+    # (evidence is counted only where it is present).
+    try:
+        archive_mints = {}   # deployer -> set of mints
+        rollup_launches = {}  # deployer -> summed rollup count
+        with open(os.path.join(
+                home, "memory", "launch_archive.jsonl")) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(rec, dict) or rec.get("v") != 1:
+                    continue
+                dep = str(rec.get("deployer") or "")
+                if not dep:
+                    continue
+                rtype = rec.get("record_type", "launch")
+                if rtype == "launch":
+                    mint = str(rec.get("mint") or "")
+                    if not mint:
+                        continue
+                    archive_mints.setdefault(dep, set()).add(mint)
+                    if mint in dead_mints:
+                        s = slot(dep)
+                        s["dead_mint_set"].add(mint)
+                        s["sources"].add("dead_mints+launch_archive")
+                elif rtype == "launch_rollup":
+                    try:
+                        n = int(rec.get("launches") or 0)
+                    except Exception:
+                        n = 0
+                    if n > 0:
+                        rollup_launches[dep] = \
+                            rollup_launches.get(dep, 0) + n
+        for dep, mints in archive_mints.items():
+            s = slot(dep)
+            s["launches"] = max(s["launches"], len(mints))
+            s["sources"].add("launch_archive")
+        for dep, n in rollup_launches.items():
+            s = slot(dep)
+            s["launches"] = max(s["launches"], n)
+            s["sources"].add("launch_archive")
+    except Exception:
+        pass
     return agg
 
 

@@ -331,6 +331,61 @@ check("queue: collect_wallets back-compat (wallet -> first_seen)",
       IR.collect_wallets().get(DW) == 1234.0)
 
 
+# ---------------- rugger: durable launch archive as evidence ----------------
+# The SAME joins as live dossiers, hardened against the 24h dossier
+# TTL: dead_mints joined through the launch archive, launch census
+# from launch records and launch_rollup rows. No live dossiers here.
+HOME3 = tempfile.mkdtemp(prefix="intel-rugger-arch-")
+RR.REGISTRY_PATH = os.path.join(HOME3, "rugger_registry.json")
+os.makedirs(os.path.join(HOME3, "dossiers"), exist_ok=True)
+os.makedirs(os.path.join(HOME3, "memory"), exist_ok=True)
+DEPA = _mk("9h")
+DEPB = _mk("1i")
+assert FC.is_plausible_wallet(DEPA) and FC.is_plausible_wallet(DEPB)
+mints_a = [_mk("3j"), _mk("4k"), _mk("5m")]
+for _m in mints_a:
+    assert FC.is_plausible_wallet(_m), _m
+with open(os.path.join(HOME3, "grad_ledger.json"), "w") as f:
+    json.dump({"dead_mints": {m: {"ts": 1.0, "reason":
+                                  "safety: rugcheck danger: rug"}
+                              for m in mints_a}}, f)
+_recs = [{"v": 1, "record_type": "launch", "mint": m,
+          "deployer": DEPA, "archived_ts": 1.0,
+          "safety_verdict": "conclusive"} for m in mints_a]
+_recs.append({"v": 1, "record_type": "launch_rollup",
+              "deployer": DEPB, "year": "2025", "launches": 4,
+              "conclusive": 3, "unknown": 1})
+_recs.append({"v": 1, "record_type": "launch_rollup",
+              "deployer": DEPB, "year": "2026", "launches": 2,
+              "conclusive": 2, "unknown": 0})
+_recs.append({"v": 1, "record_type": "outcome", "mint": mints_a[0],
+              "lane": "grad", "archived_ts": 2.0,
+              "realized_mult": 0.1, "closed_reason": "stop",
+              "provenance": "simulated"})
+with open(os.path.join(HOME3, "memory", "launch_archive.jsonl"),
+          "w") as f:
+    for _r in _recs:
+        f.write(json.dumps(_r) + "\n")
+RR.refresh()
+ra = RR.lookup(DEPA)
+check("rugger: archive joins dead_mints after dossier TTL",
+      ra["flagged"] is True and ra["dead"] == 3
+      and set(ra["examples"]) == set(mints_a))
+check("rugger: archive launch census counted with source label",
+      ra["launches"] == 3)
+rb = RR.lookup(DEPB)
+check("rugger: launch_rollup rows feed the launch census",
+      rb["launches"] == 6 and rb["dead"] == 0
+      and rb["flagged"] is False)
+check("rugger: simulated outcomes are NOT dead/rug evidence",
+      ra["dead"] == 3)  # the outcome record added nothing
+_reg = RR.load_registry()
+_srcs = _reg["deployers"][DEPA]["sources"]
+check("rugger: archive evidence auditable in sources",
+      "launch_archive" in _srcs
+      and "dead_mints+launch_archive" in _srcs)
+
+
 print()
 if fails:
     print("FAILURES:", fails)

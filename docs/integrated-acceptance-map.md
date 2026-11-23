@@ -176,3 +176,29 @@ save failure keeps intake pending. Retained sell events are not currently bounde
 so storage grows; this is not a complete buy/sell attribution or loss-forensics
 solution. A failed post-replace fsync can leave visible state, with retry dedup and
 resave, not rollback. No new grading or trading threshold is activated.
+
+
+## Acquisition caller coverage audit
+
+The repaired `scripts/smart-watcher.poll_wallet` is NOT the only wallet source.
+`daemon.launch_scanner.smartmoney.poll_wallets` is called directly by the actual
+scanner cycle, then `_smart_fasttrack` consumes returned activity. Inspection
+finds that separate path still advances its saved cursor before transaction
+success and uses a legacy unvalidated last-account balance parser. It is OPEN,
+not covered by the smart-watcher parser/retry acceptance. Its configured cadence
+is max(smart_poll_seconds default120, registry_count*12) in the actual caller,
+while the standalone poll function's default is180; do not silently speed either.
+
+Current RPC acquisition code search also finds reads in bundle, curve_cache,
+deployers, exit_copy, funding_clusters, grad_raw, grad_select, logstream, lp_lock,
+moon_lane, raw_tight, reserves, tx_guards and wallet_discovery. Presence is not an
+audited equivalent source or proof of safe parsing. Each relevant production
+caller needs classification and failure/causal evidence before any all-source
+completion claim. The separate daemon/intelligence acquisition/decoder stack
+remains another integration boundary.
+
+Grade recording counts now require successful snapshot save; buy/reconciliation
+persistence failure raises to the existing scanner error logger rather than
+reporting a fictional committed count. This fixes count honesty only: the scanner
+caller previously ignored counts, and its already-advanced acquisition cursor
+still needs durable pending/outbox acceptance at that actual path.

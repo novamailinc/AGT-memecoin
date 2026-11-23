@@ -127,3 +127,14 @@ else:
         rec=json.loads((Path(self.tmp.name)/'launch_scanner/smart_wallet_grades.json').read_text())['W']
         self.assertEqual(len(rec['buys']),1)
         self.assertEqual(len(rec['sell_events']),8)
+
+    def test_buy_and_reconcile_cannot_report_count_after_failed_save(self):
+        with patch.object(smartgrade,'save_grades',return_value=False):
+            with self.assertRaises(OSError):smartgrade.record_wallet_buys({'Mpump':['W']})
+        self.assertFalse(self.path.exists())
+        self.assertEqual(smartgrade.record_wallet_buys({'Mpump':['W']}),1)
+        before=self.path.read_bytes()
+        with patch.object(smartgrade,'save_grades',return_value=False):
+            with self.assertRaises(OSError):
+                smartgrade.reconcile({'milestone_watch':{'Mpump':{'anchor':100,'hit':[2.0],'peak_mult':2.0}}})
+        self.assertEqual(self.path.read_bytes(),before)

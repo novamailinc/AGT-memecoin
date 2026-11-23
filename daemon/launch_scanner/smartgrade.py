@@ -164,7 +164,8 @@ def record_wallet_buys(fresh: Dict[str, List[str]],
 
     ``fresh`` is ``{mint: [wallet_addresses]}`` as returned by
     ``smartmoney.poll_wallets()``. Returns the number of new buy records.
-    Never raises.
+    Returns a committed new-record count. Persistence/lock failure raises;
+    zero means no new records, not a claimed successful write.
     """
     try:
         if not fresh:
@@ -196,12 +197,12 @@ def record_wallet_buys(fresh: Dict[str, List[str]],
                     "last_check_ts": 0.0,
                 })
                 added += 1
-        if added:
-            save_grades(grades)
+        if added and not save_grades(grades):
+            raise OSError('wallet buy grade persistence unavailable')
         return added
     except Exception as exc:
         logger.warning("record_wallet_buys failed: %s", exc)
-        return 0
+        raise
 
 
 def _f(value: Any) -> float:
@@ -219,8 +220,8 @@ def reconcile(launch_state: Dict[str, Any], degen: Any = None) -> int:
     ``hit_2x`` / ``peak_mult`` from the watch record. Watch records
     expire after 24h — a buy whose watch is gone keeps its last recorded
     values (frozen at window end). Prunes buys older than
-    ``_PRUNE_AFTER_DAYS``. Returns the number of buys updated. Never
-    raises.
+    ``_PRUNE_AFTER_DAYS``. Returns the committed number of buys updated.
+    Persistence/lock failure raises; the next reconciliation can retry.
     """
     try:
         grades = load_grades()
@@ -258,12 +259,12 @@ def reconcile(launch_state: Dict[str, Any], degen: Any = None) -> int:
             rec["buys"] = kept
             if not kept and not rec.get('sell_events') and not float(rec.get("last_active_ts") or 0):
                 grades.pop(wallet, None)
-        if updated:
-            save_grades(grades)
+        if updated and not save_grades(grades):
+            raise OSError('wallet grade reconciliation persistence unavailable')
         return updated
     except Exception as exc:
         logger.warning("grade reconcile failed: %s", exc)
-        return 0
+        raise
 
 
 def grade_wallet(wallet: str, registry: Dict[str, Dict[str, Any]],

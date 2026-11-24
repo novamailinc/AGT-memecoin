@@ -81,6 +81,11 @@ def _assigns(path, attrs):
 
 
 class TestStaticBypass(unittest.TestCase):
+    def test_gap_live_engine_must_not_install_noop_safety_or_veto(self):
+        p = os.path.join(ROOT, 'daemon', 'launch_scanner', 'live_select.py')
+        bad = [a for a in _assigns(p, ('_safety_ok', '_veto_ok')) if 'no_' in a[1]]
+        self.assertEqual(bad, [], 'live lane installs no-op gates: %r' % bad)
+
     def test_gap_no_duplicate_executor_copy_outside_broker(self):
         dups = []
         for d, _, fs in os.walk(ROOT):

@@ -3850,13 +3850,18 @@ def _poll_exits(price_fn):
     # Entry quotes are NOT touched: quote_price() below is shared
     # with entry, and this hierarchy lives only in _poll_exits.
     jup_prices = {}
+    jup_obs = {}     # mint -> observation ts of the Jupiter price (None = the source gave no timestamp: unknown, never invented)
     if _jup is not None:
+        _jm = [m for m, p in snapshot.items() if (p.get("chain") or "solana") == "solana"]
         try:
-            jup_prices = _jup.get_prices(
-                [m for m, p in snapshot.items()
-                 if (p.get("chain") or "solana") == "solana"]) or {}
+            if hasattr(_jup, "get_prices_observed"):
+                _o = _jup.get_prices_observed(_jm) or {}
+                jup_prices = {m: v[0] for m, v in _o.items()}
+                jup_obs = {m: v[1] for m, v in _o.items()}
+            else:
+                jup_prices = _jup.get_prices(_jm) or {}
         except Exception:
-            jup_prices = {}
+            jup_prices, jup_obs = {}, {}
     quotes = {}
     for mint, pos in snapshot.items():
         q = {"px": 0.0, "src": "", "liq": 0.0, "pair": ""}
@@ -3871,9 +3876,11 @@ def _poll_exits(price_fn):
                 if q["px"] <= 0 and mint in jup_prices:
                     q["px"] = jup_prices[mint]
                     q["src"] = _jup.SOURCE
+                    q["obs_ts"] = jup_obs.get(mint)
             elif mint in jup_prices:
                 q["px"] = jup_prices[mint]
                 q["src"] = _jup.SOURCE
+                q["obs_ts"] = jup_obs.get(mint)
             elif armed and _reserves is not None:
                 rpx, rsrc = _reserves.price_for_position(pos)
                 if rpx > 0:
@@ -3954,7 +3961,10 @@ def _poll_exits(price_fn):
                     pos["last_price_source"] = q.get("src") or ""
                     jq = pos.setdefault("quote_journal", [])
                     jq.append({"ts": now, "px": px,
-                               "src": q.get("src") or ""})
+                               "src": q.get("src") or "",
+                               # price observation time (visibility only, no rule): None = the source did not say
+                               "obs_ts": q.get("obs_ts"),
+                               "obs_age_s": (now - float(q["obs_ts"])) if q.get("obs_ts") else None})
                     del jq[:-40]
                     # SHADOW STOP (2026-11-20, faster-exits item 1c):
                     # journal-only — records the first eval at/below

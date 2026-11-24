@@ -1348,6 +1348,26 @@ check("P7zb REAL try_debit_instance position (no stubs): G3 and G6 are EVALUATED
 _opi = "%s:leg:a:%s:%s" % (GR.LANE, _gmi, GR.open_positions()[_gmi]["pa_pos_id"])
 check("P7zb2 the real account op is an INSTANCE op (operation_receipt instance flag %s) so P7zb exercised the instance contract. CAVEAT: this entry route drops durable_refusal, so DEMO refusal journaling (design O-A4) is NOT covered" % (PAi.operation_receipt(_opi)[0] or {}).get("instance"),
       (PAi.operation_receipt(_opi)[0] or {}).get("instance") is True)
+# P7zd price OBSERVATION contract: the exit quote journal records the Jupiter price's own observation time (visibility only, no new rule, TTL untouched).
+# Offline: GR._jup is replaced by a fake (no network); price_fn None so the Jupiter route is the one under test.
+PAp, Fp, CTp = fresh(start="10"); go_sim(); _lp = dict(build(PAp, CTp)); _okp, _whp = _lp["grad"](1); assert _okp, _whp
+_gmp = list(GR.open_positions())[0]; _ep = float(GR.open_positions()[_gmp]["entry_price"]); _tsold = time.time() - 9.0
+class _JupObs:
+    SOURCE = "jupiter-fake"
+    def get_prices_observed(self, mints, now=None): return {m: (_ep, _tsold) for m in mints}
+    def get_prices(self, mints, now=None): return {m: _ep for m in mints}
+class _JupNoObs:
+    SOURCE = "jupiter-fake"
+    def get_prices(self, mints, now=None): return {m: _ep for m in mints}
+_jsave = GR._jup
+try:
+    GR._jup = _JupObs(); GR.poll_exits(price_fn=None); _j1 = (GR.open_positions()[_gmp].get("quote_journal") or [])[-1]
+    GR._jup = _JupNoObs(); GR.poll_exits(price_fn=None); _j2 = (GR.open_positions()[_gmp].get("quote_journal") or [])[-1]
+finally: GR._jup = _jsave
+check("P7zd1 quote journal carries the price's OBSERVATION time and age (obs_ts %s == injected %s, age %.1fs), price and source unchanged (px %s src %s)" % (_j1.get("obs_ts"), _tsold, _j1.get("obs_age_s") or -1, _j1.get("px"), _j1.get("src")),
+      _j1.get("obs_ts") == _tsold and 8.0 <= (_j1.get("obs_age_s") or 0) <= 60.0 and _j1.get("px") == _ep and _j1.get("src") == "jupiter-fake")
+check("P7zd2 a source without observation times records obs_ts None / obs_age None (unknown, never invented), same price (%s)" % ((_j2.get("obs_ts"), _j2.get("obs_age_s")),),
+      _j2.get("obs_ts") is None and _j2.get("obs_age_s") is None and _j2.get("px") == _ep)
 check("P7zc unavailable_gates key is present on every verdict path: TWAP %s, entry_op %s, quarantine %s, unavailable %s" % ("unavailable_gates" in _dt, "unavailable_gates" in GR.diagnose_position(_gmi) , "unavailable_gates" in _dq, "unavailable_gates" in _dm),
       all("unavailable_gates" in x for x in (_dt, _dq, _dm, _di)) and _dt["unavailable_gates"] == [] and _dm["unavailable_gates"] == ["G3", "G6"] and _dq["unavailable_gates"] in (["G3", "G6"], ["G3"], ["G6"], []))
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.

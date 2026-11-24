@@ -57,10 +57,11 @@ class HeliusAdapter(BaseProviderAdapter):
         # owns the Helius WSS URL. Return None (do not fabricate).
         return None
 
-    def call(self, method, params, timeout=12):
+    def call(self, method, params, timeout=12, max_transport_attempts=None):
         start = time.monotonic()
         if getattr(self,'revised',False):
-            return revised_call(self,method,params,timeout)
+            return revised_call(self,method,params,timeout,
+                                max_transport_attempts=max_transport_attempts)
         try:
             from daemon.launch_scanner import reserves
         except Exception:
@@ -142,20 +143,27 @@ def _record_key_stat(home, label, field, cost=0):
         pass
 
 
-def revised_call(adapter,method,params,timeout):
+def revised_call(adapter,method,params,timeout,max_transport_attempts=None):
     """Cooperative multi-key dispatch over ONE conservative account bucket.
 
-    The three numbered keys COOPERATE rather than merely rotate: a stable
-    method/params shard gives every call a home key (distinct calls
-    spread across all three keys), and a KEY-LEVEL failure (unconfigured
-    source or transport error) fails over to the next key in order.
-    Every attempt acquires from the SAME aggregate account bucket first,
-    so failover can never bypass project throttling or an exhausted
-    shared budget, and an aggregate refusal (shared account hold or
-    cooldown) hops no keys. Vendor 429s are answered, not evaded: a
-    rate_limited result is returned immediately with no retry on another
-    key. The bucket's rate is the operator's allocation policy and is
-    unchanged by this dispatch layer.
+    The three numbered keys COOPERATE via stable home-key workload
+    distribution: a method/params shard gives every call a home key, so
+    distinct calls spread across all three keys ACROSS CALLS. Within one
+    call there is NO retry of an uncertain request: any actual transport
+    outcome (answer or unknown post-I/O failure such as a timeout, where
+    the request may have reached the vendor) returns IMMEDIATELY, never
+    hops to another key, and the caller's credit reservation is retained
+    (the budget_reservations contract: no refund/retry of an uncertain
+    request). Failover to the next key happens ONLY for proven pre-I/O
+    skips: an unconfigured key source, where no request was made and no
+    credit could have been billed. Every real attempt acquires from the
+    SAME aggregate account bucket (rate pacer) first, and the caller
+    holds a credit reservation before the attempt, so failover can never
+    bypass project throttling, an exhausted shared budget, or the
+    max_attempts transport-attempt bound. Vendor 429s are answered, not
+    evaded: a rate_limited result is returned immediately with no retry
+    on another key. The bucket's rate is the operator's allocation
+    policy and is unchanged by this dispatch layer.
     """
     import hashlib,json
     from .base import http_json_rpc,_parse_rpc_body
@@ -169,38 +177,49 @@ def revised_call(adapter,method,params,timeout):
         return answer(None,'rate_limited',note='shared account hold')
     bucket=helius_ratelimit.bucket_id_for_key('account:helius_main')
     pacer=helius_ratelimit.pacer()
-    last=None
+    transport_attempts=0
     for hop in range(3):
+        if max_transport_attempts is not None and transport_attempts>=max_transport_attempts:
+            out=answer(None,'rate_limited',note='max_attempts transport-attempt budget exhausted')
+            out['transport_attempts']=transport_attempts
+            return out
         idx=(shard+hop)%3
         key=keys[idx]
         label='key%d'%(idx+1)
         if not key:
+            # Proven pre-I/O skip: no request was made, no credit could
+            # have been billed; trying the next key is safe failover.
             _record_key_stat(adapter.home,label,'unconfigured',0)
             continue
         if not pacer.acquire(bucket):
-            return answer(None,'rate_limited',note='shared account cooldown')
+            out=answer(None,'rate_limited',note='shared account cooldown')
+            out['transport_attempts']=transport_attempts
+            return out
+        transport_attempts+=1
         start=time.monotonic()
         status,body,err,retry=http_json_rpc('https://mainnet.helius-rpc.com/?api-key={key}'.format(key=key),method,params,timeout=timeout,_opener=adapter._transport)
         value,kind,wait,rl_kind=_parse_rpc_body('helius',status,body,err,retry_after=retry)
         if err is not None and status is None:
-            # KEY-LEVEL transport failure: the aggregate token for this
-            # attempt is spent (a real request was attempted); fail over
-            # to the next key, which must acquire its own token.
+            # UNKNOWN post-I/O transport outcome: the request may have
+            # reached the vendor and been billed. Return immediately;
+            # NEVER hop to another key (that would retry an uncertain
+            # request and multiply real spend against one reservation).
             _record_key_stat(adapter.home,label,'transport_error',
                              adapter.cost(method) or 0)
-            last=(value,kind,wait,rl_kind,status,label)
-            continue
+            out=_result(value,kind,time.monotonic()-start,'helius',http_status=status,wait_hint_s=wait,rate_limit_kind=rl_kind)
+            out['credential_source']=label
+            out['account']='helius_main'
+            out['transport_attempts']=transport_attempts
+            return out
         if kind=='rate_limited':helius_account.throttled(adapter.home,wait,rl_kind=='monthly_quota')
         if kind in ('ok','rate_limited'):pacer.report(bucket,kind=='ok')
         _record_key_stat(adapter.home,label,kind,
                          adapter.cost(method) or 0)
         out=_result(value,kind,time.monotonic()-start,'helius',http_status=status,wait_hint_s=wait,rate_limit_kind=rl_kind)
         out['credential_source']=label
-        return out
-    if last is not None:
-        value,kind,wait,rl_kind,status,label=last
-        out=_result(value,kind,0.,'helius',http_status=status,wait_hint_s=wait,rate_limit_kind=rl_kind)
-        out['credential_source']=label
         out['account']='helius_main'
+        out['transport_attempts']=transport_attempts
         return out
-    return answer(None,'unconfigured',note='no fixed numbered source available')
+    out=answer(None,'unconfigured',note='no fixed numbered source available')
+    out['transport_attempts']=transport_attempts
+    return out

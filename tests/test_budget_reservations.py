@@ -164,3 +164,39 @@ def test_actual_router_malformed_retained_window_refuses_before_transport(tmp_pa
     result=r.call('getSlot',[],max_attempts=1)
     assert not calls and result['kind']=='rate_limited'
     assert result['attempts'][0]['note']=='budget_reservation_unavailable'
+
+
+def test_unknown_outcome_no_key_hop_and_ledger_matches_attempts(tmp_path,monkeypatch):
+    # Unknown post-I/O outcome on the home key: NO failover hop to
+    # another key (an uncertain request is never retried), the credit
+    # reservation taken before the attempt is retained (never refunded),
+    # and retained reservations stay 1:1 with actual transport attempts.
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':100,'unit':'credits'}})
+    calls=[]
+    def transport(req,timeout=None):
+        calls.append(1)
+        raise TimeoutError('fixture uncertainty')
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=transport)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        out=r.call('getBalance',['fixture'],max_attempts=3)
+    assert out['kind']=='timeout'
+    assert len(calls)==1  # one actual attempt despite 3 configured keys
+    import sqlite3 as _s
+    with _s.connect(str(tmp_path)+'/acquisition_budget_reservations.sqlite3') as db:
+        rows=db.execute('SELECT count(*) FROM reservations').fetchone()[0]
+    assert rows==len(calls)  # one retained reservation per actual attempt
+
+
+def test_exhausted_credit_budget_makes_no_transport_attempt(tmp_path,monkeypatch):
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':0,'unit':'credits'}} if account=='helius_main' else None)
+    calls=[]
+    def transport(req,timeout=None):
+        calls.append(1);raise AssertionError('transport must not run')
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=transport)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        r.call('getTransaction',['fixture'],max_attempts=1)
+    assert calls==[]

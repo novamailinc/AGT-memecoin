@@ -91,20 +91,42 @@ def test_stable_shard_spreads_and_repeats(env, monkeypatch):
     assert len(set(seen.values())) > 1  # distinct calls spread
 
 
-def test_failover_on_transport_error_consumes_tokens(env, monkeypatch):
+def test_no_failover_on_unknown_transport_outcome(env, monkeypatch):
+    # Unknown post-I/O transport outcome (timeout: the request may have
+    # reached the vendor and been billed): NEVER retry on another key.
+    # The budget_reservations contract is no refund/retry of an
+    # uncertain request; a key hop would multiply real spend against a
+    # single reservation. Exactly one transport attempt is made.
     map_parse(monkeypatch)
     calls = script_transport(monkeypatch, [
         (None, None, "timeout", None),          # home key transport error
-        (200, {"result": 42}, None, None),       # next key answers
+        (200, {"result": 42}, None, None),       # must never be used
     ])
     out = env["adapter"].call("getBalance", ["acct-x"])
-    assert out["kind"] == "ok"
-    assert len(calls) == 2
-    assert env["state"]["pacer"].acquire_calls == 2  # each attempt pays
+    assert out["kind"] != "ok"
+    assert len(calls) == 1
+    assert out.get("transport_attempts") == 1
+    assert env["state"]["pacer"].acquire_calls == 1  # one attempt, one token
     stats = json.load(open(os.path.join(env["home"],
                                         "helius_key_stats.json")))
     assert sum(s.get("transport_error", 0) for s in stats.values()) == 1
-    assert sum(s.get("ok", 0) for s in stats.values()) == 1
+    assert sum(s.get("ok", 0) for s in stats.values()) == 0
+
+
+def test_transport_attempt_budget_refuses_extra_hops(env, monkeypatch):
+    # The caller's max_attempts is an upper bound on TOTAL actual
+    # transport attempts. With the budget already spent, the dispatch
+    # refuses before touching the transport - even for a configured key.
+    map_parse(monkeypatch)
+    calls = script_transport(monkeypatch, [
+        (200, {"result": 42}, None, None),
+    ])
+    out = env["adapter"].call("getBalance", ["acct-x"],
+                              max_transport_attempts=0)
+    assert out["kind"] == "rate_limited"
+    assert "transport-attempt budget" in (out.get("note") or "")
+    assert len(calls) == 0
+    assert out.get("transport_attempts") == 0
 
 
 def test_no_failover_on_rpc_level_error(env, monkeypatch):

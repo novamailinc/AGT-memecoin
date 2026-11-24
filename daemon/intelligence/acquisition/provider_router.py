@@ -831,7 +831,15 @@ class ProviderRouter:
             candidates = candidates[:max_attempts]
         attempts = []
         last = None
+        transport_attempts = 0
         for provider in candidates:
+            if max_attempts is not None and transport_attempts >= max_attempts:
+                # max_attempts bounds TOTAL actual transport attempts
+                # across candidates AND intra-provider key failover.
+                attempts.append({"provider": provider, "kind": "skipped",
+                                 "elapsed_s": 0.0,
+                                 "note": "max_attempts transport-attempt budget exhausted"})
+                break
             adapter = self._adapter(provider)
             account = self._account(provider)
             # Capability gate: never send a request to a provider
@@ -933,7 +941,15 @@ class ProviderRouter:
                 last=rpc_mod._result(None,'rate_limited',0.,provider,note=reservation_reason)
                 attempts.append({'provider':provider,'kind':'skipped','elapsed_s':0.,'note':reservation_reason})
                 continue
-            result = adapter.call(method, params, timeout=timeout)
+            if provider == "helius":
+                result = adapter.call(
+                    method, params, timeout=timeout,
+                    max_transport_attempts=(
+                        None if max_attempts is None
+                        else max_attempts - transport_attempts))
+            else:
+                result = adapter.call(method, params, timeout=timeout)
+            transport_attempts += int(result.get("transport_attempts") or 1)
             result['budget_reservation_id']=reservation_id
             result['budget_reservation_policy']=reservation_reason
             attempts.append({"provider": provider,

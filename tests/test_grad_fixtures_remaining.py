@@ -1598,5 +1598,47 @@ for f in __import__("glob").glob(GR.LEDGER_PATH + ".corrupt-*"): os.remove(f)
 open(GR.LEDGER_PATH, "w").write(good)
 check("O4 lane evidence restored: the same explicit marks are accepted again", PA.snapshot(marks=exp).get("marks_status") == "ok")
 
+# ===== P7zr (SOURCE ONLY, UNEXECUTED, NOT CLEARED TO RUN): real grad ledger + real paper account driven by daemon/grad_cycle in THIS process =====
+# Offline: GR._jup is a fake (no network), price_fn injected, no process/thread start, guard intact. A fresh-module-state same-process replay is
+# NOT a kill/restart proof. SEAM (disclosed): the real poll-abort path is reached by making price_fn raise AND replacing grad._persist_poll_failure
+# with a function that returns False (the "failure state could not be restored" branch); everything else is the real code. clear_fault's commit
+# switch stays OFF, so no clear record or removal can happen here. Needs reviewer clearance before the first run.
+from daemon import grad_cycle as _GCY
+_env_save = {k: os.environ.get(k) for k in (_GCY.ENV_FLAG, _GCY.LANES_ENV)}; _pf_save = GR._persist_poll_failure; _jsave_r = GR._jup; _cm_save = _GCY.CLEAR_COMMIT_ENABLED
+try:
+    os.environ[_GCY.ENV_FLAG] = "1"; _GCY.CLEAR_COMMIT_ENABLED = False; _GCY._MEM.clear()
+    PAr, Fr, CTr = fresh(start="10"); go_sim(); _lr = dict(build(PAr, CTr)); _okr, _whr = _lr["grad"](1); assert _okr, _whr
+    _gmr = list(GR.open_positions())[0]; _epr = float(GR.open_positions()[_gmr]["entry_price"])
+    class _JupNone:
+        SOURCE = "jupiter-fake"
+        def get_prices(self, mints, now=None): return {}
+        def get_prices_observed(self, mints, now=None): return {}
+    GR._jup = _JupNone(); _scans = []
+    _good_px = lambda c, m, i: _epr
+    def _bad_px(c, m, i): raise RuntimeError("injected quote failure")
+    _r1 = _GCY.run_cycle(GR, price_fn=_good_px, scan_fn=lambda: _scans.append(1), now=time.time())
+    _r1c = _GCY.clear_fault(GR); _ncl = len(_GCY._clear_records(GR))
+    check("P7zr1 real ledger, clean cycle: done, the scan ran (gate open), clear_fault says exactly no_fault and wrote NO clear record (%s)" % (_r1c[1].get("blocked"),),
+          _r1.get("status") == "done" and _scans == [1] and _r1c[0] is False and _r1c[1].get("blocked") == ["no_fault"] and _ncl == 0)
+    GR._persist_poll_failure = lambda d, mint, pos, exc: False; _scans.clear(); _a0 = GR._POLL_ABORTS.get("count", 0)
+    _r2 = _GCY.run_cycle(GR, price_fn=_bad_px, scan_fn=lambda: _scans.append(2), now=time.time())
+    GR._persist_poll_failure = _pf_save
+    _r3 = _GCY.run_cycle(GR, price_fn=_good_px, scan_fn=lambda: _scans.append(3), now=time.time())
+    check("P7zr2 REAL abort path: the poll aborted (count %s -> %s), the cycle recorded a durable fault, the scan was NOT called that cycle (%s) nor in the following CLEAN cycle (%s), exits ran in both (steps %s / %s)"
+          % (_a0, GR._POLL_ABORTS.get("count"), _r2.get("scan_skipped"), _r3.get("scan_skipped"), _r2["steps"].get("exits"), _r3["steps"].get("exits")),
+          GR._POLL_ABORTS.get("count", 0) > _a0 and _scans == [] and os.path.exists(GR.LEDGER_PATH + ".cycle-fault.json") and str(_r3.get("scan_skipped", "")).startswith("unresolved_fault")
+          and _r2["steps"].get("exits", {}).get("ran", True) and _r3["steps"].get("exits", {}).get("ok") is True)
+    _cl = _GCY.clear_fault(GR); _bl = _cl[1].get("blocked") or []
+    check("P7zr3 real ledger, real legacy position: clear_fault refuses and the ONLY reasons are the position verdict and the disabled commit switch (no false orphan, no fill-ownership, no cash/replay, no marker reason): %s" % (_bl,),
+          (not _cl[0]) and all(b.startswith("position:") or b == "commit_disabled_no_common_writer_lock" for b in _bl) and any(b.startswith("position:") for b in _bl) and not _GCY._clear_records(GR))
+finally:
+    for _k, _v in _env_save.items():
+        if _v is None: os.environ.pop(_k, None)
+        else: os.environ[_k] = _v
+    GR._persist_poll_failure = _pf_save; GR._jup = _jsave_r; _GCY.CLEAR_COMMIT_ENABLED = _cm_save; _GCY._MEM.clear()
+# NOT YET AUTHORED (stated gaps): empty lane + real account orphan, orphan entry/exit fill on the real journal, pending_sol/holds for the lane, a real
+# try_debit_instance position that diagnoses consistent (positive clear with the commit switch on), prior-boot "running" journal simulated restart.
+# ===== end P7zr =====
+
 print("FAILS: %d" % len(FAILS))
 sys.exit(1 if FAILS else 0)

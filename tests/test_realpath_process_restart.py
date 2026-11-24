@@ -22,6 +22,7 @@ import json,os,sys
 from pathlib import Path
 home=Path(os.environ['FOREX_AGENT_HOME'])
 c=json.loads((home/'fixture-checkpoint.json').read_text())
+import tests._guard_fixture as _g; _g.block_network()  # mandatory-guard migration (disclosed)
 from daemon.launch_scanner import watcher_lane as w, paper_account as pa, dossiers as d
 w.LEDGER_PATH=c['ledger']
 pos=w.open_positions()[c['mint']]
@@ -45,6 +46,7 @@ from pathlib import Path
 home=Path(os.environ['FOREX_AGENT_HOME'])
 c=json.loads((home/'fixture-checkpoint.json').read_text())
 end=json.loads((home/'fixture-completed.json').read_text())
+import tests._guard_fixture as _g; _g.block_network()  # mandatory-guard migration (disclosed)
 from daemon.launch_scanner import watcher_lane as w,paper_account as pa,dossiers as d
 w.LEDGER_PATH=c['ledger']
 assert not w.open_positions()

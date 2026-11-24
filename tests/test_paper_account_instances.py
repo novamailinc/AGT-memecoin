@@ -18,11 +18,33 @@ def account(tmp_path, monkeypatch):
     monkeypatch.setattr(pa, 'LEDGER_PATH', str(folder / 'ledger.json'))
     monkeypatch.setattr(pa, 'JOURNAL_PATH', str(folder / 'events.jsonl'))
     monkeypatch.setattr(pa, 'LOCK_FILE', str(folder / '.lock'))
-    for key in ('PAPER_ACCOUNT_LANE_CAP', 'PAPER_ACCOUNT_GATES_ENABLED',
+    for key in ('PAPER_ACCOUNT_LANE_CAP',
                 'PAPER_ACCOUNT_PROVIDER_HEALTH_GATE_ENABLED'):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv('PAPER_ACCOUNT_START', '10')
-    return pa
+    # Mandatory-guard migration (disclosed, 2026-11-24): the shared account
+    # harness now runs with gates ON and TEST-FIXTURE limits (not owner
+    # values), matching production where entries always reserve under
+    # configured gates. Marks resolve through the real pipeline with
+    # at-cost fixture prices; no network. Tests asserting gate-refusal
+    # semantics set their own env and do not use this fixture.
+    monkeypatch.setenv('PAPER_ACCOUNT_GATES_ENABLED', '1')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_DAILY_LOSS_USD', '1000000')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_DRAWDOWN_PCT', '99')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_EXPOSURE_PCT', '100')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_SIMULTANEOUS', '1000')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_POSITIONS', '1000')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_DATA_AGE_S', '100000')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD', '1000000')
+    monkeypatch.setenv('PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD', '1000000')
+    from tests import _guard_fixture as _gf
+    from daemon.solana_ids import WSOL_MINT
+    _feed = _gf.install_price_feed(at_cost=True)
+    # FX/settlement flows mark pending SOL through the same seam; supply a
+    # disclosed fixture SOL/USD price so the denied curve is never needed.
+    _feed.set({WSOL_MINT: (150.0, time.time())})
+    yield pa
+    _feed.uninstall()
 
 
 class TestPaperAccountInstances:
@@ -128,6 +150,8 @@ class TestPaperAccountInstances:
 import os,sys
 os.environ['FOREX_AGENT_HOME']=sys.argv[1]
 os.environ['PAPER_ACCOUNT_START']='10'
+from tests import _guard_fixture as g
+g.install_price_feed(at_cost=True)
 from daemon.launch_scanner import paper_account as pa
 pa.try_debit_instance('scanner','M',1.,100.,'a')
 pa.try_debit_instance('scanner','M',2.,200.,'b')
@@ -139,6 +163,8 @@ pa.credit('scanner','M',1.5,'exit-a',pos_id='scanner/M#1',price_kind='current_pr
         verify = '''
 import os,sys,json
 os.environ['FOREX_AGENT_HOME']=sys.argv[1]
+from tests import _guard_fixture as g
+g.install_price_feed(at_cost=True)
 from daemon.launch_scanner import paper_account as pa
 s=pa.snapshot()
 assert s['degraded'] is None

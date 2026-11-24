@@ -276,7 +276,18 @@ def test_archive_status_distinguishes_empty_from_unavailable():
                     exist_ok=True)
         with open(dossiers.ARCHIVE_FILE, "w") as f:
             f.write(json.dumps({"v": 1, "mint": "M1"}) + "\n")
+        # chmod 000 does not stop root (CI/containers run as uid 0), so
+        # also force the open() itself to fail with PermissionError; the
+        # code under test sees an unreadable file either way.
         os.chmod(dossiers.ARCHIVE_FILE, 0o000)
+        import builtins as _bi
+        _real_open = _bi.open
+        def _deny(f, *a, **k):
+            if str(f) == str(dossiers.ARCHIVE_FILE):
+                raise PermissionError(13, "denied", str(f))
+            return _real_open(f, *a, **k)
+        if os.geteuid() == 0:
+            _bi.open = _deny
         try:
             st2 = dossiers.archive_status()
             check("status: unreadable archive is UNAVAILABLE",
@@ -286,6 +297,7 @@ def test_archive_status_distinguishes_empty_from_unavailable():
                   isinstance(mem, dict)
                   and mem.get("unavailable") is True)
         finally:
+            _bi.open = _real_open
             os.chmod(dossiers.ARCHIVE_FILE, 0o600)
 
 

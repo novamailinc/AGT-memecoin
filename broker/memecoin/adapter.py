@@ -123,7 +123,8 @@ class MemecoinAdapter(BrokerAdapter):
                  chains: Optional[List[str]] = None,
                  key_provider=None,
                  devnet_rpc_url: str = "", shared_account=None, fx_observer=None,
-                 shared_mark_observer=None):
+                 shared_mark_observer=None,
+                 demo_executor=None, demo_decimals_fn=None):
         """
         data_dir: state directory (created if missing).
         mode: "paper" | "live". Live is fail-closed (see module docstring).
@@ -140,9 +141,9 @@ class MemecoinAdapter(BrokerAdapter):
         devnet_rpc_url: Solana devnet RPC endpoint for mode="devnet".
             The execution layer refuses non-devnet hosts regardless.
         """
-        if mode not in ("paper", "devnet", "live"):
+        if mode not in ("paper", "devnet", "live", "demo"):
             raise BrokerError(CONFIG_INVALID,
-                              f"memecoin mode must be paper|devnet|live, got {mode!r}")
+                              f"memecoin mode must be paper|devnet|live|demo, got {mode!r}")
         home = os.environ.get("FOREX_AGENT_HOME", os.path.expanduser("~/.forex-agent"))
         self._data_dir = Path(data_dir or os.path.join(home, "data", "memecoin"))
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -152,8 +153,8 @@ class MemecoinAdapter(BrokerAdapter):
         self._shared_account = shared_account
         self._fx_observer = fx_observer
         self._shared_mark_observer = shared_mark_observer
-        if shared_account is not None and mode != "paper":
-            raise BrokerError(CONFIG_INVALID, "shared capital bridge is paper-only")
+        if shared_account is not None and mode not in ("paper", "demo"):
+            raise BrokerError(CONFIG_INVALID, "shared capital bridge is paper/demo-only")
         self._paper_start_sol = float(paper_start_sol)
         self._live_armed = bool(live_armed)
         self._wallet_pubkey = (wallet_pubkey or "").strip()
@@ -181,6 +182,28 @@ class MemecoinAdapter(BrokerAdapter):
         # so paper mode never imports the signing stack.
         self._devnet_rpc_url = (devnet_rpc_url or "").strip()
         self._devnet = None  # DevnetExecutor once connected
+        # Demo execution (mode="demo" only): live quotes through the same
+        # Jupiter client the live path uses, settled by SimulationExecutor
+        # on a scratch book that mirrors this adapter's state at fill
+        # time. Never authoritative, never on-chain, no keys.
+        self._demo_bridge = None
+        if self._mode == "demo":
+            if demo_decimals_fn is None:
+                raise BrokerError(
+                    CONFIG_INVALID,
+                    "demo mode requires demo_decimals_fn — token decimals "
+                    "are never guessed")
+            from broker.memecoin.execution.demo_bridge import (  # noqa: PLC0415 (lazy)
+                DemoExecutionBridge)
+            from broker.memecoin.execution.sim_executor import (  # noqa: PLC0415 (lazy)
+                SimulationExecutor)
+            executor = demo_executor if demo_executor is not None \
+                else SimulationExecutor(
+                    chain_state_path=str(
+                        self._data_dir / "sim_chain.json"))
+            self._demo_bridge = DemoExecutionBridge(
+                executor, demo_decimals_fn)
+        self._request_fingerprint: Optional[str] = None
         self._sol_price_cache: Optional[tuple] = None  # (ts, price_usd)
         with self._state_lock():
             self._refresh_locked()
@@ -193,21 +216,27 @@ class MemecoinAdapter(BrokerAdapter):
         path = self._state_path()
         if path.exists():
             state = json.loads(path.read_text())
+            state.setdefault("unresolved_execs", {})
             self._validate_native_state(state)
         else:
             if self._fills_path().exists() and not self._intent_path().exists():
                 raise ValueError("native state missing with existing fill history")
             state = {"balance_sol": self._paper_start_sol,
-                     "positions": {}, "next_ticket": 1}
+                     "positions": {}, "next_ticket": 1,
+                     "unresolved_execs": {}}
         self._balance_sol = float(state["balance_sol"])
         self._positions = state["positions"]
         self._next_ticket = state["next_ticket"]
+        self._unresolved = state["unresolved_execs"]
+        if not isinstance(self._unresolved, dict):
+            raise ValueError("invalid native unresolved-execution state")
         self._loaded_native_state = self._native_snapshot()
 
     def _native_snapshot(self) -> dict:
         return {"balance_sol": self._balance_sol,
                 "positions": copy.deepcopy(self._positions),
-                "next_ticket": self._next_ticket}
+                "next_ticket": self._next_ticket,
+                "unresolved_execs": copy.deepcopy(self._unresolved)}
 
     @staticmethod
     def _validate_native_state(state: dict) -> None:
@@ -217,7 +246,8 @@ class MemecoinAdapter(BrokerAdapter):
                                       state["positions"])
         if (isinstance(balance, bool) or not math.isfinite(float(balance))
                 or type(ticket) is not int or ticket < 1
-                or not isinstance(positions, dict)):
+                or not isinstance(positions, dict)
+                or not isinstance(state.get("unresolved_execs", {}), dict)):
             raise ValueError("invalid native state values")
         for key, pos in positions.items():
             if str(int(key)) != key or not 0 < int(key) < ticket:
@@ -233,8 +263,15 @@ class MemecoinAdapter(BrokerAdapter):
             "balance_sol": self._balance_sol,
             "positions": self._positions,
             "next_ticket": self._next_ticket,
+            "unresolved_execs": self._unresolved,
             "updated_at": _utcnow().isoformat(),
         })
+        # A direct save outside _commit_native (pre-call seal, UNKNOWN
+        # adoption) IS a durable state transition: the intent
+        # before-image must never go stale against disk, or a later
+        # crash leaves the pending intent matching neither image and
+        # recovery freezes on "conflicts with state".
+        self._loaded_native_state = self._native_snapshot()
 
     def _lock_path(self) -> Path:
         return self._data_dir / "paper_state.lock"
@@ -274,6 +311,24 @@ class MemecoinAdapter(BrokerAdapter):
         self._fill_keys_cache = None
         self._require_shared_binding()
         self._recover_native_intent()
+        self._sweep_orphan_holds_locked()
+
+    def _sweep_orphan_holds_locked(self) -> None:
+        """Release THIS book's holds that no sealed record claims: the
+        crash gap between the account-wide hold and the record save.
+        Runs once per process (before this process can hold anything
+        itself), after intent recovery so a pending adoption consumes
+        its hold first. Holds with a live record are never touched;
+        holds never expire silently."""
+        if self._shared_account is None or getattr(
+                self, "_holds_swept", False):
+            return
+        prefix = "native-hold:" + self._shared_book_id + ":"
+        for op_id in self._shared_account.list_holds(prefix):
+            if op_id[len(prefix):] not in self._unresolved:
+                self._shared_account.release_hold(
+                    op_id, "orphan hold: no sealed record")
+        self._holds_swept = True
 
     def _require_shared_binding(self):
         marker = self._data_dir / "shared_binding.json"
@@ -325,8 +380,12 @@ class MemecoinAdapter(BrokerAdapter):
                 identity = fill.get("idempotency_key") or fill["native_op_id"]
                 intent["shared_entry"] = entry_plan(
                     "main", self._market.mint_for(fill["symbol"]), fill["ticket"],
-                    fill["tokens"], fill["volume_sol"], fx,
-                    "native-entry:" + self._shared_book_id + ":" + identity)
+                    fill["tokens"],
+                    fill["volume_sol"] + float(fill.get("fee_sol") or 0.0),
+                    fx,
+                    "native-entry:" + self._shared_book_id + ":" + identity,
+                    getattr(self, "_fx_eval_now_override", None),
+                    hold_op_id=getattr(self, "_pending_hold_op_id", None))
             else:
                 fill["price_evidence"] = (getattr(self,"_shared_last_exit_price",None)
                     if fill.get("price_sol") else {"kind":"explicit_zero","reason":fill.get("close_reason")})
@@ -468,6 +527,12 @@ class MemecoinAdapter(BrokerAdapter):
         self._balance_sol = float(after["balance_sol"])
         self._positions = copy.deepcopy(after["positions"])
         self._next_ticket = int(after["next_ticket"])
+        # The unresolved-execution map is part of the transaction's
+        # after-image too: without this a crash mid-adoption restores
+        # the fill but keeps the record sealed, and a later reconcile
+        # would apply the same landed fill a second time.
+        if "unresolved_execs" in after:
+            self._unresolved = copy.deepcopy(after["unresolved_execs"])
         self._save_state()
         self._loaded_native_state = self._native_snapshot()
         if not matches:
@@ -1255,6 +1320,19 @@ class MemecoinAdapter(BrokerAdapter):
                 })
                 return recovered
 
+        # UNKNOWN guard: a prior attempt whose outcome is unresolved is
+        # never blindly re-executed under the same key — reconcile first.
+        if (self._mode == "demo" and req.idempotency_key
+                and req.idempotency_key in self._unresolved):
+            rec = self._unresolved[req.idempotency_key]
+            raise BrokerError(
+                BROKER_UNAVAILABLE,
+                "prior demo execution for this idempotency key is "
+                "UNRESOLVED (confirm_timeout) — call "
+                "reconcile_demo_execution() before retrying; blind "
+                "re-execution could double-fill",
+                detail={"reason": "unknown_unresolved",
+                        "signature": rec.get("signature")})
         self._verify_position_mints(symbol)
         if self._shared_account is not None and req.direction == "BUY":
             # One FX observation prices native entry and its USD debit. A stale
@@ -1270,6 +1348,9 @@ class MemecoinAdapter(BrokerAdapter):
 
         if self._mode == "devnet":
             return self._devnet_fill(req, symbol, price_sol)
+
+        if self._mode == "demo":
+            return self._demo_fill(req, symbol)
 
         if req.direction == "BUY":
             result = self._paper_buy(req, symbol, price_sol)
@@ -1354,6 +1435,543 @@ class MemecoinAdapter(BrokerAdapter):
         logger.info("devnet %s %s: %.6f SOL on-chain sig=%s (ticket %s)",
                     req.direction, symbol, sol_amount, sig, result.ticket)
         return result
+
+    def _reserved_exposure_locked(self):
+        """Exposure reserved by unresolved (UNKNOWN) executions: SOL for
+        pending BUYs, per-mint tokens for pending SELLs. Caller owns
+        the state lock. A reserved exposure is spendable by NO other
+        key until reconcile resolves it — an ambiguous first attempt
+        must never be silently double-spent."""
+        sol = 0.0
+        tokens: Dict[str, float] = {}
+        for rec in self._unresolved.values():
+            request = rec.get("request") or {}
+            direction = rec.get("direction") or request.get("direction")
+            fee_sol = int(rec.get("max_fee_lamports") or 0) / 1e9
+            if direction == "BUY":
+                stake = rec.get("stake_sol")
+                if stake is None:
+                    stake = float(request.get("volume") or 0.0)
+                sol += float(stake) + fee_sol
+            elif direction == "SELL":
+                mint, qty = rec.get("mint"), rec.get("qty_tokens")
+                if mint and qty:
+                    tokens[mint] = tokens.get(mint, 0.0) + float(qty)
+        return sol, tokens
+
+    def _price_shared_entry(self, cost_sol: float,
+                            max_fee_lamports: int):
+        """Pin (stake_usd, max_fee_usd) from the sealed FX evidence.
+        No cash check here: admission happens account-wide in
+        _seal_shared_entry_hold."""
+        fx = getattr(self, "_entry_pricing_fx", None)
+        if not isinstance(fx, dict) or not fx.get("usd_per_sol"):
+            raise BrokerError(
+                BROKER_UNAVAILABLE,
+                "shared entry pricing FX unavailable — refusing to "
+                "seal the reservation")
+        px = float(fx["usd_per_sol"])
+        return (round(cost_sol * px, 6),
+                round(max_fee_lamports / 1e9 * px, 6))
+
+    def _seal_shared_entry_hold(self, key: str, stake_usd: float,
+                                max_fee_usd: float) -> str:
+        """Account-wide seal-time admission: reserve stake + max fee in
+        the SHARED ACCOUNT LEDGER itself (not a per-book snapshot
+        estimate), so a fill that settles before this process learns
+        of it is always adoptable and no second book/lane/adapter can
+        spend the reservation. Runs the account's full gate suite NOW
+        (lane cap, gates, provider health): adoption later recovers
+        recorded truth and is never refused."""
+        amount = round(stake_usd + max_fee_usd, 6)
+        hold_op_id = "native-hold:" + self._shared_book_id + ":" + key
+        ok, why = self._shared_account.hold_stake("main", amount,
+                                                  hold_op_id)
+        if not ok:
+            if "unreadable" in why or "degraded" in why:
+                raise BrokerError(
+                    BROKER_UNAVAILABLE,
+                    "shared account unavailable — refusing to seal "
+                    "the reservation: " + why)
+            raise BrokerError(
+                RISK_LIMIT_EXCEEDED,
+                "shared capital refused entry hold $%.6f: %s"
+                % (amount, why),
+                detail={"reason": "shared_entry_reserved",
+                        "stake_usd": stake_usd,
+                        "max_fee_usd": max_fee_usd,
+                        "refusal": why})
+        return hold_op_id
+
+    def _settle_shared_fee_locked(self, rec: Optional[dict],
+                                  fee_lamports: int) -> None:
+        """Book a settled FAILED tx's real fee against the shared
+        ledger (reviewer gap: native mirror lost the fee, shared USD
+        stayed whole). Crash-safe/idempotent via the account's own
+        journaling; a failure here leaves the sealed record in place
+        so reconcile retries the settlement."""
+        if not rec or not rec.get("hold_op_id"):
+            return
+        hold_op_id = rec["hold_op_id"]
+        key = hold_op_id.rsplit(":", 1)[-1]
+        fee_usd = 0.0
+        fx = rec.get("entry_pricing_fx")
+        if fee_lamports > 0 and isinstance(fx, dict) and fx.get("usd_per_sol"):
+            fee_usd = round(fee_lamports / 1e9
+                            * float(fx["usd_per_sol"]), 6)
+        if fee_usd > 0:
+            ok, why = self._shared_account.settle_hold_fee(
+                hold_op_id, fee_usd,
+                "native-fee:" + self._shared_book_id + ":" + key)
+        else:
+            ok, why = self._shared_account.release_hold(
+                hold_op_id, "tx_failed with no fee")
+        if not ok:
+            raise BrokerError(
+                BROKER_UNAVAILABLE,
+                "shared fee settlement failed (%s) — sealed record "
+                "kept for reconcile retry" % why)
+
+    def _demo_fill(self, req: OrderRequest, symbol: str) -> OrderResult:
+        """Demo mode: execute through SimulationExecutor (live Jupiter
+        quote, fee/slippage/latency/UNKNOWN semantics) instead of an
+        optimistic quote-price fill. The executor's scratch book is
+        synced from authoritative state before the call and read back
+        after; adapter state and the shared ledger change only through
+        the measured fill. Skips and UNKNOWN propagate unchanged."""
+        mint = self._market.mint_for(symbol)
+        from broker.memecoin.execution.sim_executor import (  # noqa: PLC0415 (lazy)
+            LAMPORTS_PER_SOL, SOL_MINT as _SOL)
+        executor = self._demo_bridge.executor
+        executor.set_book_balance(_SOL, int(round(
+            self._balance_sol * LAMPORTS_PER_SOL)))
+        shared_reserve = None  # (stake_usd, max_fee_usd) when shared BUY
+        if req.direction == "BUY":
+            cost_sol = float(req.volume)
+            in_mint, out_mint = _SOL, mint
+            amount_units = int(round(cost_sol * LAMPORTS_PER_SOL))
+            max_fee = int(0.05 * amount_units)
+            if self._shared_account is None:
+                reserved_sol, _ = self._reserved_exposure_locked()
+                available = self._balance_sol - reserved_sol
+                if (cost_sol + max_fee / LAMPORTS_PER_SOL
+                        > available + 1e-15):
+                    raise BrokerError(
+                        RISK_LIMIT_EXCEEDED,
+                        f"insufficient virtual balance: need "
+                        f"{cost_sol + max_fee / LAMPORTS_PER_SOL:.6f} SOL "
+                        f"(stake + max fee), have {available:.6f} SOL "
+                        f"after {reserved_sol:.6f} SOL reserved by "
+                        f"unresolved executions",
+                        detail={"need_sol": cost_sol,
+                                "max_fee_sol": max_fee / LAMPORTS_PER_SOL,
+                                "balance_sol": self._balance_sol,
+                                "reserved_sol": reserved_sol})
+            else:
+                shared_reserve = self._price_shared_entry(
+                    cost_sol, max_fee)
+        else:
+            sell_sol = float(req.volume)
+            price_est = (self._shared_price_sol(symbol)
+                         if self._shared_account is not None
+                         else self._price_sol(symbol))
+            holdings = [(int(t), p) for t, p in self._positions.items()
+                        if p["symbol"] == symbol and p["direction"] == "BUY"]
+            if not holdings:
+                raise BrokerError(
+                    INVALID_ORDER,
+                    f"SELL {symbol} rejected: no open long position to "
+                    f"reduce (spot market — shorting is unsupported)")
+            available = sum(p["tokens"] for _, p in holdings)
+            qty = sell_sol / price_est
+            _, reserved_tokens = self._reserved_exposure_locked()
+            sellable = available - reserved_tokens.get(mint, 0.0)
+            if qty > sellable + 1e-12:
+                raise BrokerError(
+                    INVALID_ORDER,
+                    f"SELL {symbol} for {sell_sol:.6f} SOL needs "
+                    f"{qty:.6f} tokens (quote estimate) but only "
+                    f"{sellable:.6f} sellable ({available:.6f} held, "
+                    f"{reserved_tokens.get(mint, 0.0):.6f} reserved by "
+                    f"unresolved executions)")
+            max_fee = int(0.05 * qty * price_est * LAMPORTS_PER_SOL)
+            dec = self._demo_bridge.decimals(mint)
+            executor.set_book_balance(
+                mint, int(round(available * (10 ** dec))))
+            in_mint, out_mint = mint, _SOL
+            amount_units = int(round(qty * (10 ** dec)))
+        # Seal the unresolved-execution record BEFORE the chain can
+        # settle anything: a crash between a landed send and this
+        # bookkeeping must still leave a reconcilable trail. The
+        # signature is reserved up front and verified against the swap.
+        key = req.idempotency_key or ("native:" + uuid.uuid4().hex)
+        sig = executor.allocate_signature(in_mint, out_mint, amount_units)
+        hold_op_id = None
+        if shared_reserve is not None:
+            # ADMISSION BEFORE EFFECT: the account-wide hold runs every
+            # entry gate and reserves the cash BEFORE the sealed record
+            # exists and long before the chain can settle. A crash
+            # between hold and seal leaves an orphan hold the next
+            # startup sweep releases by book prefix; a crash after the
+            # seal leaves a record whose hold adoption consumes.
+            hold_op_id = self._seal_shared_entry_hold(
+                key, *shared_reserve)
+            self._pending_hold_op_id = hold_op_id
+        record = {
+            "signature": sig,
+            "request_fingerprint": getattr(
+                self, "_request_fingerprint", None),
+            "request": asdict(req),
+            "mint": mint,
+            "direction": req.direction,
+            "max_fee_lamports": max_fee,
+            "sealed_at": _utcnow().isoformat(),
+        }
+        if req.direction == "BUY":
+            record["stake_sol"] = cost_sol
+        else:
+            record["qty_tokens"] = qty
+        if shared_reserve is not None:
+            record["stake_usd"], record["max_fee_usd"] = shared_reserve
+            record["hold_op_id"] = hold_op_id
+            record["entry_pricing_fx"] = getattr(
+                self, "_entry_pricing_fx", None)
+            record["entry_token_evidence"] = getattr(
+                self, "_entry_token_evidence", None)
+        self._unresolved[key] = record
+        try:
+            self._save_state()
+        except Exception:
+            # The chain effect has NOT happened yet, so this
+            # reservation is provably unbacked by any execution:
+            # release it inline instead of stranding spendable cash
+            # until the next process sweep, then resync from the
+            # durable state (atomic save: either the old state or the
+            # new one, never a torn mix).
+            if hold_op_id is not None:
+                try:
+                    self._shared_account.release_hold(
+                        hold_op_id, "seal write failed")
+                except Exception:
+                    logger.exception(
+                        "shared hold release after seal-write "
+                        "failure failed; restart sweep owns it")
+            self._load_state()
+            raise
+        try:
+            if req.direction == "BUY":
+                fill = self._demo_bridge.buy(mint, cost_sol)
+            else:
+                fill = self._demo_bridge.sell(mint, qty)
+        except BrokerError as exc:
+            det = getattr(exc, "detail", {}) or {}
+            if det.get("reason") == "confirm_timeout":
+                # Keep the record; adopt the actual signature (it
+                # normally matches the reserved one) and persist.
+                self._unresolved[key]["signature"] = det.get(
+                    "signature", sig)
+                self._save_state()
+            elif det.get("reason") == "tx_failed" and det.get("signature"):
+                # LANDED failure: the network fee is gone for real.
+                # Book it against authoritative state before unsealing —
+                # a scratch-book-only debit would be erased by the next
+                # call's sync. Crash-atomic: the state write is tmp +
+                # replace, so a crash here leaves either the sealed old
+                # state (reconcile books the fee exactly once) or the
+                # booked new state (no record, no double deduction).
+                fee_lost = int(det.get("fee_lamports") or 0)
+                try:
+                    self._balance_sol = max(
+                        0.0, self._balance_sol - fee_lost / 1e9)
+                    self._settle_shared_fee_locked(
+                        self._unresolved.get(key), fee_lost)
+                    self._unresolved.pop(key, None)
+                    self._save_state()
+                except Exception:
+                    self._load_state()
+                    raise
+            else:
+                # Skips and clean failures settle nothing: unseal and
+                # free the seal-time reservation.
+                rec = self._unresolved.get(key)
+                if rec is not None and rec.get("hold_op_id"):
+                    self._shared_account.release_hold(
+                        rec["hold_op_id"], "execution did not settle")
+                self._unresolved.pop(key, None)
+                self._save_state()
+            raise
+        self._unresolved.pop(key, None)
+        # Read back the scratch book BEFORE journaling: the measured
+        # SOL delta (stake + fee on BUY, net proceeds on SELL) becomes
+        # the authoritative balance — no double-counted or capped-fee
+        # drift.
+        self._balance_sol = executor.book_balance(_SOL) / LAMPORTS_PER_SOL
+        try:
+            if req.direction == "BUY":
+                return self._demo_buy(req, symbol, fill)
+            return self._demo_sell(req, symbol, fill, qty)
+        except Exception:
+            # The bridge settled but the commit failed: in-memory
+            # mutations (popped record, read-back balance) may diverge
+            # from disk. Reload the durable state before propagating;
+            # the sealed record survives for reconciliation.
+            self._load_state()
+            raise
+        finally:
+            self.__dict__.pop("_pending_hold_op_id", None)
+
+    def reconcile_demo_execution(self, key: str) -> Dict[str, Any]:
+        """Resolve an UNKNOWN (confirm_timeout) demo execution against
+        the simulated chain's durable memory. Adopts a landed fill
+        through the normal journaling path, books a landed failure's
+        fee loss, or clears an unlanded attempt. Refuses to guess."""
+        self._ensure()
+        if self._mode != "demo":
+            raise BrokerError(CONFIG_INVALID,
+                              "reconcile_demo_execution is demo-mode only")
+        with self._state_lock():
+            self._refresh_locked()
+            rec = self._unresolved.get(key)
+            if rec is None:
+                raise BrokerError(
+                    INVALID_ORDER,
+                    "no unresolved demo execution under this key",
+                    detail={"reason": "no_unknown_execution"})
+            truth = self._demo_bridge.executor.reconcile(rec["signature"])
+            status = truth.get("status")
+            if status in ("unlanded", "allocated"):
+                # Nothing happened on-chain; no fee, no fill. An
+                # "allocated" record is a pre-send crash: the signature
+                # was reserved durably but provably never executed.
+                # Safe to retry after this resolution.
+                if rec.get("hold_op_id"):
+                    self._shared_account.release_hold(
+                        rec["hold_op_id"], "execution never landed")
+                self._unresolved.pop(key, None)
+                self._save_state()
+                return {"status": "unlanded", "settled": False,
+                        "fee_lamports": 0,
+                        "chain_status": status,
+                        "signature": rec["signature"]}
+            if status == "failed":
+                # Landed but reverted: the fee is gone for real — in
+                # the native mirror AND authoritatively in the shared
+                # USD ledger (settle first, then unseal, so a crash
+                # never loses the fee).
+                fee = int(truth.get("fee_lamports") or 0)
+                self._balance_sol = max(
+                    0.0, self._balance_sol - fee / 1_000_000_000)
+                self._settle_shared_fee_locked(rec, fee)
+                self._unresolved.pop(key, None)
+                self._save_state()
+                return {"status": "failed", "settled": False,
+                        "fee_lamports": fee,
+                        "signature": rec["signature"]}
+            if status != "settled" or not isinstance(
+                    truth.get("result"), dict):
+                raise BrokerError(
+                    BROKER_UNAVAILABLE,
+                    "simulated chain record incomplete — refusing to "
+                    "guess the outcome",
+                    detail={"reason": "reconcile_incomplete",
+                            "signature": rec["signature"]})
+            result = truth["result"]
+            req = OrderRequest(**rec["request"])
+            dec = self._demo_bridge.decimals(rec["mint"])
+            from broker.memecoin.execution.sim_executor import (  # noqa: PLC0415 (lazy)
+                LAMPORTS_PER_SOL, SOL_MINT as _SOL)
+            # Adoption replays the SEALED request's own context: its
+            # request fingerprint and, for shared entries, the pinned
+            # FX/token evidence — never whatever request happened to
+            # run last on this adapter instance.
+            _missing = object()
+            prev_fp = getattr(self, "_request_fingerprint", _missing)
+            prev_fx = getattr(self, "_entry_pricing_fx", _missing)
+            prev_ev = getattr(self, "_entry_token_evidence", _missing)
+            if rec.get("request_fingerprint") is not None:
+                self._request_fingerprint = rec["request_fingerprint"]
+            if rec.get("entry_pricing_fx") is not None:
+                self._entry_pricing_fx = rec["entry_pricing_fx"]
+            if rec.get("entry_token_evidence") is not None:
+                self._entry_token_evidence = rec["entry_token_evidence"]
+            # The pinned FX was fresh when the intent was SEALED; an
+            # adoption committed later must validate it as of the seal,
+            # not as of now — a settled fill must never be stranded by
+            # the 60s quote-freshness window.
+            prev_fxnow = getattr(self, "_fx_eval_now_override", _missing)
+            if rec.get("sealed_at"):
+                self._fx_eval_now_override = datetime.fromisoformat(
+                    rec["sealed_at"]).timestamp()
+            prev_hold = getattr(self, "_pending_hold_op_id", _missing)
+            if rec.get("hold_op_id") is not None:
+                self._pending_hold_op_id = rec["hold_op_id"]
+            try:
+                if result["input_mint"] == _SOL:
+                    fill = {
+                        "qty_tokens": result["out_amount"] / (10 ** dec),
+                        "fee_lamports": result["priority_fee_lamports"],
+                        "signature": result["signature"],
+                        "latency_move_pct": result.get("latency_move_pct"),
+                        "price_impact_pct": result.get("price_impact_pct"),
+                    }
+                    # Apply the settled swap's MEASURED SOL delta so other
+                    # orders interleaved before the reconcile stay exact.
+                    self._balance_sol += (
+                        (result["sol_after"] - result["sol_before"])
+                        / LAMPORTS_PER_SOL)
+                    # Pop BEFORE the commit so the native intent's
+                    # after-image carries fill and unseal as ONE
+                    # transition: recovery can never restore one
+                    # without the other (no restart double-apply).
+                    self._unresolved.pop(key, None)
+                    order = self._demo_buy(req, req.symbol.upper(), fill)
+                else:
+                    # The sold quantity comes from the recorded swap amount,
+                    # not from the request's SOL-denominated volume.
+                    qty = result["in_amount"] / (10 ** dec)
+                    fill = {
+                        "proceeds_sol": result["out_amount"] / LAMPORTS_PER_SOL,
+                        "price_sol": (result["out_amount"] / LAMPORTS_PER_SOL
+                                      ) / qty,
+                        "fee_lamports": result["priority_fee_lamports"],
+                        "signature": result["signature"],
+                        "latency_move_pct": result.get("latency_move_pct"),
+                        "price_impact_pct": result.get("price_impact_pct"),
+                    }
+                    # out_amount is the measured net SOL delta (fee included)
+                    self._balance_sol += (result["out_amount"]
+                                          / LAMPORTS_PER_SOL)
+                    self._unresolved.pop(key, None)
+                    order = self._demo_sell(req, req.symbol.upper(), fill, qty)
+            except Exception:
+                # Commit failed mid-adoption: reload the durable state
+                # (the native intent machinery recovers or rolls back
+                # to a consistent image) before propagating.
+                self._load_state()
+                raise
+            finally:
+                for name, prev in (("_request_fingerprint", prev_fp),
+                                   ("_entry_pricing_fx", prev_fx),
+                                   ("_entry_token_evidence", prev_ev),
+                                   ("_fx_eval_now_override", prev_fxnow),
+                                   ("_pending_hold_op_id", prev_hold)):
+                    if prev is _missing:
+                        self.__dict__.pop(name, None)
+                    else:
+                        setattr(self, name, prev)
+            self._save_state()
+            return {"status": "settled", "settled": True,
+                    "ticket": order.ticket,
+                    "signature": rec["signature"]}
+
+    def _demo_buy(self, req: OrderRequest, symbol: str,
+                  fill: dict) -> OrderResult:
+        cost_sol = float(req.volume)
+        fee_sol = fill["fee_lamports"] / 1_000_000_000
+        tokens = fill["qty_tokens"]
+        price_sol = cost_sol / tokens
+        ticket = self._next()
+        comment = req.order_comment()
+        self._positions[str(ticket)] = {
+            "symbol": symbol,
+            "direction": "BUY",
+            "volume_sol": cost_sol,
+            "tokens": tokens,
+            "entry_price_sol": price_sol,
+            "fee_sol": fee_sol,
+            "sl": req.stop_loss,
+            "tp": req.take_profit,
+            "comment": comment,
+            "signal_id": req.signal_id,
+            "time_open": _utcnow().isoformat(),
+        }
+        self._commit_native({
+            "ticket": ticket, "kind": "BUY", "symbol": symbol,
+            "volume_sol": cost_sol, "tokens": tokens,
+            "price_sol": price_sol, "fee_sol": fee_sol,
+            "comment": comment, "signal_id": req.signal_id,
+            "idempotency_key": req.idempotency_key,
+            "balance_sol_after": self._balance_sol,
+            "exec_signature": fill["signature"],
+            **({"features": req.features} if req.features else {}),
+        })
+        logger.info("demo BUY %s: %.6f SOL -> %.6f tokens @ %.9f SOL "
+                    "(fee %.9f SOL, sig %s, ticket %s)",
+                    symbol, cost_sol, tokens, price_sol, fee_sol,
+                    fill["signature"][:12], ticket)
+        return OrderResult(ticket=ticket, symbol=symbol, direction="BUY",
+                           volume=cost_sol, price=price_sol, retcode=0,
+                           message="demo fill",
+                           raw={"mode": "demo", "tokens": tokens,
+                                "fee_lamports": fill["fee_lamports"],
+                                "signature": fill["signature"],
+                                "latency_move_pct":
+                                    fill.get("latency_move_pct"),
+                                "price_impact_pct":
+                                    fill.get("price_impact_pct"),
+                                "request_fingerprint":
+                                    self._request_fingerprint})
+
+    def _demo_sell(self, req: OrderRequest, symbol: str, fill: dict,
+                   qty_tokens: float) -> OrderResult:
+        """Spot reduce-only demo sell: FIFO against measured proceeds."""
+        price_sol = fill["price_sol"]
+        proceeds_sol = fill["proceeds_sol"]
+        holdings = [(int(t), p) for t, p in self._positions.items()
+                    if p["symbol"] == symbol and p["direction"] == "BUY"]
+        holdings.sort(key=lambda tp: tp[0])  # FIFO
+        remaining = qty_tokens
+        realized = 0.0
+        closed_tickets = []
+        allocations = []
+        for ticket, p in holdings:
+            if remaining <= 1e-12:
+                break
+            take = min(p["tokens"], remaining)
+            basis = p["volume_sol"] * (take / p["tokens"])
+            allocations.append({"ticket": ticket, "tokens": take,
+                                "basis_sol": basis,
+                                "proceeds_sol": take * price_sol,
+                                "entry_price_sol": p["entry_price_sol"]})
+            realized += (price_sol - p["entry_price_sol"]) * take
+            p["tokens"] -= take
+            if p["tokens"] <= 1e-12:
+                closed_tickets.append(ticket)
+                del self._positions[str(ticket)]
+            else:
+                frac = p["tokens"] / (p["tokens"] + take)
+                p["volume_sol"] *= frac
+            remaining -= take
+        ticket = self._next()
+        comment = req.order_comment()
+        self._commit_native({
+            "ticket": ticket, "kind": "SELL", "symbol": symbol,
+            "volume_sol": proceeds_sol, "tokens": qty_tokens,
+            "price_sol": price_sol, "fee_sol": fill["fee_lamports"] / 1e9,
+            "realized_pnl_sol": realized,
+            "closed_tickets": closed_tickets, "allocations": allocations,
+            "comment": comment, "signal_id": req.signal_id,
+            "idempotency_key": req.idempotency_key,
+            "balance_sol_after": self._balance_sol,
+            "exec_signature": fill["signature"],
+        })
+        logger.info("demo SELL %s: %.6f tokens @ %.9f SOL, realized %+.9f "
+                    "SOL (sig %s, ticket %s)", symbol, qty_tokens,
+                    price_sol, realized, fill["signature"][:12], ticket)
+        return OrderResult(ticket=ticket, symbol=symbol, direction="SELL",
+                           volume=proceeds_sol, price=price_sol, retcode=0,
+                           message="demo fill",
+                           raw={"mode": "demo", "tokens": qty_tokens,
+                                "fee_lamports": fill["fee_lamports"],
+                                "signature": fill["signature"],
+                                "latency_move_pct":
+                                    fill.get("latency_move_pct"),
+                                "price_impact_pct":
+                                    fill.get("price_impact_pct"),
+                                "request_fingerprint":
+                                    self._request_fingerprint,
+                                "realized_pnl_sol": realized,
+                                "closed_tickets": closed_tickets})
 
     def _paper_buy(self, req: OrderRequest, symbol: str,
                    price_sol: float) -> OrderResult:

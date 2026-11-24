@@ -26,6 +26,7 @@ signal, and capped so one crazy poll can't max the score alone.
 from __future__ import annotations
 
 import json
+import math
 import os
 import urllib.request
 from contextlib import contextmanager
@@ -101,6 +102,26 @@ def fetch_total_holders(mint: str, timeout_s: float = 4.0) -> Optional[int]:
         return None
 
 
+def validate_recorded_series(series, until=None):
+    """Validate retained observation evidence, never repair or sort it."""
+    previous=None
+    for obs in series:
+        if not isinstance(obs,(tuple,list)) or len(obs)!=8:
+            raise ValueError('recorded observation shape invalid')
+        for i,v in enumerate(obs):
+            if i==7 and v is None:continue
+            if type(v) not in (int,float) or not math.isfinite(v) or v<0:
+                raise ValueError('recorded numeric evidence invalid')
+            if i in (4,5,7) and v!=int(v):
+                raise ValueError('recorded count evidence invalid')
+        if previous is not None and obs[0]<previous:
+            raise ValueError('recorded chronology invalid')
+        if until is not None and obs[0]>until:
+            raise ValueError('recorded observation postdates record')
+        previous=obs[0]
+    return series
+
+
 class FingerprintTracker:
     """Per-mint acceleration time series + composite fingerprint score."""
 
@@ -125,6 +146,7 @@ class FingerprintTracker:
             getattr(cfg, "fp_series_journal_retention_s",
                     _JOURNAL_RETENTION_S))
         self._journal_appends = 0
+        self._journal_last_read_state = 'unread'
         self._journal_health: Dict[str, Any] = {
             "write_failures": 0, "read_failures": 0,
             "compaction_failures": 0, "compactions": 0,
@@ -191,6 +213,8 @@ class FingerprintTracker:
                float(stats.get("sells_m5") or 0),
                _f(stats.get("usd_liquidity")),
                float(holders) if holders else None)
+        from daemon.launch_scanner import input_availability as inputs
+        obs=inputs.Observation(obs,inputs.envelope(mint,obs,stats,now,holders))
         q.append(obs)
         self._journal_append(mint, obs)
 
@@ -203,8 +227,9 @@ class FingerprintTracker:
         try:
             with self._journal_lock():
                 with open(self._journal_path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"mint": mint, "obs": list(obs)})
-                             + "\n")
+                    row={"mint":mint,"obs":list(obs)}
+                    if hasattr(obs,'evidence_json'):row['input_evidence']=json.loads(obs.evidence_json)
+                    fh.write(json.dumps(row)+"\n")
             self._journal_appends += 1
             if self._journal_appends % _COMPACT_EVERY == 0:
                 self._journal_compact(obs[0])
@@ -235,10 +260,12 @@ class FingerprintTracker:
                             continue
                         try:
                             rec = json.loads(line)
-                            if _f((rec.get("obs") or [0])[0]) >= cutoff:
+                            timestamp=rec['obs'][0]
+                            from daemon.launch_scanner import input_availability as inputs
+                            if inputs.availability(timestamp)!='recorded' or timestamp >= cutoff:
                                 kept.append(line)
                         except Exception:
-                            continue  # malformed: drop on compaction
+                            kept.append(line)  # retain unattributable corruption, never launder it
                 tmp = self._journal_path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as fh:
                     fh.write("\n".join(kept) + ("\n" if kept else ""))
@@ -253,34 +280,87 @@ class FingerprintTracker:
                        ) -> Optional[List[Tuple[float, ...]]]:
         """Full journaled series for one mint (oldest first), or None
         when the journal is disabled/unavailable/has nothing - callers
-        then fall back to the truncated in-memory window and MUST flag
-        the record window-truncated. Tolerates malformed lines."""
+        then may fall back to the truncated in-memory window only when no
+        invalid same-mint source was found. Invalid data is unavailable,
+        never sorted or numerically repaired. Unattributable malformed
+        lines are skipped; this is not complete journal validation."""
+        self._journal_last_read_state='unavailable'
         if not self._journal_enabled or not mint:
             return None
         out: List[Tuple[float, ...]] = []
         try:
             with open(self._journal_path, "r", encoding="utf-8") as fh:
                 for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except Exception:
-                        continue
-                    if rec.get("mint") != mint:
-                        continue
-                    obs = rec.get("obs")
-                    if isinstance(obs, list) and len(obs) == 8:
-                        out.append(tuple(_f(v) if i != 7 or v is not None
-                                         else None
-                                         for i, v in enumerate(obs)))
-        except Exception as exc:
-            self._journal_health["read_failures"] += 1
-            self._journal_health["last_error"] = repr(exc)
+                    line=line.strip()
+                    if not line:continue
+                    try:rec=json.loads(line)
+                    except Exception:continue
+                    if not isinstance(rec,dict) or rec.get('mint')!=mint:continue
+                    obs=rec.get('obs')
+                    checked=(list(obs[:7])+[None] if isinstance(rec.get('input_evidence'),dict)
+                             and isinstance(obs,(tuple,list)) and len(obs)==8 else obs)
+                    validate_recorded_series([checked])
+                    if out and obs[0]<out[-1][0]:
+                        raise ValueError('same-mint journal chronology invalid')
+                    out.append(tuple(obs))
+        except FileNotFoundError:
+            self._journal_last_read_state='missing'
             return None
-        out.sort(key=lambda o: o[0])
+        except Exception as exc:
+            self._journal_last_read_state='invalid'
+            self._journal_health['read_failures']+=1
+            self._journal_health['last_error']=repr(exc)
+            return None
+        self._journal_last_read_state='recorded' if out else 'empty'
         return out or None
+
+    def historical_inputs(self,mint,now,since=None):
+        from daemon.launch_scanner import input_availability as inputs
+        return inputs.capture(mint,now,self._historical_inputs(mint,now,since))
+
+    def _historical_inputs(self,mint,now,since=None):
+        """Versioned tracker-boundary evidence, independent of live scoring.
+
+        Legacy evidence stays unrecorded. Never repairs a journal or substitutes
+        a window after a journal integrity failure.
+        """
+        from daemon.launch_scanner import input_availability as inputs
+        if inputs.availability(now)!='recorded':
+            return {'state':'record-time-unavailable','rows':[]}
+        if since is not None and (inputs.availability(since)!='recorded' or since>now):
+            return {'state':'episode-time-unavailable','rows':[]}
+        selected=[];ids=set();previous=None
+        if self._journal_enabled:
+            try:
+                with open(self._journal_path) as f:
+                    for line in f:
+                        if not line.strip():continue
+                        try:r=json.loads(line)
+                        except Exception:return {'state':'unattributable-corruption','rows':selected}
+                        if not isinstance(r,dict):return {'state':'unattributable-corruption','rows':selected}
+                        if r.get('mint')!=mint:continue
+                        obs=r.get('obs')
+                        try:validate_recorded_series([list(obs[:7])+[None]] if isinstance(obs,(list,tuple)) and len(obs)==8 else [obs])
+                        except Exception:return {'state':'invalid-observation','rows':selected}
+                        if previous is not None and obs[0]<previous:return {'state':'chronology-invalid','rows':selected}
+                        previous=obs[0]
+                        if obs[0]>now:return {'state':'future-observation','rows':selected}
+                        if since is not None and obs[0]<since:continue
+                        e=r.get('input_evidence');state=inputs.validate(mint,obs,e)
+                        if state!='recorded':return {'state':state,'rows':selected}
+                        if e['observation_id'] in ids:return {'state':'duplicate-identity','rows':selected}
+                        ids.add(e['observation_id']);selected.append({'obs':obs,'evidence':e})
+                return {'state':'recorded' if selected else 'empty','rows':selected,'source':'journal'}
+            except FileNotFoundError:pass
+            except Exception:return {'state':'journal-unavailable','rows':[]}
+        series=list(self._series.get(mint,[]))
+        try:validate_recorded_series([list(o[:7])+[None] if isinstance(o,(tuple,list)) and len(o)==8 else o for o in series],until=now)
+        except (ValueError,TypeError,OverflowError):return {'state':'invalid-observation','rows':[],'source':'window'}
+        if since is not None:series=[obs for obs in series if obs[0]>=since]
+        result=inputs.window(mint,series)
+        if any(r['obs'][0]>now for r in result['rows']):result['state']='future-observation'
+        result['source']='window'
+        return result
 
     def observations(self, mint: str) -> List[Tuple[float, ...]]:
         """Read-only copy of the raw per-mint observation series.

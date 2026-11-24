@@ -24,31 +24,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PER_TEST_TIMEOUT_S = 600
 
 
-def _collectable(node):
-    """pytest can only run a test whose params are all optional."""
-    args = node.args
-    params = args.posonlyargs + args.args + args.kwonlyargs
-    n_defaults = len(args.defaults) + len(args.kw_defaults or [])
-    if params and params[0].arg == "self":
-        params = params[1:]
-    return len(params) <= n_defaults
-
-
-def is_script_test(path):
-    """A test file is script-style when pytest can collect nothing in it:
-    no test functions or Test classes, or test functions that take
-    required arguments (a __main__ driver passes those by hand)."""
-    try:
-        tree = ast.parse(open(path).read())
-    except (SyntaxError, OSError):
-        return False
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                and node.name.startswith("test_") and _collectable(node):
-            return False
-        if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            return False
-    return True
+from test_discovery import is_script_test
 
 
 def main():

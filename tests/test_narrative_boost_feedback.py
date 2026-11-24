@@ -136,6 +136,8 @@ def _write_dataset(path, records):
 def _rec(score, peak_mult, heat=1.0, rug=False):
     return {"outcome_kind": "paper", "sniper_score": score,
             "peak_mult": peak_mult, "narrative_heat": heat, "rug": rug,
+            # Explicit synthetic settled return, not a missing value fill.
+            "realized_mult": 2.0 if peak_mult>=2 else 0.5,
             "t_close": time.time()}
 
 
@@ -167,6 +169,9 @@ class TestFeedbackAnalyze(unittest.TestCase):
         thr = [p for p in props if p["knob"] == "sniper_tier_threshold"]
         self.assertEqual(len(thr), 1)
         self.assertEqual(thr[0]["suggested"], 55.0)
+        recs[0].pop('realized_mult')
+        _write_dataset(self.dpath,recs)
+        self.assertEqual(feedback.analyze(d),[])
         self.assertEqual(thr[0]["current"], 50.0)
         # runner preservation: 8 runners total, 7 kept = 87.5% >= 80%
         kept, total = thr[0]["evidence"]["runners_kept"]

@@ -133,7 +133,7 @@ class TransportStatsTests(unittest.TestCase):
             "chainId": "solana",
             "dexId": "orca",
             "pairAddress": "PAIR1",
-            "baseToken": {"name": "Bonk", "symbol": "BONK"},
+            "baseToken": {"name": "Bonk", "symbol": "BONK", "address": "MINT1"},
             "priceUsd": "0.000003589",
             "fdv": 318955271,
             "liquidity": {"usd": 344980.79},

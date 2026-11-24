@@ -627,38 +627,38 @@ def _rpc_impl(method, params, timeout=12, exempt=False):
     return result
 
 
-def rpc_typed(method, params, timeout=12, exempt=False):
-    """(result, kind) variant of rpc() for callers that must tell a
-    null ANSWER from a FAILURE (e.g. the provider adapter, which
-    used to report every null payload as an outage). kind is "ok",
-    "null" or "error". Same transport, pacer, failover and shadow
-    observation as rpc().
+def helius_rpc_typed(method, params, timeout=12):
+    """Explicit Helius-only diagnostic transport, never routine failover."""
+    body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+    for url,bucket in rpc_url_pairs():
+        if 'helius-rpc.com' not in url or not bucket:
+            continue
+        if not _pacer().acquire(bucket):
+            continue
+        out,kind,_elapsed = _rpc_attempt(url,body,method,'helius',timeout)
+        if kind in ('ok','null'):
+            _pacer().report(bucket,True)
+            return out,kind
+        if kind == '429':
+            _pacer().report(bucket,False)
+    return None,'error'
 
-    Phase 3 (shadow-first wiring): after the live call executes
-    EXACTLY as before, the central router's routing decision for
-    this call is recorded against the provider that actually served
-    it (``daemon.intelligence.acquisition.shadow_observer``). The
-    observer asks the router for a PURE decision (``route()`` — no
-    transport, no network) and appends one JSONL line; it never
-    sends, retries, or changes a request. The hook is best-effort
-    and can never break the live path: any failure disables the
-    observer for the process and the result is returned untouched.
-    A null answer is journaled as "ok" (the provider answered),
-    never as "error" (2026-11-22 null-vs-error fix).
-    """
-    import time as _time
-    _start = _time.monotonic()
-    result, kind = _rpc_impl_typed(method, params, timeout=timeout,
-                                   exempt=exempt)
+
+def rpc_typed(method, params, timeout=12, exempt=False):
+    """Routine scanner RPC follows owner section 9, with serving provenance."""
+    from daemon.intelligence.acquisition.routine import call
     try:
-        from daemon.intelligence.acquisition import shadow_observer
-        shadow_observer.observe_live_call(
-            method, params, served=last_rpc_source(),
-            kind=("error" if kind == "error" else "ok"),
-            elapsed=_time.monotonic() - _start)
+        response = call(method, params, timeout=timeout, critical=exempt)
+        _LAST_SOURCE.value = response.get('provider')
+        if response.get('decision_usable', response['kind'] == 'ok'):
+            value = response['result']
+            return value, ('null' if value is None else 'ok')
+        return None, 'error'
     except Exception:
-        pass
-    return result, kind
+        _LAST_SOURCE.value = None
+        logger.exception('routine reserves acquisition unavailable')
+        return None, 'error'
+
 
 
 def rpc(method, params, timeout=12, exempt=False):

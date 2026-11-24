@@ -1,12 +1,9 @@
-"""Smart-money wallet tracking (Helius).
+"""Smart-money wallet tracking through the central acquisition router.
 
-Watches curated wallets via Helius RPC. When tracked wallets buy a token
-we're watching as a candidate, the candidate earns a smart-money boost:
-fewer rising polls needed to confirm, plus a line on the card.
-
-API key: ``~/.forex-agent/helius/api_key`` (0600) or ``HELIUS_API_KEY`` env.
-Helius free tier is enough for a small wallet list polled every few
-minutes. Without a key the module idles — nothing breaks.
+Routine wallet signatures and transaction reads follow configured provider
+selection, shared quota/capability checks and durable intake. Helius key
+helpers below remain for explicit selective/diagnostic consumers; their
+presence does not gate ordinary polling or authorize quota substitution.
 
 Buy detection: for each new wallet transaction, compare pre/post token
 balances; a balance increase for (wallet, mint) means the wallet bought
@@ -124,101 +121,17 @@ def reset_key_caches() -> None:
 
 
 def _rpc(method: str, params: List[Any]) -> Any:
-    """One Helius call through the fleet-wide pacer (2026-11-17
-    pacing fix). The old in-process-only guard let the scanner
-    daemon poll wallets on its own private cooldown while the
-    traders hammered the same key; now every attempt first takes
-    a pacer token for the main-key bucket. Never raises."""
-    key = api_key()
-    if not key:
-        return None
-    bucket = helius_ratelimit.bucket_id_for_key(key)
-    # Auto-shed (2026-11-18): smart-money background checks stop
-    # attempting while the bucket is in backoff (logged once per
-    # episode) instead of competing for entry-critical tokens.
-    if not helius_ratelimit.background_call_allowed(bucket):
-        helius_ratelimit.log_backoff_episode_once(
-            bucket, "smartmoney", logger)
-        return None
-    # wait_s=0: take a token only if one is free right now.
-    if not helius_ratelimit.pacer_acquire(bucket, wait_s=0):
-        return None  # pacer: no token — fail-soft like any miss
-    payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": method,
-         "params": params}).encode()
-    req = urllib.request.Request(
-        _RPC_URL.format(key=key), data=payload,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "Mozilla/5.0",
-                 "Connection": "close"})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            result = json.loads(
-                resp.read().decode("utf-8", "replace")).get("result")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            helius_ratelimit.pacer_report(bucket, False)
-            logger.warning("helius %s rate-limited (429); pacer "
-                           "backoff engaged", method)
-        else:
-            logger.warning("helius %s failed: HTTP %s", method, exc.code)
-        return None
-    except Exception as exc:
-        logger.warning("helius %s failed: %s", method, exc)
-        return None
-    helius_ratelimit.pacer_report(bucket, True)
-    return result
+    """Routine wallet transaction reads use owner section 9 central routing."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=_TIMEOUT, background=True)
+
 
 
 def discovery_rpc(method: str, params: List[Any]) -> Any:
-    """Helius RPC on the research key, with its own rate-limit bucket.
+    """Routine discovery backfill is not Helius-specific enrichment."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=_TIMEOUT, background=True)
 
-    This is the ``rpc`` to inject into ``wallet_discovery.run_discovery``:
-    heavy one-off research that must never contend with (or be starved
-    by) the live signals on the main key. Falls back to the main key's
-    ``_rpc`` when no discovery key is configured, with a warning.
-    Never raises.
-    """
-    key = discovery_api_key()
-    if not key:
-        logger.warning("discovery_rpc: no research key configured; "
-                       "falling back to the main key (contention risk)")
-        return _rpc(method, params)
-    bucket = helius_ratelimit.bucket_id_for_key(key)
-    # Auto-shed (2026-11-18): same as _rpc, research key.
-    if not helius_ratelimit.background_call_allowed(bucket):
-        helius_ratelimit.log_backoff_episode_once(
-            bucket, "smartmoney-discovery", logger)
-        return None
-    # wait_s=0: take a token only if one is free right now.
-    if not helius_ratelimit.pacer_acquire(bucket, wait_s=0):
-        return None  # pacer: no token — fail-soft like any miss
-    payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": method,
-         "params": params}).encode()
-    req = urllib.request.Request(
-        _RPC_URL.format(key=key), data=payload,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "Mozilla/5.0",
-                 "Connection": "close"})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            result = json.loads(
-                resp.read().decode("utf-8", "replace")).get("result")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            helius_ratelimit.pacer_report(bucket, False)
-            logger.warning("discovery helius %s rate-limited (429); "
-                           "pacer backoff engaged", method)
-        else:
-            logger.warning("discovery helius %s failed: HTTP %s",
-                           method, exc.code)
-        return None
-    except Exception as exc:
-        logger.warning("discovery helius %s failed: %s", method, exc)
-        return None
-    helius_ratelimit.pacer_report(bucket, True)
-    return result
 
 
 def _f(value: Any) -> float:
@@ -239,24 +152,17 @@ def _bought_mints(wallet: str, signature: str):
 
 
 def load_registry() -> Dict[str, Dict[str, Any]]:
-    """Wallet registry from the shared JSON file (both daemons use it)."""
-    try:
-        data = json.loads(_REGISTRY_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    from .wallet_registry import read
+    return read(_REGISTRY_FILE)
 
 
 def save_registry(wallets: Dict[str, Dict[str, Any]]) -> bool:
+    from .wallet_registry import replace
     try:
-        _REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _REGISTRY_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(wallets))
-        os.chmod(tmp, 0o600)
-        tmp.replace(_REGISTRY_FILE)
+        replace(_REGISTRY_FILE,wallets)
         return True
-    except OSError as exc:
-        logger.warning("could not save smart wallet registry: %s", exc)
+    except (OSError,ValueError):
+        logger.warning('wallet registry save unavailable',exc_info=True)
         return False
 
 
@@ -280,7 +186,6 @@ def poll_wallets(state: Dict[str, Any], poll_seconds: float = 180.0) -> Dict[str
             intake.accept_deliveries(wallet,signatures)
         state['smart_committed_refs']={}
     state['smart_delivery_refs']={}
-    if not api_key():return {}
     if now-float(state.get('smart_last_poll',0))<poll_seconds:return {}
     state['smart_last_poll']=now
     intake=_intake();fresh={};activity=state.setdefault('smart_activity',{})
@@ -339,46 +244,50 @@ def smart_buys_for(state: Dict[str, Any], mint: str) -> int:
     return len((state.get("smart_activity") or {}).get(mint, []))
 
 
-def record_outcome(mint: str, won: bool,
-                   wallets_involved: List[str]) -> None:
-    """Score wallets that bought a closed runner: picks+1, wins+=won."""
-    wallets = load_registry()
-    changed = False
-    for wallet in wallets_involved:
-        w = wallets.get(wallet)
-        if w is not None:
-            w["picks"] = int(w.get("picks") or 0) + 1
-            w["wins"] = int(w.get("wins") or 0) + (1 if won else 0)
-            changed = True
-    if changed:
-        save_registry(wallets)
+def record_outcome(mint: str, won: bool, wallets_involved: List[str], effect_id=None, registry_path=None, require_existing=False):
+    from .wallet_registry import update
+    import uuid
+    if registry_path is not None:
+        from pathlib import Path
+        if not isinstance(registry_path,(str,Path)) or not str(registry_path) or not Path(registry_path).is_absolute():
+            raise ValueError('wallet registry target must be absolute')
+    if require_existing and registry_path is None:raise ValueError('pinned wallet registry required')
+    payload={'mint':mint,'won':bool(won),'wallets':sorted(set(wallets_involved))}
+    def reducer(wallets,p):
+        for wallet in p['wallets']:
+            if require_existing and wallet not in wallets:raise ValueError('pinned wallet missing')
+            if wallet in wallets:
+                wallets[wallet]['picks']=wallets[wallet].get('picks',0)+1
+                wallets[wallet]['wins']=wallets[wallet].get('wins',0)+int(p['won'])
+        return wallets
+    return update(_REGISTRY_FILE if registry_path is None else registry_path,effect_id or 'legacy-'+uuid.uuid4().hex,payload,reducer,require_existing=require_existing)
 
 
 def add_wallet(wallet: str, label: str = "") -> Tuple[bool, str]:
-    wallet = (wallet or "").strip()
-    if not (32 <= len(wallet) <= 48):
-        return False, "that doesn't look like a Solana wallet address"
-    wallets = load_registry()
-    if wallet in wallets:
-        return False, "already tracked"
-    if len(wallets) >= _MAX_REGISTRY:
-        return False, "wallet list is full (%d)" % _MAX_REGISTRY
-    wallets[wallet] = {"label": label[:32], "added_ts": time.time(),
-                       "picks": 0, "wins": 0}
-    if save_registry(wallets):
-        return True, "tracking %s" % (label or wallet[:8] + "…")
-    return False, "could not save the wallet list"
+    from .wallet_registry import update
+    import uuid
+    wallet=(wallet or '').strip()
+    if not 32<=len(wallet)<=48:return False,"that doesn't look like a Solana wallet address"
+    def reducer(wallets,p):
+        if p['wallet'] in wallets:raise ValueError('already tracked')
+        if len(wallets)>=_MAX_REGISTRY:raise ValueError('wallet list is full')
+        wallets[p['wallet']]={'label':p['label'],'added_ts':p['ts'],'picks':0,'wins':0}
+        return wallets
+    try:update(_REGISTRY_FILE,'add-'+uuid.uuid4().hex,{'wallet':wallet,'label':label[:32],'ts':time.time()},reducer)
+    except (OSError,ValueError) as exc:return False,str(exc)
+    return True,'tracking '+(label or wallet[:8])
 
 
 def remove_wallet(wallet: str) -> Tuple[bool, str]:
-    wallet = (wallet or "").strip()
-    wallets = load_registry()
-    if wallet not in wallets:
-        return False, "not in the tracked list"
-    wallets.pop(wallet)
-    if save_registry(wallets):
-        return True, "removed"
-    return False, "could not save the wallet list"
+    from .wallet_registry import update
+    import uuid
+    wallet=(wallet or '').strip()
+    def reducer(wallets,p):
+        if p['wallet'] not in wallets:raise ValueError('not in the tracked list')
+        wallets.pop(p['wallet']);return wallets
+    try:update(_REGISTRY_FILE,'remove-'+uuid.uuid4().hex,{'wallet':wallet},reducer)
+    except (OSError,ValueError) as exc:return False,str(exc)
+    return True,'removed'
 
 
 def wallet_score(w: Dict[str, Any]) -> float:

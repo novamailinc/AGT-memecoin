@@ -79,9 +79,10 @@ class FakeMarket(MemecoinMarketData):
         px = self.usd.get(symbol.upper())
         if px is None:
             return None
-        return {"symbol": symbol.upper(), "mint": "fake-mint",
+        return {"symbol": symbol.upper(), "mint": self.mint_for(symbol),
+                "source": "fixture:observed",
                 "price_usd": px, "price_sol": None,
-                "pair": None, "ts": None}
+                "pair": None, "ts": datetime.now(timezone.utc)}
 
     def get_candles(self, symbol, timeframe, count):
         if self.fail:

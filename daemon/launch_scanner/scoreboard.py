@@ -1,7 +1,7 @@
 """Degen scoreboard — the honesty instrument.
 
-Reads ``position.closed`` events with ``degen_*`` reasons from the event
-queue and computes real performance: trades, win rate, total P&L,
+Reads durable shared-scanner close events plus legacy ``degen_*`` events
+from the event queue and computes real performance: trades, win rate, total P&L,
 average win/loss, profit factor, and a per-tier breakdown.
 
 No exchange, no estimates — only closed paper positions. If the strategy
@@ -31,10 +31,33 @@ def load_degen_closes(db_path: str, limit: int = 2000) -> List[Dict[str, Any]]:
     try:
         db = sqlite3.connect(db_path)
         try:
+            # New shared scanner closes retain their immutable event projection
+            # in event_journal after the delivery queue is consumed. Do not
+            # reconstruct unrelated historical events or change old accounting.
+            durable = []
+            try:
+                durable = db.execute(
+                    "select ts, payload from event_journal where event_id in "
+                    "(select symbol from journal where kind='scanner_close_committed') "
+                    "order by id desc limit ?", (limit,)).fetchall()
+            except sqlite3.OperationalError:
+                pass  # Older databases have only the queue contract.
             rows = db.execute(
                 "select ts, event from event_queue "
                 "where event like '%\"event\": \"position.closed\"%' "
                 "order by rowid desc limit ?", (limit,)).fetchall()
+            known = {json.loads(blob).get('event_id') for _,blob in durable}
+            legacy = []
+            for ts, blob in rows:
+                try:
+                    event_id = json.loads(blob).get('event_id')
+                except (ValueError, AttributeError):
+                    continue
+                if event_id not in known:
+                    legacy.append((ts,blob))
+            rows = durable + legacy
+            rows.sort(key=lambda row:row[0], reverse=True)
+            rows = rows[:limit]
         finally:
             db.close()
     except Exception as exc:

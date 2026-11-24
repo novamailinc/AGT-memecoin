@@ -183,7 +183,8 @@ def get_wallets():
     try:
         with open(os.path.join(HOME, "launch_scanner",
                                "smart_wallets.json")) as f:
-            reg = json.load(f)
+            from wallet_registry import read
+            reg = read(f.name)
             # Exclude muted wallets (Phase 1 farmer/dead-weight filter)
             return [w for w, d in reg.items()
                     if not (isinstance(d, dict) and d.get("muted"))]
@@ -405,7 +406,8 @@ def load_registry():
     try:
         with open(os.path.join(HOME, "launch_scanner",
                                "smart_wallets.json")) as f:
-            return json.load(f) or {}
+            from wallet_registry import read
+            return read(f.name)
     except Exception:
         return {}
 

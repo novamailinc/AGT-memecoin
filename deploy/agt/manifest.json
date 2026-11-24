@@ -4,7 +4,8 @@
     "AGT deploys accept GitHub URLs only; this manifest targets the public repo on branch main.",
     "The deployment must operate independently: the development agent's computer does not need to remain online.",
     "Secrets mapping: deploy/agt/secrets_mapping.md. Storage budget: deploy/agt/storage_budget.md. Backup + restore drill: deploy/agt/backup_recovery.md. Upgrade + rollback: deploy/agt/upgrade_rollback.md.",
-    "Phase 13 finalize (2026-11-22): void list live in deploy/agt/voided_closes.json (dashboard shows raw vs void-excluded totals); restore drill run against a scratch home with all steps passing (see ~/workspace/reports/phase13-finalize-2026-11-22.md); hourly backup now runs backup_verify --verify-latest after every backup. Still on-phone: the 2h full soak (supervisor + scheduler + traders), the phone-reboot running check, live Alchemy/Chainstack verification, and live benchmarks (Phase 10, UNMEASURED here) - procedures are in deploy/agt/README.md and deploy/agt/live_benchmarks.md."
+    "Phase 13 finalize (2026-11-22): void list live in deploy/agt/voided_closes.json (dashboard shows raw vs void-excluded totals); restore drill run against a scratch home with all steps passing (see ~/workspace/reports/phase13-finalize-2026-11-22.md); hourly backup now runs backup_verify --verify-latest after every backup. Still on-phone: the 2h full soak (supervisor + scheduler + traders), the phone-reboot running check, live Alchemy/Chainstack verification, and live benchmarks (Phase 10, UNMEASURED here) - procedures are in deploy/agt/README.md and deploy/agt/live_benchmarks.md.",
+    "2026-11-23 qualification in progress: local tests do not establish Stage A, full VM lifecycle or phone admission. Alchemy HTTPS qualified; current Free Solana WSS access denied. No deployment or activation authorized by this manifest."
   ],
   "branch": "main",
   "components_started_by_start_sh": [
@@ -25,19 +26,15 @@
   },
   "mainnet_enabled": false,
   "mode": "paper",
-  "name": "meme-project-paper-bot",
+  "name": "agt-memecoin-paper-bot",
   "optional_env": [
     {
       "name": "HELIUS_API_KEY_DISCOVERY",
-      "purpose": "Second Helius key for research/discovery traffic, kept off the live signals' quota."
+      "purpose": "Legacy research credential, not an independent billing account or numbered source."
     },
     {
       "name": "HELIUS_API_KEY",
-      "purpose": "Helius main RPC key. SELECTIVE per the §9 architecture: required only for enriched Helius workloads (parsed streams/events/enrichment); the lane RPC tiers use it when present and otherwise fail over to the budgeted public endpoint."
-    },
-    {
-      "name": "CHAINSTACK_ENDPOINT",
-      "purpose": "Full Chainstack Solana mainnet endpoint URL (the key is its final path segment). Required only when the router enables Chainstack (Phases 5-12 cutover; not the live leg today)."
+      "purpose": "Legacy slot-1 compatibility only; the declared three-source deployment requires explicit numbered sources."
     },
     {
       "name": "HELIUS_ALERT_CHAT_ID",
@@ -45,21 +42,37 @@
     },
     {
       "name": "GITHUB_TOKEN",
-      "purpose": "GitHub personal access token for the repo sync loop. Deferred to the finalize pass (the VM sync script uses the authd vault credential, which does not exist on AGT)."
+      "purpose": "GitHub personal access token for the repo sync loop."
     }
   ],
   "port": 8765,
   "port_purpose": "Read-only status dashboard (deploy/agt/status_server.py). AGT health-checks the port with a TCP connect; the tunnel publishes it. Binds 127.0.0.1 only.",
   "python": "3.12",
-  "repo_url": "https://github.com/olamoreA/meme-project",
+  "repo_url": "https://github.com/novamailinc/AGT-memecoin",
   "required_env": [
     {
       "name": "ALCHEMY_API_KEY",
-      "purpose": "Alchemy API key (key only, or a full RPC URL; both shapes resolve). PRIMARY routine acquisition leg per the user's §9 provider architecture, wired into the lane entry-critical reads 2026-11-23. Startup fails closed without it."
+      "purpose": "Normal scanning through supported Alchemy HTTP/WSS endpoints; current plan access must be qualified separately."
     },
     {
       "name": "TELEGRAM_BOT_TOKEN",
-      "purpose": "Telegram bot token (alerts + control bot). Startup fails closed without it."
+      "purpose": "Telegram bot token (alerts + control bot)."
+    },
+    {
+      "name": "CHAINSTACK_ENDPOINT",
+      "purpose": "Complementary supported recent transaction/block/account reads and independent verification within plan limits."
+    },
+    {
+      "name": "HELIUS_API_KEY_1",
+      "purpose": "Fixed routine RPC/WSS/transaction and selective intelligence source 1; all three sources share one Helius account allowance, no denial rotation."
+    },
+    {
+      "name": "HELIUS_API_KEY_2",
+      "purpose": "Fixed routine RPC/WSS/transaction and selective intelligence source 2; all three sources share one Helius account allowance, no denial rotation."
+    },
+    {
+      "name": "HELIUS_API_KEY_3",
+      "purpose": "Fixed routine RPC/WSS/transaction and selective intelligence source 3; all three sources share one Helius account allowance, no denial rotation."
     }
   ],
   "start_command": "bash deploy/agt/start.sh"

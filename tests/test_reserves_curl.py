@@ -279,3 +279,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

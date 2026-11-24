@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import time
 
+from ..acquisition.transaction_identity import response_signature_matches
 from ..acquisition.event_backfill import (
     GapDetector,
     backfill_signatures,
@@ -148,7 +149,7 @@ def backfill_after_disconnect(processor, stream_key, address,
     outcomes = {}
     for sig in signatures:
         tx = fetch_transaction(sig)
-        if tx is None:
+        if not response_signature_matches(tx, sig):
             outcomes[sig] = "failed"
             continue
         outcome, _event_id = processor.process_transaction(

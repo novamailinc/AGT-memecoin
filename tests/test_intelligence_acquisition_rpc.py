@@ -119,14 +119,14 @@ check("chainstack does NOT support getProgramAccounts",
 check("chainstack unsupported call kind",
       cs.call("getSignaturesForAddress", ["x"]).kind == "unsupported")
 al = R.make_adapter("alchemy", home=HOME)
-check("alchemy getTokenLargestAccounts flagged UNVERIFIED",
-      al.unverified("getTokenLargestAccounts"))
+check("alchemy getTokenLargestAccounts documented",
+      not al.unverified("getTokenLargestAccounts"))
 check("alchemy CU table: history 40, account 10, slot 20",
       R.method_cost("alchemy", "getTransaction") == 40
       and R.method_cost("alchemy", "getAccountInfo") == 10
       and R.method_cost("alchemy", "getSlot") == 20)
-check("alchemy getTokenLargestAccounts CU unknown (None)",
-      R.method_cost("alchemy", "getTokenLargestAccounts") is None)
+check("alchemy getTokenLargestAccounts CU documented 20",
+      R.method_cost("alchemy", "getTokenLargestAccounts") == 20)
 
 # ---------------- HTTP paths via fake opener ----------------
 ok_body = {"jsonrpc": "2.0", "id": 1, "result": 123456}

@@ -70,8 +70,8 @@ check("alchemy getTransaction costs 40 CU",
       method_cost("alchemy", "getTransaction") == 40)
 check("chainstack getTransaction costs 1 RU",
       method_cost("chainstack", "getTransaction") == 1)
-check("alchemy getTokenLargestAccounts cost UNVERIFIED -> None",
-      method_cost("alchemy", "getTokenLargestAccounts") is None)
+check("alchemy fixtureUnknownMethod cost UNVERIFIED -> None",
+      method_cost("alchemy", "fixtureUnknownMethod") is None)
 check("chainstack getProgramAccounts cost UNVERIFIED -> None",
       method_cost("chainstack", "getProgramAccounts") is None)
 check("unknown method -> None (never assumed 1)",
@@ -88,7 +88,7 @@ est = cm.cost_estimate("alchemy", "getTransaction", calls=3)
 check("cost_estimate traces to METHOD_COSTS (3 x 40 CU)",
       est["cost"] == 120 and est["unit"] == "compute units"
       and est["verified"] is True)
-est = cm.cost_estimate("alchemy", "getTokenLargestAccounts")
+est = cm.cost_estimate("alchemy", "fixtureUnknownMethod")
 check("cost_estimate for UNVERIFIED method is None, flagged",
       est["cost"] is None and est["verified"] is False)
 
@@ -222,7 +222,7 @@ cm_a.record_dedup("alchemy", "alchemy", "getTransaction",
 dd = cm_a.accounting()["dedup"]["alchemy"]
 check("dedup saved cost = 5 x 40 CU",
       dd["requests"] == 5 and dd["saved_cost"] == 200)
-cm_a.record_dedup("alchemy", "alchemy", "getTokenLargestAccounts",
+cm_a.record_dedup("alchemy", "alchemy", "fixtureUnknownMethod",
                   "routine_tx", count=2)
 dd = cm_a.accounting()["dedup"]["alchemy"]
 check("dedup with UNVERIFIED method cost -> saved_unknown, no "
@@ -299,10 +299,10 @@ store_r.record("alchemy", "alchemy", "getTransaction", "routine_tx",
 store_r.record("alchemy", "alchemy", "getTransaction", "routine_tx",
                PRIORITY_CARD, cost=40, kind="ok", elapsed=0.0,
                cached=True)
-store_r.record("alchemy", "alchemy", "getTokenLargestAccounts",
+store_r.record("alchemy", "alchemy", "fixtureUnknownMethod",
                "routine_tx", PRIORITY_CARD, cost=None, kind="ok",
                elapsed=0.1)
-store_r.record("alchemy", "alchemy", "getTokenSupply", "routine_tx",
+store_r.record("alchemy", "alchemy", "fixtureOtherUnknownMethod", "routine_tx",
                PRIORITY_CARD, cost=None, kind="ok", elapsed=0.1)
 # alchemy x routine_account: 1 ok getSlot (20 CU, 0.2s), 1
 # rate_limited getAccountInfo (10 CU, 0.3s).

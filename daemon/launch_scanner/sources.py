@@ -261,6 +261,8 @@ def dexscreener_boosts() -> List[Dict[str, Any]]:
 
 
 def _pair_to_stats(top: Dict[str, Any]) -> Dict[str, Any]:
+    from daemon.launch_scanner import provider_inputs as provenance
+    evidence=provenance.begin('dexscreener',top)
     base = top.get("baseToken") or {}
     dex = str(top.get("dexId") or "")
     chain = str(top.get("chainId") or "")
@@ -268,7 +270,7 @@ def _pair_to_stats(top: Dict[str, Any]) -> Dict[str, Any]:
     txns_m5 = (top.get("txns") or {}).get("m5") or {}
     txns_h1 = (top.get("txns") or {}).get("h1") or {}
     _chg = top.get("priceChange") or {}
-    return {
+    result = {
         "symbol": str(base.get("symbol") or ""),
         "name": str(base.get("name") or ""),
         "usd_liquidity": _f((top.get("liquidity") or {}).get("usd")),
@@ -301,6 +303,8 @@ def _pair_to_stats(top: Dict[str, Any]) -> Dict[str, Any]:
         # priced off dexscreener or the geckoterminal fallback.
         "tape_source": "dexscreener",
     }
+    result[provenance.KEY]=provenance.finish(evidence,result)
+    return result
 
 
 def dexscreener_batch_stats(mints: List[str],
@@ -332,11 +336,12 @@ def dexscreener_batch_stats(mints: List[str],
     for m in addrs:
         hit = best.get(m.lower())
         if hit:
-            out[m] = hit
+            from daemon.launch_scanner import provider_inputs as provenance
+            out[m] = provenance.resolved(hit,m,chain,'highest-liquidity-base-token-pair')
     return out
 
 
-def dexscreener_token_stats(mint: str) -> Optional[Dict[str, Any]]:
+def dexscreener_token_stats(mint: str, chain: str = "solana") -> Optional[Dict[str, Any]]:
     """Resolve a mint -> {symbol, name, usd_liquidity, usd_market_cap, url}."""
     data = _get_json(_DEX_TOKEN_URL.format(mint=mint))
     pairs = (data or {}).get("pairs") or []
@@ -345,7 +350,9 @@ def dexscreener_token_stats(mint: str) -> Optional[Dict[str, Any]]:
     pairs = sorted(pairs,
                    key=lambda p: _f((p.get("liquidity") or {}).get("usd")),
                    reverse=True)
-    return _pair_to_stats(pairs[0])
+    from daemon.launch_scanner import provider_inputs as provenance
+    stats=_pair_to_stats(pairs[0])
+    return provenance.resolved(stats,mint,chain,'highest-liquidity-single-token-pair')
 
 
 # ----------------------------------------------------------------------
@@ -451,6 +458,8 @@ def _gt_token_to_stats(token: Dict[str, Any], chain: str,
     """
     if not isinstance(token, dict):
         return None
+    from daemon.launch_scanner import provider_inputs as provenance
+    evidence=provenance.begin('geckoterminal',token)
     attrs = token.get("attributes") or {}
     addr = str(attrs.get("address") or "").strip()
     if not addr:
@@ -459,7 +468,7 @@ def _gt_token_to_stats(token: Dict[str, Any], chain: str,
     chg = attrs.get("price_change_percentage") or {}
     chg_m5 = chg.get("m5")
     chg_h1 = chg.get("h1")
-    return {
+    result = {
         "symbol": str(attrs.get("symbol") or ""),
         "name": str(attrs.get("name") or ""),
         "usd_liquidity": _f(attrs.get("total_reserve_in_usd")),
@@ -483,6 +492,8 @@ def _gt_token_to_stats(token: Dict[str, Any], chain: str,
         "chain": chain,
         "tape_source": "geckoterminal",
     }
+    result[provenance.KEY]=provenance.finish(evidence,result)
+    return result
 
 
 def geckoterminal_token_stats(mints: List[str],
@@ -525,7 +536,8 @@ def geckoterminal_token_stats(mints: List[str],
             continue
         st = _gt_token_to_stats(tok, (chain or "").lower(), network)
         if st:
-            out[orig] = st  # keyed by the caller's mint, case preserved
+            from daemon.launch_scanner import provider_inputs as provenance
+            out[orig] = provenance.resolved(st,orig,chain,'token-resource-no-pair-selection')
     return out
 
 

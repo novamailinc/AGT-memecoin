@@ -113,7 +113,7 @@ class ProviderManager:
     """Provider lifecycle + stats. All selection delegates to the
     central router (``provider_router.ProviderRouter``)."""
 
-    def __init__(self, home=None, helius_enabled=True, transport=None,
+    def __init__(self, home=None, helius_enabled=False, transport=None,
                  router=None):
         self.home = home
         self.helius_enabled = helius_enabled

@@ -138,9 +138,9 @@ check("impl: null answer stamps last_rpc_source",
 
 # ---- 3. rpc() / rpc_typed() contracts -----------------------------
 check("rpc(): null answer still returns bare None (fleet contract)",
-      res.rpc("getTransaction", [["sig"]]) is None)
+      res._rpc_impl("getTransaction", [["sig"]]) is None)
 check("rpc_typed(): null answer -> (None, null)",
-      res.rpc_typed("getTransaction", [["sig"]]) == (None, "null"))
+      res._rpc_impl_typed("getTransaction", [["sig"]]) == (None, "null"))
 
 calls["helius"] = []
 
@@ -152,9 +152,9 @@ def _ok_attempt(url, body, method, host, timeout):
 
 res._rpc_attempt = _ok_attempt
 check("rpc(): ok result unchanged",
-      res.rpc("getSlot", []) == {"v": 1})
+      res._rpc_impl("getSlot", []) == {"v": 1})
 check("rpc_typed(): ok -> (result, ok)",
-      res.rpc_typed("getSlot", []) == ({"v": 1}, "ok"))
+      res._rpc_impl_typed("getSlot", []) == ({"v": 1}, "ok"))
 
 res._pacer = _real_pacer_fn
 res.rpc_url_pairs = _real_pairs
@@ -165,24 +165,24 @@ from daemon.intelligence.acquisition.providers import helius as hadapt
 
 adapter = hadapt.HeliusAdapter()
 
-_real_rpc_typed = res.rpc_typed
-res.rpc_typed = lambda method, params, timeout=12, exempt=False: (
+_real_rpc_typed = res.helius_rpc_typed
+res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
     None, "null")
 r = adapter.call("getTransaction", [["sig"]])
 check("adapter: null answer -> kind ok, null payload, noted",
       r["kind"] == "ok" and r["result"] is None
       and "null" in (r.get("note") or ""))
-res.rpc_typed = lambda method, params, timeout=12, exempt=False: (
+res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
     {"x": 1}, "ok")
 r = adapter.call("getSlot", [])
 check("adapter: ok passthrough",
       r["kind"] == "ok" and r["result"] == {"x": 1})
-res.rpc_typed = lambda method, params, timeout=12, exempt=False: (
+res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
     None, "error")
 r = adapter.call("getSlot", [])
 check("adapter: error stays error",
       r["kind"] == "error" and r["result"] is None)
-res.rpc_typed = _real_rpc_typed
+res.helius_rpc_typed = _real_rpc_typed
 
 # ---- 5. Safety-report contract: unknown never carries pass --------
 from daemon.launch_scanner import instant_safety, safety

@@ -194,54 +194,10 @@ def api_key() -> Optional[str]:
 
 
 def _rpc(method: str, params: List[Any]) -> Any:
-    """One Helius call through the fleet-wide pacer (2026-11-17
-    pacing fix). The old in-process-only guard let every trader
-    process hammer the same key with its own private cooldown;
-    now every attempt first takes a pacer token for the main-key
-    bucket, and a 429 engages progressive backoff + the single
-    probe instead of a 600s lockout. Never raises."""
-    key = api_key()
-    if not key:
-        return None
-    bucket = helius_ratelimit.bucket_id_for_key(key)
-    # Auto-shed (2026-11-18): deployer scans are background work —
-    # when the bucket is in backoff they stop attempting entirely
-    # (logged once per episode) instead of competing for the tokens
-    # entry-critical calls need. Never raises.
-    if not helius_ratelimit.background_call_allowed(bucket):
-        helius_ratelimit.log_backoff_episode_once(
-            bucket, "deployers", logger)
-        return None
-    # wait_s=0: take a token only if one is free right now — never
-    # queue for a refilling token an entry call needs.
-    if not helius_ratelimit.pacer_acquire(bucket, wait_s=0):
-        return None  # pacer: no token — fail-soft like any miss
-    payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": method,
-         "params": params}).encode()
-    req = urllib.request.Request(
-        _RPC_URL.format(key=key), data=payload,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "Mozilla/5.0",
-                 "Connection": "close"})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            result = json.loads(
-                resp.read().decode("utf-8", "replace")).get("result")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            helius_ratelimit.pacer_report(bucket, False)
-            logger.warning("deployer rpc %s rate-limited (429); "
-                           "pacer backoff engaged", method)
-        else:
-            logger.warning("deployer rpc %s failed: HTTP %s",
-                           method, exc.code)
-        return None
-    except Exception as exc:
-        logger.warning("deployer rpc %s failed: %s", method, exc)
-        return None
-    helius_ratelimit.pacer_report(bucket, True)
-    return result
+    """Routine behavior/history reads use owner section 9 routing."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=_TIMEOUT, background=True)
+
 
 
 # ----------------------------------------------------------------------
@@ -301,7 +257,7 @@ def resolve_deployer(mint: str, chain: str,
                             "maxSupportedTransactionVersion": 0}]) or {}
         # meta.err gate (2026-11-17, Batch 3): a reverted oldest
         # tx names no deployer — the launch never happened.
-        if not _txg.tx_succeeded(tx):
+        if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,oldest):
             return None
         return _first_signer(tx)
     except Exception as exc:
@@ -343,26 +299,77 @@ def cached_deployer(state: Dict[str, Any], mint: str, chain: str,
 # Registry (shared JSON file, 0600 — same convention as smartmoney.py)
 # ----------------------------------------------------------------------
 
+class RegistrySnapshot(dict):
+    """Compatibility snapshot carrying its original compare-and-swap digest."""
+    def __init__(self,value):
+        from .learning_effects import _encoded
+        import hashlib
+        super().__init__(value)
+        self.source_digest=hashlib.sha256(_encoded(value).encode()).hexdigest()
+
+
+def _registry_value(value):
+    from .deployer_registry import validate
+    return validate(value)
+
+
+def _registry_doc(path=None):
+    from .deployer_registry import read_document
+    return read_document(path or _REGISTRY_FILE)
+
+
 def load_registry() -> Dict[str, Dict[str, Any]]:
-    """Deployer history from the shared JSON file (both daemons read it)."""
-    try:
-        data = json.loads(_REGISTRY_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    """Read compatible value; malformed persisted data is unavailable, not empty."""
+    return RegistrySnapshot(_registry_doc()['value']['registry'])
+
+
+def _registry_effect(effect_id,payload,update,*,full_value=False,registry_path=None):
+    """Serialize archive preparation outside the pure atomic store reducer.
+
+    Archive precedes eviction. Failed registry commit retains live data; stable
+    archive segment identities allow safe re-preparation on exact retry.
+    """
+    from . import learning_effects as effects
+    import fcntl,copy,hashlib
+    target=Path(registry_path or _REGISTRY_FILE)
+    if not target.is_absolute():raise ValueError('deployer registry path invalid')
+    target.parent.mkdir(parents=True,exist_ok=True)
+    with open(str(target)+'.transaction.lock','a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        try:
+            doc=_registry_doc(target);digest=hashlib.sha256(effects._encoded(payload).encode()).hexdigest()
+            prior=doc['effects'].get(effect_id)
+            if prior is not None and prior!=digest:raise ValueError('deployer effect identity conflict')
+            from .deployer_registry import canonical
+            before=doc['value'];after=copy.deepcopy(before)
+            if prior is None:
+                if full_value:after=canonical(update(after))
+                else:after['registry']=_registry_value(update(after['registry']))
+            def reducer(current,unused):
+                if canonical(current)!=before:raise ValueError('deployer concurrent registry conflict')
+                return after
+            created,value=effects.apply(target,effect_id,payload,reducer,canonical({}),legacy_import=canonical)
+            value=canonical(value)
+            return created,value if full_value else value['registry']
+        finally:fcntl.flock(lock,fcntl.LOCK_UN)
 
 
 def save_registry(hist: Dict[str, Dict[str, Any]]) -> bool:
+    """CAS compatibility writer; new plain mappings can initialize only."""
+    from . import learning_effects as effects
+    import hashlib,uuid
     try:
-        _REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _REGISTRY_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(hist))
-        os.chmod(tmp, 0o600)
-        tmp.replace(_REGISTRY_FILE)
+        replacement=_registry_value(dict(hist));expected=getattr(hist,'source_digest',None)
+        def update(current):
+            if expected is None:
+                if current:raise ValueError('deployer replacement needs source snapshot')
+            elif hashlib.sha256(effects._encoded(current).encode()).hexdigest()!=expected:
+                raise ValueError('deployer snapshot stale')
+            return replacement
+        _registry_effect('snapshot-'+uuid.uuid4().hex,{'replacement':replacement,'source_digest':expected},update)
         return True
-    except OSError as exc:
-        logger.warning("could not save deployer registry: %s", exc)
-        return False
+    except Exception:
+        logger.warning('deployer registry save unavailable',exc_info=True);return False
 
 
 def _new_entry(now: float) -> Dict[str, Any]:
@@ -370,86 +377,88 @@ def _new_entry(now: float) -> Dict[str, Any]:
             "first_seen": now, "last_seen": now, "launch_ts": []}
 
 
-def record_launch(deployer: str) -> Optional[Dict[str, Any]]:
-    """Count one launch for a deployer. Returns the updated entry."""
-    deployer = (deployer or "").strip()
-    if not deployer:
-        return None
-    now = time.time()
-    hist = load_registry()
-    entry = hist.get(deployer) or _new_entry(now)
-    entry["launches_seen"] = int(entry.get("launches_seen") or 0) + 1
-    entry["last_seen"] = now
-    _record_launch_ts(entry, now)  # bounded serial-launcher history
-    hist[deployer] = entry
-    if len(hist) > _MAX_REGISTRY:
-        # Evict least-recently-seen, never hot deployers. An entry
-        # is evicted only after its archive append SUCCEEDS; a
-        # blocked (unarchivable) candidate is SKIPPED, counted, and
-        # the remaining eligible entries are tried within this
-        # bounded pass - one blocked entry must not stall all
-        # future eviction, and unarchivable history is never
-        # silently deleted. When every candidate is blocked the
-        # registry overflows the cap: recorded as
-        # eviction_overflow_events, an explicit unavailable
-        # eviction state (no hard-bound claim).
-        evicted = False
-        for dep in sorted(
-                hist,
-                key=lambda d: float((hist.get(d) or {}).get("last_seen")
-                                    or 0))[:len(hist) - _MAX_REGISTRY]:
-            if _entry_is_hot(hist.get(dep), 3, 0.30):
-                continue
-            if _archive_deployer(dep, hist.get(dep), now):
-                hist.pop(dep, None)
-                evicted = True
-                break
-            _meta_bump("eviction_skips_blocked")
-        if not evicted:
-            _meta_bump("eviction_overflow_events")
-    save_registry(hist)
-    return entry
+def record_launch(deployer: str, *, effect_id=None, observed_at=None,registry_path=None) -> Optional[Dict[str, Any]]:
+    """Count a launch atomically; explicit IDs support exact retry."""
+    import uuid,math
+    deployer=(deployer or '').strip()
+    if not deployer:return None
+    now=time.time() if observed_at is None else observed_at
+    if type(now) not in (int,float) or not math.isfinite(now):raise ValueError('deployer launch timestamp invalid')
+    def update(hist):
+        entry = hist.get(deployer) or _new_entry(now)
+        entry["launches_seen"] = int(entry.get("launches_seen") or 0) + 1
+        entry["last_seen"] = now
+        _record_launch_ts(entry, now)  # bounded serial-launcher history
+        hist[deployer] = entry
+        if len(hist) > _MAX_REGISTRY:
+            # Evict least-recently-seen, never hot deployers. An entry
+            # is evicted only after its archive append SUCCEEDS; a
+            # blocked (unarchivable) candidate is SKIPPED, counted, and
+            # the remaining eligible entries are tried within this
+            # bounded pass - one blocked entry must not stall all
+            # future eviction, and unarchivable history is never
+            # silently deleted. When every candidate is blocked the
+            # registry overflows the cap: recorded as
+            # eviction_overflow_events, an explicit unavailable
+            # eviction state (no hard-bound claim).
+            evicted = False
+            for dep in sorted(
+                    hist,
+                    key=lambda d: float((hist.get(d) or {}).get("last_seen")
+                                        or 0))[:len(hist) - _MAX_REGISTRY]:
+                if _entry_is_hot(hist.get(dep), 3, 0.30):
+                    continue
+                if _archive_deployer(dep, hist.get(dep), now):
+                    hist.pop(dep, None)
+                    evicted = True
+                    break
+                _meta_bump("eviction_skips_blocked")
+            if not evicted:
+                _meta_bump("eviction_overflow_events")
+        return hist
+    identity=effect_id or 'launch-'+uuid.uuid4().hex
+    _,hist=_registry_effect(identity,{'kind':'launch','deployer':deployer,'ts':now},update,registry_path=registry_path)
+    return hist.get(deployer)
 
 
-def record_outcome(mint: str, deployer: str, outcome: str) -> bool:
-    """Grade one closed launch: outcome in {"hit_2x","rug","dead"}.
+def record_outcome(mint: str, deployer: str, outcome: str, *, effect_id=None, observed_at=None) -> bool:
+    """Grade with preserved counters; optional exact effect and source time."""
+    import uuid,math
+    if outcome not in OUTCOMES:return False
+    deployer=(deployer or '').strip()
+    if not deployer:return False
+    now=time.time() if observed_at is None else observed_at
+    if type(now) not in (int,float) or not math.isfinite(now):return False
+    def update(hist):
+        entry = hist.get(deployer)
+        if entry is None:
+            entry = _new_entry(now)
+            entry["launches_seen"] = 1
+        else:
+            entry["launches_seen"] = max(int(entry.get("launches_seen") or 0), 1)
+        if outcome == "hit_2x":
+            entry["hits_2x"] = int(entry.get("hits_2x") or 0) + 1
+        elif outcome == "rug":
+            entry["rugs"] = int(entry.get("rugs") or 0) + 1
+        else:
+            entry["dead"] = int(entry.get("dead") or 0) + 1
+        entry["last_seen"] = now
+        # Bounded per-outcome timestamps: depth over time per wallet
+        # (when each outcome landed), capped like launch_ts.
+        stamps = entry.get("outcome_ts")
+        if not isinstance(stamps, list):
+            stamps = []
+        stamps.append({"ts": now, "outcome": outcome})
+        entry["outcome_ts"] = stamps[-_MAX_OUTCOME_TS:]
+        hist[deployer] = entry
+        return hist
+    try:
+        _registry_effect(effect_id or 'outcome-'+uuid.uuid4().hex,
+            {'kind':'outcome','mint':mint,'deployer':deployer,'outcome':outcome,'ts':now},update)
+        return True
+    except Exception:
+        logger.warning('deployer outcome pending',exc_info=True);return False
 
-    ``mint`` is recorded for audit only; grading keys off the deployer.
-    Deployers seen here but never launched through ``record_launch`` are
-    created with launches_seen=1 (first-seen assumption) so hit rates
-    stay <= 1. Returns False on an unknown outcome (never raises).
-    """
-    if outcome not in OUTCOMES:
-        logger.warning("record_outcome: unknown outcome %r for %s", outcome,
-                       mint)
-        return False
-    deployer = (deployer or "").strip()
-    if not deployer:
-        return False
-    now = time.time()
-    hist = load_registry()
-    entry = hist.get(deployer)
-    if entry is None:
-        entry = _new_entry(now)
-        entry["launches_seen"] = 1
-    else:
-        entry["launches_seen"] = max(int(entry.get("launches_seen") or 0), 1)
-    if outcome == "hit_2x":
-        entry["hits_2x"] = int(entry.get("hits_2x") or 0) + 1
-    elif outcome == "rug":
-        entry["rugs"] = int(entry.get("rugs") or 0) + 1
-    else:
-        entry["dead"] = int(entry.get("dead") or 0) + 1
-    entry["last_seen"] = now
-    # Bounded per-outcome timestamps: depth over time per wallet
-    # (when each outcome landed), capped like launch_ts.
-    stamps = entry.get("outcome_ts")
-    if not isinstance(stamps, list):
-        stamps = []
-    stamps.append({"ts": now, "outcome": outcome})
-    entry["outcome_ts"] = stamps[-_MAX_OUTCOME_TS:]
-    hist[deployer] = entry
-    return save_registry(hist)
 
 
 # ----------------------------------------------------------------------
@@ -486,7 +495,7 @@ def _meta_bump(key: str, n: int = 1) -> None:
             meta[key] = int(meta.get(key) or 0) + n
             _meta_write(meta)
     except Exception:
-        pass
+        logger.warning('deployer archive diagnostic update unavailable',exc_info=True)
 
 
 def _meta_read() -> Dict[str, Any]:
@@ -498,21 +507,16 @@ def _meta_read() -> Dict[str, Any]:
 
 
 def _meta_write(meta: Dict[str, Any]) -> None:
-    try:
-        _ARCHIVE_META_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = str(_ARCHIVE_META_FILE) + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(json.dumps(meta))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, _ARCHIVE_META_FILE)
-        try:
-            os.chmod(_ARCHIVE_META_FILE, 0o600)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
+    """Persist diagnostics or raise, never acknowledge an unflushed rename."""
+    from .learning_effects import _sync_directory
+    _ARCHIVE_META_FILE.parent.mkdir(parents=True,exist_ok=True)
+    for ancestor in (_ARCHIVE_META_FILE.parent,*_ARCHIVE_META_FILE.parent.parents):_sync_directory(ancestor)
+    tmp=str(_ARCHIVE_META_FILE)+'.tmp'
+    with open(tmp,'w') as f:
+        os.fchmod(f.fileno(),0o600)
+        f.write(json.dumps(meta));f.flush();os.fsync(f.fileno())
+    os.replace(tmp,_ARCHIVE_META_FILE)
+    _sync_directory(_ARCHIVE_META_FILE.parent)
 
 
 
@@ -688,6 +692,8 @@ def _archive_append(rec: Dict[str, Any]) -> bool:
     Returns True only when the segment is durable. Never raises."""
     try:
         _ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        from .learning_effects import _sync_directory
+        for ancestor in (_ARCHIVE_FILE.parent,*_ARCHIVE_FILE.parent.parents):_sync_directory(ancestor)
         with _archive_lock():
             meta = _meta_read()
             try:
@@ -701,18 +707,19 @@ def _archive_append(rec: Dict[str, Any]) -> bool:
                                 f.seek(0)
                                 data = f.read()
                                 cut = data.rfind(b"\n") + 1
+                                meta["torn_tail_repairs"] = int(meta.get("torn_tail_repairs") or 0)+1
+                                _meta_write(meta)  # Before removing source evidence.
                                 f.truncate(cut)
-                                meta["torn_tail_repairs"] = int(
-                                    meta.get("torn_tail_repairs")
-                                    or 0) + 1
             except Exception:
-                pass
+                logger.warning('deployer archive tail preparation unavailable',exc_info=True)
+                raise
             with open(_ARCHIVE_FILE, "a") as out:
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
                 os.fsync(out.fileno())
             _maybe_compact_archive(meta)
             _meta_write(meta)
+            _sync_directory(_ARCHIVE_FILE.parent)
         return True
     except Exception:
         return False
@@ -764,7 +771,12 @@ def _maybe_compact_archive(meta: Dict[str, Any]) -> None:
                         _row_from_segments(dep, state)) + "\n")
             out.flush()
             os.fsync(out.fileno())
+        # Record possible diagnostic loss BEFORE replacing source lines.
+        meta['compaction_attempts']=int(meta.get('compaction_attempts') or 0)+1
+        _meta_write(meta)
         os.replace(tmp, _ARCHIVE_FILE)
+        from .learning_effects import _sync_directory
+        _sync_directory(_ARCHIVE_FILE.parent)
         try:
             os.chmod(_ARCHIVE_FILE, 0o600)
         except Exception:
@@ -923,7 +935,7 @@ def is_hot(deployer: Optional[str], degen: Any) -> bool:
 
 def evaluate_deployer_fasttrack(state: Dict[str, Any], degen: Any, mint: str,
                                 deployer: Optional[str],
-                                safety_passed: bool = True
+                                safety_passed: bool = True,*,registry_path=None,strict=False
                                 ) -> Optional[Dict[str, Any]]:
     """Decide whether a coin gets the hot-deployer fast-track.
 
@@ -951,9 +963,13 @@ def evaluate_deployer_fasttrack(state: Dict[str, Any], degen: Any, mint: str,
         seen = state.setdefault(_SEEN_KEY, [])
         if mint in seen:
             return None  # new-to-us mints only
-        if not is_hot(deployer, degen):
-            return None
-        entry = load_registry().get(deployer) or {}
+        if registry_path is None and not strict:
+            if not is_hot(deployer,degen):return None
+            entry=load_registry().get(deployer) or {}
+        else:
+            from .deployer_registry import read
+            entry=read(registry_path or _REGISTRY_FILE,require_existing=strict).get(deployer) or {}
+            if not _entry_is_hot(entry,max(1,int(getattr(degen,'deployer_min_launches',3))),float(getattr(degen,'deployer_hot_hit_rate',.30))):return None
         launches = int(entry.get("launches_seen") or 0)
         hits = int(entry.get("hits_2x") or 0)
         rate = hit_rate(entry)
@@ -969,6 +985,7 @@ def evaluate_deployer_fasttrack(state: Dict[str, Any], degen: Any, mint: str,
         }
     except Exception as exc:
         logger.warning("deployer fast-track eval failed: %s", exc)
+        if strict:raise
         return None
 
 
@@ -1239,8 +1256,11 @@ def funder_for(deployer: str,
                      [sig, {"maxSupportedTransactionVersion": 0}])
             # meta.err gate (2026-11-17, Batch 3): a reverted tx
             # funds nothing — its balances never moved.
-            if _txg.tx_succeeded(tx):
-                funder = _extract_funder(tx, deployer)
+            if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,sig):
+                # Unknown/unrelated detail must not become a permanent
+                # negative cache entry. A later ordinary caller may retry.
+                return None
+            funder = _extract_funder(tx, deployer)
         funders[deployer] = {"funder": funder, "ts": now}
         _save_json_0600(_FUNDERS_FILE, funders)
         return funder
@@ -1443,3 +1463,36 @@ def daily_intel(state: Dict[str, Any],
     except Exception as exc:
         logger.warning("deployer daily intel failed: %s", exc)
         return summary
+
+
+def claim_outcome(mint,deployer,outcome,observed_at,source,*,registry_path=None):
+    """Durable first recorded grade per mint, shared by close and expiry.
+
+    Competing later proposals return the recorded winner without changing it.
+    Claim and counters commit together and claims survive registry eviction.
+    """
+    import hashlib,math
+    from .deployer_registry import canonical
+    from .learning_effects import _encoded
+    if (not isinstance(mint,str) or not mint or not isinstance(deployer,str) or not deployer
+            or outcome not in OUTCOMES or type(observed_at) not in (int,float) or not math.isfinite(observed_at)
+            or not isinstance(source,str) or not source):raise ValueError('deployer proposal invalid')
+    proposal={'mint':mint,'deployer':deployer,'outcome':outcome,'observed_at':observed_at,'source':source}
+    # Proposal identity includes exact source parameters. First-winner handling
+    # belongs to the atomic reducer, not hash conflicts or cache flags.
+    effect='grade-proposal-'+hashlib.sha256(_encoded(proposal).encode()).hexdigest()
+    def update(value):
+        value=canonical(value)
+        if mint in value['grade_claims']:return value
+        hist=value['registry'];entry=hist.get(deployer)
+        if entry is None:entry=_new_entry(observed_at);entry['launches_seen']=1
+        else:entry['launches_seen']=max(int(entry.get('launches_seen') or 0),1)
+        field={'hit_2x':'hits_2x','rug':'rugs','dead':'dead'}[outcome]
+        entry[field]=int(entry.get(field) or 0)+1;entry['last_seen']=observed_at
+        stamps=entry.get('outcome_ts') or []
+        if not isinstance(stamps,list):raise ValueError('deployer outcome history invalid')
+        entry['outcome_ts']=(stamps+[{'ts':observed_at,'outcome':outcome}])[-_MAX_OUTCOME_TS:]
+        hist[deployer]=entry;value['grade_claims'][mint]=proposal
+        return canonical(value)
+    _,value=_registry_effect(effect,proposal,update,full_value=True,registry_path=registry_path)
+    return value['grade_claims'][mint]

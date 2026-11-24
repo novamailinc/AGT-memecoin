@@ -39,6 +39,7 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         FAILS.append(name)
+        raise AssertionError(name)
 
 
 class _FakePacer:
@@ -128,7 +129,7 @@ def test_alchemy_ok_is_primary_and_attributed():
         att = _FakeAttempt({"alchemy": [({"ok": 1}, "ok")],
                             "helius": [({"ok": 2}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: primary ok returns its result",
               got == {"ok": 1})
         check("alchemy: Helius never attempted on primary success",
@@ -151,7 +152,7 @@ def test_alchemy_429_fails_over_to_helius_not_public():
             "helius": [({"ok": 2}, "ok")],
             "public": [({"ok": 3}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: 429 falls over to Helius with its result",
               got == {"ok": 2})
         check("alchemy: 429 order is alchemy -> helius, never "
@@ -170,7 +171,7 @@ def test_alchemy_non429_fails_over_to_helius():
             "alchemy": [(None, "fail")],
             "helius": [({"ok": 4}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: non-429 failure falls over to Helius",
               got == {"ok": 4})
         check("alchemy: non-429 order is alchemy -> helius",
@@ -185,7 +186,7 @@ def test_alchemy_null_is_definitive():
         att = _FakeAttempt({"alchemy": [(None, "null")],
                             "helius": [({"ok": 5}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: definitive null returned as None",
               got is None)
         check("alchemy: null never re-asks another tier",
@@ -202,7 +203,7 @@ def test_alchemy_single_attempt_no_same_tier_burn():
             "helius": [(None, "fail"), (None, "fail")],
             "public": [({"ok": 7}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: exactly one alchemy attempt per call",
               att.calls.count("alchemy") == 1)
         check("alchemy: public reached only after both keyed tiers",
@@ -221,7 +222,7 @@ def test_no_alchemy_key_leaves_helius_first():
         att = _FakeAttempt({"alchemy": [({"ok": 8}, "ok")],
                             "helius": [({"ok": 9}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: unconfigured -> previous Helius-first order",
               att.calls == ["helius"])
         check("alchemy: unconfigured -> Helius result",
@@ -239,7 +240,7 @@ def test_no_token_no_attempt_no_bypass():
                             "helius": [({"ok": 2}, "ok")],
                             "public": [(None, "429")]})
         c.patch(pacer, att)
-        reserves.rpc("getSignaturesForAddress", ["X"])
+        reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])
         check("alchemy: no token -> zero keyed attempts",
               "alchemy" not in att.calls
               and "helius" not in att.calls)
@@ -257,7 +258,7 @@ def test_full_url_credential_shape():
         pacer = _FakePacer(True)
         att = _FakeAttempt({"alchemy": [({"ok": 1}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl_typed("getSignaturesForAddress", ["X"])[0]
         check("alchemy: full-URL credential serves the call",
               got == {"ok": 1} and att.calls == ["alchemy"])
     with _Ctx(alchemy="barekey") as c:

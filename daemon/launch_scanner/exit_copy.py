@@ -21,7 +21,11 @@ review. There is no auto-copying, no signal, no gate — the module
 cannot influence entries, exits, or alerts.
 
 Dataset: runtime state ``<home>/launch_scanner/exit_copy.json``
-(0600, atomic writes), bounded (500 closes), 7-day TTL.
+(0600, locked atomic effect writes), bounded (500 closes), 7-day source
+retention watermark. Exact receipts retained separately and unbounded. Reads
+apply current-wallclock seven-day filtering. New closes have distinct identities
+and mint fields; legacy mint-keyed rows remain readable. Old wallet prefixes
+are preserved without inventing missing full addresses.
 """
 
 import json
@@ -83,100 +87,103 @@ def _resolve_path(path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _load(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
-    p = _resolve_path(path)
-    if not p:
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (FileNotFoundError, OSError, ValueError):
-        return {}
-    except Exception:
-        logger.exception("exit_copy: load failed")
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    cutoff = time.time() - _TTL_S
-    return {str(m): r for m, r in data.items()
-            if isinstance(r, dict) and _f(r.get("close_ts")) >= cutoff}
+def _validate_closes(closes):
+    import math
+    from . import learning_effects as effects
+    effects._validate(closes)
+    if not isinstance(closes,dict):raise ValueError('exit-copy store unavailable')
+    for identity,rec in closes.items():
+        if not identity or not isinstance(rec,dict):raise ValueError('exit-copy close invalid')
+        if any(type(rec.get(k)) not in (int,float) or not math.isfinite(rec[k]) for k in ('entry_ts','close_ts','close_mult','pnl_sol')):
+            raise ValueError('exit-copy economics invalid')
+        if rec['close_mult']<0 or rec['close_ts']<rec['entry_ts'] or not isinstance(rec.get('reason'),str):raise ValueError('exit-copy close source invalid')
+        if not isinstance(rec.get('wallet_exits'),dict) or not isinstance(rec.get('scanned_day'),str):raise ValueError('exit-copy enrichment invalid')
+        day=rec['scanned_day']
+        if day:
+            from datetime import date
+            if date.fromisoformat(day).isoformat()!=day:raise ValueError('exit-copy scan day invalid')
+        if 'mint' in rec and (not isinstance(rec['mint'],str) or not rec['mint']):raise ValueError('exit-copy mint invalid')
+        for wallet,info in rec['wallet_exits'].items():
+            if (not wallet or not isinstance(info,dict) or any(type(info.get(k)) not in (int,float) or not math.isfinite(info[k]) for k in ('sold_ts','after_our_close_h'))):
+                raise ValueError('exit-copy wallet evidence invalid')
+            if 'complete' in info and type(info['complete']) is not bool:raise ValueError('exit-copy wallet completeness invalid')
+            if info['sold_ts']<rec['entry_ts'] or info['after_our_close_h']!=round((info['sold_ts']-rec['close_ts'])/3600.,2):
+                raise ValueError('exit-copy wallet timing conflict')
+    return closes
 
 
-def _save(path: Optional[str], closes: Dict[str, Dict[str, Any]]) -> bool:
-    p = _resolve_path(path)
-    if not p:
-        return False
+def _all_closes(path):
+    from . import learning_effects as effects
+    p=_resolve_path(path)
+    if not p:return {}
     try:
-        blob = json.dumps(closes, separators=(",", ":")).encode("utf-8")
-    except Exception:
-        logger.exception("exit_copy: serialize failed")
-        return False
-    tmp = "%s.tmp.%d" % (p, os.getpid())
-    try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(blob)
-                fh.flush()
-                os.fsync(fh.fileno())
-        except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, p)
-        return True
-    except Exception:
-        logger.exception("exit_copy: write failed")
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return False
+        with open(p,'r',encoding='utf-8') as fh:doc=json.load(fh,object_pairs_hook=effects._pairs,parse_constant=effects._constant)
+    except FileNotFoundError:return {}
+    if isinstance(doc,dict) and set(doc)=={'version','value','effects'}:
+        if type(doc['version']) is not int or doc['version']!=1 or not isinstance(doc['effects'],dict) or any(not isinstance(k,str) or not k or not isinstance(v,str) or len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for k,v in doc['effects'].items()):
+            raise ValueError('exit-copy receipts invalid')
+        doc=doc['value']
+    return _validate_closes(doc)
+
+
+def _load(path):
+    cutoff=time.time()-_TTL_S
+    return {identity:rec for identity,rec in _all_closes(path).items() if rec['close_ts']>=cutoff}
+
+
+def _immutable(rec):
+    return {k:v for k,v in rec.items() if k not in ('wallet_exits','scanned_day')}
+
+
+def append_close(path,record,effect_id):
+    from . import learning_effects as effects
+    from pathlib import Path
+    p=Path(path)
+    if not p.is_absolute():raise ValueError('exit-copy path must be absolute')
+    _validate_closes({effect_id:record});p.parent.mkdir(parents=True,exist_ok=True)
+    def reducer(state,payload):
+        _validate_closes(state)
+        if effect_id in state and state[effect_id]!=payload:raise ValueError('exit-copy close identity conflict')
+        state[effect_id]=payload
+        watermark=max(r['close_ts'] for r in state.values())
+        rows=[(k,r) for k,r in state.items() if r['close_ts']>=watermark-_TTL_S]
+        rows.sort(key=lambda pair:(pair[1]['close_ts'],pair[0]))
+        return _validate_closes(dict(rows[-_MAX_CLOSES:]))
+    return effects.apply(p,effect_id,record,reducer,{},legacy_import=_validate_closes)
+
+
+def merge_enrichment(path,identity,original,exits,day):
+    """Merge only this source close's patch into the current locked store."""
+    from . import learning_effects as effects
+    import hashlib
+    from pathlib import Path
+    p=Path(path)
+    if not p.is_absolute():raise ValueError('exit-copy path must be absolute')
+    payload={'identity':identity,'source':_immutable(original),'wallet_exits':exits,'scanned_day':day}
+    _validate_closes({identity:dict(payload['source'],wallet_exits=exits,scanned_day=day)})
+    effect_id='enrichment-'+hashlib.sha256(effects._encoded(payload).encode()).hexdigest()
+    def reducer(state,payload):
+        _validate_closes(state)
+        current=state.get(identity)
+        if current is None or _immutable(current)!=payload['source']:raise ValueError('exit-copy enrichment stale or missing close')
+        for wallet,info in payload['wallet_exits'].items():
+            prior=current['wallet_exits'].get(wallet)
+            if prior is not None and prior!=info:
+                # An incomplete bounded search can improve to an earlier sale;
+                # a complete result cannot silently regress or contradict.
+                if prior.get('complete') is True or info['sold_ts']>prior['sold_ts']:
+                    raise ValueError('exit-copy wallet evidence conflict')
+            current['wallet_exits'][wallet]=info
+        current['scanned_day']=max(current['scanned_day'],payload['scanned_day'])
+        return _validate_closes(state)
+    return effects.apply(p,effect_id,payload,reducer,{},legacy_import=_validate_closes,require_existing=True)
 
 
 def _rpc(method: str, params: List[Any]) -> Any:
-    """Helius RPC through the shared rate-limit guard (fail-soft)."""
-    try:
-        from . import helius_ratelimit  # noqa: PLC0415
-        from . import smartmoney  # noqa: PLC0415
-        key = smartmoney.api_key()
-        if not key:
-            return None
-        if helius_ratelimit.cooldown_remaining() > 0:
-            return None
-        payload = json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method,
-             "params": params}).encode()
-        req = urllib.request.Request(
-            smartmoney._RPC_URL.format(key=key), data=payload,
-            headers={"Content-Type": "application/json",
-                     "User-Agent": "Mozilla/5.0",
-                     "Connection": "close"})
-        try:
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-                result = json.loads(
-                    resp.read().decode("utf-8", "replace")).get("result")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                wait = helius_ratelimit.report_ratelimited()
-                logger.warning("exit_copy helius %s 429; cooldown %.0fs",
-                               method, wait)
-            else:
-                logger.warning("exit_copy helius %s: HTTP %s", method,
-                               exc.code)
-            return None
-        except Exception as exc:
-            logger.warning("exit_copy helius %s failed: %s", method, exc)
-            return None
-        helius_ratelimit.report_success()
-        return result
-    except Exception:
-        logger.exception("exit_copy _rpc failed")
-        return None
+    """Routine exit-history investigation follows central section 9 routing."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=_TIMEOUT, background=True)
+
 
 
 def _token_delta(tx: Dict[str, Any], wallet: str,
@@ -204,23 +211,31 @@ def _token_delta(tx: Dict[str, Any], wallet: str,
 
 
 def _wallet_sold_after(wallet: str, mint: str, after_ts: float,
-                       budget: List[int]) -> Optional[float]:
+                       budget: List[int], *, detailed=False, reserve=None, progress_path=None):
     """Earliest blockTime at/after after_ts where the wallet's balance
     of mint decreased. None when no sell found (or on any failure).
     budget[0] caps getTransaction parses; decremented per parse."""
+    if progress_path is not None:
+        return _wallet_progress(wallet,mint,after_ts,budget,reserve,progress_path)
     try:
-        sigs = _rpc("getSignaturesForAddress",
-                    [wallet, {"limit": _SIG_LIMIT}]) or []
+        if reserve is not None:reserve()
+        sigs = _rpc("getSignaturesForAddress",[wallet, {"limit": _SIG_LIMIT}])
+        if not isinstance(sigs,list):raise ValueError('wallet signature history unavailable')
+        covered=len(sigs)<_SIG_LIMIT
+        complete=True
         earliest: Optional[float] = None
         for s in sigs:
             if not isinstance(s, dict):
-                continue
+                complete=False;continue
             bt = _f(s.get("blockTime"))
             sig = s.get("signature")
-            if not sig or bt < after_ts:
-                continue
+            if not sig or bt<=0:
+                complete=False;continue
+            if bt < after_ts:
+                covered=True;continue
             if budget[0] <= 0:
-                break
+                complete=False;break
+            if reserve is not None:reserve()
             budget[0] -= 1
             tx = _rpc("getTransaction",
                       [sig, {"encoding": "jsonParsed",
@@ -229,15 +244,16 @@ def _wallet_sold_after(wallet: str, mint: str, after_ts: float,
             # tx's balances never moved — skip it, don't count
             # its delta as a sale.
             if not _txg.tx_succeeded(tx):
+                if _txg.tx_reverted_reason(tx)=='tx_unknown':complete=False
                 continue
             if _token_delta(tx, wallet, mint) < 0:
                 if earliest is None or bt < earliest:
                     earliest = bt
             time.sleep(0.15)
-        return earliest
+        return {'sold_ts':earliest,'complete':complete and covered} if detailed else earliest
     except Exception:
         logger.exception("exit_copy wallet scan failed for %s", wallet[:8])
-        return None
+        return {'sold_ts':None,'complete':False} if detailed else None
 
 
 def record_close(degen: Any, mint: str, entry_ts: float, close_ts: float,
@@ -254,24 +270,15 @@ def record_close(degen: Any, mint: str, entry_ts: float, close_ts: float,
         if not mint:
             return None
         mint = str(mint)
-        closes = _load(path)
-        rec = closes.get(mint) or {}
-        rec.update({
-            "close_ts": float(close_ts),
-            "entry_ts": float(entry_ts),
-            "close_mult": round(float(close_mult or 0.0), 4),
-            "reason": str(reason or ""),
-            "pnl_sol": round(float(pnl_sol or 0.0), 6),
-            "wallet_exits": rec.get("wallet_exits") or {},
-            "scanned_day": rec.get("scanned_day") or "",
-        })
-        closes[mint] = rec
-        if len(closes) > _MAX_CLOSES:
-            for m in sorted(closes,
-                            key=lambda k: _f(closes[k].get("close_ts"))
-                            )[:len(closes) - _MAX_CLOSES]:
-                closes.pop(m, None)
-        _save(path, closes)
+        import uuid
+        p=_resolve_path(path)
+        if not p:return None
+        identity='exit-copy-'+uuid.uuid4().hex
+        rec={
+            'mint':mint,'close_ts':float(close_ts),'entry_ts':float(entry_ts),
+            'close_mult':round(float(close_mult),4),'reason':str(reason or ''),
+            'pnl_sol':round(float(pnl_sol),6),'wallet_exits':{},'scanned_day':''}
+        append_close(p,rec,identity)
         return rec
     except Exception:
         logger.exception("exit_copy record_close failed for %s", mint)
@@ -294,43 +301,53 @@ def daily_pass(state: Dict[str, Any], degen: Any,
         day = datetime.fromtimestamp(now, WAT).date().isoformat()
         if state.get(_STATE_DAY_KEY) == day:
             return 0
-        state[_STATE_DAY_KEY] = day
-
         max_tx = int(getattr(degen, "exit_copy_max_tx_per_day", 40) or 40)
         budget = [max_tx]
         closes = _load(path)
         if not closes:
+            state[_STATE_DAY_KEY] = day
             return 0
         activity = state.get("smart_activity") or {}
         enriched = 0
-        for mint, rec in closes.items():
+        all_complete=True
+        def reserve():
+            reserve_daily_call(_resolve_path(path),day,max_tx)
+        for identity, rec in closes.items():
+            mint=rec.get('mint') or identity
             if not isinstance(rec, dict):
                 continue
             if rec.get("scanned_day") == day:
                 continue
             buyers = activity.get(mint) or []
             if not buyers:
-                rec["scanned_day"] = day
+                merge_enrichment(_resolve_path(path),identity,rec,{},day)
                 continue
             entry_ts = _f(rec.get("entry_ts"))
+            complete=True
             exits = dict(rec.get("wallet_exits") or {})
             for wallet in buyers:
-                if not isinstance(wallet, str) or wallet in exits:
+                if not isinstance(wallet,str) or not wallet:
+                    complete=False;continue
+                if (exits.get(wallet) or {}).get('complete') is True:
                     continue
                 if budget[0] <= 0:
-                    break
-                sold_ts = _wallet_sold_after(wallet, mint, entry_ts, budget)
+                    complete=False;break
+                result = _wallet_sold_after(wallet,mint,entry_ts,budget,detailed=True,reserve=reserve,progress_path=_resolve_path(path))
+                sold_ts=result['sold_ts']
+                complete=complete and result['complete']
+                if not sold_ts and wallet in exits:
+                    # A newly empty history contradicts retained positive
+                    # evidence; do not upgrade it to a complete negative.
+                    complete=False
                 if sold_ts:
-                    exits[wallet[:16]] = {"sold_ts": sold_ts,
+                    exits[wallet] = {"sold_ts": sold_ts,"complete":result['complete'],
                                           "after_our_close_h": round(
                                               (sold_ts - _f(rec.get("close_ts")))
                                               / 3600.0, 2)}
-            rec["wallet_exits"] = exits
-            rec["scanned_day"] = day
-            enriched += 1
-            if budget[0] <= 0:
-                break
-        _save(path, closes)
+            merge_enrichment(_resolve_path(path),identity,rec,exits,day if complete else rec['scanned_day'])
+            if complete:enriched += 1
+            else:all_complete=False
+        if all_complete:state[_STATE_DAY_KEY] = day
         if enriched:
             logger.warning("exit_copy daily pass: %d closes scanned, "
                            "%d tx budget left", enriched, budget[0])
@@ -388,3 +405,169 @@ def weekly_section(path: Optional[str] = None) -> List[str]:
                    "profit, our exits are fine; when they leave first "
                    "and we round-trip, their exits were the tell.")
     return out
+
+
+def reserve_daily_call(path,day,limit):
+    """Durably reserve before every investigation request, even failed calls.
+
+    Uses the configured daily transaction limit as a conservative total RPC
+    request ceiling, including signature lookup. Retry cannot reset this file.
+    """
+    import uuid
+    from pathlib import Path
+    from . import learning_effects as effects
+    p=Path(path).absolute().with_name(Path(path).name+'.budget.json')
+    p.parent.mkdir(parents=True,exist_ok=True)
+    def reducer(state,payload):
+        if not isinstance(state,dict) or any(not isinstance(k,str) or type(v) is not int or v<0 for k,v in state.items()):raise ValueError('exit-copy budget unavailable')
+        used=state.get(day,0)
+        if used>=limit:raise ValueError('exit-copy daily request budget exhausted')
+        state[day]=used+1
+        return state
+    effects.apply(p,'request-'+uuid.uuid4().hex,{'day':day,'limit':limit},reducer,{})
+
+
+def _wallet_progress(wallet,mint,after_ts,budget,reserve,path):
+    """Durable bounded signature queue and pagination, scoped to source entry.
+
+    Progress never claims a negative on missing tx/status/balances. A failed
+    parse stays at queue head; successful/reverted work advances across days.
+    """
+    from . import learning_effects as effects
+    from pathlib import Path
+    import hashlib,uuid,copy,math
+    p=Path(path).absolute().with_name(Path(path).name+'.progress.json')
+    identity=hashlib.sha256(effects._encoded([wallet,mint,after_ts]).encode()).hexdigest()
+    initial={'before':None,'queue':[],'done':False,'earliest':None,'completed_day':''}
+    def validate_state(state,boundary=after_ts):
+        from datetime import date
+        if (not isinstance(state,dict) or set(state)!=set(initial) or type(state['done']) is not bool
+                or not isinstance(state['queue'],list) or len(state['queue'])>_SIG_LIMIT
+                or state['before'] is not None and (not isinstance(state['before'],str) or not state['before'])
+                or not isinstance(state['completed_day'],str)):
+            raise ValueError('exit-copy progress invalid')
+        if state['completed_day']:
+            if date.fromisoformat(state['completed_day']).isoformat()!=state['completed_day'] or not state['done'] or state['queue']:
+                raise ValueError('exit-copy progress completion invalid')
+        if state['earliest'] is not None and (type(state['earliest']) not in (int,float) or not math.isfinite(state['earliest']) or state['earliest']<boundary):
+            raise ValueError('exit-copy progress earliest invalid')
+        seen=set()
+        for item in state['queue']:
+            if (not isinstance(item,dict) or set(item)!={'signature','blockTime'} or not isinstance(item['signature'],str) or not item['signature']
+                    or item['signature'] in seen or type(item['blockTime']) not in (int,float) or not math.isfinite(item['blockTime']) or item['blockTime']<boundary):
+                raise ValueError('exit-copy progress queue invalid')
+            seen.add(item['signature'])
+        return state
+    def read():
+        try:doc=json.loads(p.read_text(),object_pairs_hook=effects._pairs,parse_constant=effects._constant)
+        except FileNotFoundError:return copy.deepcopy(initial)
+        if (not isinstance(doc,dict) or set(doc)!={'version','value','effects'} or type(doc['version']) is not int or doc['version']!=1
+                or not isinstance(doc['value'],dict) or not isinstance(doc['effects'],dict)
+                or any(not isinstance(k,str) or not k or not isinstance(v,str) or len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for k,v in doc['effects'].items())):
+            raise ValueError('exit-copy progress unavailable')
+        # Every cached row has its source tuple, not merely an opaque key.
+        for source_id,row in doc['value'].items():
+            if not isinstance(row,dict) or set(row)!={'source','state'}:raise ValueError('exit-copy progress source unavailable')
+            source=row['source']
+            if (not isinstance(source,list) or len(source)!=3 or not all(isinstance(v,str) and v for v in source[:2])
+                    or type(source[2]) not in (int,float) or not math.isfinite(source[2])
+                    or hashlib.sha256(effects._encoded(source).encode()).hexdigest()!=source_id):raise ValueError('exit-copy progress source conflict')
+            # Validate each row against its own entry boundary.
+            validate_state(row['state'],source[2])
+        row=doc['value'].get(identity)
+        return copy.deepcopy(row['state'] if row else initial)
+    def save(old,new):
+        def reducer(state,payload):
+            expected={'source':[wallet,mint,after_ts],'state':payload['old']}
+            if not isinstance(state,dict) or state.get(identity,{'source':[wallet,mint,after_ts],'state':initial})!=expected:raise ValueError('exit-copy concurrent progress changed')
+            validate_state(payload['new'])
+            state[identity]={'source':[wallet,mint,after_ts],'state':payload['new']};return state
+        effects.apply(p,'progress-'+uuid.uuid4().hex,{'old':old,'new':new},reducer,{})
+    state=None
+    try:
+        state=read()
+        day=datetime.fromtimestamp(time.time(),WAT).date().isoformat()
+        if state['done'] and not state['queue'] and state['earliest'] is None and state['completed_day']!=day:
+            new=copy.deepcopy(initial);save(state,new);state=new
+        while True:
+            if not state['queue']:
+                if state['done']:
+                    if state['completed_day']!=day:
+                        new=copy.deepcopy(state);new['completed_day']=day;save(state,new);state=new
+                    return {'sold_ts':state['earliest'],'complete':True}
+                if reserve is not None:reserve()
+                options={'limit':_SIG_LIMIT}
+                if state['before']:options['before']=state['before']
+                sigs=_rpc('getSignaturesForAddress',[wallet,options])
+                if not isinstance(sigs,list):raise ValueError('signature page unavailable')
+                new=copy.deepcopy(state);queue=[];done=len(sigs)<_SIG_LIMIT
+                seen=set()
+                for item in sigs:
+                    if (not isinstance(item,dict) or not isinstance(item.get('signature'),str) or not item['signature']
+                            or item['signature'] in seen or type(item.get('blockTime')) not in (int,float)
+                            or not math.isfinite(item['blockTime'])):raise ValueError('signature page malformed')
+                    seen.add(item['signature'])
+                    if item['blockTime']<after_ts:done=True
+                    else:queue.append({'signature':item['signature'],'blockTime':item['blockTime']})
+                before=sigs[-1]['signature'] if sigs else state['before']
+                if sigs and before==state['before']:raise ValueError('signature pagination did not advance')
+                new.update(queue=queue,before=before,done=done)
+                save(state,new);state=new
+                if not queue:continue
+            if budget[0]<=0:return {'sold_ts':state['earliest'],'complete':False}
+            item=state['queue'][0]
+            if reserve is not None:reserve()
+            budget[0]-=1
+            tx=_rpc('getTransaction',[item['signature'],{'encoding':'jsonParsed','maxSupportedTransactionVersion':0}])
+            _verify_transaction_source(tx,item)
+            status=_txg.tx_reverted_reason(tx)
+            if status=='tx_unknown':raise ValueError('transaction execution unknown')
+            new=copy.deepcopy(state)
+            if status is None:
+                if _verified_token_delta(tx,item,wallet,mint)<0:
+                    new['earliest']=min(new['earliest'],item['blockTime']) if new['earliest'] is not None else item['blockTime']
+            new['queue']=new['queue'][1:];save(state,new);state=new
+            time.sleep(.15)
+    except Exception:
+        logger.warning('exit-copy wallet history partial/unavailable',exc_info=True)
+        return {'sold_ts':state['earliest'] if state else None,'complete':False}
+
+
+def _verify_transaction_source(tx,item):
+    import math
+    if not isinstance(tx,dict):raise ValueError('transaction unavailable')
+    signatures=(tx.get('transaction') or {}).get('signatures')
+    ts=tx.get('blockTime')
+    if (not isinstance(signatures,list) or not signatures or signatures[0]!=item['signature']
+            or type(ts) not in (int,float) or not math.isfinite(ts) or ts!=item['blockTime']):
+        raise ValueError('transaction signature/time source conflict')
+
+
+def _verified_token_delta(tx,item,wallet,mint):
+    """Exact raw-unit change; UI floats never determine a sale."""
+    _verify_transaction_source(tx,item)
+    meta=tx.get('meta') or {}
+    identities={};relevant_decimals=set()
+    def balances(name):
+        rows=meta.get(name)
+        if not isinstance(rows,list):raise ValueError('transaction balances unavailable')
+        found={}
+        for row in rows:
+            if not isinstance(row,dict) or not isinstance(row.get('owner'),str) or not row['owner'] or not isinstance(row.get('mint'),str) or not row['mint']:
+                raise ValueError('transaction balance identity unresolved')
+            index=row.get('accountIndex');token=row.get('uiTokenAmount')
+            if type(index) is not int or index<0 or index in found or not isinstance(token,dict):raise ValueError('transaction token account unresolved')
+            raw=token.get('amount');decimals=token.get('decimals')
+            if (not isinstance(raw,str) or not raw or any(c not in '0123456789' for c in raw)
+                    or type(decimals) is not int or not 0<=decimals<=255):raise ValueError('transaction raw amount unavailable')
+            identity=(row['owner'],row['mint'],decimals)
+            if index in identities and identities[index]!=identity:raise ValueError('transaction account identity/decimals conflict')
+            identities[index]=identity;found[index]=(identity,int(raw))
+            if row['owner']==wallet and row['mint']==mint:relevant_decimals.add(decimals)
+        return found
+    pre=balances('preTokenBalances');post=balances('postTokenBalances')
+    if len(relevant_decimals)>1:raise ValueError('transaction mint decimals conflict')
+    def total(rows):return sum(raw for identity,raw in rows.values() if identity[:2]==(wallet,mint))
+    # Fully validated token balance lists with no matching owner/mint establish
+    # that this transaction did not change the requested token balance.
+    return total(post)-total(pre)

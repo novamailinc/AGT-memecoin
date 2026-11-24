@@ -26,17 +26,20 @@ exist on AGT:
 
 | Env var | Required | Purpose | File fallback on VM | Env-first in live code? |
 |---|---|---|---|---|
-| `HELIUS_API_KEY` | **yes** | Helius main RPC key | `helius/api_key` | Yes — `reserves.py`, `smartmoney.py` |
-| `HELIUS_API_KEY_DISCOVERY` | no | Second Helius key (research/discovery traffic) | `helius/api_key_discovery` | Yes — `reserves.py`, `smartmoney.py`, `funding_clusters.py`, `instant_safety.py` |
-| `ALCHEMY_API_KEY` | no* | Alchemy API key — **key only, never the endpoint URL** | `alchemy/api_key` | Yes — `acquisition/providers/base.py` |
-| `CHAINSTACK_ENDPOINT` | no* | Full Chainstack Solana mainnet endpoint URL (the key is its final path segment) | `.forex-agent/chainstack/endpoint` | Yes — `acquisition/providers/base.py` |
-| `TELEGRAM_BOT_TOKEN` | **yes** | Telegram bot token (alerts + control bot) | `telegram/bot_token` | Yes — `daemon/telegram/__init__.py` |
-| `HELIUS_ALERT_CHAT_ID` | no | Telegram chat id for Helius 429-spike alerts | — (env only) | Yes — `helius_alerts.py` |
-| `GITHUB_TOKEN` | no† | GitHub token for the repo sync loop | — | No (finalize pass) |
+| `ALCHEMY_API_KEY` | **yes** | Normal scanning, bare key or validated supported Alchemy URL | `alchemy/api_key` | `acquisition/providers/base.py` |
+| `TELEGRAM_BOT_TOKEN` | **yes** | Alerts/control | `telegram/bot_token` | `daemon/telegram/__init__.py` |
+| `HELIUS_API_KEY_1` | **yes** | Fixed routine RPC/WSS/transaction and selective intelligence source 1 | env only | `providers/helius.py`, `selective_enrichment.py` |
+| `HELIUS_API_KEY_2` | **yes** | Fixed routine RPC/WSS/transaction and selective intelligence source 2 | env only | `providers/helius.py`, `selective_enrichment.py` |
+| `HELIUS_API_KEY_3` | **yes** | Fixed routine RPC/WSS/transaction and selective intelligence source 3 | env only | `providers/helius.py`, `selective_enrichment.py` |
+| `HELIUS_API_KEY` | no | Legacy compatibility only, not a numbered-slot substitute | `helius/api_key` | legacy readers |
+| `HELIUS_API_KEY_DISCOVERY` | no | Legacy research source, not a numbered slot | `helius/api_key_discovery` | legacy readers |
+| `CHAINSTACK_ENDPOINT` | **yes** | Supported complementary recent reads/verification | `chainstack/endpoint` | `providers/base.py` |
+| `HELIUS_ALERT_CHAT_ID` | no | 429-spike alerts | env only | `helius_alerts.py` |
+| `GITHUB_TOKEN` | no | Repo sync, currently blocked | env only | not installed |
 
-\* Required only when the acquisition router enables that provider
-(Phases 5–12 cutover). Helius is the live leg today; neither is
-required for the skeleton deploy.
+All three numbered Helius slots share the same account budget and cooldown.
+Missing slots remain missing; there is no remapping or quota-evasion rotation.
+No actual credentials are installed by editing this inventory.
 
 † Deferred to the finalize pass: the VM sync script
 (`workspace/github-deploy/push_all.sh`) lives outside the repo and
@@ -44,6 +47,10 @@ authenticates via the VM authd vault credential. On AGT it needs a
 GitHub token in the vault plus a vendored push script. The scheduler
 records `github-repo-sync` as `blocked` until then — it never runs
 half-authenticated.
+
+For Chainstack, the bridge writes `FOREX_AGENT_HOME/chainstack/endpoint`.
+The resolver accepts that path for an explicit runtime home and the legacy
+`HOME/.forex-agent/chainstack/endpoint` path for a user home. Env is first.
 
 ## How each credential is consumed on AGT
 
@@ -85,9 +92,10 @@ contains names only — never values.
 ## Rotation
 
 Rotate a credential by updating it in the AGT vault and restarting
-the deployment (AGT app → deployment → Restart). The bridge files are
-rewritten from env on every start, so no stale file can survive a
-rotation. Revoking an agent's vault in AGT wipes that agent's secrets;
+the deployment (AGT app → deployment → Restart). Env-first readers use the updated variables. The file bridge is seed-only and
+does not overwrite existing files. File-only consumers require a fresh private
+state directory or separately reviewed credential-file rotation. Restart alone
+does not prove file-only readers received the new value. Revoking an agent's vault in AGT wipes that agent's secrets;
 the deployment then fails closed at preflight until the vault is
 re-seeded — by design.
 
@@ -100,3 +108,7 @@ re-seeded — by design.
   and must never be created on AGT**. Mainnet stays disabled; there is
   no mainnet wallet on this deployment, and the backup explicitly
   deletes any key file from staged copies.
+
+Preflight requires every source in this declared profile. It checks inventory and
+placeholders only, not endpoint access, payload correctness, feed completeness or
+qualification. A successful preflight does not authorize deployment or trading.

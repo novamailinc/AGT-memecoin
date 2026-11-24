@@ -151,7 +151,7 @@ class ExitClockTests(unittest.TestCase):
         self.assertIsNotNone(rec)
         mode = stat.S_IMODE(os.stat(p).st_mode)
         self.assertEqual(mode, 0o600)
-        data = json.load(open(p))
+        data = exit_liquidity_clock._all_records(p)
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["mint"], MINT)
 
@@ -302,7 +302,7 @@ class ExitCopyTests(unittest.TestCase):
             close_mult=1.5, reason="trail_stop", pnl_sol=0.02, path=p)
         self.assertIsNotNone(rec)
         data = json.load(open(p))
-        self.assertAlmostEqual(data[MINT]["close_mult"], 1.5)
+        self.assertAlmostEqual(next(iter(data['value'].values()))["close_mult"], 1.5)
         mode = stat.S_IMODE(os.stat(p).st_mode)
         self.assertEqual(mode, 0o600)
 
@@ -338,22 +338,22 @@ class ExitCopyTests(unittest.TestCase):
             if method == "getSignaturesForAddress":
                 return [{"signature": "sig1", "blockTime": 1500.0}]
             if method == "getTransaction":
-                return {"meta": {"err": None,
+                return {"transaction":{"signatures":["sig1"]},"blockTime":1500.0,"meta": {"err": None,
                     "preTokenBalances": [
-                        {"owner": wallet, "mint": MINT,
-                         "uiTokenAmount": {"uiAmount": 100.0}}],
+                        {"accountIndex":1,"owner": wallet, "mint": MINT,
+                         "uiTokenAmount": {"uiAmount": 100.0,"amount":"100","decimals":0}}],
                     "postTokenBalances": [
-                        {"owner": wallet, "mint": MINT,
-                         "uiTokenAmount": {"uiAmount": 20.0}}]}}
+                        {"accountIndex":1,"owner": wallet, "mint": MINT,
+                         "uiTokenAmount": {"uiAmount": 20.0,"amount":"20","decimals":0}}]}}
             return None
 
         with patch.object(exit_copy, "_load", return_value=closes), \
-             patch.object(exit_copy, "_save", return_value=True), \
+             patch.object(exit_copy, "merge_enrichment", return_value=True) as merged, \
              patch.object(exit_copy, "_rpc", side_effect=_fake_rpc):
             n = exit_copy.daily_pass(state, _degen(), now=1_700_000_000.0,
                                      path=p)
         self.assertEqual(n, 1)
-        exits = closes[MINT]["wallet_exits"]
+        exits = merged.call_args.args[3]
         self.assertEqual(len(exits), 1)
         sold = list(exits.values())[0]
         self.assertAlmostEqual(sold["sold_ts"], 1500.0)

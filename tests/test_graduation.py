@@ -208,6 +208,18 @@ class CheckTests(unittest.TestCase):
 
 class PaperEnterGraduationTests(unittest.TestCase):
     def setUp(self):
+        # Import-time environment changes cannot isolate an already imported
+        # killswitch module. Pin real state files per test, never stub the gate.
+        from daemon.launch_scanner import killswitch
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        scratch=tempfile.TemporaryDirectory(prefix='entry-gate-test-')
+        self.addCleanup(scratch.cleanup)
+        for field,name in [('STATE_FILE','state.json'),('SHADOW_FILE','state.json.bak'),('LOCK_FILE','state.lock')]:
+            scope=patch.object(killswitch,field,str(Path(scratch.name)/name))
+            scope.start();self.addCleanup(scope.stop)
+
         self.sc = LaunchScanner.__new__(LaunchScanner)
         # Isolate the unit under test (the graduation filter) from the
         # veto gate that _paper_enter runs first: veto_check's bundle

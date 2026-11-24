@@ -46,10 +46,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+try:
+    from . import tx_guards as _txg
+except ImportError:  # direct scanner-module import
+    import tx_guards as _txg
 
 logger = logging.getLogger("forex_agent.daemon.launch_scanner.wallet_discovery")
 
@@ -175,6 +181,15 @@ def early_buyers_for_mint(rpc: Callable[[str, List[Any]], Any],
                 tx = rpc("getTransaction",
                          [sig, {"encoding": "jsonParsed",
                                 "maxSupportedTransactionVersion": 0}]) or {}
+                if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx, sig):
+                    continue
+                response_time = tx.get("blockTime")
+                if (isinstance(response_time, bool)
+                        or not isinstance(response_time, (int, float))
+                        or not math.isfinite(response_time)
+                        or response_time <= 0 or response_time != bt
+                        or not lo <= response_time <= hi):
+                    continue
                 for wallet in _tx_buyers(tx, mint):
                     if wallet not in buyers or bt < buyers[wallet]:
                         buyers[wallet] = bt

@@ -765,6 +765,9 @@ def _demo_positions_lines(snap):
                 p.get("pos_id") or "%s/%s" % (lane, p.get("mint")),
                 (p.get("mint") or "")[:12], p.get("qty"),
                 _fmt_money(p.get("basis"))))
+    for p in snap.get("pending_sol") or []:
+        lines.append("Pending USD settlement: %s, %s SOL proceeds, retained basis %s (unspendable)" % (
+            p.get("pending_id"), p.get("proceeds_sol"), _fmt_money(p.get("basis"))))
     return n, lines
 
 
@@ -824,7 +827,10 @@ def _cmd_account(ctx, chat_id, user_id, update_id, args):
         else:
             lines = ["🧪 Demo account (SIMULATED capital, never real funds):",
                      "Cash: %s" % _fmt_money(snap.get("cash")),
-                     "Cost exposure (open, at basis): %s"
+                     "Spendable cash: %s" % _fmt_money(snap.get("cash_spendable")),
+                     "Pending SOL settlements: %d, retained basis %s (not spendable cash)" % (
+                         len(snap.get("pending_sol") or []), _fmt_money(snap.get("pending_sol_basis", 0.))),
+                     "Retained cost basis (open + pending): %s"
                      % _fmt_money(snap.get("cost_exposure")),
                      "Book value: %s" % _fmt_money(snap.get("book_value")),
                      "Realized P/L: %s" % _fmt_money(snap.get("realized_pnl"))]

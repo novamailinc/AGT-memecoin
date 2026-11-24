@@ -20,6 +20,7 @@ so no test needs a live broker or the (not yet built) gateway.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict
 
 logger = logging.getLogger("forex_agent.tools.backend")
@@ -93,7 +94,12 @@ def _build_adapter():
             # per fill. Never mainnet — the execution layer is devnet-only
             # by construction, and the live switch stays a separate gate.
             mode = "devnet"
+        shared_account = None
+        if mode == "paper" and os.environ.get("PAPER_ACCOUNT_ENABLED") == "1":
+            from daemon.launch_scanner import paper_account
+            shared_account = paper_account
         adapter = MemecoinAdapter(
+            shared_account=shared_account,
             data_dir=getattr(meme, "data_dir", "") or None,
             mode=mode,
             paper_start_sol=getattr(meme, "paper_start_sol", 10.0),

@@ -157,6 +157,21 @@ class HeliusParsedEventsClient:
         http_status). Never raises; never logs the URL."""
         if not self.configured():
             return "unconfigured", None, 0.0, None
+        account_home=getattr(self,'account_home',None)
+        if account_home is not None:
+            from . import helius_account
+            from daemon.launch_scanner import helius_ratelimit
+            bucket=helius_ratelimit.bucket_id_for_key('account:helius_main')
+            try:
+                admitted=helius_account.allowed(account_home) and helius_ratelimit.pacer().acquire(bucket,wait_s=0)
+            except Exception:
+                return 'error',None,0.,None  # fail closed, no HTTP on unavailable admission state
+            if not admitted:return 'rate_limited',None,0.,None
+            from .usage_tracker import UsageTracker
+            from .budget_reservations import reserve
+            admitted,_,_=reserve(UsageTracker(home=account_home),'helius_main','helius',
+                                 'complex_tx_parse',CREDITS_PER_REQUEST)
+            if not admitted:return 'rate_limited',None,0.,None
         url = "%s%s?api-key=%s" % (PARSED_EVENTS_BASE, path,
                                    self._api_key)
         data = json.dumps(body).encode() if body is not None else None
@@ -181,6 +196,16 @@ class HeliusParsedEventsClient:
             except ValueError:
                 parsed = {}
             if status == 429:
+                if account_home is not None:
+                    from .providers.base import classify_429
+                    error=parsed.get('error') if isinstance(parsed,dict) else parsed
+                    if not isinstance(error,dict):error={'message':str(error)}
+                    kind,wait=classify_429('helius',429,error,(exc.headers or {}).get('Retry-After'))
+                    try:
+                        helius_account.throttled(account_home,wait,kind=='monthly_quota')
+                        helius_ratelimit.pacer().report(bucket,False)
+                    except Exception:
+                        return 'error',None,time.monotonic()-start,status
                 return "rate_limited", parsed, \
                     time.monotonic() - start, status
             return "error", parsed, time.monotonic() - start, status

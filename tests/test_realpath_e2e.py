@@ -145,6 +145,7 @@ calls = []
 fail_primary = [False]
 fail_detail = [False]
 sell_mode = [False]
+response_mode = ['normal']
 def transport(url, body, method, host, timeout):
     req = json.loads(body)
     calls.append((host, req["method"]))
@@ -170,11 +171,32 @@ def transport(url, body, method, host, timeout):
         tx['meta']['postTokenBalances']=[]
     return tx, "ok", 0.001
 
-pairs = [("https://fixture.g.alchemy.com/v2/not-a-key", "alchemy-fixture"),
-         ("https://fixture.helius-rpc.com/?api-key=not-a-key", "helius-fixture")]
-with patch.object(R, "rpc_url_pairs", return_value=pairs), \
-        patch.object(R, "_pacer", return_value=Pacer()), \
-        patch.object(R, "_rpc_attempt", side_effect=transport):
+# Central routine router with real adapters/decoder/intake; only transport and
+# quota tokens are fixtures. Unknown-age history never claims Chainstack recency.
+from daemon.intelligence.acquisition import routine
+from daemon.intelligence.acquisition.provider_router import ProviderRouter
+from daemon.intelligence.acquisition.request_scheduler import SharedQuota
+os.environ['ALCHEMY_API_KEY']='fixture-not-real'
+class RpcResponse:
+    status=200
+    def __init__(self,value):self.value=value
+    def read(self):return json.dumps({'jsonrpc':'2.0','id':1,'result':self.value}).encode()
+    def __enter__(self):return self
+    def __exit__(self,*a):pass
+
+def central_transport(req,timeout=12):
+    import urllib.error
+    from urllib.parse import urlsplit
+    method=json.loads(req.data)['method']
+    if response_mode[0]=='null':return RpcResponse(None)
+    if response_mode[0]=='outage':raise urllib.error.URLError('fixture total outage')
+    value,kind,elapsed=transport(req.full_url,req.data,method,urlsplit(req.full_url).hostname,timeout)
+    if kind!='ok':raise urllib.error.URLError('fixture provider unavailable')
+    if response_mode[0]=='failed':value['meta']['err']={'InstructionError':[0,'fixture_failure']}
+    return RpcResponse(value)
+central_router=ProviderRouter(home=os.environ['FOREX_AGENT_HOME'],helius_enabled=False,transport=central_transport)
+with patch.object(routine,'router',return_value=central_router), \
+        patch.object(SharedQuota,'acquire',return_value=(True,0.,'fixture token')):
     from daemon.launch_scanner.wallet_intake import WalletIntake
     intake=WalletIntake(os.environ['FOREX_AGENT_HOME'])
     for wallet in ("WalA", "WalB", "WalC"):
@@ -191,8 +213,8 @@ with patch.object(R, "rpc_url_pairs", return_value=pairs), \
         sw.poll_wallet(wallet,'unused-fixture',REGISTRY,seen,intake)
         check('actual poll acknowledges parsed and persisted sighting for '+wallet,
               intake.wallet(wallet)['pending']==[])
-    check("primary failure traversed actual Helius fallback tier",
-          any("helius" in host for host, _ in calls))
+    check("primary failure traversed actual public fallback without Helius",
+          any("mainnet-beta.solana" in host for host,_ in calls) and not any("helius" in host for host,_ in calls))
     check("actual poll used signature discovery and transaction detail methods",
           {method for _,method in calls}=={'getSignaturesForAddress','getTransaction'})
     fail_primary[0] = False
@@ -214,7 +236,8 @@ with patch.object(R, "rpc_url_pairs", return_value=pairs), \
           and sells[0]['holding_period_status']=='unavailable_no_causal_buy_match'
           and intake.wallet('WalA')['pending']==[])
     sell_mode[0]=False
-    with patch.object(R, "_rpc_attempt", return_value=(None, "null", 0.001)):
+    response_mode[0]='null'
+    with patch.object(R, '_rpc_attempt'):
         check("definitive primary null yields no fabricated wallet buy",
               sw.get_buy_details("WalN", "sig:WalN", "unused") == [])
     # An RPC-success response can still describe a failed chain
@@ -223,11 +246,13 @@ with patch.object(R, "rpc_url_pairs", return_value=pairs), \
         tx, kind, elapsed = transport(*args)
         tx["meta"]["err"] = {"InstructionError": [0, "fixture_failure"]}
         return tx, kind, elapsed
-    with patch.object(R, "_rpc_attempt", side_effect=failed_chain):
+    response_mode[0]='failed'
+    with patch.object(R, '_rpc_attempt'):
         check("failed chain transaction produces no sighting input",
               sw.get_buy_details("WalF", "sig:WalF", "unused") == [])
     before_outage = len(seen)
-    with patch.object(R, "_rpc_attempt", return_value=(None, "fail", 0.001)):
+    response_mode[0]='outage'
+    with patch.object(R, '_rpc_attempt'):
         check("total provider failure yields no fabricated wallet buy",
               sw.get_buy_details("WalD", "sig:WalD", "unused") == [])
     check("provider outage created no resolved token", len(seen) == before_outage)

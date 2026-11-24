@@ -1,0 +1,166 @@
+import json,os,sqlite3,subprocess,sys
+from pathlib import Path
+from unittest.mock import patch
+import pytest
+from daemon.intelligence.acquisition import provider_usage as usage
+from daemon.intelligence.acquisition.budget_reservations import reserve
+from daemon.intelligence.acquisition.usage_tracker import UsageTracker
+from daemon.intelligence.acquisition.provider_router import ProviderRouter,ROUTING_MODE_REVISED
+from daemon.intelligence.acquisition.helius_parsed_events import HeliusParsedEventsClient
+
+
+@pytest.mark.parametrize('cost',[None,float('nan'),float('inf'),-1,True,'1'])
+def test_unknown_invalid_metered_cost_refuses(tmp_path,cost):
+    assert not reserve(UsageTracker(home=str(tmp_path)),'helius_main','helius','routine_account',cost)[0]
+
+
+def test_projected_monthly_reservation_survives_new_instance(tmp_path,monkeypatch):
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'monthly_quota':{'amount':10,'unit':'credits'}})
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',6)[0]
+    assert not reserve(UsageTracker(home=str(tmp_path)),'helius_main','helius','routine_account',5)[0]
+    assert reserve(u,'helius_main','helius','routine_account',4)[0]
+    assert not reserve(u,'helius_main','helius','routine_account',1)[0]
+
+@pytest.mark.parametrize('scope',['daily','feature'])
+def test_daily_and_feature_projected_limits(tmp_path,monkeypatch,scope):
+    if scope=='daily':monkeypatch.setitem(usage.BUDGET_OVERRIDES,'helius_main',{'daily_amount':10})
+    else:monkeypatch.setitem(usage.FEATURE_BUDGETS,('helius_main','standard_rpc'),{'amount':10})
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',7)[0]
+    out=reserve(u,'helius_main','helius','routine_account',4)
+    assert not out[0] and scope in out[1]
+
+
+def test_actual_router_reserves_before_transport_and_unknown_failure_not_refunded(tmp_path,monkeypatch):
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':10,'unit':'credits'}} if account=='helius_main' else None)
+    seen=[]
+    def transport(req,timeout=None):
+        with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:seen.append(db.execute('SELECT sum(cost) FROM reservations').fetchone()[0])
+        raise TimeoutError('fixture uncertainty')
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=transport)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        r.call('getTransaction',['fixture'],max_attempts=1)
+    assert seen==[10]
+    assert not reserve(UsageTracker(home=str(tmp_path)),'helius_main','helius','routine_tx',1)[0]
+
+
+def test_actual_selective_rest_unknown_failure_retains_projected_cost(tmp_path,monkeypatch):
+    calls=[]
+    def transport(*a,**kw):
+        with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:calls.append(db.execute('SELECT sum(cost) FROM reservations').fetchone()[0])
+        raise TimeoutError('fixture uncertainty')
+    c=HeliusParsedEventsClient(api_key='fixture',_opener=transport);c.account_home=str(tmp_path)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        assert c.parse_transactions(['s'],'decoder_unconfident')['kind']=='timeout'
+    assert calls==[10]
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:assert db.execute('SELECT count(*) FROM reservations').fetchone()[0]==1
+
+
+def test_competing_fresh_processes_cannot_reserve_past_limit(tmp_path):
+    code='''import sys
+from daemon.intelligence.acquisition import provider_usage as u
+from daemon.intelligence.acquisition.usage_tracker import UsageTracker
+from daemon.intelligence.acquisition.budget_reservations import reserve
+u.caps.get_account=lambda account:{'monthly_quota':{'amount':10,'unit':'credits'}}
+print(int(reserve(UsageTracker(home=sys.argv[1]),'helius_main','helius','routine_account',6)[0]))
+'''
+    env=dict(os.environ,PYTHONPATH=str(Path(__file__).parents[1]))
+    procs=[subprocess.Popen([sys.executable,'-c',code,str(tmp_path)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) for _ in range(6)]
+    results=[p.communicate(timeout=10) for p in procs]
+    assert all(p.returncode==0 for p in procs),results
+    assert sum(int(out.strip()) for out,err in results)==1
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:assert db.execute('SELECT sum(cost) FROM reservations').fetchone()[0]==6
+
+
+def test_lock_or_corruption_refuses_before_io(tmp_path):
+    path=tmp_path/'acquisition_budget_reservations.sqlite3';path.write_bytes(b'broken')
+    out=reserve(UsageTracker(home=str(tmp_path)),'helius_main','helius','routine_account',1)
+    assert not out[0] and out[1]=='budget_reservation_unavailable'
+    assert path.read_bytes()==b'broken'
+
+
+def test_completed_usage_is_conservatively_double_counted_not_released(tmp_path,monkeypatch):
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'monthly_quota':{'amount':10,'unit':'credits'}})
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',4)[0]
+    u.record('helius_main','helius','getSlot','routine_account','card',cost=4)
+    assert not reserve(u,'helius_main','helius','routine_account',3)[0]
+    assert reserve(u,'helius_main','helius','routine_account',2)[0]
+
+
+def test_abrupt_child_after_reservation_keeps_debit_on_fresh_process(tmp_path,monkeypatch):
+    code="""import sys,os
+from daemon.intelligence.acquisition import provider_usage as u
+from daemon.intelligence.acquisition.usage_tracker import UsageTracker
+from daemon.intelligence.acquisition.budget_reservations import reserve
+u.caps.get_account=lambda account:{'monthly_quota':{'amount':10,'unit':'credits'}}
+assert reserve(UsageTracker(home=sys.argv[1]),'helius_main','helius','routine_account',10)[0]
+os._exit(47)
+"""
+    env=dict(os.environ,PYTHONPATH=str(Path(__file__).parents[1]))
+    assert subprocess.run([sys.executable,'-c',code,str(tmp_path)],env=env,timeout=10).returncode==47
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:assert db.execute('SELECT sum(cost) FROM reservations').fetchone()[0]==10
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'monthly_quota':{'amount':10,'unit':'credits'}})
+    assert reserve(UsageTracker(home=str(tmp_path)),'helius_main','helius','routine_account',1)[0] is False
+
+
+def test_invalid_retained_reservation_refused(tmp_path):
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',1)[0]
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:db.execute('UPDATE reservations SET cost=-100')
+    assert reserve(u,'helius_main','helius','routine_account',1)==(False,'budget_reservation_unavailable',None)
+
+
+def test_commit_directory_durability_failure_refuses_but_keeps_reservation(tmp_path):
+    u=UsageTracker(home=str(tmp_path))
+    with patch('os.fsync',side_effect=OSError('fixture dir sync')):
+        assert reserve(u,'helius_main','helius','routine_account',10)==(False,'budget_reservation_unavailable',None)
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:assert db.execute('SELECT sum(cost) FROM reservations').fetchone()[0]==10
+
+
+def test_locked_reservation_db_refuses_without_erasing_hold(tmp_path):
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',1)[0]
+    db=sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3');db.execute('BEGIN IMMEDIATE')
+    try:assert reserve(u,'helius_main','helius','routine_account',1)==(False,'budget_reservation_unavailable',None)
+    finally:db.rollback();db.close()
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:assert db.execute('SELECT sum(cost) FROM reservations').fetchone()[0]==1
+
+
+def test_selective_rest_projected_exhaustion_no_transport(tmp_path,monkeypatch):
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':9,'unit':'credits'}})
+    calls=[]
+    c=HeliusParsedEventsClient(api_key='fixture',_opener=lambda *a,**kw:calls.append(a));c.account_home=str(tmp_path)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        assert c.parse_transactions(['s'],'decoder_unconfident')['kind']=='rate_limited'
+    assert not calls
+
+
+def test_actual_router_unknown_metered_cost_never_calls_transport(tmp_path,monkeypatch):
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    calls=[];r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=lambda *a,**kw:calls.append(a))
+    monkeypatch.setattr(r._adapter('helius'),'cost',lambda method:None)
+    result=r.call('getSlot',[],max_attempts=1)
+    assert not calls and result['kind']=='rate_limited'
+    assert result['attempts'][0]['note']=='unknown_projected_cost'
+
+
+@pytest.mark.parametrize('field,value',[
+ ('month','broken'),('day','broken'),('month','2001-01'),('day','2001-01-01'),
+ ('account',''),('account','   '),('account',7),('feature',''),('feature','   '),('feature',7),
+ ('id',''),('id','bad'),('created',0),('created',-1),('created','not-time'),('cost','not-cost')])
+def test_malformed_retained_identity_cannot_hide_holds(tmp_path,monkeypatch,field,value):
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'monthly_quota':{'amount':10,'unit':'credits'}})
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',10)[0]
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:db.execute('UPDATE reservations SET '+field+'=?',(value,))
+    assert reserve(u,'helius_main','helius','routine_account',10)==(False,'budget_reservation_unavailable',None)
+
+
+def test_actual_router_malformed_retained_window_refuses_before_transport(tmp_path,monkeypatch):
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    u=UsageTracker(home=str(tmp_path));assert reserve(u,'helius_main','helius','routine_account',1)[0]
+    with sqlite3.connect(tmp_path/'acquisition_budget_reservations.sqlite3') as db:db.execute("UPDATE reservations SET month='bad',day='bad'")
+    calls=[];r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=lambda *a,**kw:calls.append(a))
+    result=r.call('getSlot',[],max_attempts=1)
+    assert not calls and result['kind']=='rate_limited'
+    assert result['attempts'][0]['note']=='budget_reservation_unavailable'

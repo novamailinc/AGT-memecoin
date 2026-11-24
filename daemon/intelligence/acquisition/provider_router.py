@@ -80,6 +80,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import os
 
 from . import rpc_client as rpc_mod
 from .provider_health import HealthMonitor
@@ -168,7 +169,8 @@ WORKLOAD_TIMEOUTS = {
 #                 workload, on evidence.
 ROUTING_MODE_SHADOW = "shadow"
 ROUTING_MODE_END_STATE = "end_state"
-ROUTING_MODES = (ROUTING_MODE_SHADOW, ROUTING_MODE_END_STATE)
+ROUTING_MODE_REVISED = "revised_20261123"
+ROUTING_MODES = (ROUTING_MODE_SHADOW, ROUTING_MODE_END_STATE, ROUTING_MODE_REVISED)
 
 # Helius priorities.
 P0 = "P0"
@@ -315,6 +317,7 @@ def chainstack_window_covers(hints, window_slots=None):
     Alchemy (archive). ``window_slots`` is the operator-measured
     window (None = unknown)."""
     hints = hints or {}
+    if hints.get("recent") is False:return False
     if hints.get("recent") is True:
         return True
     target = hints.get("target_slot")
@@ -322,7 +325,7 @@ def chainstack_window_covers(hints, window_slots=None):
     if target is None or latest is None or window_slots is None:
         return False
     try:
-        return (int(latest) - int(target)) <= int(window_slots)
+        return 0 <= (int(latest) - int(target)) <= int(window_slots)
     except (TypeError, ValueError):
         return False
 
@@ -603,12 +606,12 @@ def fallback_difference(primary, serving, method, workload):
 class ProviderRouter:
     """The central routing layer. See the module docstring."""
 
-    def __init__(self, home=None, helius_enabled=True, transport=None,
+    def __init__(self, home=None, helius_enabled=False, transport=None,
                  chainstack_recent_window_slots=None, cache=None,
                  usage_tracker=None, health=None, now=None,
                  mode=None):
-        """mode="shadow" (default): Helius leads, the live leg.
-        mode="end_state": Alchemy-first, Helius absent from ordinary
+        """mode="shadow": explicit diagnostics with Helius leading.
+        mode="end_state" (default): Alchemy-first, Helius absent from ordinary
         routing (specialised products only). When mode is None (the
         default) it is DERIVED from ``helius_enabled`` — True ->
         shadow, False -> end_state — so the pre-Phase-3
@@ -621,12 +624,14 @@ class ProviderRouter:
                     else ROUTING_MODE_END_STATE)
         if mode not in ROUTING_MODES:
             raise ValueError("unknown routing mode %r" % (mode,))
-        if (mode == ROUTING_MODE_END_STATE) != (not helius_enabled):
+        if (mode != ROUTING_MODE_END_STATE) != bool(helius_enabled):
             logger.warning(
                 "provider router: mode=%r disagrees with "
                 "helius_enabled=%r; mode wins", mode, helius_enabled)
         self.mode = mode
-        self.helius_enabled = (mode == ROUTING_MODE_SHADOW)
+        self.helius_enabled = (mode in (ROUTING_MODE_SHADOW, ROUTING_MODE_REVISED))
+        if mode == ROUTING_MODE_REVISED:
+            home=os.path.abspath(os.path.expanduser(str(home or os.environ.get('FOREX_AGENT_HOME') or '~/.forex-agent')))
         self.home = home
         self._transport = transport
         self.chainstack_recent_window_slots = chainstack_recent_window_slots
@@ -665,6 +670,8 @@ class ProviderRouter:
         if provider not in self._adapters:
             self._adapters[provider] = rpc_mod.make_adapter(
                 provider, home=self.home, transport=self._transport)
+        if provider == 'helius' and self.mode == ROUTING_MODE_REVISED:
+            self._adapters[provider].revised = True
         return self._adapters[provider]
 
     def _account(self, provider):
@@ -718,6 +725,20 @@ class ProviderRouter:
         order = candidate_order(workload, method, hints,
                                 self.helius_enabled, prio,
                                 self.chainstack_recent_window_slots)
+        if self.mode == ROUTING_MODE_REVISED:
+            covers=chainstack_window_covers(hints,self.chainstack_recent_window_slots)
+            if workload == INDEPENDENT_VERIFICATION:
+                order = ['chainstack','alchemy','public'] if (covers or method not in ('getTransaction','getBlock','getSignaturesForAddress')) else ['alchemy','public']
+            elif hints.get('purpose') == 'normal_scanning':
+                order = ['alchemy']
+                if workload == ROUTINE_ACCOUNT or covers:
+                    order.append('chainstack')
+                order += ['helius','public']
+            elif workload not in (COMPLEX_TX_PARSE,PARSED_TX_STREAM):
+                order = ['helius','alchemy']
+                if workload == ROUTINE_ACCOUNT or covers:
+                    order.append('chainstack')
+                order.append('public')
         # Capability + configured filtering happens in call(); route()
         # reports the preference order. A refused Helius-only
         # workload has an empty order here.
@@ -820,6 +841,10 @@ class ProviderRouter:
                                  "elapsed_s": 0.0,
                                  "note": "capability refusal"})
                 continue
+            if self.mode in (ROUTING_MODE_END_STATE,ROUTING_MODE_REVISED) and adapter.unverified(method):
+                attempts.append({'provider':provider,'kind':'skipped','elapsed_s':0.,
+                                 'note':'unverified support is probe-only'})
+                continue
             is_configured = adapter.configured()
             self.health.set_configured(provider, is_configured)
             if not is_configured:
@@ -844,17 +869,15 @@ class ProviderRouter:
                                  "elapsed_s": 0.0,
                                  "note": budget_reason})
                 if budget_reason in (
+                        "budget_exhausted", "daily_budget_exhausted",
                         "budget_stop_nonessential",
                         "daily_budget_stop_nonessential") or \
                         (budget_reason or "").startswith(
-                            "feature_budget_stop_nonessential"):
-                    stop_pct = self.usage.budget_status(account).get(
-                        "stop_nonessential_pct") or 0.0
+                            ("feature_budget_stop_nonessential", "feature_budget_exhausted")):
                     last = rpc_mod._result(
                         None, "rate_limited", 0.0, provider,
-                        note="budget stop (%s): nonessential traffic "
-                             "refused at %.0f%% of budget"
-                             % (budget_reason, 100.0 * stop_pct))
+                        note="budget admission refused (%s); priority does not authorize overspend"
+                             % budget_reason)
                 continue
             # Response cache (idempotent reads only; no quota spent).
             cached = self.cache.get(provider, method, params)
@@ -870,6 +893,9 @@ class ProviderRouter:
                 hit["fallback"] = provider != decision["primary"]
                 hit["fallback_difference"] = fallback_difference(
                     decision["primary"], provider, method, workload)
+                if adapter.unverified(method):
+                    hit['fallback_difference'] = ((hit['fallback_difference']+'; ') if hit['fallback_difference'] else '') + 'UNVERIFIED support; provisional'
+                hit['support_unverified'] = adapter.unverified(method)
                 self.usage.record(account, provider, method, workload,
                                   priority, helius_priority=prio,
                                   cost=None, kind="ok", elapsed=0.0,
@@ -900,11 +926,22 @@ class ProviderRouter:
                         kind="rate_limited", elapsed=0.0)
                     last = refused
                     continue
+            from .budget_reservations import reserve
+            admitted, reservation_reason, reservation_id = reserve(
+                self.usage, account, provider, workload, adapter.cost(method))
+            if not admitted:
+                last=rpc_mod._result(None,'rate_limited',0.,provider,note=reservation_reason)
+                attempts.append({'provider':provider,'kind':'skipped','elapsed_s':0.,'note':reservation_reason})
+                continue
             result = adapter.call(method, params, timeout=timeout)
+            result['budget_reservation_id']=reservation_id
+            result['budget_reservation_policy']=reservation_reason
             attempts.append({"provider": provider,
                              "kind": result["kind"],
                              "elapsed_s": round(result["elapsed"], 4),
-                             "note": result.get("note")})
+                             "note": result.get("note"),
+                             "credential_source":result.get('credential_source'),
+                             "account":account})
             self.health.record_rpc(result)
             breaker_was = self.breaker.status(provider)["state"]
             self.breaker.record(provider, result)
@@ -920,6 +957,7 @@ class ProviderRouter:
                 except Exception:
                     pass
             if result.get("rate_limit_kind") == "monthly_quota":
+                self.usage.record_monthly_quota(account)
                 try:
                     self.health.persist()
                 except Exception:
@@ -966,6 +1004,7 @@ class ProviderRouter:
                         "provisional" % (method, provider))
                     diff = ((diff + "; ") if diff else "") + unverified_note
                 result["fallback_difference"] = diff
+                result["support_unverified"] = adapter.unverified(method)
                 result["cached"] = False
                 return result
             last = result

@@ -118,10 +118,10 @@ check("chainstack unsupported call makes zero HTTP calls",
       and op0.state["calls"] == 0)
 
 al = make_adapter("alchemy", home=HOME)
-check("alchemy getTokenLargestAccounts flagged UNVERIFIED",
-      al.unverified("getTokenLargestAccounts"))
-check("alchemy getTokenSupply flagged UNVERIFIED",
-      al.unverified("getTokenSupply"))
+check("alchemy getTokenLargestAccounts officially supported",
+      not al.unverified("getTokenLargestAccounts"))
+check("alchemy getTokenSupply officially supported",
+      not al.unverified("getTokenSupply"))
 check("alchemy getTransaction NOT flagged unverified",
       not al.unverified("getTransaction"))
 pub = make_adapter("public", home=HOME)
@@ -137,7 +137,7 @@ check("costs come from provider_capabilities.METHOD_COSTS",
       RC.method_cost("alchemy", "getTransaction") == 40
       and RC.method_cost("alchemy", "getAccountInfo") == 10
       and RC.method_cost("alchemy", "getSlot") == 20
-      and RC.method_cost("alchemy", "getTokenLargestAccounts") is None
+      and RC.method_cost("alchemy", "getTokenLargestAccounts") == 20
       and RC.method_cost("chainstack", "getSignaturesForAddress") == 2
       and RC.method_cost("chainstack", "getProgramAccounts") is None
       and RC.method_cost("helius", "getTransaction") == 10
@@ -168,9 +168,8 @@ op2 = fake_opener_factory([(200, {"jsonrpc": "2.0", "id": 1,
 ad2 = RC.AlchemyAdapter(home=HOME, transport=op2)
 ad2._url = lambda: "https://example.invalid/v2/k"
 res2 = ad2.call("getTokenLargestAccounts", ["x"])
-check("unverified method via configured adapter notes UNVERIFIED",
-      res2["kind"] == "ok" and res2.get("note") is not None
-      and "UNVERIFIED" in res2["note"])
+check("documented Alchemy method is not provisional",
+      res2["kind"] == "ok" and res2.get("note") is None)
 
 op429 = fake_opener_factory([(429, {"jsonrpc": "2.0", "id": 1, "error": {
     "code": -32005, "message": "slow down",
@@ -293,9 +292,9 @@ saved_res = sys.modules.get("daemon.launch_scanner.reserves")
 try:
     fake_reserves = types.ModuleType("daemon.launch_scanner.reserves")
     fake_reserves.rpc = lambda method, params, timeout=12: {"slot": 999}
-    fake_reserves.rpc_typed = lambda method, params, timeout=12: (
+    fake_reserves.helius_rpc_typed = lambda method, params, timeout=12: (
         {"slot": 999}, "ok")
-    fake_reserves.rpc_url_pairs = lambda: [("https://example.invalid",
+    fake_reserves.rpc_url_pairs = lambda: [("https://mainnet.helius-rpc.com",
                                             "k")]
     fake_pkg = types.ModuleType("daemon.launch_scanner")
     fake_pkg.__path__ = []
@@ -306,18 +305,18 @@ try:
     check("helius adapter configured when reserves holds keys",
           had.configured())
     res_h = had.call("getSlot", [])
-    check("helius adapter delegates to reserves.rpc_typed (stubbed)",
+    check("helius adapter delegates to reserves.helius_rpc_typed (stubbed)",
           res_h["kind"] == "ok" and res_h["result"] == {"slot": 999}
           and res_h["provider"] == "helius")
 
-    fake_reserves.rpc_typed = lambda method, params, timeout=12: (
+    fake_reserves.helius_rpc_typed = lambda method, params, timeout=12: (
         None, "null")
     res_null = had.call("getSlot", [])
     check("helius adapter: null answer -> kind ok, null payload "
           "(an answer, not an outage; 2026-11-22 null-vs-error)",
           res_null["kind"] == "ok" and res_null["result"] is None)
 
-    fake_reserves.rpc_typed = lambda method, params, timeout=12: (
+    fake_reserves.helius_rpc_typed = lambda method, params, timeout=12: (
         None, "error")
     res_none = had.call("getSlot", [])
     check("helius adapter: transport failure -> kind error",
@@ -325,7 +324,7 @@ try:
 
     def _boom(method, params, timeout=12):
         raise RuntimeError("boom")
-    fake_reserves.rpc_typed = _boom
+    fake_reserves.helius_rpc_typed = _boom
     check("helius adapter: reserves raising -> kind error, no raise",
           had.call("getSlot", []).kind == "error")
 

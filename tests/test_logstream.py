@@ -139,5 +139,138 @@ class WSClientTest(unittest.TestCase):
             ws.connect()
 
 
-if __name__ == "__main__":
+
+
+class SubscriptionAcceptanceTest(unittest.TestCase):
+    def test_health_waits_for_every_subscription_ack_and_clears_on_disconnect(self):
+        import tempfile,json
+        from unittest.mock import patch
+        from daemon.intelligence.acquisition import routine
+        with tempfile.TemporaryDirectory() as home:
+            stream=LogStream(ws_url='wss://fixture.invalid',programs=('program1','program2'),intake_home=home)
+            seen=[]
+            class Socket:
+                messages=iter([{'id':1,'result':11},{'id':2,'result':12},None])
+                def connect(self):seen.append(stream.healthy)
+                def send_text(self,msg):seen.append(stream.healthy)
+                def recv_text(self):
+                    seen.append(stream.healthy)
+                    value=next(self.messages)
+                    return json.dumps(value) if value is not None else None
+                def close(self):pass
+            with patch.object(logstream,'WSClient',return_value=Socket()),patch.object(routine,'websocket_admit'),patch.object(routine,'websocket_result'):
+                with self.assertRaises(WSError):stream._serve()
+            self.assertEqual(seen,[False,False,False,False,False,True])
+            self.assertFalse(stream.healthy)
+
+    def test_subscription_error_never_reports_healthy(self):
+        import tempfile,json
+        from unittest.mock import patch
+        from daemon.intelligence.acquisition import routine
+        for response in ({'id':1,'error':{'code':429}},{'id':1,'result':True},{'id':1,'result':None}):
+            with tempfile.TemporaryDirectory() as home:
+                stream=LogStream(ws_url='wss://fixture.invalid',intake_home=home)
+                class Socket:
+                    def connect(self):pass
+                    def send_text(self,msg):pass
+                    def recv_text(self):return json.dumps(response)
+                    def close(self):pass
+                with patch.object(logstream,'WSClient',return_value=Socket()),patch.object(routine,'websocket_admit'),patch.object(routine,'websocket_result'):
+                    with self.assertRaisesRegex(WSError,'subscription rejected'):stream._serve()
+                self.assertFalse(stream.healthy)
+
+
+    def test_post_ack_errors_and_contradictions_fail_closed(self):
+        import tempfile,json
+        from unittest.mock import patch
+        from daemon.intelligence.acquisition import routine
+        for final in ({'id':1,'result':12},{'id':1,'error':{'code':429}},{'id':999,'error':{'code':429}}):
+            with tempfile.TemporaryDirectory() as home:
+                stream=LogStream(ws_url='wss://fixture.invalid',intake_home=home)
+                class Socket:
+                    messages=iter([{'id':1,'result':11},final])
+                    def connect(self):pass
+                    def send_text(self,msg):pass
+                    def recv_text(self):return json.dumps(next(self.messages))
+                    def close(self):pass
+                with patch.object(logstream,'WSClient',return_value=Socket()),patch.object(routine,'websocket_admit'),patch.object(routine,'websocket_result'),patch.object(routine,'websocket_subscription_throttled') as throttle:
+                    with self.assertRaises(WSError):stream._serve()
+                    self.assertEqual(throttle.call_count,int('error' in final))
+                self.assertFalse(stream.healthy)
+
+    def test_identical_ack_repeat_and_notification_connection_binding(self):
+        import tempfile,json
+        from unittest.mock import patch
+        from daemon.intelligence.acquisition import routine
+        with tempfile.TemporaryDirectory() as home:
+            stream=LogStream(ws_url='wss://fixture.invalid',intake_home=home)
+            delivered=[]
+            def notification(sub):return {'method':'logsNotification','params':{'subscription':sub,'result':{'value':{'signature':'s','err':None}}}}
+            class Socket:
+                messages=iter([{'id':1,'result':11},{'id':1,'result':11},notification(99),notification(11),None])
+                def connect(self):pass
+                def send_text(self,msg):pass
+                def recv_text(self):
+                    value=next(self.messages)
+                    return json.dumps(value) if value is not None else None
+                def close(self):pass
+            stream._handle_message=lambda msg:delivered.append(json.loads(msg)['params']['subscription'])
+            with patch.object(logstream,'WSClient',return_value=Socket()),patch.object(routine,'websocket_admit'),patch.object(routine,'websocket_result'):
+                with self.assertRaises(WSError):stream._serve()
+            self.assertEqual(delivered,[11])
+            self.assertFalse(stream.healthy)
+
+    def test_absolute_ack_deadline_and_quiet_freshness_bound(self):
+        import tempfile,json
+        from unittest.mock import patch
+        from daemon.intelligence.acquisition import routine
+        clock=[100.]
+        with tempfile.TemporaryDirectory() as home:
+            stream=LogStream(ws_url='wss://fixture.invalid',intake_home=home)
+            class Socket:
+                def connect(self):pass
+                def send_text(self,msg):pass
+                def recv_text(self):
+                    clock[0]+=11
+                    return json.dumps({'id':999,'result':22})
+                def close(self):pass
+            with patch.object(logstream.time,'monotonic',side_effect=lambda:clock[0]),patch.object(logstream,'WSClient',return_value=Socket()),patch.object(routine,'websocket_admit'),patch.object(routine,'websocket_result'):
+                with self.assertRaisesRegex(WSError,'acknowledgement deadline'):stream._serve()
+                stream._set_healthy(True)
+                self.assertTrue(stream.healthy)
+                clock[0]+=61
+                self.assertFalse(stream.healthy)  # quiet delivery is unverified, not asserted broken
+                stream._set_healthy(True)
+                self.assertTrue(stream.healthy)
+
+    def test_lowlevel_ping_flood_cannot_extend_absolute_deadline(self):
+        from unittest.mock import patch
+        clock=[100.]
+        client=WSClient('ws://fixture.invalid');client.read_deadline=102.
+        class Socket:
+            def settimeout(self,value):self.timeout=value
+            def recv(self,n):clock[0]+=.6;return b'\x89\x00'
+            def send(self,data):return len(data)
+        sock=Socket();client._sock=sock
+        with patch.object(logstream.time,'monotonic',side_effect=lambda:clock[0]):
+            with self.assertRaisesRegex(WSError,'absolute websocket response deadline'):client.recv_text()
+        self.assertLessEqual(sock.timeout,2.)
+
+    def test_ping_reply_write_uses_remaining_deadline(self):
+        from unittest.mock import patch
+        clock=[100.];timeouts=[]
+        client=WSClient('ws://fixture.invalid');client.read_deadline=102.
+        class Socket:
+            def settimeout(self,value):self.timeout=value;timeouts.append(value)
+            def recv(self,n):clock[0]+=1.9;return b'\x89\x00'
+            def send(self,data):
+                clock[0]+=self.timeout
+                raise TimeoutError('fixture blocking write')
+        client._sock=Socket()
+        with patch.object(logstream.time,'monotonic',side_effect=lambda:clock[0]):
+            with self.assertRaises(TimeoutError):client.recv_text()
+        self.assertAlmostEqual(timeouts[-1],.1)
+        self.assertAlmostEqual(clock[0],102.)
+
+if __name__ == '__main__':
     unittest.main()

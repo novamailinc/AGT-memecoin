@@ -52,13 +52,9 @@ governs (it adds insider graphs, creator history and sell-path
 intelligence this module cannot see), because callers only invoke
 this path when RugCheck has NO report.
 
-RPC endpoints, in order: Helius with the discovery key (the main key
-is at its monthly cap; the public endpoint 429s
-getTokenLargestAccounts outright from this VM — both verified live
-2026-10-20), then Helius with the main key, then the public endpoint.
-Keys are read from their files at runtime and never logged. Results
-are cached ~120s per mint: the gates re-check the same coin several
-times inside one decision.
+Routine RPC uses the central capability/quota router. Results are cached
+for about120s per mint, retaining acquisition evidence from the original
+verdict. No Helius key is required for ordinary safety reads.
 """
 
 from __future__ import annotations
@@ -263,62 +259,10 @@ def _pump_curve_pda(mint: str) -> Optional[str]:
 # ------------------------------------------------------------------- RPC
 
 def _rpc(method: str, params: List[Any], timeout: float) -> Any:
-    """One JSON-RPC call across the endpoint chain. Never raises,
-    never logs a URL (the Helius URLs carry the key).
+    """Safety routine RPC through the common capability/budget router."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=timeout, critical=True)
 
-    2026-11-16 (RPC-burn fix, Lever 1): Helius legs whose key bucket
-    is cooling down fleet-wide are SKIPPED (the guard is hot — the
-    keys are already dead, so attempting them only burns the quota
-    further). The public mainnet-beta leg is still tried — it is not
-    Helius quota. Outcomes are reported to the pacer: a 429 engages
-    progressive backoff + the single probe for that key, a success
-    clears it (the pacer mirrors both into the shared guard, so the
-    hot-bucket skip above keeps working off pacer state).
-    Screening outcomes when RPC is healthy are unchanged — only
-    which legs are attempted during exhaustion changes.
-
-    2026-11-17 (pacing fix): a Helius leg is attempted only with a
-    pacer token for its key's bucket. No token -> that leg is
-    skipped (fail over to the next leg). Helius also spells rate
-    limits as a JSON-RPC error (code -32005) with HTTP 200 — those
-    report to the pacer as 429s too."""
-    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
-                          "params": params}).encode()
-    guard = _shared_guard()
-    for url, bucket in _rpc_endpoint_pairs():
-        if bucket and guard.cooldown_remaining(bucket) > 0:
-            logger.debug("instant_safety skipping hot Helius leg %s",
-                         method)
-            continue
-        if bucket and not _helius_ratelimit.pacer_acquire(bucket):
-            logger.debug("instant_safety skipping unpaced Helius leg %s",
-                         method)
-            continue
-        req = urllib.request.Request(url, data=payload, headers=_UA)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8",
-                                                     "replace"))
-            if isinstance(data, dict) and data.get("error"):
-                # Helius also spells rate limits as a JSON-RPC error
-                # (code -32005) with HTTP 200 — engage the guard for
-                # those too, so the fleet backs off either way.
-                err = data.get("error") or {}
-                if isinstance(err, dict) and err.get("code") in (
-                        -32005, -32029) and bucket:
-                    _helius_ratelimit.pacer_report(bucket, False)
-                continue
-            if bucket:
-                _helius_ratelimit.pacer_report(bucket, True)
-            return data.get("result") if isinstance(data, dict) \
-                else None
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429 and bucket:
-                _helius_ratelimit.pacer_report(bucket, False)
-            continue
-        except Exception:
-            continue
-    return None
 
 
 def _f(value: Any) -> float:
@@ -354,7 +298,7 @@ def _transfer_fee_bps(state: Dict[str, Any]) -> Optional[int]:
 
 # ----------------------------------------------------------------- check
 
-def check(mint: str, timeout: float = 8.0) -> Dict[str, Any]:
+def _check_impl(mint: str, timeout: float = 8.0) -> Dict[str, Any]:
     """Instant safety verdict for one Solana mint. Never raises.
 
     Returns a safety-report dict; unknown=True when the chain data
@@ -368,7 +312,10 @@ def check(mint: str, timeout: float = 8.0) -> Dict[str, Any]:
     hit = _cache.get(mint)
     now = time.time()
     if hit and now - hit[0] < _CACHE_TTL_S:
-        return hit[1]
+        import copy
+        result = copy.deepcopy(hit[1])
+        result["verdict_cached"] = True
+        return result
     try:
         rep = _check_inner(mint, max(2.0, float(timeout)))
     except Exception:
@@ -682,3 +629,20 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
             "program_held_pct": round(program_pct, 2),
         },
     }
+
+
+def check(mint: str, timeout: float = 8.0) -> Dict[str, Any]:
+    """Attach and retain actual acquisition evidence across verdict caching."""
+    import copy
+    from daemon.intelligence.acquisition import routine
+    routine.clear_evidence()
+    result = copy.deepcopy(_check_impl(mint, timeout))
+    trace = routine.evidence_since()
+    if not result.get('verdict_cached'):
+        result['acquisition_evidence'] = trace
+        result['acquisition_degraded'] = any(e.get('degraded') for e in trace)
+        result['verdict_cached'] = False
+        hit = _cache.get(mint)
+        if hit is not None:
+            _cache[mint] = (hit[0], copy.deepcopy(result))
+    return result

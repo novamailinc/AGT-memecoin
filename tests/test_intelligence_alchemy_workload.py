@@ -19,7 +19,7 @@ method in section 4A (account lookups, tx retrieval, slot/block
 reads) via the router; getTransaction cached per signature (never
 re-fetched); request batching (chunked multi-account / status
 calls); getTokenLargestAccounts flagged PROVISIONAL (UNVERIFIED);
-getTokenAccountsByOwner flagged PROVISIONAL (cost UNVERIFIED —
+getTokenAccountsByOwner documented cost (UNVERIFIED —
 its router gap was fixed 2026-11-22 by the router-owner
 addition); WSS
 subscription lifecycle (connect, drop, reconnect, handshake-429
@@ -160,16 +160,16 @@ check("verify_methods covers all 12 section-4A methods",
       and set(by_method) == set(AW.ROUTINE_METHODS)
       | set(AW.PROVISIONAL_METHODS))
 supported = [m for m, v in by_method.items() if v["status"] == "supported"]
-check("10 routine methods supported on Alchemy",
-      len(supported) == 10)
-check("getTokenLargestAccounts flagged PROVISIONAL (UNVERIFIED), "
-      "cost unknown",
-      by_method["getTokenLargestAccounts"]["status"] == "provisional"
-      and by_method["getTokenLargestAccounts"]["alchemy_cost_cu"] is None)
-check("getTokenAccountsByOwner flagged PROVISIONAL (cost "
-      "UNVERIFIED; router gap fixed 2026-11-22)",
-      by_method["getTokenAccountsByOwner"]["status"] == "provisional"
-      and by_method["getTokenAccountsByOwner"]["alchemy_cost_cu"] is None
+check("12 routine methods supported on Alchemy",
+      len(supported) == 12)
+check("getTokenLargestAccounts documented support, "
+      "20 CU",
+      by_method["getTokenLargestAccounts"]["status"] == "supported"
+      and by_method["getTokenLargestAccounts"]["alchemy_cost_cu"] == 20)
+check("getTokenAccountsByOwner documented cost ("
+      "10 CU; router gap fixed 2026-11-22)",
+      by_method["getTokenAccountsByOwner"]["status"] == "supported"
+      and by_method["getTokenAccountsByOwner"]["alchemy_cost_cu"] == 10
       and by_method["getTokenAccountsByOwner"]
       ["router_primary_end_state"] == "alchemy")
 check("every routable method has Alchemy as end-state primary",
@@ -337,9 +337,9 @@ check("getSignatureStatuses(300) chunked at 256 into 2 calls",
 # -- getTokenLargestAccounts: provisional flag on the result -----------
 res = wl.get_token_largest_accounts(
     "So11111111111111111111111111111111111111112")
-check("getTokenLargestAccounts result flagged provisional",
-      res.get("provisional") is True
-      and "UNVERIFIED" in (res.get("note") or ""))
+check("getTokenLargestAccounts result documented, not provisional",
+      not res.get("provisional", False)
+      and "UNVERIFIED" not in (res.get("note") or ""))
 
 # -- scheduler + usage tracking honoured on every call -----------------
 quota_path = os.path.join(HOME, "acquisition_quota_alchemy.json")

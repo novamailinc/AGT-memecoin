@@ -33,6 +33,11 @@ import time
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from . import tx_guards as _txg
+except ImportError:  # direct scanner-module import
+    import tx_guards as _txg
+
 logger = logging.getLogger("forex_agent.daemon.launch_scanner.bundle")
 
 _RPC_URL = "https://api.mainnet-beta.solana.com"
@@ -79,21 +84,10 @@ def _total_supply(mint: str) -> float:
 
 
 def _rpc(method: str, params: List[Any]) -> Any:
-    payload = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": method,
-         "params": params}).encode()
-    req = urllib.request.Request(
-        _RPC_URL, data=payload,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "Mozilla/5.0",
-                 "Connection": "close"})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        return data.get("result")
-    except Exception as exc:
-        logger.warning("bundle rpc %s failed: %s", method, exc)
-        return None
+    """Routine behavior/history reads use owner section 9 routing."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=_TIMEOUT, background=True)
+
 
 
 def _f(value: Any) -> float:
@@ -122,6 +116,8 @@ def _funder_of(holder: str, signature: str) -> Optional[str]:
               [signature, {"encoding": "jsonParsed",
                            "maxSupportedTransactionVersion": 0}])
     try:
+        if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx, signature):
+            return None
         ixs = ((tx or {}).get("transaction") or {}).get("message") or {}
         all_ixs = list(ixs.get("instructions") or [])
         for inner in (tx.get("meta") or {}).get("innerInstructions") or []:
@@ -290,11 +286,9 @@ def _wallet_token_flow(wallet: str, mint: str,
             "getTransaction",
             [sig, {"encoding": "jsonParsed",
                    "maxSupportedTransactionVersion": 0}])
-        if not tx:
+        if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx, sig):
             continue
         meta = tx.get("meta") or {}
-        if meta.get("err"):
-            continue
         pre: Dict[Any, float] = {}
         for b in meta.get("preTokenBalances") or []:
             if b.get("mint") == mint and b.get("owner") == wallet:

@@ -61,6 +61,7 @@ class ProviderHealth:
         self.calls = 0
         self.rpc_429s = 0
         self.wss_handshake_429s = 0  # SEPARATE from RPC 429s
+        self.wss_subscription_429s = 0
         self.timeouts = 0
         self.monthly_quota_down = False
         self.last_success = None
@@ -91,6 +92,10 @@ class ProviderHealth:
         self.wss_handshake_429s += 1
         self.last_error = time.time()
 
+    def record_wss_subscription_429(self):
+        self.wss_subscription_429s += 1
+        self.last_error = time.time()
+
     def record_wss_handshake_ok(self):
         self.last_success = time.time()
 
@@ -115,7 +120,7 @@ class ProviderHealth:
         if self.calls >= 5 and self.error_rate >= 1.0:
             return "down"
         if self.error_rate >= 0.2 or self.rpc_429s > 0 \
-                or self.wss_handshake_429s > 0:
+                or self.wss_handshake_429s > 0 or self.wss_subscription_429s > 0:
             lat = self.latency_stats()
             if (lat["p95_s"] or 0) > 5.0:
                 return "degraded"
@@ -132,6 +137,7 @@ class ProviderHealth:
              "error_rate": round(self.error_rate, 4),
              "rpc_429s": self.rpc_429s,
              "wss_handshake_429s": self.wss_handshake_429s,
+             "wss_subscription_429s": self.wss_subscription_429s,
              "timeouts": self.timeouts,
              "monthly_quota_down": self.monthly_quota_down,
              "last_success": self.last_success,
@@ -156,6 +162,9 @@ class HealthMonitor:
 
     def record_wss_handshake_429(self, provider):
         self.provider(provider).record_wss_handshake_429()
+
+    def record_wss_subscription_429(self, provider):
+        self.provider(provider).record_wss_subscription_429()
 
     def record_wss_handshake_ok(self, provider):
         self.provider(provider).record_wss_handshake_ok()
@@ -183,6 +192,7 @@ class HealthMonitor:
                     "calls": p.calls, "errors": p.errors,
                     "rpc_429s": p.rpc_429s,
                     "wss_handshake_429s": p.wss_handshake_429s,
+                    "wss_subscription_429s": p.wss_subscription_429s,
                     "timeouts": p.timeouts,
                     "monthly_quota_down": p.monthly_quota_down,
                     "last_success": p.last_success,
@@ -218,6 +228,7 @@ class HealthMonitor:
             p.errors = int(rec.get("errors") or 0)
             p.rpc_429s = int(rec.get("rpc_429s") or 0)
             p.wss_handshake_429s = int(rec.get("wss_handshake_429s") or 0)
+            p.wss_subscription_429s = int(rec.get("wss_subscription_429s") or 0)
             p.timeouts = int(rec.get("timeouts") or 0)
             p.monthly_quota_down = bool(rec.get("monthly_quota_down"))
             p.last_success = rec.get("last_success")
@@ -315,6 +326,7 @@ def read_durable_statuses(home=None, max_age_s=900):
         p.errors = int(rec.get("errors") or 0)
         p.rpc_429s = int(rec.get("rpc_429s") or 0)
         p.wss_handshake_429s = int(rec.get("wss_handshake_429s") or 0)
+        p.wss_subscription_429s = int(rec.get("wss_subscription_429s") or 0)
         p.timeouts = int(rec.get("timeouts") or 0)
         p.monthly_quota_down = bool(rec.get("monthly_quota_down"))
         statuses[name] = p.status()

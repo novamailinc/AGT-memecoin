@@ -195,14 +195,26 @@ def poll(state: Dict[str, Any], degen: Any, now: float,
         th = thresholds(degen)
         floor = _min_mcap_now(degen)
         # Expire stale entries first.
+        def valid_card(rec):
+            import math
+            ts=rec.get('card_ts') if isinstance(rec,dict) else None
+            return type(ts) in (int,float) and math.isfinite(ts) and ts>0
         for mint in list(watch):
-            if now - float(watch[mint].get("card_ts") or 0) > _EXPIRY_S:
-                _grade_deployer_outcome(state, degen, mint, watch[mint])
-                watch.pop(mint, None)
+            if not valid_card(watch[mint]):
+                logger.warning('milestone card timestamp unavailable for %s',mint)
+                continue
+            if now - watch[mint]['card_ts'] > _EXPIRY_S:
+                if _grade_deployer_outcome(state, degen, mint, watch[mint]):
+                    watch.pop(mint, None)
         if not watch:
             return out
-        stats = _batch_stats(watch)
-        for mint, rec in list(watch.items()):
+        # Expired pending grades retain their frozen evidence but must not
+        # observe new prices or mutate their source peak after expiry.
+        active={mint:rec for mint,rec in watch.items()
+                if valid_card(rec) and now-rec['card_ts']<=_EXPIRY_S}
+        if not active:return out
+        stats = _batch_stats(active)
+        for mint, rec in list(active.items()):
             hit = stats.get(mint)
             mcap = _f((hit or {}).get("usd_market_cap"))
             if mcap <= 0:
@@ -275,25 +287,50 @@ def _grade_deployer_outcome(state: Dict[str, Any], degen: Any,
     """
     try:
         if not getattr(degen, "deployer_tracking_enabled", True):
-            return
+            return True
         if not mint or not isinstance(rec, dict):
-            return
+            return True
         recorded = state.setdefault("deployer_outcome_recorded", {})
         if recorded.get(mint):
-            return  # already graded at the paper close — no double count
-        deployer = ((state.get("deployer_cache") or {}).get(mint)
-                    or {}).get("deployer")
-        if not deployer:
-            return
-        outcome = "hit_2x" if _f(rec.get("peak_mult")) >= 2.0 else "dead"
-        from daemon.launch_scanner import deployers  # local: avoid cycles
-        if deployers.record_outcome(mint, deployer, outcome):
-            recorded[mint] = {"ts": time.time(), "outcome": outcome}
+            return True  # Terminal historical/cross-path grade.
+        from daemon.launch_scanner import deployers
+        import hashlib,json,math
+        from pathlib import Path
+        card_ts=rec.get('card_ts')
+        if type(card_ts) not in (int,float) or not math.isfinite(card_ts) or card_ts<=0:
+            raise ValueError('milestone original card time unavailable')
+        proposal=rec.get('deployer_grade_proposal')
+        if proposal is None:
+            deployer=((state.get('deployer_cache') or {}).get(mint) or {}).get('deployer')
+            if not isinstance(deployer,str) or not deployer:return False
+            peak=rec.get('peak_mult')
+            if type(peak) not in (int,float) or not math.isfinite(peak) or peak<0:return False
+            outcome='hit_2x' if peak>=2 else 'dead'
+            proposal={'mint':mint,'deployer':deployer,'outcome':outcome,'observed_at':time.time(),
+                      'card_ts':rec.get('card_ts'),'peak_mult':peak,
+                      'path':str(deployers._REGISTRY_FILE.absolute())}
+            rec['deployer_grade_proposal']=proposal
+        if (not isinstance(proposal,dict) or set(proposal)!={'mint','deployer','outcome','observed_at','card_ts','peak_mult','path'}
+                or proposal['mint']!=mint or not isinstance(proposal['deployer'],str) or not proposal['deployer']
+                or type(proposal['peak_mult']) not in (int,float) or not math.isfinite(proposal['peak_mult']) or proposal['peak_mult']<0
+                or type(proposal['observed_at']) not in (int,float) or not math.isfinite(proposal['observed_at']) or proposal['observed_at']<card_ts+_EXPIRY_S
+                or proposal['outcome']!=('hit_2x' if proposal['peak_mult']>=2 else 'dead')
+                or proposal['card_ts']!=rec.get('card_ts') or proposal['peak_mult']!=rec.get('peak_mult')
+                or not isinstance(proposal['path'],str) or not proposal['path'] or not Path(proposal['path']).is_absolute()):
+            raise ValueError('milestone grade source changed')
+        deployer=proposal['deployer'];outcome=proposal['outcome']
+        source='milestone-expiry-'+hashlib.sha256(json.dumps(proposal,sort_keys=True,allow_nan=False).encode()).hexdigest()
+        winner=deployers.claim_outcome(mint,deployer,outcome,proposal['observed_at'],source,registry_path=proposal['path'])
+        if winner:
+            recorded[mint] = {"ts":winner['observed_at'],"outcome":winner['outcome']}
             logger.warning("DEPLOYER graded %s -> %s (%s…)", mint,
                            outcome, str(deployer)[:8])
+            return True
+        return False
     except Exception:
         logger.warning("deployer expiry grade failed for %s", mint,
                        exc_info=True)
+        return False
 
 
 def _batch_stats(watch: Dict[str, Dict[str, Any]]

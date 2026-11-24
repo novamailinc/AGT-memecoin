@@ -122,3 +122,12 @@ def log_messages(tx):
         return list(logs) if isinstance(logs, list) else []
     except Exception:
         return []
+
+
+def response_signature_matches(tx,requested):
+    """Bind a fetched transaction to its request, not creator/swap semantics."""
+    if not isinstance(requested,str) or not requested or not isinstance(tx,dict):return False
+    transaction=tx.get('transaction')
+    if not isinstance(transaction,dict):return False
+    signatures=transaction.get('signatures')
+    return isinstance(signatures,list) and bool(signatures) and type(signatures[0]) is str and signatures[0]==requested

@@ -171,6 +171,9 @@ class FeedbackWinnerHookTest(unittest.TestCase):
                 for i in range(6)]
         recs += [_rec("Y%d" % i, 0.5, smart_buys=0, heat=1.0, sniper=40)
                  for i in range(5)]
+        # Explicit synthetic settled returns, not inferred from unknowns.
+        for r in recs:
+            r['realized_mult'] = 2.0 if r['mint'].startswith('X') else 0.5
         insiders = [{"mint": "X0", "direction": "diluting",
                      "cluster_start": 3.0}]
         degen = _degen()
@@ -180,6 +183,10 @@ class FeedbackWinnerHookTest(unittest.TestCase):
                                      insider_rows=insiders)
         knobs = {p["knob"] for p in props}
         self.assertIn("winner_min_score", knobs)
+        recs[0].pop('realized_mult')
+        with patch.object(feedback, "load_outcomes", return_value=recs):
+            self.assertEqual(feedback.analyze(degen,now=time.time(),existing=[],
+                                             insider_rows=insiders),[])
 
     def test_winner_min_score_in_allowlist(self):
         self.assertIn("winner_min_score", feedback.TUNABLE)

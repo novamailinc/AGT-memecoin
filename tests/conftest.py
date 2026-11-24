@@ -21,27 +21,6 @@ import ast as _ast
 import glob as _glob
 import os
 
-def _collectable(_node):
-    """pytest can only run a test whose params are all optional."""
-    _args = _node.args
-    _params = _args.posonlyargs + _args.args + _args.kwonlyargs
-    _n_defaults = len(_args.defaults) + len(_args.kw_defaults or [])
-    if _params and _params[0].arg == "self":
-        _params = _params[1:]
-    return len(_params) <= _n_defaults
-
-
-collect_ignore = []
-for _p in _glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "test_*.py")):
-    try:
-        _tree = _ast.parse(open(_p).read())
-    except (SyntaxError, OSError):
-        continue
-    _has_pytest_tests = any(
-        (isinstance(_n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
-         and _n.name.startswith("test_") and _collectable(_n))
-        or (isinstance(_n, _ast.ClassDef) and _n.name.startswith("Test"))
-        for _n in _ast.walk(_tree))
-    if not _has_pytest_tests:
-        collect_ignore.append(_p)
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+from test_discovery import is_script_test
+collect_ignore=[p for p in _glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test_*.py')) if is_script_test(p)]

@@ -232,15 +232,18 @@ class SharedQuota:
                               state.get("backoff_s", BACKOFF_BASE_S) * 2)
             else:
                 backoff = min(BACKOFF_MAX_S, backoff)
+            backoff = max(backoff, hint)  # server-directed minimum can exceed our exponential cap
             state["backoff_s"] = backoff
-            state["backoff_until"] = now + backoff
+            state["backoff_until"] = max(state.get("backoff_until", 0.), now + backoff)
             return "backoff"
         return self._transact(_do)
 
     def report_success(self):
-        """A success clears the backoff fleet-wide at once (single-
-        probe recovery shape: one success ends the episode)."""
+        """A success after expiry clears the backoff. A response from a
+        pre-existing request cannot cancel an active server not-before."""
         def _do(state, now):
+            if now < state.get("backoff_until", 0.):
+                return "cooldown_preserved"
             state["backoff_until"] = 0.0
             state["backoff_s"] = BACKOFF_BASE_S
             return "ok"

@@ -204,9 +204,10 @@ class UsageStore:
 
     All mutations go through a flock-guarded read-modify-write so
     several processes (fleet daemons) can record against one file
-    without losing counts. A corrupt/empty file reseeds to empty
-    counters (usage history is accounting, not financial state —
-    the journal lines survive independently; a reseed is logged).
+    without losing counts. Reports may return empty on unreadable
+    data for legacy compatibility; mutations never reseed corrupt or
+    unreadable counters. Helius account writers always use strict
+    durability because every credential shares the same allowance.
     """
 
     def __init__(self, home=None):
@@ -253,7 +254,7 @@ class UsageStore:
             lock_fh = open(self._lock_path, "w")
             fcntl.flock(lock_fh, fcntl.LOCK_EX)
             try:
-                data = self._load(strict=strict)
+                data = self._load(strict=True)
                 result = fn(data)
                 self._save(data)
                 if strict and self._load(strict=True) != data:
@@ -283,6 +284,10 @@ class UsageStore:
         unknown cost is recorded as unknown (cost_spent unchanged),
         never assumed to be 0 or 1.
         """
+        # All Helius credentials/writers share one allowance. Ordinary
+        # RPC writers must obey the same preservation contract as streams;
+        # opting out would allow corrupt counters to be silently reseeded.
+        strict = strict or account == "helius_main"
         ts = ts if ts is not None else time.time()
         month = _month_key(ts)
         entry = {
@@ -315,16 +320,15 @@ class UsageStore:
                 try:os.fsync(directory)
                 finally:os.close(directory)
 
-        if not strict:
-            try:_append_journal()
-            except OSError:logger.warning("could not append usage journal")
-
         def _do(data):
+            # Mutations never reseed damaged accounting, even for legacy
+            # writers. Fail-soft reporting _load() remains unchanged.
+            self.validate_admission_state(account)
             if strict:
-                # Validate BEFORE appending: a fresh store has no counters
-                # and no journal. Existing corruption/loss must never reseed.
-                self.validate_admission_state(account)
                 _append_journal()
+            else:
+                try:_append_journal()
+                except OSError:logger.warning("could not append usage journal")
             rec = data.get(account)
             if rec is None:
                 rec = _default_account_record(account)
@@ -491,6 +495,12 @@ class UsageStore:
     # -- disablement (operator action) ----------------------------------
     def set_disabled(self, account, disabled, reason=None):
         def _do(data):
+            # Same admission contract as record: never re-create an account
+            # whose counters were lost (journal evidence retained). A refused
+            # disable still leaves traffic fail-closed, because admission
+            # validates before every record. Never auto-repairs, never
+            # re-enables a lost account.
+            self.validate_admission_state(account)
             rec = data.get(account)
             if rec is None:
                 rec = _default_account_record(account)
@@ -502,6 +512,9 @@ class UsageStore:
 
     def mark_warned(self, account, ts=None):
         def _do(data):
+            # Same admission contract as record: warning state must never
+            # reseed a missing account's counters to zero.
+            self.validate_admission_state(account)
             rec = data.get(account)
             if rec is None:
                 rec = _default_account_record(account)

@@ -156,10 +156,10 @@ def sig_row(sig, slot, idx=0):
 
 
 def fake_tx(sig, slot, fee=5000):
-    return {"blockTime": 1795341600 + slot,
-            "meta": {"fee": fee, "err": None, "preBalances": [100],
-                     "postBalances": [90], "innerInstructions": []},
-            "transaction": {"message": {
+    return {"slot": slot, "blockTime": 1795341600 + slot,
+            "meta": {"fee": fee, "err": None, "preBalances": [100, 0],
+                     "postBalances": [90, 10], "innerInstructions": []},
+            "transaction": {"signatures": [sig], "message": {
                 "accountKeys": [{"pubkey": "AAA" + sig[:4]},
                                 {"pubkey": "BBB" + sig[:4]}],
                 "instructions": [{"programId":
@@ -388,7 +388,7 @@ r8 = make_router(t8)
 v8 = CW.verify_transaction(r8, TX_SIG, TX_FIXTURE["result"])
 check("verify_transaction conflict: fee difference flagged",
       v8["status"] == "conflict" and v8["verified"] is True
-      and v8["differences"] == ["fee"])
+      and v8["differences"] == ["fee", "meta"])
 
 # Unverified: the re-read errors -> unverified, NOT a conflict.
 t9 = MethodTransport({

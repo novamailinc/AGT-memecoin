@@ -682,6 +682,17 @@ def publish(event: dict, severity: Optional[str] = None) -> dict:
     return normalized
 
 
+def notify_committed(event: dict) -> None:
+    """Best-effort fanout after an external atomic event projection.
+
+    Call only for a newly committed event. Recovery does not resend external
+    notifications because delivery itself is not an exactly-once effect.
+    """
+    normalized = validate_event(event)
+    _dispatch(normalized)
+    _deliver_webhook(normalized)
+
+
 def poll(since: Optional[str] = None, limit: int = 100) -> List[dict]:
     """Read the pollable event log, chronological order, capped at ``limit``.
 

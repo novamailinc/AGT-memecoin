@@ -122,100 +122,39 @@ try:
 finally:
     M._curve = _real_curve
 
-# ---- Helius rate-limit guard (stubbed network, offline) -------------------------
+# Actual central router, no Helius fallback even with a configured old key.
 import json as _json
+import tempfile as _tempfile
 import urllib.error as _urlerr
-import urllib.request as _urlreq
-
-_real_urlopen = _urlreq.urlopen
-_real_rpc_urls = C.rpc_urls
-_real_guard = C._GUARD
-
-
-class _FakeResp:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def read(self):
-        return _json.dumps(self._payload).encode()
-
-
-def _raise_429(*a, **k):
-    raise _urlerr.HTTPError("https://mainnet.helius-rpc.com/", 429,
-                            "Too Many Requests", {}, None)
-
-
+from daemon.intelligence.acquisition import routine as _routine
+from daemon.intelligence.acquisition.provider_router import ProviderRouter as _Router
+class _Resp:
+    def __init__(self,result): self.result=result
+    def read(self): return _json.dumps({"jsonrpc":"2.0","id":1,"result":self.result}).encode()
+    def __enter__(self): return self
+    def __exit__(self,*a): return False
+_calls=[]
+def _transport(req,timeout=None):
+    _calls.append(req.full_url.split('?')[0])
+    if 'alchemy.com' in req.full_url:
+        raise _urlerr.URLError('fixture outage')
+    return _Resp({"value":"FALLBACK"})
+os.environ['ALCHEMY_API_KEY']='fixture-not-real'
+os.environ['HELIUS_API_KEY']='fixture-not-real'
+os.environ.pop('CHAINSTACK_ENDPOINT',None)
+_router=_Router(home=_tempfile.mkdtemp(),helius_enabled=False,transport=_transport)
+_previous=getattr(_routine._local,'router',None)
+_routine._local.router=_router
+_routine.clear_evidence()
 try:
-    # Pacer cooldown skips Helius without touching the network.
-    # The file already sets a temp FOREX_AGENT_HOME at import time;
-    # fake key "x" so the pacer bucket matches the rpc_urls lambda.
-    import helius_ratelimit as _rlmod
-    os.environ["HELIUS_API_KEY_DISCOVERY"] = "x"
-    _rlmod._PACER = None
-    _rlmod._SHARED_GUARD = None
-    _bkt = _rlmod.bucket_id_for_key("x")
-    calls = []
-
-    def _counting_urlopen(*a, **k):
-        calls.append(1)
-        raise AssertionError("network touched while cooled")
-
-    C.rpc_urls = lambda: ["https://mainnet.helius-rpc.com/?api-key=x"]
-    _rlmod.pacer_report(_bkt, False)  # engage pacer cooldown (~30s)
-    _urlreq.urlopen = _counting_urlopen
-    check("curve: cooled pacer skips Helius with zero network calls",
-          C.rpc("getAccountInfo", ["X"]) is None and calls == [])
+    _result=C.rpc("getAccountInfo", ["X"])
+    check("central router serves fallback account read",_result=={"value":"FALLBACK"})
+    check("Alchemy primary, no Helius request",len(_calls)==2 and 'alchemy.com' in _calls[0] and all('helius' not in x for x in _calls))
+    _ev=_routine.evidence_since()[-1]
+    check("fallback retains degraded consumer evidence",_ev['provider']=='public' and _ev['degraded'] and _ev['decision_usable'])
 finally:
-    _urlreq.urlopen = _real_urlopen
-    C.rpc_urls = _real_rpc_urls
-
-try:
-    # A 429 engages the pacer backoff; a success on a fresh pacer
-    # returns the result and leaves no cooldown.
-    import helius_ratelimit as _rlmod
-    import time as _time
-    guard = _rlmod.RateGuard()  # legacy class, unchanged
-    C.rpc_urls = lambda: ["https://mainnet.helius-rpc.com/?api-key=x"]
-    _bkt = _rlmod.bucket_id_for_key("x")
-
-    def _expire():
-        _home = os.environ["FOREX_AGENT_HOME"]
-        _p = os.path.join(_home, "helius_pacer.json")
-        with open(_p) as _fh:
-            _d = _json.load(_fh)
-        _d["buckets"][_bkt]["cooldown_until"] = _time.time() - 1.0
-        with open(_p, "w") as _fh:
-            _json.dump(_d, _fh)
-
-    _expire()  # let block 1's cooldown lapse so the 429 is really attempted
-    _urlreq.urlopen = _raise_429
-    check("curve: 429 returns None",
-          C.rpc("getAccountInfo", ["X"]) is None)
-    check("curve: probe 429 doubles pacer backoff to 60",
-          _rlmod.pacer()._read_state()[_bkt]["backoff_s"] == 60.0)
-    _expire()
-    _urlreq.urlopen = lambda *a, **k: _FakeResp(
-        {"jsonrpc": "2.0", "id": 1, "result": {"value": 7}})
-    check("curve: success returns result",
-          C.rpc("getAccountInfo", ["X"]) == {"value": 7})
-    check("curve: success leaves no cooldown",
-          _rlmod.pacer()._read_state()[_bkt]["cooldown_until"] == 0.0)
-    g = _rlmod.RateGuard()
-    check("curve: backoff ladder 60 then 120",
-          g.report_ratelimited() == 60.0
-          and g.report_ratelimited() == 120.0)
-    g.report_success()
-    check("curve: success resets backoff ladder to 60",
-          g.report_ratelimited() == 60.0)
-finally:
-    _urlreq.urlopen = _real_urlopen
-    C.rpc_urls = _real_rpc_urls
+    if _previous is None: del _routine._local.router
+    else: _routine._local.router=_previous
 
 # ---- wiring (file text, no side effects) --------------------------------------
 with open(os.path.join(_LS, "mimic.py")) as f:

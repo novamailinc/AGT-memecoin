@@ -54,7 +54,7 @@ NOW = time.time()
 # meta.err gate fails closed without it, so the fixture carries
 # a success meta (err None).
 CANNED_TX = {"meta": {"err": None},
-             "transaction": {"message": {"accountKeys": [
+             "transaction": {"signatures":["SIG1"],"message": {"accountKeys": [
                  {"pubkey": "DEPLOYER1", "signer": True,
                   "writable": True},
                  {"pubkey": "OTHER1", "signer": False,

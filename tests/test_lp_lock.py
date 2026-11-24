@@ -107,15 +107,13 @@ check("fmt 1.0B", lp_lock._fmt_supply(1_000_000_000) == "1.0B")
 check("fmt 5k", lp_lock._fmt_supply(5000) == "5.0k")
 check("fmt garbage", lp_lock._fmt_supply("nope") == "")
 
-_orig_post = lp_lock._post_json
-lp_lock._post_json = lambda url, payload, timeout: {
-    "result": {"value": {"amount": "1000000000000000", "decimals": 6}}}
-check("solana supply mocked",
-      lp_lock.token_supply("solana", "SoLaNaMiNt") == "1.0B")
-lp_lock._post_json = lambda url, payload, timeout: None
-check("solana RPC down -> empty (fail-soft)",
-      lp_lock.token_supply("solana", "SoLaNaMiNt") == "")
-lp_lock._post_json = _orig_post
+from daemon.intelligence.acquisition import routine
+_orig_read = routine.read
+routine.read = lambda *a, **k: {"value": {"amount": "1000000000000000", "decimals": 6}}
+check("solana supply central RPC mocked", lp_lock.token_supply("solana", "SoLaNaMiNt") == "1.0B")
+routine.read = lambda *a, **k: None
+check("solana RPC down -> empty", lp_lock.token_supply("solana", "SoLaNaMiNt") == "")
+routine.read = _orig_read
 
 _orig_call = lp_lock._eth_call
 lp_lock._eth_call = lambda rpc, to, data, t: (

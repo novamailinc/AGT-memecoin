@@ -163,7 +163,11 @@ def refresh_intel():
     if time.time() - _last_refresh < 3600:
         return
     _wallet_grades = load_json(os.path.join(LS_DIR, "smart_wallet_grades.json"))
-    _deployer_hist = load_json(os.path.join(LS_DIR, "deployer_history.json"))
+    from deployer_registry import read as read_deployers
+    try:_deployer_hist=read_deployers(os.path.join(LS_DIR,"deployer_history.json"))
+    except Exception:
+        logger.warning('deployer history unavailable',exc_info=True)
+        _deployer_hist={}
     _last_refresh = time.time()
     logger.warning("intel: %d wallets, %d deployers",
                    len(_wallet_grades), len(_deployer_hist))

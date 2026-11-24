@@ -188,11 +188,11 @@ res.rpc_url_pairs = lambda: [
     ("https://api.mainnet-beta.solana.com", None)]
 res._rpc_attempt = _fake_attempt
 check("reserves: denied pacer -> None, zero Helius HTTP",
-      res.rpc("getSlot", []) is None and calls["helius"] == [])
+      res._rpc_impl("getSlot", []) is None and calls["helius"] == [])
 grant = _GrantPacer()
 res._pacer = lambda: grant
 check("reserves: granted pacer -> result",
-      res.rpc("getSlot", []) == {"v": 1})
+      res._rpc_impl("getSlot", []) == {"v": 1})
 check("reserves: success reported to pacer",
       grant.reported == [("b1", True)])
 
@@ -209,7 +209,7 @@ grant2 = _GrantPacer()
 res._pacer = lambda: grant2
 res._rpc_attempt = _fake_429_attempt
 check("reserves: 429 -> None (no public fallback)",
-      res.rpc("getSlot", []) is None and calls["public"] == [])
+      res._rpc_impl("getSlot", []) is None and calls["public"] == [])
 check("reserves: 429 reported to pacer",
       grant2.reported == [("b1", False)])
 res._pacer = _real_pacer_fn

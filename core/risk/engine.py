@@ -155,6 +155,7 @@ class RiskManager:
         self.config = config
         self._store = store if store is not None else _default_store()
         self._mem_state: dict = {}
+        self._strict_shared_state = False
 
     # -- persisted state -------------------------------------------------
     def _get_state(self) -> dict:
@@ -162,6 +163,8 @@ class RiskManager:
             try:
                 return dict(self._store.get_risk_state())
             except Exception:
+                if self._strict_shared_state:
+                    raise BrokerError(RISK_LIMIT_EXCEEDED, "Shared risk history unreadable")
                 logger.exception("Risk store read failed — using in-memory state.")
         return dict(self._mem_state)
 
@@ -171,6 +174,8 @@ class RiskManager:
             try:
                 self._store.set_risk_state(patch)
             except Exception:
+                if self._strict_shared_state:
+                    raise BrokerError(RISK_LIMIT_EXCEEDED, "Shared risk history persistence uncertain")
                 logger.exception("Risk store write failed — state is memory-only this run.")
 
     def _roll_day_if_needed(self, current_equity: float) -> float:
@@ -219,6 +224,23 @@ class RiskManager:
             return RiskCheckResult(False, "Signal has no stop loss — rejected by policy",
                                    reason_code=INVALID_ORDER)
 
+        identity_fn = getattr(adapter, "risk_state_identity", None)
+        identity = identity_fn() if identity_fn else None
+        if identity is not None:
+            self._strict_shared_state = True
+            if self._store is None:
+                raise BrokerError(RISK_LIMIT_EXCEEDED, "Shared risk requires persistent history")
+            prior_state = self._get_state()
+            recorded = prior_state.get("risk_account_identity")
+            if recorded is None and any(k in prior_state for k in
+                                        (self._DAY_KEY, self._EQUITY_KEY, self._OUTCOMES_KEY)):
+                return RiskCheckResult(False, "Risk baseline identity unbound; explicit reconciliation required",
+                                       reason_code=RISK_LIMIT_EXCEEDED)
+            if recorded is not None and recorded != identity:
+                return RiskCheckResult(False, "Risk baseline account identity conflict",
+                                       reason_code=RISK_LIMIT_EXCEEDED)
+            if recorded is None:
+                self._set_state({"risk_account_identity":identity})
         account = adapter.account_info()
         equity = account.equity
         start_equity = self._roll_day_if_needed(equity)

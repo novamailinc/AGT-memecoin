@@ -19,6 +19,7 @@ lane's stored window plainly.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -63,6 +64,14 @@ def _fmt_pct(n, d):
     return "n/a" if not d else "%.1f%%" % (100.0 * n / d)
 
 
+def _number(value, nonnegative=False):
+    if type(value) not in (int,float):return None
+    try:
+        n=float(value)
+        return n if math.isfinite(n) and (not nonnegative or n>=0) else None
+    except (OverflowError,ValueError):return None
+
+
 def _live_ledger_closes(home=None):
     """Read real paper closes from the live lane ledgers (USD paper).
 
@@ -88,37 +97,39 @@ def _live_ledger_closes(home=None):
         except Exception:
             missing.append(lane)
             continue
-        closes = ledger.get("closes") or []
+        if not isinstance(ledger,dict) or ('closes' in ledger and not isinstance(ledger['closes'],list)):
+            missing.append(lane)
+            continue
+        closes = ledger.get("closes",[])
         first_ts = None
         last_ts = None
         skipped = 0
         for c in closes:
-            ts = c.get("close_ts")
-            mult = c.get("realized_mult")
-            if mult is None:
-                ru = c.get("realized_usd")
-                en = c.get("entry_notional_usd")
-                if ru is not None and en:
-                    mult = ru / en
-            if ts is None or mult is None:
-                skipped += 1
+            if not isinstance(c,dict):
+                skipped+=1
                 continue
-            pnl = c.get("pnl_usd")
-            if pnl is None:
-                ru = c.get("realized_usd")
-                en = c.get("entry_notional_usd")
-                if ru is not None and en is not None:
-                    pnl = ru - en
-                else:
-                    pnl = 0.0
+            ts = _number(c.get("close_ts"),True)
+            mult = _number(c.get("realized_mult"),True)
+            ru=_number(c.get('realized_usd'),True)
+            en=_number(c.get('entry_notional_usd'),True)
+            if 'realized_mult' not in c and ru is not None and en is not None and en>0:
+                mult=_number(ru/en,True)
+            if ts is None:
+                skipped+=1
+                continue
+            pnl=_number(c.get('pnl_usd'))
+            if 'pnl_usd' not in c and ru is not None and en is not None:
+                pnl=_number(ru-en)
             records.append({
                 "t_close": ts,
                 "symbol": c.get("symbol"),
                 "realized_mult": mult,
-                "pnl_usd": float(pnl),
+                "pnl_usd": pnl,
                 "exit_reason": c.get("closed_reason") or "?",
                 "lane": lane,
                 "mint": c.get("mint"),
+                "exit_price_kind": (c.get('exit_price_kind') if isinstance(c.get('exit_price_kind'),str)
+                                    and c['exit_price_kind'] else 'unknown'),
             })
             first_ts = ts if first_ts is None else min(first_ts, ts)
             last_ts = ts if last_ts is None else max(last_ts, ts)
@@ -150,7 +161,7 @@ def _paper_section_live(papers, coverage, missing):
                    LEDGER_CAP))
         if skipped:
             out.append("coverage: %s skipped %d stored closes "
-                       "without a usable close time or multiple."
+                       "without a usable close time; economics of retained rows may still be unavailable."
                        % (lane, skipped))
     if missing:
         out.append("note: unreadable ledgers skipped: "
@@ -162,17 +173,25 @@ def _paper_section_live(papers, coverage, missing):
                    "above) — it does not mean the bot opened nothing.")
         return out
     n = len(papers)
-    wins = [r for r in papers if (r.get("realized_mult") or 1.0) >= WIN_MULT]
-    losses = [r for r in papers if (r.get("realized_mult") or 1.0) < 1.0]
-    breakeven = n - len(wins) - len(losses)
-    mults = [(r.get("realized_mult") or 1.0) for r in papers]
-    avg_mult = sum(mults) / n
-    pnl = sum(float(r.get("pnl_usd") or 0) for r in papers)
-    out.append(f"closes: {n} | wins(>=1.5x): {len(wins)} | "
-               f"losses(<1x): {len(losses)} | flat: {breakeven}")
-    out.append(f"win rate: {_fmt_pct(len(wins), n)} | avg realized: "
-               f"{avg_mult:.3f}x | expectancy: {avg_mult - 1:+.3f}x")
-    out.append(f"total realized P&L: {pnl:+.2f} USD (stored closes only)")
+    mults=[_number(r.get('realized_mult'),True) for r in papers]
+    pnls=[_number(r.get('pnl_usd')) for r in papers]
+    unknown=sum(v is None for v in mults)
+    if unknown:
+        out.append(f"closes: {n} | return statistics unavailable ({unknown} missing/invalid multiples)")
+    else:
+        wins=sum(m>=WIN_MULT for m in mults)
+        losses=sum(m<1 for m in mults)
+        other=n-wins-losses
+        avg_mult=math.fsum(m/n for m in mults)
+        out.append(f"closes: {n} | wins(>=1.5x): {wins} | losses(<1x): {losses} | flat: {other}")
+        out.append(f"win rate: {_fmt_pct(wins,n)} | avg realized: {avg_mult:.3f}x | expectancy: {avg_mult-1:+.3f}x")
+    try:
+        pnl=math.fsum(pnls) if all(v is not None for v in pnls) else None
+    except (OverflowError,ValueError):pnl=None
+    if pnl is None or not math.isfinite(pnl):
+        out.append('total realized P&L: unavailable (missing/invalid economics or nonfinite aggregate; no subset total)')
+    else:
+        out.append(f"total realized P&L: {pnl:+.2f} USD (stored closes only)")
     # Stage C visibility (owner-approved 2026-11-22): simulated
     # performance is never presented as qualified. The expectancy
     # above is reproducibility material only.
@@ -200,26 +219,27 @@ def _paper_section_live(papers, coverage, missing):
     out.append("by exit: " + " | ".join(
         f"{k}: {v}" for k, v in by_exit.most_common()))
     by_lane = defaultdict(list)
-    for r in papers:
-        by_lane[r.get("lane") or "?"].append(r.get("realized_mult") or 1.0)
+    for r in papers:by_lane[r.get('lane') or '?'].append(_number(r.get('realized_mult'),True))
     out.append("by lane (trades, win rate, avg x):")
-    for lane, ms in sorted(by_lane.items(),
-                           key=lambda kv: sum(kv[1]) / len(kv[1]),
-                           reverse=True):
-        w = sum(1 for m in ms if m >= WIN_MULT)
-        out.append(f"  {lane}: {len(ms)} trades, {_fmt_pct(w, len(ms))}, "
-                   f"{sum(ms) / len(ms):.2f}x avg")
-    out.append("top closes:")
-    for r in sorted(papers, key=lambda r: r.get("realized_mult") or 0,
-                    reverse=True)[:5]:
-        out.append(f"  {r.get('symbol')} x{r.get('realized_mult')} "
-                   f"({r.get('exit_reason')}, pnl "
-                   f"{r.get('pnl_usd'):+.2f} USD, {r.get('lane')})")
-    out.append("worst closes:")
-    for r in sorted(papers, key=lambda r: r.get("realized_mult") or 0)[:5]:
-        out.append(f"  {r.get('symbol')} x{r.get('realized_mult')} "
-                   f"({r.get('exit_reason')}, pnl "
-                   f"{r.get('pnl_usd'):+.2f} USD, {r.get('lane')})")
+    for lane,ms in sorted(by_lane.items()):
+        if any(m is None for m in ms):
+            out.append(f"  {lane}: {len(ms)} trades, statistics unavailable")
+        else:
+            w=sum(m>=WIN_MULT for m in ms)
+            out.append(f"  {lane}: {len(ms)} trades, {_fmt_pct(w,len(ms))}, {math.fsum(m/len(ms) for m in ms):.2f}x avg")
+    def detail(r):
+        m=_number(r.get('realized_mult'),True);p=_number(r.get('pnl_usd'))
+        multiple='unavailable' if m is None else str(m)
+        pnl='unavailable' if p is None else f'{p:+.2f} USD'
+        return f"  {r.get('symbol')} x{multiple} ({r.get('exit_reason')}, pnl {pnl}, {r.get('lane')})"
+    if unknown:
+        out.append('top/worst ranking unavailable: incomplete return evidence; all records retained')
+        out.extend(detail(r) for r in papers)
+    else:
+        out.append('top closes:')
+        out.extend(detail(r) for r in sorted(papers,key=lambda r:r['realized_mult'],reverse=True)[:5])
+        out.append('worst closes:')
+        out.extend(detail(r) for r in sorted(papers,key=lambda r:r['realized_mult'])[:5])
     return out
 
 
@@ -356,15 +376,20 @@ def _verdict_section(all_papers: List[Dict[str, Any]]) -> List[str]:
     out.append(f"stored real closes in live lane ledgers: {n} "
                f"(capped lanes show their last {LEDGER_CAP}; "
                f"tuning threshold: {MIN_CLOSES_FOR_TUNING})")
-    if n < 10:
+    unavailable=sum(_number(r.get('realized_mult'),True) is None
+                    or _number(r.get('pnl_usd')) is None for r in all_papers)
+    if unavailable:
+        out.append(f"VERDICT: unavailable economics in {unavailable}/{n} stored closes; no tuning evidence inferred from this count.")
+    elif n < 10:
         out.append("VERDICT: too thin — no tuning yet. Keep collecting; "
                    "the gate stays as-is.")
     elif n < MIN_CLOSES_FOR_TUNING:
         out.append("VERDICT: building — directional reads only, "
                    "no threshold changes yet.")
     else:
-        out.append("VERDICT: enough data to tune entry bar / narrative "
-                   "weights with evidence.")
+        out.append("VERDICT: numeric stored-close count meets the legacy minimum, "
+                   "not evidence that tuning is justified. Representative chronology, "
+                   "coverage, net economics and untouched evaluation remain unverified.")
     return out
 
 

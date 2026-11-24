@@ -61,6 +61,9 @@ def skip(name, reason):
 
 
 FAKE_ENV = {
+    'HELIUS_API_KEY_1': 'fixture-helius-source-1',
+    'HELIUS_API_KEY_2': 'fixture-helius-source-2',
+    'HELIUS_API_KEY_3': 'fixture-helius-source-3',
     # Well-known public placeholder shapes, never real values and
     # never the "TEST-" placeholder prefix: credentials.py refuses
     # TEST- values outright (2026-11-22), and the GitHub secret
@@ -84,8 +87,8 @@ check("manifest: parses as JSON with required top-level fields",
       all(k in manifest for k in ("repo_url", "branch", "start_command",
                                   "port", "required_env", "optional_env",
                                   "mode", "mainnet_enabled")))
-check("manifest: repo URL is the public meme-project repo",
-      manifest["repo_url"] == "https://github.com/olamoreA/meme-project")
+check("manifest: repo URL is the owner AGT-memecoin repo",
+      manifest["repo_url"] == "https://github.com/novamailinc/AGT-memecoin")
 check("manifest: branch is main",
       manifest["branch"] == "main")
 check("manifest: start command is the AGT start script",
@@ -97,11 +100,8 @@ check("manifest: port is a valid TCP port",
       and 1 <= manifest["port"] <= 65535)
 check("manifest: paper only, mainnet disabled",
       manifest["mode"] == "paper" and manifest["mainnet_enabled"] is False)
-check("manifest: required env lists Alchemy key + Telegram token "
-      "(2026-11-23: §9 made Alchemy the required primary "
-      "acquisition leg; Helius is optional/selective)",
-      {e["name"] for e in manifest["required_env"]} == {
-          "ALCHEMY_API_KEY", "TELEGRAM_BOT_TOKEN"})
+check("manifest: required env matches revised complete provider profile",
+      {e["name"] for e in manifest["required_env"]} == set(CREDS.REQUIRED_ENVS))
 check("manifest: env entries carry names only, never values",
       all("value" not in e and "secret" not in e
           for e in manifest["required_env"] + manifest["optional_env"]))
@@ -115,7 +115,7 @@ check("manifest: deploy kind is GitHub URL (the only git deploy AGT "
 # ---------------- credentials: env-only startup ----------------
 check("credentials: full fake env passes the preflight",
       set(CREDS.check_credentials(FAKE_ENV)) == set(CREDS.present(FAKE_ENV))
-      and len(CREDS.check_credentials(FAKE_ENV)) == 6)
+      and len(CREDS.check_credentials(FAKE_ENV)) == len(FAKE_ENV))
 check("credentials: missing ALCHEMY_API_KEY fails closed",
       CREDS.missing_required(
           {k: v for k, v in FAKE_ENV.items()
@@ -124,9 +124,8 @@ check("credentials: missing TELEGRAM_BOT_TOKEN fails closed",
       CREDS.missing_required(
           {k: v for k, v in FAKE_ENV.items()
            if k != "TELEGRAM_BOT_TOKEN"}) == ["TELEGRAM_BOT_TOKEN"])
-check("credentials: empty env fails closed naming both required vars",
-      CREDS.missing_required({}) == ["ALCHEMY_API_KEY",
-                                     "TELEGRAM_BOT_TOKEN"])
+check("credentials: empty env names every required provider/control source",
+      CREDS.missing_required({}) == list(CREDS.REQUIRED_ENVS))
 try:
     CREDS.check_credentials({})
     check("credentials: check_credentials raises on empty env", False)
@@ -136,10 +135,9 @@ except CREDS.CredentialError as exc:
           "ALCHEMY_API_KEY" in str(exc)
           and "TELEGRAM_BOT_TOKEN" in str(exc)
           and "TEST-" not in str(exc))
-check("credentials: optional vars are not required",
-      CREDS.missing_required(
-          {"HELIUS_API_KEY": "x", "ALCHEMY_API_KEY": "x",
-           "TELEGRAM_BOT_TOKEN": "y"}) == [])
+check("credentials: legacy source alone cannot satisfy numbered profile",
+      set(CREDS.missing_required({"HELIUS_API_KEY":"fixture","ALCHEMY_API_KEY":"fixture","TELEGRAM_BOT_TOKEN":"fixture"})) ==
+      {"CHAINSTACK_ENDPOINT",*(f"HELIUS_API_KEY_{i}" for i in (1,2,3))})
 check("credentials: vault surrogate is unavailable without authd",
       CREDS.vault_surrogate_available() is False
       or os.path.exists("/run/hatch/auth/authd.sock"))
@@ -200,7 +198,7 @@ check("credentials: TEST- placeholder values are detected",
       == ["HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN"])
 try:
     CREDS.check_credentials(
-        {"HELIUS_API_KEY": "TEST-HELIUS-KEY-AAAAAAAA",
+        {**FAKE_ENV, "HELIUS_API_KEY": "TEST-HELIUS-KEY-AAAAAAAA",
          "TELEGRAM_BOT_TOKEN": "TEST-TELEGRAM-TOKEN-CCCCCCCC",
          "ALCHEMY_API_KEY": "fake-alchemy-key"})
     check("credentials: check_credentials raises on TEST- values", False)
@@ -1063,7 +1061,7 @@ with tempfile.TemporaryDirectory() as tmp:
                    "commit": "abc123def456",
                    "commit_source": "git rev-parse HEAD",
                    "generated_at_utc": "2026-11-22T10:00:00Z",
-                   "repo": "https://github.com/olamoreA/meme-project"},
+                   "repo": "https://github.com/novamailinc/AGT-memecoin"},
                   fh)
     ver = DASH.read_versions(vhome)
     check("versions: version file present -> commit reported, "

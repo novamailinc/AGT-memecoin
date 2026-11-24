@@ -105,12 +105,21 @@ HTTP_RPC_URLS = (
 
 def _rpc_label(url: str) -> str:
     """Safe log label: strips query strings (may carry API keys)."""
-    return url.split("?", 1)[0]
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    return parts.hostname or 'unconfigured'
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 class WSError(Exception):
     """Websocket transport failure."""
+
+
+class WSHandshakeError(WSError):
+    """HTTP rejection, without treating a status line as a transient outage."""
+    def __init__(self, status_code):
+        self.status_code = status_code
+        super().__init__('websocket handshake rejected: HTTP %s' % status_code)
 
 
 class WSClient:
@@ -121,6 +130,14 @@ class WSClient:
         self.timeout = timeout
         self._sock: Optional[socket.socket] = None
         self._buf = b""
+        self.read_deadline = None
+        self._meter = None
+        self._meter_id = None
+
+    def _measure(self,rx=0,tx=0,stage=None,closed=False):
+        if self._meter is None:return
+        try:self._meter.observe(self._meter_id,rx=rx,tx=tx,stage=stage,closed=closed)
+        except Exception:logger.warning('WS transport measurement unavailable')
 
     # ------------------------------------------------------------------
     # connect
@@ -136,17 +153,25 @@ class WSClient:
             return None
         return parts.hostname, parts.port or 8080
 
-    @staticmethod
-    def _send_all(sock: socket.socket, data: bytes) -> None:
+    def _send_all(self, sock: socket.socket, data: bytes) -> None:
         view = memoryview(data)
         while view:
+            if self.read_deadline is not None:
+                remaining=self.read_deadline-time.monotonic()
+                if remaining<=0:
+                    raise WSError('absolute websocket response deadline exceeded')
+                sock.settimeout(min(self.timeout,remaining))
             sent = sock.send(view)
+            self._measure(tx=max(0,sent))
+            if sent<=0:
+                raise WSError('websocket write made no progress')
             view = view[sent:]
 
     def _read_line(self, sock: socket.socket) -> str:
         buf = self._buf
         while b"\r\n" not in buf:
             chunk = sock.recv(4096)
+            self._measure(rx=len(chunk))
             if not chunk:
                 raise WSError("connection closed during handshake")
             buf += chunk
@@ -154,6 +179,8 @@ class WSClient:
         return line.decode("latin-1")
 
     def connect(self) -> None:
+        if not self.url:
+            raise WSError('Alchemy WebSocket endpoint is not configured')
         parts = urlsplit(self.url)
         if parts.scheme not in ("ws", "wss"):
             raise WSError("unsupported scheme %s" % parts.scheme)
@@ -164,49 +191,70 @@ class WSClient:
         if parts.query:
             path += "?" + parts.query
 
-        proxy = self._proxy_for(secure)
-        if proxy:
-            ph, pp = proxy
-            sock = socket.create_connection((ph, pp), timeout=self.timeout)
-            self._send_all(
-                sock,
-                ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
-                 % (host, port, host, port)).encode())
+        try:
+            if (parts.hostname or '').endswith('.alchemy.com'):
+                try:
+                    from daemon.intelligence.acquisition.ws_telemetry import AsyncTransportMeter
+                    from daemon.intelligence.acquisition.routine import router
+                    self._meter=AsyncTransportMeter(router().home)
+                    self._meter_id=self._meter.begin('alchemy')
+                except Exception:
+                    self._meter=None
+                    logger.warning('WS transport measurement initialization unavailable')
+            proxy = self._proxy_for(secure)
+            if proxy:
+                ph, pp = proxy
+                sock = socket.create_connection((ph, pp), timeout=self.timeout)
+                self._sock = sock
+                self._measure(stage='transport_open')
+                self._send_all(
+                    sock,
+                    ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n"
+                     % (host, port, host, port)).encode())
+                status = self._read_line(sock)
+                if not (status.startswith("HTTP/1.1 200")
+                        or status.startswith("HTTP/1.0 200")):
+                    raise WSError("proxy CONNECT rejected: %s" % status.strip())
+                while self._read_line(sock).strip():
+                    pass
+            else:
+                sock = socket.create_connection((host, port), timeout=self.timeout)
+                self._sock = sock
+                self._measure(stage='transport_open')
+
+            if secure:
+                sock = ssl.create_default_context().wrap_socket(
+                    sock, server_hostname=host)
+                self._sock = sock
+
+            key = base64.b64encode(os.urandom(16)).decode()
+            self._send_all(sock, (
+                "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+                % (path, host, port, key)).encode())
             status = self._read_line(sock)
-            if not (status.startswith("HTTP/1.1 200")
-                    or status.startswith("HTTP/1.0 200")):
-                raise WSError("proxy CONNECT rejected: %s" % status.strip())
-            while self._read_line(sock).strip():
-                pass
-        else:
-            sock = socket.create_connection((host, port), timeout=self.timeout)
-
-        if secure:
-            sock = ssl.create_default_context().wrap_socket(
-                sock, server_hostname=host)
-
-        key = base64.b64encode(os.urandom(16)).decode()
-        self._send_all(sock, (
-            "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
-            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-            % (path, host, port, key)).encode())
-        status = self._read_line(sock)
-        if "101" not in status:
-            raise WSError("websocket handshake rejected: %s" % status.strip())
-        accept = None
-        while True:
-            line = self._read_line(sock)
-            if not line.strip():
-                break
-            if line.lower().startswith("sec-websocket-accept:"):
-                accept = line.split(":", 1)[1].strip()
-        expect = base64.b64encode(
-            hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
-        if accept != expect:
-            raise WSError("bad Sec-WebSocket-Accept")
-        sock.settimeout(self.timeout)
-        self._sock = sock
+            status_parts = status.split()
+            code = int(status_parts[1]) if len(status_parts)>1 and status_parts[1].isdigit() else None
+            if code != 101:
+                raise WSHandshakeError(code)
+            accept = None
+            while True:
+                line = self._read_line(sock)
+                if not line.strip():
+                    break
+                if line.lower().startswith("sec-websocket-accept:"):
+                    accept = line.split(":", 1)[1].strip()
+            expect = base64.b64encode(
+                hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+            if accept != expect:
+                raise WSError("bad Sec-WebSocket-Accept")
+            sock.settimeout(self.timeout)
+            self._sock = sock
+            self._measure(stage='handshake_ok')
+        except BaseException:
+            self.close()
+            raise
 
     # ------------------------------------------------------------------
     # frames
@@ -214,7 +262,13 @@ class WSClient:
     def _recv_exactly(self, n: int) -> bytes:
         assert self._sock is not None
         while len(self._buf) < n:
+            if self.read_deadline is not None:
+                remaining=self.read_deadline-time.monotonic()
+                if remaining<=0:
+                    raise WSError('absolute websocket response deadline exceeded')
+                self._sock.settimeout(min(self.timeout,remaining))
             chunk = self._sock.recv(65536)
+            self._measure(rx=len(chunk))
             if not chunk:
                 raise WSError("connection closed")
             self._buf += chunk
@@ -252,6 +306,8 @@ class WSClient:
         """Next complete text message, or None on clean server close."""
         fragments: List[bytes] = []
         while True:
+            if self.read_deadline is not None and time.monotonic()>=self.read_deadline:
+                raise WSError('absolute websocket response deadline exceeded')
             head = self._recv_exactly(2)
             b1, b2 = head[0], head[1]
             fin = b1 & 0x80
@@ -291,8 +347,12 @@ class WSClient:
             if self._sock is not None:
                 self._sock.close()
         except Exception:
-            pass
+            logger.warning('WS socket close failed; ownership and telemetry remain unresolved')
+            if self._meter is not None and hasattr(self._meter,'stop'):self._meter.stop()
+            return  # retain ownership for a caller cleanup retry
         self._sock = None
+        self._measure(closed=True)
+        self._meter=None
 
 
 # ----------------------------------------------------------------------
@@ -348,11 +408,13 @@ class LogStream:
     scanner simply keeps polling.
     """
 
-    def __init__(self, ws_url: str = WS_URL, http_rpc: Optional[str] = None,
+    def __init__(self, ws_url: Optional[str] = None, http_rpc: Optional[str] = None,
                  programs: Tuple[str, ...] = (PUMP_PROGRAM,),
                  http_rpcs: Optional[List[str]] = None,
                  intake_home=None,intake_filename='logstream_intake.json'):
-        self._ws_url = ws_url
+        from daemon.intelligence.acquisition.routine import websocket_url
+        self._ws_url = ws_url or websocket_url(purpose="normal_scanning")
+        self._central_rpc = not bool(http_rpc or http_rpcs)
         if http_rpcs:
             urls = [u for u in http_rpcs if u]
         elif http_rpc:
@@ -370,12 +432,20 @@ class LogStream:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._healthy = False
+        self._useful_evidence_at = None
         from pathlib import Path
         try:
             from .stream_intake import StreamIntake
         except ImportError:
             from stream_intake import StreamIntake
         self._intake=StreamIntake(intake_home or os.environ.get('FOREX_AGENT_HOME',Path.home()/'.forex-agent'),filename=intake_filename)
+        self._selective_enricher = None
+        if self._central_rpc:
+            try:
+                from daemon.intelligence.acquisition.selective_enrichment import SelectiveEnrichment
+                self._selective_enricher = SelectiveEnrichment(home=str(self._intake.path.parent.parent))
+            except Exception:
+                logger.warning('selective diagnostics unavailable at initialization')
         self._last_retry_ts=0.0
         # RPC politeness / failure accounting (worker thread only).
         self._last_rpc_ts = 0.0
@@ -412,7 +482,9 @@ class LogStream:
     @property
     def healthy(self) -> bool:
         with self._lock:
-            return self._healthy
+            # Silence is not proof of a broken transport, nor proof of fresh
+            # useful delivery. Expose unknown/degraded after this local bound.
+            return self._healthy and self._useful_evidence_at is not None and time.monotonic()-self._useful_evidence_at<=60.
 
     def drain(self) -> List[Dict[str, Any]]:
         """Snapshot resolved unaccepted detections; never consumes them."""
@@ -430,13 +502,14 @@ class LogStream:
             if self._stop.is_set():break
             if rec.get('mint'):continue
             mint=self._mint_for_signature(sig)
-            if mint:self._intake.resolve(sig,mint)
+            if mint:self._intake.resolve(sig,mint,acquisition_evidence=getattr(self,'_last_tx_evidence',{}))
             else:self._intake.defer(sig)
 
     # -- internals ------------------------------------------------------
     def _set_healthy(self, value: bool) -> None:
         with self._lock:
             self._healthy = value
+            if value:self._useful_evidence_at=time.monotonic()
 
     def _run(self) -> None:
         backoff = 5.0
@@ -446,6 +519,10 @@ class LogStream:
                 self._serve()
             except Exception as exc:
                 logger.warning("logstream connection failed: %s", exc)
+                if isinstance(exc, WSHandshakeError) and exc.status_code in (401,403):
+                    self._set_healthy(False)
+                    logger.warning('logstream access denied; stopping WS attempts until explicit restart, no provider substitution')
+                    return
             self._set_healthy(False)
             if self._stop.is_set():
                 break
@@ -454,9 +531,16 @@ class LogStream:
             backoff = min(backoff * 2, 120.0)
 
     def _serve(self) -> None:
+        from daemon.intelligence.acquisition import routine
+        routine.websocket_admit(self._ws_url)
         ws = WSClient(self._ws_url)
         try:
-            ws.connect()
+            try:
+                ws.connect()
+            except Exception as exc:
+                routine.websocket_result(self._ws_url, exc)
+                raise
+            routine.websocket_result(self._ws_url)
             req_id = 0
             for prog in self._programs:
                 req_id += 1
@@ -466,16 +550,59 @@ class LogStream:
                     "params": [{"mentions": [prog]},
                                {"commitment": "processed"}],
                 }))
-            self._set_healthy(True)
-            logger.warning("logstream subscribed to %d program(s)",
-                           len(self._programs))
+            pending=set(range(1,req_id+1))
+            subscriptions=set()
+            acknowledgements={}
+            ack_deadline=time.monotonic()+20.  # local admission policy, not provider SLA
+            # Socket open is not subscription acceptance. Until every requested
+            # program has a valid ACK, expose polling-only/degraded health.
+            self._set_healthy(False)
             while not self._stop.is_set():
                 self._retry_pending()
+                if pending and time.monotonic()>=ack_deadline:
+                    raise WSError('log subscription acknowledgement deadline exceeded')
+                ws.read_deadline=ack_deadline if pending else time.monotonic()+20.
                 msg = ws.recv_text()
+                if pending and time.monotonic()>=ack_deadline:
+                    raise WSError('log subscription acknowledgement deadline exceeded')
                 if msg is None:
                     raise WSError("server closed the stream")
+                try:envelope=json.loads(msg)
+                except (ValueError,TypeError):envelope=None
+                if isinstance(envelope,dict):
+                    error=envelope.get('error')
+                    # A rate-limit response is account-wide even if its ID is
+                    # unknown, repeated, or belongs to an accepted subscription.
+                    if isinstance(error,dict) and error.get('code')==429:
+                        routine.websocket_subscription_throttled(self._ws_url)
+                        raise WSError('log subscription rejected: rate limited')
+                    rid=envelope.get('id')
+                    if type(rid) is int and rid in acknowledgements:
+                        if error is not None or type(envelope.get('result')) is not int or envelope.get('result')!=acknowledgements[rid]:
+                            raise WSError('log subscription contradictory acknowledgement')
+                        continue  # Exact repeated acceptance is harmless.
+                    if type(rid) is int and rid in pending:
+                        sub=envelope.get('result')
+                        if error is not None or type(sub) is not int or sub<0 or sub in subscriptions:
+                            raise WSError('log subscription rejected or invalid acknowledgement')
+                        pending.remove(rid);subscriptions.add(sub);acknowledgements[rid]=sub
+                        if not pending:
+                            self._set_healthy(True)
+                            logger.warning('logstream acknowledged %d program subscription(s)',len(subscriptions))
+                        continue
+                    if error is not None:
+                        raise WSError('uncorrelated log subscription error')
+                    if envelope.get('method')=='logsNotification':
+                        sub=(envelope.get('params') or {}).get('subscription')
+                        if type(sub) is not int or sub not in subscriptions:
+                            continue  # Never route another/old connection's stream.
+                        result=(envelope.get('params') or {}).get('result')
+                        value=result.get('value') if isinstance(result,dict) else None
+                        if isinstance(value,dict) and isinstance(value.get('signature'),str) and value['signature'] and 'err' in value:
+                            self._set_healthy(not pending)
                 self._handle_message(msg)
         finally:
+            self._set_healthy(False)
             try:
                 ws.close()
             except Exception:
@@ -500,7 +627,7 @@ class LogStream:
             return
         if not self._intake.receive(sig):return
         mint=self._mint_for_signature(sig)
-        if mint:self._intake.resolve(sig,mint)
+        if mint:self._intake.resolve(sig,mint,acquisition_evidence=getattr(self,'_last_tx_evidence',{}))
         else:self._intake.defer(sig)
 
     def _mint_for_signature(self, sig: str) -> Optional[str]:
@@ -511,6 +638,7 @@ class LogStream:
         if delta < 0.5:
             time.sleep(0.5 - delta)
         self._last_rpc_ts = time.monotonic()
+        self._last_tx_evidence = {"recorded": False, "completeness": "unrecorded", "method": "getTransaction"}
         tx = self._http_rpc("getTransaction",
                             [sig, {"encoding": "jsonParsed",
                                     "maxSupportedTransactionVersion": 0}])
@@ -524,7 +652,19 @@ class LogStream:
         signatures=(tx.get('transaction') or {}).get('signatures')
         if not isinstance(signatures,list) or not signatures or signatures[0]!=sig:
             return None
-        return extract_mint(tx)
+        mint = extract_mint(tx)
+        if mint is None and self._central_rpc:
+            # Selective investigation only. Never synthesize a raw transaction,
+            # infer a mint from provider prose, or promote uncertain evidence.
+            try:
+                from daemon.intelligence.acquisition.selective_enrichment import SelectiveEnrichment
+                enricher = getattr(self, '_selective_enricher', None)
+                if enricher is None:
+                    return mint
+                self._last_enrichment = enricher.submit(sig, tx)
+            except Exception:
+                logger.warning('selective diagnostic unavailable; candidate remains unresolved')
+        return mint
 
     def _note_rpc_failure(self, method: str, exc: Any) -> None:
         # Loud enough to notice, quiet enough not to flood the log during
@@ -551,6 +691,15 @@ class LogStream:
         a public endpoint). A 429 reports to the pacer (progressive
         backoff + single probe); a success clears the cooldown.
         """
+        if getattr(self, "_central_rpc", False):
+            from daemon.intelligence.acquisition.routine import call
+            result = call(method, params, hints={"purpose":"normal_scanning"})
+            import copy
+            self._last_tx_evidence = {k:copy.deepcopy(result.get(k)) for k in (
+                'provider','kind','attempts','fallback','fallback_difference','cached',
+                'decision_usable','degraded','completeness','note')}
+            self._last_tx_evidence.update(recorded=True,method=method,observed_at=time.time())
+            return result.get('result') if result.get('decision_usable',False) else None
         payload = json.dumps({"jsonrpc": "2.0", "id": 1,
                               "method": method, "params": params}).encode()
         transient = (http.client.IncompleteRead,

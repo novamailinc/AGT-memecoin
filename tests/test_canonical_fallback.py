@@ -162,7 +162,7 @@ _MIG_TX = {
                  "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
                  "Program log: Instruction: Migrate",
                  "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"]},
-    "transaction": {"message": {"accountKeys": [
+    "transaction": {"signatures":["sig-mig"],"message": {"accountKeys": [
         {"pubkey": TRADER_OK, "signer": True, "writable": True},
         {"pubkey": POOL_REAL, "signer": False, "writable": True},
         CURVE_FB,  # plain-string entry: also handled

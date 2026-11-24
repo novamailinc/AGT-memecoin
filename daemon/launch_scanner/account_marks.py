@@ -121,13 +121,21 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
                         or not isinstance(pos_id, str)
                         or not pos_id):
                     continue
-                wanted.append((lane, mint, float(qty), pos_id))
+                wanted.append((lane, mint, float(qty), pos_id, p.get("mark_key", mint)))
                 if mint not in mints:
                     mints.append(mint)
     except Exception as e:
         logger.warning("account marks: bad snapshot shape: %s",
                        type(e).__name__)
         return {}
+    from daemon.solana_ids import WSOL_MINT
+    for pending in snap.get("pending_sol") or []:
+        qty = pending.get("proceeds_sol")
+        if isinstance(qty, (int, float)) and qty >= 0:
+            wanted.append((pending["lane"], WSOL_MINT, float(qty),
+                           pending["pending_id"], pending["pending_id"]))
+            if WSOL_MINT not in mints:
+                mints.append(WSOL_MINT)
     if not wanted:
         return {}
     try:
@@ -170,7 +178,7 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
             logger.warning("account marks: curve %s failed: %s",
                            mint[:8], type(e).__name__)
     marks = {}
-    for lane, mint, qty, pos_id in wanted:
+    for lane, mint, qty, pos_id, mark_key in wanted:
         try:
             jpx, jts = prices.get(mint, (None, None))
             if _ok_price(jpx):
@@ -183,7 +191,7 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
             if not isinstance(ots, (int, float)) \
                     or isinstance(ots, bool) or not math.isfinite(ots):
                 ots = now
-            marks.setdefault(lane, {})[mint] = {
+            marks.setdefault(lane, {})[mark_key] = {
                 "value": round(qty * px, 6),
                 "ts": float(ots),
                 "source": source,

@@ -543,7 +543,9 @@ class MethodFixtureTransport:
     getSignaturesForAddress so backfill rate can be measured past
     the 2-row recorded page — the rows are synthetic, the transport
     is mocked, and both facts are labelled in the report. Every
-    call is recorded (host + method) so a test can prove no live
+    synthetic page gets synthetic matching identity envelopes, never a
+    relabeled recorded response. Every call is recorded (host + method)
+    so a test can prove no live
     host was ever touched.
     """
 
@@ -564,6 +566,17 @@ class MethodFixtureTransport:
                 "err": None, "memo": None})
         return rows
 
+    def synthetic_transaction(self, signature):
+        """Explicit synthetic identity envelope for synthetic paging benchmarks.
+
+        Not a rewritten recorded transaction or decoded market evidence.
+        """
+        index = int(signature[5:]) if signature.startswith('bench') and signature[5:].isdigit() else 0
+        return {"transaction": {"signatures": [signature], "message": {}},
+                "meta": {"err": None, "fee": 0},
+                "slot": 472499532 - index, "blockTime": 1795341615 - index,
+                "benchmark_synthetic": True}
+
     def __call__(self, req, timeout=None):
         import json as _json
         url = req.full_url
@@ -576,6 +589,8 @@ class MethodFixtureTransport:
         self.calls.append((host, method))
         if method == "getSignaturesForAddress" and self.sig_page_size:
             result = self._sig_page()
+        elif method == "getTransaction" and self.sig_page_size:
+            result = self.synthetic_transaction(body["params"][0])
         else:
             result = self.fixtures.get(method)
         payload = _json.dumps(
@@ -816,7 +831,7 @@ def run_phase10_suite(repo_root, calls_route=200, calls_router=30,
         if method == "getSignaturesForAddress":
             return {"kind": "ok", "result": bf_transport._sig_page()}
         return {"kind": "ok",
-                "result": fixtures.get("getTransaction")}
+                "result": bf_transport.synthetic_transaction(params[0])}
 
     def _recover_primitives_once():
         sink = DedupEventSink()
@@ -841,10 +856,13 @@ def run_phase10_suite(repo_root, calls_route=200, calls_router=30,
                                     "live archive latency")
     primitives["synthetic_page"] = ("getSignaturesForAddress page "
                                     "synthesised to 100 rows; the "
+                                    "synthetic identity envelopes returned per row; "
+                                    "no recorded response relabeled; "
                                     "recorded fixture page has 2 rows")
     # (d2) router-mediated, recorded 2-row page, fresh router (full
     # token bucket) per run: the end-to-end driver-over-router rate
-    # for a gap the recorded fixture can actually cover.
+    # One page row matches the single recorded transaction; the other
+    # is explicitly refused and remains an unrecovered gap.
     def _recover_router_once():
         router = router_mod.ProviderRouter(
             home=tempfile.mkdtemp(prefix="phase10_backfill_rt_"),
@@ -858,7 +876,8 @@ def run_phase10_suite(repo_root, calls_route=200, calls_router=30,
         _recover_router_once, runs=backfill_runs)
     router_mediated["proves"] = ("BackfillDriver over the central "
                                  "router on mocked transport, "
-                                 "recorded 2-row page, token available")
+                                 "recorded 2-row page, one matching transaction; "
+                                 "other signature refused as unrecovered, token available")
     router_mediated["does_not_prove"] = ("live provider paging rate; "
                                          "see the scheduler-cap note")
     # (d3) scheduler-cap observation: ONE 100-row page through ONE

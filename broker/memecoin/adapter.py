@@ -26,11 +26,16 @@ See RUNTIME.md for the full contract.
 """
 
 import contextlib
+import copy
+import uuid
 import fcntl
 import json
+import hashlib
+import math
 import logging
 import os
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -94,14 +99,15 @@ def _write_json_atomic(path: Path, obj) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def _fsync_dir(path: Path) -> None:
+    dfd = os.open(str(path), os.O_RDONLY)
     try:
-        dfd = os.open(str(path.parent) or ".", os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 class MemecoinAdapter(BrokerAdapter):
@@ -116,7 +122,8 @@ class MemecoinAdapter(BrokerAdapter):
                  market_data: Optional[MemecoinMarketData] = None,
                  chains: Optional[List[str]] = None,
                  key_provider=None,
-                 devnet_rpc_url: str = ""):
+                 devnet_rpc_url: str = "", shared_account=None, fx_observer=None,
+                 shared_mark_observer=None):
         """
         data_dir: state directory (created if missing).
         mode: "paper" | "live". Live is fail-closed (see module docstring).
@@ -140,6 +147,13 @@ class MemecoinAdapter(BrokerAdapter):
         self._data_dir = Path(data_dir or os.path.join(home, "data", "memecoin"))
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._mode = mode
+        # Explicit injection only while integration qualification is incomplete.
+        # No environment switch activates the unfinished bridge.
+        self._shared_account = shared_account
+        self._fx_observer = fx_observer
+        self._shared_mark_observer = shared_mark_observer
+        if shared_account is not None and mode != "paper":
+            raise BrokerError(CONFIG_INVALID, "shared capital bridge is paper-only")
         self._paper_start_sol = float(paper_start_sol)
         self._live_armed = bool(live_armed)
         self._wallet_pubkey = (wallet_pubkey or "").strip()
@@ -168,20 +182,51 @@ class MemecoinAdapter(BrokerAdapter):
         self._devnet_rpc_url = (devnet_rpc_url or "").strip()
         self._devnet = None  # DevnetExecutor once connected
         self._sol_price_cache: Optional[tuple] = None  # (ts, price_usd)
-        self._load_state()
+        with self._state_lock():
+            self._refresh_locked()
 
     # -- persisted paper state -------------------------------------------
     def _state_path(self) -> Path:
         return self._data_dir / "paper_state.json"
 
     def _load_state(self) -> None:
-        state = _read_json(self._state_path(), None)
+        path = self._state_path()
+        if path.exists():
+            state = json.loads(path.read_text())
+            self._validate_native_state(state)
+        else:
+            if self._fills_path().exists() and not self._intent_path().exists():
+                raise ValueError("native state missing with existing fill history")
+            state = {"balance_sol": self._paper_start_sol,
+                     "positions": {}, "next_ticket": 1}
+        self._balance_sol = float(state["balance_sol"])
+        self._positions = state["positions"]
+        self._next_ticket = state["next_ticket"]
+        self._loaded_native_state = self._native_snapshot()
+
+    def _native_snapshot(self) -> dict:
+        return {"balance_sol": self._balance_sol,
+                "positions": copy.deepcopy(self._positions),
+                "next_ticket": self._next_ticket}
+
+    @staticmethod
+    def _validate_native_state(state: dict) -> None:
         if not isinstance(state, dict):
-            state = {}
-        self._balance_sol: float = float(
-            state.get("balance_sol", self._paper_start_sol))
-        self._positions: Dict[str, dict] = state.get("positions", {})
-        self._next_ticket: int = int(state.get("next_ticket", 1))
+            raise ValueError("invalid native state")
+        balance, ticket, positions = (state["balance_sol"], state["next_ticket"],
+                                      state["positions"])
+        if (isinstance(balance, bool) or not math.isfinite(float(balance))
+                or type(ticket) is not int or ticket < 1
+                or not isinstance(positions, dict)):
+            raise ValueError("invalid native state values")
+        for key, pos in positions.items():
+            if str(int(key)) != key or not 0 < int(key) < ticket:
+                raise ValueError("invalid native position ticket")
+            for name in ("tokens", "volume_sol", "entry_price_sol"):
+                if not math.isfinite(float(pos[name])) or float(pos[name]) < 0:
+                    raise ValueError("invalid native position economics")
+            for name in ("symbol", "direction", "sl", "tp", "comment", "time_open"):
+                pos[name]  # missing required fields fail closed
 
     def _save_state(self) -> None:
         _write_json_atomic(self._state_path(), {
@@ -227,6 +272,263 @@ class MemecoinAdapter(BrokerAdapter):
         process's journal appends."""
         self._load_state()
         self._fill_keys_cache = None
+        self._require_shared_binding()
+        self._recover_native_intent()
+
+    def _require_shared_binding(self):
+        marker = self._data_dir / "shared_binding.json"
+        if marker.exists():
+            binding = json.loads(marker.read_text())
+            if self._shared_account is None:
+                raise ValueError("native book requires authoritative shared account binding")
+            actual = str(Path(self._shared_account.LEDGER_PATH).resolve())
+            if binding.get("account_path") != actual:
+                raise ValueError("native shared account identity conflict")
+            self._shared_account.account_identity(binding["account_id"])
+            self._shared_book_id = binding["book_id"]
+        elif self._shared_account is not None:
+            binding = {"version":1,"book_id":uuid.uuid4().hex,
+                       "account_id":self._shared_account.account_identity(),
+                       "account_path":str(Path(self._shared_account.LEDGER_PATH).resolve())}
+            _write_json_atomic(marker,binding)
+            self._shared_book_id = binding["book_id"]
+
+    def _intent_path(self) -> Path:
+        return self._data_dir / "native_pending.json"
+
+    def _commit_native(self, fill: dict) -> None:
+        """Caller owns the state lock. Persist exact after-image before effects.
+
+        This is native-only durability, not shared-capital admission. No market
+        quote, FX, FIFO selection or ticket allocation is repeated on recovery.
+        """
+        if fill.get("kind") in ("BUY", "SELL"):
+            fill = dict(fill, request_fingerprint=self._request_fingerprint)
+        fill = dict(fill, native_op_id=uuid.uuid4().hex,
+                    ts=_utcnow().isoformat(), mode=self._mode)
+        self._validate_fill(fill)
+        self._fill_keys_cache = None
+        intent = {"version": 1, "fill": fill,
+                  "before": self._loaded_native_state,
+                  "after": self._native_snapshot()}
+        self._validate_native_state(intent["after"])
+        intent["sha256"] = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        if self._shared_account is not None:
+            if fill["kind"] == "BUY":
+                from broker.memecoin.shared_capital import entry_plan
+                if any(not p.get("shared_pos_id") for p in intent["before"]["positions"].values()):
+                    raise BrokerError(BROKER_UNAVAILABLE, "unbound legacy native inventory")
+                fx = self._entry_pricing_fx
+                fill["price_evidence"]={"kind":"USD_ratio","fx":fx,
+                                        "token":self._entry_token_evidence}
+                identity = fill.get("idempotency_key") or fill["native_op_id"]
+                intent["shared_entry"] = entry_plan(
+                    "main", self._market.mint_for(fill["symbol"]), fill["ticket"],
+                    fill["tokens"], fill["volume_sol"], fx,
+                    "native-entry:" + self._shared_book_id + ":" + identity)
+            else:
+                fill["price_evidence"] = (getattr(self,"_shared_last_exit_price",None)
+                    if fill.get("price_sol") else {"kind":"explicit_zero","reason":fill.get("close_reason")})
+                intent["shared_exits"] = []
+                for index, allocation in enumerate(fill["allocations"]):
+                    pos = intent["before"]["positions"][str(allocation["ticket"])]
+                    if not pos.get("shared_pos_id"):
+                        raise BrokerError(BROKER_UNAVAILABLE, "unbound native exit requires reconciliation")
+                    intent["shared_exits"].append({
+                        "lane": pos["shared_lane"],
+                        "mint": pos["shared_mint"],
+                        "pos_id": pos["shared_pos_id"], "allocation": allocation,
+                        "sold_at": datetime.fromisoformat(fill["ts"]).timestamp(),
+                        "op_id": "native-pending:" + fill["native_op_id"] + ":" + str(index)})
+            self._seal_intent(intent)
+        _write_json_atomic(self._intent_path(), intent)
+        self._recover_native_intent()
+
+    @staticmethod
+    def _seal_intent(intent):
+        intent.pop("sha256", None)
+        intent["sha256"] = hashlib.sha256(json.dumps(
+            intent, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+    def _observe_entry_fx(self):
+        from broker.memecoin.shared_capital import validate_fx
+        if self._fx_observer is not None:
+            return validate_fx(self._fx_observer())
+        q = self._market.get_quote("SOL")
+        observed = q.get("ts") if isinstance(q, dict) else None
+        if isinstance(observed, datetime):
+            observed = observed.timestamp()
+        return validate_fx({"usd_per_sol": q.get("price_usd") if q else None,
+                            "observed_at": observed,
+                            "source": q.get("source") if q else None})
+
+    def _recover_native_intent(self) -> None:
+        path = self._intent_path()
+        if not path.exists():
+            return
+        # A corrupt intent is never equivalent to no intent. Admission freezes.
+        intent = json.loads(path.read_text())
+        if intent.get("version") != 1:
+            raise ValueError("unsupported native pending intent")
+        digest = intent.pop("sha256")
+        if digest != hashlib.sha256(json.dumps(
+                intent, sort_keys=True, allow_nan=False).encode()).hexdigest():
+            raise ValueError("native pending intent checksum mismatch")
+        fill, after = intent["fill"], intent["after"]
+        self._validate_native_state(after)
+        if self._loaded_native_state not in (intent["before"], after):
+            raise ValueError("native pending intent conflicts with state")
+        op_id = fill["native_op_id"]
+        if not isinstance(op_id, str) or not op_id:
+            raise ValueError("invalid native operation identity")
+        entries = []
+        if self._fills_path().exists():
+            entries = [json.loads(line) for line in
+                       self._fills_path().read_text().splitlines() if line.strip()]
+        matches = [e for e in entries if e.get("native_op_id") == op_id]
+        if matches and (len(matches) != 1 or matches[0] != fill):
+            raise ValueError("native pending intent conflicts with fill journal")
+        # Validate the entire history and the intended fill BEFORE either
+        # projection. Even a matching op cannot hide a duplicate elsewhere.
+        keys, operations, request_keys = set(), set(), set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("invalid native fill journal record")
+            pair = (entry.get("ticket"), entry.get("kind"))
+            if pair in keys:
+                raise ValueError("duplicate native fill history")
+            keys.add(pair)
+            operation = entry.get("native_op_id")
+            if operation:
+                if operation in operations:
+                    raise ValueError("duplicate native operation identity")
+                operations.add(operation)
+            request_key = entry.get("idempotency_key")
+            if request_key and entry.get("kind") in ("BUY", "SELL"):
+                if request_key in request_keys:
+                    raise ValueError("duplicate native request identity")
+                request_keys.add(request_key)
+        request_key = fill.get("idempotency_key")
+        if (not matches and request_key and fill.get("kind") in ("BUY", "SELL")
+                and request_key in request_keys):
+            raise ValueError("pending native request identity conflicts with history")
+        self._fill_keys_cache = {pair for pair in keys if not matches or
+                                 pair != (fill["ticket"], fill["kind"])}
+        self._fill_buy_ts = {e["ticket"]: e.get("ts") for e in entries
+                            if e.get("kind") == "BUY" and e is not (matches[0] if matches else None)}
+        self._validate_fill(fill)
+        self._fill_keys_cache = None
+        if intent.get("shared_entry") is not None:
+            from broker.memecoin.shared_capital import apply_entry
+            if self._shared_account is None:
+                raise ValueError("shared entry intent requires its account binding")
+            receipt, refusal = apply_entry(intent["shared_entry"], self._shared_account)
+            if refusal is not None:
+                # The account owns a durable terminal refusal for this attempt.
+                # Delete no evidence of an uncertain commit and never debit SOL.
+                self._load_state()
+                path.unlink()
+                _fsync_dir(path.parent)
+                raise BrokerError(RISK_LIMIT_EXCEEDED, "shared capital refused: " + refusal)
+            if intent.get("shared_receipt") not in (None, receipt):
+                raise ValueError("stored shared entry receipt conflict")
+            intent["shared_receipt"] = receipt
+            binding = {"shared_pos_id": receipt["pos_id"],
+                       "shared_entry_op_id": intent["shared_entry"]["op_id"],
+                       "shared_entry_fx": intent["shared_entry"]["fx"],
+                       "shared_entry_usd": receipt["stake"], "shared_lane": receipt["lane"],
+                       "shared_mint": receipt["mint"], "shared_book_id": self._shared_book_id}
+            after["positions"][str(fill["ticket"])].update(binding)
+            fill.update(binding)
+            self._seal_intent(intent)
+            _write_json_atomic(path, intent)
+        if intent.get("shared_exits") is not None:
+            if self._shared_account is None:
+                raise ValueError("shared exit intent requires its account binding")
+            from daemon.launch_scanner import pending_sol
+            for item in intent["shared_exits"]:
+                allocation = item["allocation"]
+                ok, why = pending_sol.reserve(
+                    self._shared_account, item["lane"], item["mint"], item["pos_id"],
+                    allocation["tokens"], allocation["proceeds_sol"], allocation["ticket"],
+                    allocation["basis_sol"], item["sold_at"], item["op_id"], fee_sol=0.)
+                if not ok:
+                    raise ValueError("shared pending exit conflict: " + why)
+                receipt, error = self._shared_account.operation_receipt(item["op_id"])
+                if error or receipt is None:
+                    raise ValueError("shared pending exit receipt unavailable: " + str(error))
+                expected = {"event": "pending_sol", "lane":item["lane"],
+                            "mint":item["mint"], "pos_id":item["pos_id"],
+                            "qty":allocation["tokens"], "proceeds_sol":allocation["proceeds_sol"],
+                            "ticket":allocation["ticket"], "native_basis_sol":allocation["basis_sol"],
+                            "sold_at":item["sold_at"], "fee_sol":0., "instance":True}
+                if any(receipt.get(k)!=v for k,v in expected.items()):
+                    raise ValueError("shared pending exit receipt conflict")
+        self._balance_sol = float(after["balance_sol"])
+        self._positions = copy.deepcopy(after["positions"])
+        self._next_ticket = int(after["next_ticket"])
+        self._save_state()
+        self._loaded_native_state = self._native_snapshot()
+        if not matches:
+            self._journal_fill(fill)
+        else:
+            # A prior replace can be visible even if its directory fsync failed.
+            # Re-establish durability before deleting the recovery source.
+            with open(self._fills_path(), "rb") as fh:
+                os.fsync(fh.fileno())
+            _fsync_dir(self._data_dir)
+        # No later mutation can start until every projection is durable.
+        path.unlink()
+        _fsync_dir(path.parent)
+
+    def retry_pending_usd(self):
+        """Existing scanner cadence retries dated FX, never blocking native exits."""
+        if self._shared_account is None:
+            return []
+        snapshot=self._shared_account.snapshot()
+        if not any(p.get("lane")=="main" for p in snapshot.get("pending_sol",[])):
+            return []
+        try:
+            fx=self._observe_entry_fx()
+        except Exception:
+            return [{"ok":False,"reason":"USD settlement pending current FX"}]
+        return self.settle_pending_usd(fx)
+
+    def settle_pending_usd(self, fx: dict) -> list:
+        """Explicit dated SOL-to-USD settlement; no token exit or native rollback.
+
+        All pending items are already account-owned SOL, unspendable until each
+        exact allocation settles. Native->account lock order matches execution.
+        An unsettled item remains pending and cannot be called converged.
+        """
+        self._ensure()
+        if self._shared_account is None:
+            raise ValueError("no shared account binding")
+        from broker.memecoin.shared_capital import validate_fx
+        from daemon.launch_scanner import pending_sol
+        fx = validate_fx(fx)
+        results = []
+        with self._state_lock():
+            self._refresh_locked()
+            snapshot = self._shared_account.snapshot()
+            if snapshot.get("degraded"):
+                raise ValueError("shared account degraded")
+            for item in snapshot.get("pending_sol", []):
+                if item["lane"] != "main":
+                    continue
+                # Each allocation is atomic in the shared WAL; no batch atomicity.
+                proceeds = round(item["proceeds_sol"] * fx["usd_per_sol"], 6)
+                op_id = "native-settle:" + item["pending_id"]
+                ok, why = pending_sol.settle(
+                    self._shared_account, item["lane"], item["mint"], item["pos_id"],
+                    item["pending_id"], fx, proceeds, op_id)
+                if ok:
+                    receipt, error = self._shared_account.operation_receipt(op_id)
+                    if error or receipt is None:
+                        raise ValueError("shared settlement receipt unavailable")
+                results.append({"pending_id":item["pending_id"], "ok":ok, "reason":why})
+        return results
 
     def _fills_path(self) -> Path:
         return self._data_dir / "fills.jsonl"
@@ -244,8 +546,20 @@ class MemecoinAdapter(BrokerAdapter):
         # Both fail LOUD (raise) — a corrupt ledger is worse than a
         # missed write, and the caller must know.
         self._validate_fill(entry)
-        with open(self._fills_path(), "a") as fh:
+        # Atomic replacement avoids a torn append losing the trailing operation
+        # boundary. The pending intent remains until this projection is durable.
+        path = self._fills_path()
+        old = path.read_text() if path.exists() else ""
+        tmp = Path("%s.tmp.%d" % (path, os.getpid()))
+        with open(tmp, "w") as fh:
+            fh.write(old)
+            if old and not old.endswith("\n"):
+                fh.write("\n")
             fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
 
     def _seen_fill_keys(self) -> set:
         """(ticket, kind) pairs already in the journal. Cached per process."""
@@ -254,19 +568,17 @@ class MemecoinAdapter(BrokerAdapter):
             buy_ts = {}
             path = self._fills_path()
             if path.exists():
-                try:
-                    for line in path.read_text(encoding="utf-8").splitlines():
-                        try:
-                            d = json.loads(line)
-                        except Exception:
-                            continue
-                        t, k = d.get("ticket"), d.get("kind")
-                        if t is not None and k:
-                            keys.add((t, k))
-                        if k == "BUY" and t is not None:
-                            buy_ts[t] = d.get("ts")
-                except OSError:
-                    pass
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    d = json.loads(line)
+                    if not isinstance(d, dict):
+                        raise ValueError("invalid native fill journal record")
+                    t, k = d.get("ticket"), d.get("kind")
+                    if t is not None and k:
+                        if (t, k) in keys:
+                            raise ValueError("duplicate native fill history")
+                        keys.add((t, k))
+                    if k == "BUY" and t is not None:
+                        buy_ts[t] = d.get("ts")
             self._fill_keys_cache = keys
             self._fill_buy_ts = buy_ts
         return self._fill_keys_cache
@@ -304,13 +616,17 @@ class MemecoinAdapter(BrokerAdapter):
         return self._data_dir / "idempotency.json"
 
     def _idempotent_get(self, key: str) -> Optional[dict]:
-        store = _read_json(self._idempotency_path(), {})
-        return store.get(key) if isinstance(store, dict) else None
+        path = self._idempotency_path()
+        store = json.loads(path.read_text()) if path.exists() else {}
+        if not isinstance(store, dict):
+            raise ValueError("invalid native idempotency store")
+        return store.get(key)
 
     def _idempotent_put(self, key: str, result: dict) -> None:
-        store = _read_json(self._idempotency_path(), {})
+        path = self._idempotency_path()
+        store = json.loads(path.read_text()) if path.exists() else {}
         if not isinstance(store, dict):
-            store = {}
+            raise ValueError("invalid native idempotency store")
         store[key] = result
         _write_json_atomic(self._idempotency_path(), store)
 
@@ -330,7 +646,7 @@ class MemecoinAdapter(BrokerAdapter):
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return None
-        for line in reversed(lines[-500:]):  # recent fills only
+        for line in reversed(lines):  # full-lifetime identity, not a recent window
             try:
                 entry = json.loads(line)
             except ValueError:
@@ -353,6 +669,10 @@ class MemecoinAdapter(BrokerAdapter):
                 message="paper fill (recovered from journal)",
                 raw={"mode": "paper",
                      "tokens": float(entry.get("tokens", 0.0)),
+                     "request_fingerprint": entry.get("request_fingerprint"),
+                     **({"realized_pnl_sol": entry["realized_pnl_sol"],
+                         "closed_tickets": entry["closed_tickets"]}
+                        if entry.get("kind") == "SELL" else {}),
                      "recovered": True},
             )
         return None
@@ -375,6 +695,58 @@ class MemecoinAdapter(BrokerAdapter):
         self._sol_price_cache = (now, price)
         return price
 
+    def _verify_position_mints(self, symbol):
+        if self._shared_account is not None:
+            mint = self._market.mint_for(symbol)
+            for pos in self._positions.values():
+                if pos["symbol"] == symbol and not pos.get("shared_mint"):
+                    raise BrokerError(INVALID_ORDER, "unbound legacy native inventory")
+                if pos["symbol"] == symbol and pos.get("shared_mint") != mint:
+                    raise BrokerError(INVALID_ORDER, "symbol mapping differs from immutable entry mint")
+
+    def _validated_usd_quote(self, symbol, quote):
+        if not isinstance(quote,dict):
+            raise BrokerError(BROKER_UNAVAILABLE,"token USD observation unavailable")
+        observed=quote.get("ts")
+        if isinstance(observed,datetime): observed=observed.timestamp()
+        usd=quote.get("price_usd")
+        if (quote.get("mint")!=self._market.mint_for(symbol)
+                or not isinstance(quote.get("source"),str) or not quote["source"]
+                or isinstance(observed,bool) or not isinstance(observed,(int,float))
+                or not math.isfinite(observed) or not 0<=time.time()-observed<=_SOL_PRICE_TTL
+                or isinstance(usd,bool) or not isinstance(usd,(int,float))
+                or not math.isfinite(usd) or usd<=0):
+            raise BrokerError(BROKER_UNAVAILABLE,"token USD observation invalid or stale")
+        return {"mint":quote["mint"],"source":quote["source"],"observed_at":observed,
+                "price_usd":usd,"pair":quote.get("pair")}
+
+    def _shared_price_sol(self, symbol):
+        self._verify_position_mints(symbol)
+        quote = self._market.get_quote(symbol)
+        if not isinstance(quote,dict):
+            raise BrokerError(BROKER_UNAVAILABLE,"shared native token price unavailable")
+        native = quote.get("price_sol")
+        observed = quote.get("ts")
+        if isinstance(observed,datetime):
+            observed=observed.timestamp()
+        if (quote.get("mint")==self._market.mint_for(symbol)
+                and quote.get("price_sol_quote_mint")==SOL_MINT
+                and isinstance(native,(int,float)) and not isinstance(native,bool)
+                and math.isfinite(native) and native>0
+                and isinstance(observed,(int,float)) and not isinstance(observed,bool)
+                and 0<=time.time()-observed<=_SOL_PRICE_TTL
+                and isinstance(quote.get("source"),str) and quote["source"]):
+            self._shared_last_exit_price = {"kind":"native_SOL_pair", "price_sol":native,
+                "mint":quote["mint"],"source":quote["source"],"observed_at":observed,
+                "quote_mint":quote["price_sol_quote_mint"], "pair":quote.get("pair")}
+            return float(native)
+        fx = self._observe_entry_fx()
+        token_evidence=self._validated_usd_quote(symbol,quote)
+        price=token_evidence["price_usd"]/fx["usd_per_sol"]
+        self._shared_last_exit_price={"kind":"USD_ratio", "price_sol":price,
+                                     "mint":self._market.mint_for(symbol),"fx":fx,"token":token_evidence}
+        return price
+
     def _price_sol(self, symbol: str) -> float:
         """Token price in SOL, via USD legs. Raises BROKER_UNAVAILABLE
         when market data is unreachable — paper fills are never priced
@@ -389,6 +761,8 @@ class MemecoinAdapter(BrokerAdapter):
 
     def _price_sol_quiet(self, symbol: str) -> Optional[float]:
         try:
+            if self._shared_account is not None:
+                return self._shared_price_sol(symbol)
             return self._price_sol(symbol)
         except BrokerError:
             return None
@@ -522,6 +896,26 @@ class MemecoinAdapter(BrokerAdapter):
 
     def account_info(self) -> AccountInfo:
         self._ensure()
+        if self._shared_account is not None:
+            with self._state_lock():
+                self._refresh_locked()
+                from daemon.launch_scanner import account_marks
+                try:
+                    fx = self._observe_entry_fx()
+                    marks = (self._shared_mark_observer or account_marks.collect_marks)()
+                    snap = self._shared_account.snapshot(marks)
+                except Exception as exc:
+                    raise BrokerError(BROKER_UNAVAILABLE, "shared SOL sizing inputs unavailable") from exc
+                equity = snap.get("marked_equity_conservative")
+                if snap.get("degraded") or equity is None:
+                    raise BrokerError(BROKER_UNAVAILABLE, "shared SOL sizing marks unavailable")
+                rate = fx["usd_per_sol"]
+                self._last_shared_sizing_evidence = {"fx":fx, "usd_equity":equity,
+                    "usd_spendable":snap["cash_spendable"], "currency":"SOL"}
+                return AccountInfo(balance=snap["cash_spendable"]/rate,
+                                   equity=equity/rate, currency="SOL", margin=0.,
+                                   free_margin=snap["cash_spendable"]/rate, leverage=1,
+                                   login=0, server="memecoin-shared-paper-sol-sizing")
         # Equity = cash + current market value of open positions. (BUY
         # deducts the cost from cash, so adding only unrealized P/L would
         # double-count the cost basis.)
@@ -536,6 +930,139 @@ class MemecoinAdapter(BrokerAdapter):
             login=0,
             server="memecoin-paper" if self._mode == "paper" else "memecoin-live",
         )
+
+    def risk_state_identity(self):
+        if self._shared_account is None:
+            return None
+        with self._state_lock():
+            self._refresh_locked()
+            binding = json.loads((self._data_dir / "shared_binding.json").read_text())
+            return {"book_id":binding["book_id"], "account_id":binding["account_id"],
+                    "currency":"SOL", "mode":"shared-usd-sol-sizing-v1"}
+
+    def scanner_entry_evidence(self,request,book,publish=None):
+        """Read exact durable BUY and current inventory, never submit or quote."""
+        self._ensure()
+        if self._shared_account is None:return None
+        with self._state_lock():
+            self._refresh_locked()
+            binding=json.loads((self._data_dir/'shared_binding.json').read_text())
+            actual={'book_id':binding['book_id'],'account_id':binding['account_id'],
+                    'currency':'SOL','mode':'shared-usd-sol-sizing-v1'}
+            if actual!=book:raise ValueError('scanner entry book conflict')
+            normalized=copy.deepcopy(request)
+            normalized['symbol']=normalized['symbol'].upper()
+            mint=normalized.pop('mint')
+            normalized['mint']=mint
+            for field in ('volume','stop_loss','take_profit'):
+                if normalized[field] is not None:normalized[field]=float(normalized[field])
+            fingerprint=hashlib.sha256(json.dumps(normalized,sort_keys=True,allow_nan=False).encode()).hexdigest()
+            entries=[json.loads(line) for line in self._fills_path().read_text().splitlines() if line.strip()] if self._fills_path().exists() else []
+            matches=[e for e in entries if e.get('kind')=='BUY' and e.get('idempotency_key')==request['idempotency_key']]
+            if not matches:return None
+            if len(matches)!=1:raise ValueError('duplicate scanner entry BUY')
+            fill=matches[0]
+            if (fill.get('request_fingerprint')!=fingerprint or fill.get('shared_book_id')!=book['book_id']
+                    or fill.get('shared_mint')!=mint or not fill.get('native_op_id')):
+                raise ValueError('scanner entry BUY identity conflict')
+            price,tokens,volume=fill['price_sol'],fill['tokens'],fill['volume_sol']
+            if (any(type(v) not in (int,float) or not math.isfinite(v) or v<=0 for v in (price,tokens,volume))
+                    or not math.isclose(price*tokens,volume,rel_tol=1e-10,abs_tol=1e-12)
+                    or volume!=normalized['volume']):raise ValueError('scanner entry BUY economics conflict')
+            datetime.fromisoformat(fill['ts'])
+            receipt,error=self._shared_account.operation_receipt(fill['shared_entry_op_id'])
+            expected={'event':'debit','instance':True,'lane':fill.get('shared_lane'),
+                'mint':mint,'stake':fill.get('shared_entry_usd'),'qty':tokens,'pos_id':fill.get('shared_pos_id')}
+            expected_op='native-entry:'+book['book_id']+':'+request['idempotency_key']
+            fx=fill.get('shared_entry_fx')
+            if (error or not isinstance(receipt,dict) or fill.get('shared_entry_op_id')!=expected_op
+                    or expected['lane']!='main' or not expected['pos_id']
+                    or not isinstance(fx,dict) or type(fx.get('usd_per_sol')) not in (int,float)
+                    or not math.isfinite(fx['usd_per_sol']) or fx['usd_per_sol']<=0
+                    or expected['stake']!=round(volume*fx['usd_per_sol'],6)
+                    or any(receipt.get(k)!=v for k,v in expected.items())):
+                raise ValueError('scanner entry shared debit receipt conflict')
+            pos=self._positions.get(str(fill['ticket']))
+            if pos is None:return {'state':'closed','fill':copy.deepcopy(fill)}
+            for field in ('symbol','tokens','volume_sol','entry_price_sol'):
+                expected=fill['price_sol'] if field=='entry_price_sol' else fill[field]
+                if pos[field]!=expected:raise ValueError('scanner entry inventory conflict')
+            if pos.get('shared_pos_id')!=fill.get('shared_pos_id'):raise ValueError('scanner entry lot conflict')
+            with open(self._fills_path(),'rb') as fh:os.fsync(fh.fileno())
+            _fsync_dir(self._data_dir)
+            closed_tickets=[]
+            for ticket in {e.get('ticket') for e in entries if e.get('kind')=='CLOSE'}:
+                identity=dict(book,ticket=ticket)
+                self._validated_scanner_close(identity,entries,binding)
+                closed_tickets.append(ticket)
+            evidence={'state':'open','fill':copy.deepcopy(fill),'position':copy.deepcopy(pos),
+                      'closed_tickets':closed_tickets}
+            if publish is not None:publish(evidence)
+            return evidence
+
+    def scanner_close_identity(self, ticket):
+        """Exact shared-book identity for a scanner recovery intent."""
+        self._ensure()
+        if self._shared_account is None:
+            return None
+        with self._state_lock():
+            self._refresh_locked()
+            binding = json.loads((self._data_dir / "shared_binding.json").read_text())
+            return {"book_id":binding["book_id"], "account_id":binding["account_id"],
+                    "currency":"SOL", "mode":"shared-usd-sol-sizing-v1", "ticket":int(ticket)}
+
+    def scanner_close_receipt(self, identity):
+        """Recover only an exact durable CLOSE, never infer it from absence."""
+        self._ensure()
+        with self._state_lock():
+            self._refresh_locked()
+            binding = json.loads((self._data_dir / "shared_binding.json").read_text())
+            entries=[json.loads(line) for line in self._fills_path().read_text().splitlines() if line.strip()] if self._fills_path().exists() else []
+            return self._validated_scanner_close(identity,entries,binding)
+
+    def _validated_scanner_close(self,identity,entries,binding):
+        expected={'book_id':binding['book_id'],'account_id':binding['account_id'],
+                  'currency':'SOL','mode':'shared-usd-sol-sizing-v1','ticket':identity['ticket']}
+        if identity!=expected:raise ValueError('scanner close book identity conflict')
+        matches=[e for e in entries if e.get('kind')=='CLOSE' and e.get('ticket')==identity['ticket']]
+        if not matches:return None
+        if len(matches)!=1:raise ValueError('duplicate scanner CLOSE receipt')
+        receipt=matches[0]
+        if str(identity['ticket']) in self._positions or not receipt.get('native_op_id'):
+            raise ValueError('scanner CLOSE receipt conflicts with inventory')
+        allocation=receipt.get('allocations')
+        buys=[e for e in entries if e.get('kind')=='BUY' and e.get('ticket')==identity['ticket']]
+        if len(buys)!=1 or not isinstance(allocation,list) or len(allocation)!=1:
+            raise ValueError('scanner CLOSE source unavailable')
+        buy=buys[0];a=allocation[0]
+        if (a.get('ticket')!=identity['ticket'] or receipt.get('symbol')!=buy.get('symbol')
+                or buy.get('shared_book_id')!=binding['book_id']):raise ValueError('scanner CLOSE allocation identity conflict')
+        price,basis,proceeds,tokens,pnl=(receipt['price_sol'],a['basis_sol'],a['proceeds_sol'],a['tokens'],receipt['realized_pnl_sol'])
+        if (any(type(x) not in (int,float) or not math.isfinite(x) for x in (price,basis,proceeds,tokens,pnl))
+                or min(price,basis,proceeds,tokens)<0
+                or tokens>buy['tokens']+1e-10
+                or not math.isclose(basis,tokens*buy['price_sol'],rel_tol=1e-10,abs_tol=1e-12)
+                or not math.isclose(proceeds,tokens*price,rel_tol=1e-10,abs_tol=1e-12)
+                or not math.isclose(pnl,proceeds-basis,rel_tol=1e-10,abs_tol=1e-12)):
+            raise ValueError('scanner CLOSE allocation economics conflict')
+        pending,error=self._shared_account.operation_receipt('native-pending:'+receipt['native_op_id']+':0')
+        expected_pending={'event':'pending_sol','lane':buy.get('shared_lane'),'mint':buy.get('shared_mint'),
+            'pos_id':buy.get('shared_pos_id'),'qty':tokens,'proceeds_sol':proceeds,
+            'ticket':identity['ticket'],'native_basis_sol':basis,
+            'sold_at':datetime.fromisoformat(receipt['ts']).timestamp(),'fee_sol':0.,'instance':True}
+        if (error or not isinstance(pending,dict) or a.get('entry_price_sol')!=buy.get('price_sol')
+                or any(pending.get(k)!=v for k,v in expected_pending.items())):
+            raise ValueError('scanner CLOSE shared pending receipt conflict')
+        with open(self._fills_path(),'rb') as fh:os.fsync(fh.fileno())
+        _fsync_dir(self._data_dir)
+        return copy.deepcopy(receipt)
+
+    def shared_account_snapshot(self):
+        """USD reporting only. Never feed native SOL risk sizing."""
+        self._ensure()
+        if self._shared_account is None:
+            raise ValueError("no shared account binding")
+        return self._shared_account.snapshot()
 
     # -- market data ---------------------------------------------------------
     def symbols(self, names: Optional[List[str]] = None) -> List[SymbolSpec]:
@@ -689,11 +1216,22 @@ class MemecoinAdapter(BrokerAdapter):
         (and have refreshed state): this is the read-modify-write
         section — idempotency check, fill, journal, idempotency put
         — that the lock serializes across processes."""
+        request = asdict(req)
+        request["symbol"] = symbol
+        request["mint"] = self._market.mint_for(symbol)
+        for field in ("volume", "stop_loss", "take_profit"):
+            if request[field] is not None:
+                request[field] = float(request[field])
+        request_fingerprint = hashlib.sha256(json.dumps(
+            request, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        self._request_fingerprint = request_fingerprint
         # Idempotency: a repeated key replays the original fill — the
         # position is never opened twice.
         if req.idempotency_key:
             prior = self._idempotent_get(req.idempotency_key)
             if prior is not None:
+                if prior.get("raw", {}).get("request_fingerprint") != request_fingerprint:
+                    raise BrokerError(INVALID_ORDER, "idempotency request conflict or unbound legacy request")
                 logger.info("idempotent replay for key %s (ticket %s)",
                             req.idempotency_key, prior.get("ticket"))
                 return OrderResult(**prior)
@@ -703,6 +1241,8 @@ class MemecoinAdapter(BrokerAdapter):
             recovered = self._idempotent_recover_from_journal(
                 req.idempotency_key)
             if recovered is not None:
+                if recovered.raw.get("request_fingerprint") != request_fingerprint:
+                    raise BrokerError(INVALID_ORDER, "idempotency request conflict or unbound legacy request")
                 logger.info("idempotent recovery from journal for key %s "
                             "(ticket %s)", req.idempotency_key,
                             recovered.ticket)
@@ -715,7 +1255,18 @@ class MemecoinAdapter(BrokerAdapter):
                 })
                 return recovered
 
-        price_sol = self._price_sol(symbol)  # raises BROKER_UNAVAILABLE when blind
+        self._verify_position_mints(symbol)
+        if self._shared_account is not None and req.direction == "BUY":
+            # One FX observation prices native entry and its USD debit. A stale
+            # SOL cache must not silently manufacture token units at another rate.
+            self._entry_pricing_fx = self._observe_entry_fx()
+            quote = self._market.get_quote(symbol)
+            self._entry_token_evidence = self._validated_usd_quote(symbol,quote)
+            price_sol = self._entry_token_evidence["price_usd"] / self._entry_pricing_fx["usd_per_sol"]
+        elif self._shared_account is not None:
+            price_sol = self._shared_price_sol(symbol)
+        else:
+            price_sol = self._price_sol(symbol)  # raises when blind
 
         if self._mode == "devnet":
             return self._devnet_fill(req, symbol, price_sol)
@@ -807,7 +1358,7 @@ class MemecoinAdapter(BrokerAdapter):
     def _paper_buy(self, req: OrderRequest, symbol: str,
                    price_sol: float) -> OrderResult:
         cost_sol = float(req.volume)
-        if cost_sol > self._balance_sol:
+        if self._shared_account is None and cost_sol > self._balance_sol:
             raise BrokerError(
                 RISK_LIMIT_EXCEEDED,
                 f"insufficient virtual balance: need {cost_sol:.6f} SOL, "
@@ -830,8 +1381,7 @@ class MemecoinAdapter(BrokerAdapter):
             "time_open": _utcnow().isoformat(),
         }
         self._balance_sol -= cost_sol
-        self._save_state()
-        self._journal_fill({
+        self._commit_native({
             "ticket": ticket, "kind": "BUY", "symbol": symbol,
             "volume_sol": cost_sol, "tokens": tokens,
             "price_sol": price_sol, "comment": comment,
@@ -846,7 +1396,8 @@ class MemecoinAdapter(BrokerAdapter):
         return OrderResult(ticket=ticket, symbol=symbol, direction="BUY",
                            volume=cost_sol, price=price_sol, retcode=0,
                            message="paper fill",
-                           raw={"mode": "paper", "tokens": tokens})
+                           raw={"mode": "paper", "tokens": tokens,
+                                "request_fingerprint": self._request_fingerprint})
 
     def _paper_sell(self, req: OrderRequest, symbol: str,
                     price_sol: float) -> OrderResult:
@@ -871,10 +1422,16 @@ class MemecoinAdapter(BrokerAdapter):
         remaining = tokens_to_sell
         realized = 0.0
         closed_tickets = []
+        allocations = []
         for ticket, p in holdings:
             if remaining <= 1e-12:
                 break
             take = min(p["tokens"], remaining)
+            basis = p["volume_sol"] * (take / p["tokens"])
+            allocations.append({"ticket": ticket, "tokens": take,
+                                "basis_sol": basis,
+                                "proceeds_sol": take * price_sol,
+                                "entry_price_sol": p["entry_price_sol"]})
             realized += (price_sol - p["entry_price_sol"]) * take
             p["tokens"] -= take
             # volume_sol tracks remaining cost basis proportionally
@@ -891,13 +1448,12 @@ class MemecoinAdapter(BrokerAdapter):
         # between the state write and the journal write, the ticket is
         # never reused on restart.
         ticket = self._next()
-        self._save_state()
         comment = req.order_comment()
-        self._journal_fill({
+        self._commit_native({
             "ticket": ticket, "kind": "SELL", "symbol": symbol,
             "volume_sol": proceeds_sol, "tokens": tokens_to_sell,
             "price_sol": price_sol, "realized_pnl_sol": realized,
-            "closed_tickets": closed_tickets,
+            "closed_tickets": closed_tickets, "allocations": allocations,
             "comment": comment, "signal_id": req.signal_id,
             "idempotency_key": req.idempotency_key,
             "balance_sol_after": self._balance_sol,
@@ -909,6 +1465,7 @@ class MemecoinAdapter(BrokerAdapter):
                            volume=proceeds_sol, price=price_sol, retcode=0,
                            message="paper fill",
                            raw={"mode": "paper", "tokens": tokens_to_sell,
+                                "request_fingerprint": self._request_fingerprint,
                                 "realized_pnl_sol": realized,
                                 "closed_tickets": closed_tickets})
 
@@ -952,17 +1509,22 @@ class MemecoinAdapter(BrokerAdapter):
                     INVALID_ORDER,
                     f"no open paper position with ticket {ticket}")
             # Price FIRST: if the quote fails the position stays untouched.
-            price_sol = self._price_sol(p["symbol"])
+            self._verify_position_mints(p["symbol"])
+            price_sol = (self._shared_price_sol(p["symbol"]) if self._shared_account is not None
+                         else self._price_sol(p["symbol"]))
             del self._positions[str(ticket)]
             proceeds = p["tokens"] * price_sol
             realized = (price_sol - p["entry_price_sol"]) * p["tokens"]
             self._balance_sol += proceeds
-            self._save_state()
-            self._journal_fill({
+            self._commit_native({
                 "ticket": ticket, "kind": "CLOSE", "symbol": p["symbol"],
                 "volume_sol": proceeds, "tokens": p["tokens"],
                 "price_sol": price_sol, "realized_pnl_sol": realized,
                 "balance_sol_after": self._balance_sol,
+                "allocations": [{"ticket": ticket, "tokens": p["tokens"],
+                                 "basis_sol": p["volume_sol"],
+                                 "proceeds_sol": proceeds,
+                                 "entry_price_sol": p["entry_price_sol"]}],
             })
         logger.info("paper CLOSE ticket %s (%s): %+.9f SOL realized",
                     ticket, p["symbol"], realized)
@@ -993,16 +1555,21 @@ class MemecoinAdapter(BrokerAdapter):
                     INVALID_ORDER,
                     f"no open paper position with ticket {ticket}")
             price_sol = float(price_sol)
+            if self._shared_account is not None and price_sol != 0.0:
+                raise BrokerError(INVALID_ORDER, "shared explicit close is restricted to confirmed dead-pool zero")
             del self._positions[str(ticket)]
             proceeds = p["tokens"] * price_sol
             realized = (price_sol - p["entry_price_sol"]) * p["tokens"]
             self._balance_sol += proceeds
-            self._save_state()
-            self._journal_fill({
+            self._commit_native({
                 "ticket": ticket, "kind": "CLOSE", "symbol": p["symbol"],
                 "volume_sol": proceeds, "tokens": p["tokens"],
                 "price_sol": price_sol, "realized_pnl_sol": realized,
                 "balance_sol_after": self._balance_sol,
+                "allocations": [{"ticket": ticket, "tokens": p["tokens"],
+                                 "basis_sol": p["volume_sol"],
+                                 "proceeds_sol": proceeds,
+                                 "entry_price_sol": p["entry_price_sol"]}],
                 "close_reason": reason or "explicit",
             })
         logger.info("paper CLOSE@%s ticket %s (%s): %+.9f SOL realized",

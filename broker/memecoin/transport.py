@@ -125,7 +125,8 @@ class MemecoinMarketData:
         if not data:
             return None
         pairs = [p for p in (data.get("pairs") or [])
-                 if str(p.get("chainId", "")).lower() == "solana"]
+                 if str(p.get("chainId", "")).lower() == "solana"
+                 and (p.get("baseToken") or {}).get("address") == mint]
         if not pairs:
             return None
         pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0),
@@ -158,8 +159,10 @@ class MemecoinMarketData:
         return {
             "symbol": symbol.upper(),
             "mint": mint,
+            "source": "dexscreener:token-top-solana-pair",
             "price_usd": price_usd,
             "price_sol": price_sol,
+            "price_sol_quote_mint": (pair.get("quoteToken") or {}).get("address"),
             "pair": pair.get("pairAddress"),
             "ts": datetime.now(timezone.utc),
         }

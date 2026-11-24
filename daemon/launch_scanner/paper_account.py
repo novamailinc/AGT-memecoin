@@ -97,6 +97,7 @@ defaults chosen for a $10 demo, flagged here as agent-chosen):
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import glob
 import json
@@ -104,6 +105,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -118,7 +120,7 @@ LOCK_FILE = os.path.join(ACCOUNT_DIR, ".lock")
 DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
-_MUTATION_EVENTS = ("debit", "credit", "write_down")
+_MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol", "debit_refused")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -372,6 +374,7 @@ def _provider_health_refusal() -> Optional[str]:
 def _new_ledger() -> Dict[str, Any]:
     now = time.time()
     return {
+        "account_id": uuid.uuid4().hex,
         "created_ts": now,
         "seq": 0,
         "start_balance": start_balance(),
@@ -475,7 +478,7 @@ def _atomic_write(path: str, data: Dict[str, Any]) -> None:
         finally:
             os.close(dfd)
     except Exception:
-        pass
+        raise
 
 
 def _journal(event: Dict[str, Any]) -> None:
@@ -491,6 +494,8 @@ def _journal(event: Dict[str, Any]) -> None:
             os.fsync(f.fileno())
     except Exception:
         logger.exception("paper_account: journal write failed")
+        if event.get("instance") is True:
+            raise
 
 
 def _read_json(path: str) -> Optional[Dict[str, Any]]:
@@ -570,7 +575,7 @@ def _seq_violation(entries: List[Dict[str, Any]]
 
 def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
                  stake: float, qty: Optional[float], pid: str,
-                 ts: Optional[float]) -> None:
+                 ts: Optional[float], instance: bool = False) -> None:
     """Shared debit mutation. Caller holds the lock and has
     validated input and cash."""
     led["cash"] = round(float(led["cash"]) - stake, 6)
@@ -578,7 +583,9 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
         float(led.get("cash_spendable", led["cash"] + stake))
         - stake, 6)
     st = _lane(led, lane)
-    st["open"][mint] = {
+    key = pid if instance else mint
+    st["open"][key] = {
+        **({"mint": mint, "instance": True} if instance else {}),
         "pos_id": pid,
         "qty": qty,                 # remaining units
         "basis": stake,             # remaining allocated cost
@@ -590,6 +597,15 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
         "ts": ts or time.time(),
     }
     st["n_entries"] += 1
+
+
+def _position_key(st: dict, mint: str, pos_id: Optional[str]) -> str:
+    if pos_id is not None:
+        pos = st["open"].get(pos_id)
+        if (isinstance(pos, dict) and pos.get("instance") is True
+                and pos.get("mint") == mint and pos.get("pos_id") == pos_id):
+            return pos_id
+    return mint
 
 
 def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
@@ -605,7 +621,8 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
     allocation; a partial sale realizes P/L against the allocated
     basis of the units sold. Caller holds the lock."""
     st = _lane(led, lane)
-    pos = st["open"].get(mint)
+    key = _position_key(st, mint, pos_id)
+    pos = st["open"].get(key)
     if pos is None:
         return None, "no open position"
     basis = _pos_basis(pos)
@@ -618,7 +635,7 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
         disposed = have_qty
         alloc = basis
         realized = round(net - alloc, 6)
-        st["open"].pop(mint)
+        st["open"].pop(key)
         pos["basis"] = 0.0
         pos["qty"] = 0.0 if have_qty is not None else None
         closed = True
@@ -640,7 +657,7 @@ def _apply_credit(led: Dict[str, Any], lane: str, mint: str,
             disposed = have_qty
             alloc = basis
             realized = round(net - alloc, 6)
-            st["open"].pop(mint)
+            st["open"].pop(key)
             pos["basis"] = 0.0
             pos["qty"] = 0.0
             closed = True
@@ -754,12 +771,15 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         if kind == "debit" and lane and mint:
             pid = ev.get("pos_id") or _pos_id(lane, mint, ev_seq)
             st = _lane(led, lane)
-            cur = st["open"].get(mint)
+            key = pid if ev.get("instance") is True else mint
+            cur = st["open"].get(key)
             if cur is not None:
                 if cur.get("pos_id", _pos_id(lane, mint, ev_seq)) == pid:
                     if op_id:
-                        ops[op_id] = {"event": "debit",
-                                      "pos_id": pid}
+                        ops[op_id] = {"event": "debit", "pos_id": pid,
+                                      "lane": lane, "mint": mint,
+                                      "stake": ev.get("stake"), "qty": ev.get("qty"),
+                                      **({"instance": True} if ev.get("instance") is True else {})}
                     led["seq"] = ev_seq
                     continue  # state already has it: idempotent
                 return led, ("replay divergence: debit %s but %s "
@@ -770,16 +790,19 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                 return led, ("replay cannot apply debit %s "
                              "(bad stake or cash)" % pid)
             _apply_debit(led, lane, mint, stake, ev.get("qty"),
-                         pid, ev.get("ts"))
+                         pid, ev.get("ts"), instance=ev.get("instance") is True)
             if op_id:
                 ops[op_id] = {"event": "debit", "pos_id": pid,
                               "lane": lane, "mint": mint,
-                              "stake": stake, "qty": ev.get("qty")}
+                              "stake": stake, "qty": ev.get("qty"),
+                              **({"instance": True} if ev.get("instance") is True else {})}
             replayed += 1
         elif kind == "credit" and lane and mint:
             st = _lane(led, lane)
-            pos = st["open"].get(mint)
+            pos = st["open"].get(_position_key(st, mint, ev.get("pos_id")))
             if pos is None:
+                if ev.get("instance") is True:
+                    return led, "replay divergence: instance credit has no matching lot"
                 led["seq"] = ev_seq
                 continue  # already settled: idempotent skip
             pid = ev.get("pos_id")
@@ -802,7 +825,11 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             if op_id:
                 ops[op_id] = {"event": "credit", "lane": lane,
                               "mint": mint, "pos_id": pid,
-                              "realized": realized}
+                              "realized": realized,
+                              **({"instance": True, "proceeds": ev.get("proceeds"),
+                                  "fee": ev.get("fee"), "qty": ev.get("qty"),
+                                  "price_kind": ev.get("price_kind")}
+                                 if ev.get("instance") is True else {})}
             replayed += 1
         elif kind == "write_down" and lane and mint:
             ok, why = _apply_write_down(
@@ -814,7 +841,21 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             if op_id:
                 ops[op_id] = {"event": "write_down", "lane": lane,
                               "mint": mint,
-                              "pos_id": ev.get("pos_id")}
+                              "pos_id": ev.get("pos_id"),
+                              **({"instance": True, "qty": ev.get("qty"),
+                                  "reason": ev.get("reason")}
+                                 if ev.get("instance") is True else {})}
+            replayed += 1
+        elif kind == "debit_refused":
+            if not op_id or ev.get("instance") is not True:
+                return led, "invalid refused entry event"
+            ops[op_id] = {k:v for k,v in ev.items() if k not in ("seq", "event_id", "ts")}
+            replayed += 1
+        elif kind in ("pending_sol", "settle_sol"):
+            from daemon.launch_scanner import pending_sol
+            reason = pending_sol.apply(led, ev, __import__(__name__, fromlist=["*"]))
+            if reason:
+                return led, "replay divergence: " + reason
             replayed += 1
         # The seq advances only for entries actually processed: on
         # a divergence return above it stays BEHIND the offending
@@ -869,7 +910,7 @@ def _derive_buckets_locked(led: Dict[str, Any],
             _apply_debit(gen, lane, mint, stake, ev.get("qty"),
                          ev.get("pos_id")
                          or _pos_id(lane, mint, int(ev["seq"])),
-                         ev.get("ts"))
+                         ev.get("ts"), instance=ev.get("instance") is True)
         elif ev["event"] == "write_down":
             ok, why = _apply_write_down(
                 gen, lane, mint, ev.get("pos_id"),
@@ -878,8 +919,16 @@ def _derive_buckets_locked(led: Dict[str, Any],
                 return led, ("cash-split migration: write_down "
                              "%s: %s; manual reconciliation "
                              "required" % (ev.get("op_id"), why))
+        elif ev["event"] == "debit_refused":
+            continue  # exact attempt refusal, no economics
+        elif ev["event"] in ("pending_sol", "settle_sol"):
+            from daemon.launch_scanner import pending_sol
+            reason = pending_sol.apply(gen, ev, __import__(__name__, fromlist=["*"]))
+            if reason:
+                return led, "cash-split migration: " + reason
         else:  # credit
-            pos = _lane(gen, lane)["open"].get(mint)
+            gst = _lane(gen, lane)
+            pos = gst["open"].get(_position_key(gst, mint, ev.get("pos_id")))
             if pos is None:
                 return led, ("cash-split migration: orphan credit "
                              "%s (position not open in genesis "
@@ -957,7 +1006,7 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
     if not os.path.exists(LEDGER_PATH):
         led = _new_ledger()
         _journal({"event": "create", "start_balance":
-                  led["start_balance"]})
+                  led["start_balance"], "account_id": led["account_id"]})
         _save_locked(led)
         return led, True, degraded
     led = _read_json(LEDGER_PATH)
@@ -1052,7 +1101,41 @@ def _op_lookup(led: Dict[str, Any], op_id: str, kind: str,
 
 def try_debit(lane: str, mint: str, stake: float, qty: float,
               op_id: str, ts: Optional[float] = None,
-              marks: Optional[Dict[str, Dict[str, Any]]] = None
+              marks: Optional[Dict[str, Dict[str, Any]]] = None):
+    """Legacy one-open-mint reservation; behavior and WAL shape unchanged."""
+    return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=False)
+
+
+def try_debit_instance(lane: str, mint: str, stake: float, qty: float,
+                       op_id: str, ts: Optional[float] = None,
+                       marks: Optional[Dict[str, Dict[str, Any]]] = None):
+    """Reserve an independent exact lot UNDER the existing lane and caps.
+
+    Only this API admits multiple same-mint lots. Credit and marks must name
+    the returned pos_id. Legacy calls cannot overwrite or absorb these lots.
+    """
+    return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=True)
+
+
+def _debit_refused(led, instance, lane, mint, stake, qty, op_id, why):
+    if instance:
+        seq = int(led.get("seq") or 0) + 1
+        event = {"event": "debit_refused", "instance": True,
+                 "lane": lane, "mint": mint, "stake": stake, "qty": qty,
+                 "op_id": op_id, "reason": why, "seq": seq,
+                 "event_id": "ev#%d" % seq}
+        _journal(event)
+        led["ops"][op_id] = {k:v for k,v in event.items()
+                              if k not in ("seq", "event_id")}
+        led["seq"] = seq
+        _save_locked(led)
+    return False, why, None
+
+
+def _try_debit(lane: str, mint: str, stake: float, qty: float,
+              op_id: str, ts: Optional[float] = None,
+              marks: Optional[Dict[str, Dict[str, Any]]] = None,
+              instance: bool = False
               ) -> Tuple[bool, str, Optional[str]]:
     """Reserve `stake` paper dollars for `lane` buying `qty` units
     of `mint`. op_id is the caller's stable operation ID: an
@@ -1096,51 +1179,66 @@ def try_debit(lane: str, mint: str, stake: float, qty: float,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        prior = led.get("ops", {}).get(op_id)
+        if instance and prior is not None and prior.get("event") == "debit_refused":
+            if any(prior.get(k) != v for k,v in
+                   {"lane":lane,"mint":mint,"stake":stake,"qty":qty,"instance":True}.items()):
+                return False, "refused entry attempt parameter conflict", None
+            return False, "original refusal: " + prior["reason"], None
         rec, conflict = _op_lookup(led, op_id, "debit", lane, mint,
-                                   {"stake": stake, "qty": qty})
+                                   {"stake": stake, "qty": qty,
+                                    "instance": instance})
         if conflict:
             return False, conflict, None
         if rec is not None:
+            if bool(rec.get("instance")) != instance:
+                return False, "op_id instance ownership conflict", None
             return True, "ok (retry of applied op)", rec["pos_id"]
         cash = float(led["cash"])
         spendable = float(led.get("cash_spendable", 0.0))
         if spendable < stake:
-            return (False, ("account spendable cash $%.2f < stake "
+            return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                                ("account spendable cash $%.2f < stake "
                             "$%.2f (total $%.2f incl. quarantined "
                             "estimated proceeds)"
-                            % (spendable, stake, cash)), None)
+                            % (spendable, stake, cash)))
         st = _lane(led, lane)
-        if mint in st["open"]:
-            return (False, ("%s already has an open %s position"
-                            % (lane, mint)), None)
+        if (mint in st["open"] or (not instance and any(
+                p.get("mint") == mint for p in st["open"].values()))):
+            return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                                  "%s already has an open %s position" % (lane, mint))
         cap = lane_cap()
         if cap is not None:
-            open_basis = sum(_pos_basis(p)
-                             for p in st["open"].values())
+            open_basis = sum(_pos_basis(p) for p in st["open"].values())
+            open_basis += sum(float(p["basis"]) for p in
+                              led.get("pending_sol", {}).values() if p["lane"] == lane)
             if open_basis + stake > cap:
-                return (False, ("lane cap $%.2f would be exceeded "
+                return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                                    ("lane cap $%.2f would be exceeded "
                                 "($%.2f open + $%.2f new)"
-                                % (cap, open_basis, stake)), None)
+                                % (cap, open_basis, stake)))
         if gates_enabled():
             view = _view_locked(led, marks, degraded)
             _update_baselines_locked(led, view)
             view.update(_gate_fields(led, view))
             refusal = _gate_check_locked(led, view, stake)
             if refusal is not None:
-                return False, refusal, None
+                return _debit_refused(led, instance, lane, mint, stake, qty, op_id, refusal)
         if provider_health_gate_enabled():
             refusal = _provider_health_refusal()
             if refusal is not None:
-                return False, refusal, None
+                return _debit_refused(led, instance, lane, mint, stake, qty, op_id, refusal)
         led["seq"] = int(led.get("seq") or 0) + 1
         pid = _pos_id(lane, mint, led["seq"])
-        _apply_debit(led, lane, mint, stake, qty, pid, ts)
+        _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
         led["ops"][op_id] = {"event": "debit", "lane": lane,
                              "mint": mint, "pos_id": pid,
-                             "stake": stake, "qty": qty}
+                             "stake": stake, "qty": qty,
+                             **({"instance": True} if instance else {})}
         _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "stake": stake, "qty": qty,
+                  **({"instance": True} if instance else {}),
                   "cash_after": led["cash"],
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
@@ -1214,9 +1312,15 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         if conflict:
             return False, conflict
         if rec is not None:
+            if rec.get("instance") is True:
+                params = {"proceeds": proceeds, "fee": fee, "qty": qty,
+                          "price_kind": price_kind, "pos_id": pos_id}
+                if any(rec.get(k) != v for k, v in params.items()):
+                    return False, "op_id instance settlement parameter conflict"
             return True, "ok (retry of applied op)"
         st = _lane(led, lane)
-        pos = st["open"].get(mint)
+        key = _position_key(st, mint, pos_id)
+        pos = st["open"].get(key)
         if pos is None:
             _journal({"event": "credit_orphan", "lane": lane,
                       "mint": mint, "proceeds": proceeds,
@@ -1249,12 +1353,16 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "credit", "lane": lane,
                              "mint": mint, "pos_id": pid,
-                             "realized": realized}
+                             "realized": realized,
+                             **({"instance": True, "proceeds": proceeds,
+                                 "fee": fee, "qty": qty, "price_kind": price_kind}
+                                if pos.get("instance") is True else {})}
         _journal({"event": "credit", "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "qty": qty, "proceeds": proceeds, "fee": fee,
+                  **({"instance": True} if pos.get("instance") is True else {}),
                   "net": net, "realized": realized,
-                  "final": mint not in st["open"],
+                  "final": key not in st["open"],
                   "cash_after": led["cash"],
                   "price_kind": price_kind,
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
@@ -1278,10 +1386,11 @@ def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
     always recompose the original cost and units exactly."""
     reg = led.setdefault("unresolved", {})
     st = _lane(led, lane)
+    key = _position_key(st, mint, pid)
     if (qty is None and pid in reg
-            and st["open"].get(mint, {}).get("pos_id") != pid):
+            and st["open"].get(key, {}).get("pos_id") != pid):
         return True, "already unresolved"
-    pos = st["open"].get(mint)
+    pos = st["open"].get(key)
     if pos is None:
         if pid in reg:
             return True, "already unresolved"
@@ -1302,6 +1411,7 @@ def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
             if have_qty > 0 else 0.0
         final = False
     entry = reg.setdefault(pid, {"lane": lane, "mint": mint,
+                                 **({"instance": True} if pos.get("instance") is True else {}),
                                  "qty": 0.0, "basis": 0.0,
                                  "entry_qty": pos.get("entry_qty"),
                                  "entry_cost": pos.get("entry_cost"),
@@ -1315,7 +1425,7 @@ def _apply_write_down(led: Dict[str, Any], lane: str, mint: str,
     entry["reason"] = reason
     entry["ts"] = ts or entry["ts"]
     if final:
-        st["open"].pop(mint)
+        st["open"].pop(key)
     else:
         pos["qty"] = round(have_qty - move_qty, 8)
         pos["basis"] = round(basis - alloc, 6)
@@ -1349,6 +1459,17 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, "ledger unreadable"
         prior = led["ops"].get(op_id)
         if prior is not None:
+            # Instance operations are exact. A different event or target can
+            # never ACK an unapplied disposal. Legacy behavior stays isolated.
+            st = _lane(led, lane)
+            target = st["open"].get(_position_key(st, mint, pos_id))
+            instance = (prior.get("instance") is True or
+                        (isinstance(target, dict) and target.get("instance") is True))
+            if instance:
+                expected = {"event": "write_down", "lane": lane, "mint": mint,
+                            "pos_id": pos_id, "qty": qty, "reason": reason}
+                if any(prior.get(k) != v for k, v in expected.items()):
+                    return False, "op_id instance write_down parameter conflict"
             return True, "already applied"
         if degraded is not None:
             _journal({"event": "write_down_intent", "lane": lane,
@@ -1359,7 +1480,8 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, ("account degraded (%s): write-down "
                            "journaled, not applied" % degraded)
         pid = pos_id
-        pos = _lane(led, lane)["open"].get(mint)
+        st = _lane(led, lane)
+        pos = st["open"].get(_position_key(st, mint, pid))
         if pid is None and pos is not None:
             pid = pos.get("pos_id")
         if pid is None:
@@ -1367,6 +1489,11 @@ def write_down(lane: str, mint: str, op_id: str,
                       "mint": mint, "op_id": op_id,
                       "pos_id": pos_id, "reason": reason, "ts": ts})
             return False, "no open position (journaled)"
+        unresolved = (led.get("unresolved") or {}).get(pid) or {}
+        instance = (isinstance(pos, dict) and pos.get("instance") is True
+                    or unresolved.get("instance") is True)
+        if unresolved and (unresolved.get("lane") != lane or unresolved.get("mint") != mint):
+            return False, "unresolved instance ownership conflict"
         ok, why = _apply_write_down(led, lane, mint, pid, reason,
                                     ts, qty=qty)
         if not ok:
@@ -1376,17 +1503,89 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, "%s (journaled, not applied)" % why
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "write_down", "lane": lane,
-                             "mint": mint, "pos_id": pid}
+                             "mint": mint, "pos_id": pid,
+                             **({"instance": True, "qty": qty, "reason": reason}
+                                if instance else {})}
         _journal({"event": "write_down",
                   "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "mint": mint,
                   "pos_id": pid, "reason": reason,
+                  **({"instance": True} if instance else {}),
                   "qty": qty,
                   "register_qty": led["unresolved"][pid]["qty"],
                   "register_basis": led["unresolved"][pid]["basis"],
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
+
+
+def account_identity(expected=None):
+    """Generation identity, no regeneration when a native book is already bound."""
+    with _lock():
+        if expected is not None and not os.path.exists(LEDGER_PATH):
+            raise ValueError("bound shared account is missing")
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None or degraded:
+            raise ValueError("shared account identity unavailable")
+        identity = led.get("account_id")
+        if not isinstance(identity,str) or not identity:
+            raise ValueError("legacy account generation unbound")
+        if expected is not None and identity != expected:
+            raise ValueError("shared account generation mismatch")
+        entries,status,_ = _journal_read()
+        creates = [e for e in entries if e.get("event")=="create"]
+        if status is not None or len(creates)!=1 or creates[0].get("account_id")!=identity:
+            raise ValueError("shared account generation WAL mismatch")
+        return identity
+
+
+def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Read exact durable applied operation after WAL recovery under the lock.
+
+    None with no error means absent, not refused or authorized. A degraded
+    account returns no usable receipt. Bridge recovery must check exact shape,
+    not infer an amount or position ID from the coarser op_outcome helper.
+    """
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None or degraded:
+            return None, degraded or "account ledger unreadable"
+        rec = led.get("ops", {}).get(op_id)
+        entries, status, _ = _journal_read()
+        if status is not None:
+            return None, "operation WAL unreadable"
+        matches = [e for e in entries if e.get("op_id") == op_id
+                   and e.get("event") in _MUTATION_EVENTS]
+        if rec is None:
+            if matches:
+                return None, "operation WAL/state disagreement"
+            return None, None
+        if len(matches) != 1:
+            return None, "operation WAL identity missing or duplicated"
+        event = matches[0]
+        if rec.get("instance") is not True:
+            return None, "operation has no exact instance contract"
+        fields = ("event", "lane", "mint", "pos_id", "instance")
+        fields += {"debit": ("stake", "qty"),
+                   "debit_refused": ("stake", "qty", "reason"),
+                   "credit": ("proceeds", "fee", "qty", "price_kind", "realized"),
+                   "write_down": ("qty", "reason"),
+                   "pending_sol": ("qty", "proceeds_sol", "ticket", "native_basis_sol",
+                                   "sold_at", "fee_sol"),
+                   "settle_sol": ("pending_id", "fx", "proceeds")}.get(rec.get("event"), ())
+        if any(event.get(k) != rec.get(k) for k in fields):
+            return None, "operation WAL/state parameter disagreement"
+        # Visible bytes are not durability. Repair uncertain prior publication
+        # under the same account lock before acknowledging an exact receipt.
+        for path in (JOURNAL_PATH, LEDGER_PATH):
+            with open(path, "rb") as fh:
+                os.fsync(fh.fileno())
+        dfd = os.open(ACCOUNT_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return copy.deepcopy(rec), None
 
 
 def op_outcome(op_id: str) -> str:
@@ -1523,27 +1722,40 @@ def _view_locked(led: Dict[str, Any],
     exposure = 0.0
     open_positions = []
     for name, st in led.get("lanes", {}).items():
-        basis = 0.0
+        basis = sum(float(p["basis"]) for p in led.get("pending_sol", {}).values()
+                    if p["lane"] == name)
         positions = []
         for mint, p in st.get("open", {}).items():
             pb = _pos_basis(p)
             basis += pb
-            open_positions.append((name, mint, _pos_qty(p),
+            mark_key = p["pos_id"] if p.get("instance") is True else mint
+            real_mint = p.get("mint", mint)
+            open_positions.append((name, mark_key, _pos_qty(p),
                                    p.get("pos_id")))
-            positions.append({"mint": mint, "qty": _pos_qty(p),
+            positions.append({"mint": real_mint, "qty": _pos_qty(p),
+                              **({"mark_key": mark_key, "instance": True}
+                                 if p.get("instance") is True else {}),
                               "basis": round(pb, 6),
                               "pos_id": p.get("pos_id")})
         exposure += basis
         out_lanes[name] = {
             "open_count": len(st.get("open", {})),
+            "pending_sol_count": sum(p["lane"] == name for p in
+                                     led.get("pending_sol", {}).values()),
             "open_basis": round(basis, 6),
             "realized_pnl": st.get("realized_pnl", 0.0),
             "n_entries": st.get("n_entries", 0),
             "n_closes": st.get("n_closes", 0),
             "positions": positions,
         }
+    # Pending proceeds are SOL holdings, never still-live token inventory.
+    for pending_id, p in led.get("pending_sol", {}).items():
+        open_positions.append((p["lane"], pending_id, p["proceeds_sol"], pending_id))
     cash = float(led["cash"])
     out = {
+        "pending_sol": list(copy.deepcopy(led.get("pending_sol", {})).values()),
+        "pending_sol_basis": round(sum(float(p["basis"]) for p in
+                                       led.get("pending_sol", {}).values()), 6),
         "start_balance": led["start_balance"],
         "cash": round(cash, 6),
         "unresolved": sorted(

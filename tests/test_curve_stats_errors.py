@@ -45,7 +45,7 @@ check("err: dict error keeps code",
 check("err: plain string unchanged",
       GS._rpc_err_text("foo") == "foo")
 
-# 2. reserves.rpc logs failures (host + type) and never the api key,
+# 2. Explicit legacy diagnostic transport logs failures (host + type) and never the api key,
 #    while keeping its None-on-failure contract
 records = []
 
@@ -67,7 +67,7 @@ try:
         # failure at that seam, not the retired urllib path.
         with patch("subprocess.run",
                    side_effect=urllib.error.URLError("boom")):
-            res = R.rpc("getSignaturesForAddress", ["addr", {}])
+            res = R._rpc_impl("getSignaturesForAddress", ["addr", {}])
 finally:
     R.logger.removeHandler(_h)
     R.logger.setLevel(_old_level)
@@ -194,7 +194,7 @@ with patch.object(R, "rpc_url_pairs", return_value=_pairs("t1")),         patch.
         _calls.append(url)
         return None, "429", 0.01
     with patch.object(R, "_rpc_attempt", side_effect=_t1):
-        res429 = R.rpc("getSignaturesForAddress", ["addr", {}])
+        res429 = R._rpc_impl("getSignaturesForAddress", ["addr", {}])
 check("rpc: Helius 429 -> no Helius retry/failover, one public attempt",
       res429 is None and _calls == [_K1, _PUB])
 check("rpc: 429 engages the pacer for that key only",
@@ -213,7 +213,7 @@ with patch.object(R, "rpc_url_pairs", return_value=_pairs("t2")),         patch.
         _calls2.append(url)
         return {"ok": 1}, "ok", 0.01
     with patch.object(R, "_rpc_attempt", side_effect=_t2):
-        res429b = R.rpc("getSignaturesForAddress", ["addr", {}])
+        res429b = R._rpc_impl("getSignaturesForAddress", ["addr", {}])
 check("rpc: pacer hot for all keys -> zero Helius attempts, "
       "public fallback serves",
       res429b == {"ok": 1} and _calls2 == [_PUB])
@@ -234,11 +234,11 @@ with patch.object(R, "rpc_url_pairs", return_value=_pairs("t3")),         patch.
             return None, "429", 0.01
         return {"price": 7}, "ok", 0.01
     with patch.object(R, "_rpc_attempt", side_effect=_t3):
-        res_hot = R.rpc("getAccountInfo", ["mint", {}], exempt=True)
+        res_hot = R._rpc_impl("getAccountInfo", ["mint", {}], exempt=True)
         n_hot = len([u for u in _calls3 if "helius" in u])
     _expire_pacer_cooldown("t3k1")
     with patch.object(R, "_rpc_attempt", side_effect=_t3):
-        res429c = R.rpc("getAccountInfo", ["mint", {}], exempt=True)
+        res429c = R._rpc_impl("getAccountInfo", ["mint", {}], exempt=True)
 check("rpc: exempt call makes no Helius attempt during a cooldown",
       res_hot is None and n_hot == 0)
 check("rpc: exempt call served once the cooldown lapses",
@@ -260,7 +260,7 @@ with patch.object(R, "rpc_url_pairs", return_value=_pairs("t4")),         patch.
             return {"ok": 1}, "ok", 0.01
         return None, "fail", 0.01
     with patch.object(R, "_rpc_attempt", side_effect=_t4):
-        res429d = R.rpc("getSignaturesForAddress", ["addr", {}])
+        res429d = R._rpc_impl("getSignaturesForAddress", ["addr", {}])
 check("rpc: non-429 failure fails over to next key then public",
       res429d == {"ok": 1} and _calls4 == [_K1, _K2, _PUB])
 check("rpc: non-429 failures do not engage the guard",
@@ -280,7 +280,7 @@ with patch.object(R, "rpc_url_pairs", return_value=_pairs("t5")),         patch.
             return None, "fail", 0.01
         return {"ok": 2}, "ok", 0.01
     with patch.object(R, "_rpc_attempt", side_effect=_t5):
-        res429e = R.rpc("getSignaturesForAddress", ["addr", {}])
+        res429e = R._rpc_impl("getSignaturesForAddress", ["addr", {}])
 check("rpc: public transport failure retried once, then succeeds",
       res429e == {"ok": 2} and _calls5 == [_K1, _K2, _PUB, _PUB])
 

@@ -235,7 +235,8 @@ def main():
         key = discovery_key
         discovery_key = ""
 
-    reg = json.loads((HOME / "launch_scanner" / "smart_wallets.json").read_text())
+    from wallet_registry import read
+    reg = read(HOME / "launch_scanner" / "smart_wallets.json")
     wallets = args.wallets.split(",") if args.wallets else list(reg.keys())
     print(f"grading {len(wallets)} wallets (limit {args.limit} tx each)")
 

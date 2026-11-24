@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the public-RPC fallback in reserves.rpc (2026-11-18).
+"""Compatibility tests for the public-RPC fallback in reserves._rpc_impl (2026-11-18).
 
 When Helius fails closed (429, or no pacer token on any key), the
 entry-critical reads try api.mainnet-beta.solana.com ONCE under its
@@ -14,6 +14,9 @@ reports which provider answered.
 Live probe 2026-11-18: getSignaturesForAddress on the pump
 program, 3 calls 7s apart, 3x HTTP 200 in ~0.7s — the leg is
 viable at low volume.
+
+Modern reserves.rpc uses central routine allocation; these tests prove only
+the retained compatibility transport, not current caller routing.
 
 No network, no live state: every test uses a temp home dir and
 fake _rpc_attempt / pacer. Run: python3 tests/test_reserves_fallback.py
@@ -84,11 +87,15 @@ class _Ctx:
         self._real["attempt"] = reserves._rpc_attempt
         self._real["keys"] = reserves._helius_keys
         self._real["vault_url"] = reserves._vault_url
+        self._real["alchemy_key"] = reserves._alchemy_key
+        reserves._alchemy_key = lambda: ""
+        reserves._vault_url = lambda: None
         reserves.HOME = self.home
         reserves._PUBLIC_BUDGET = None
         return self
 
     def __exit__(self, *exc):
+        reserves._alchemy_key = self._real["alchemy_key"]
         reserves.HOME = self._real["HOME"]
         reserves._PUBLIC_BUDGET = self._real["BUDGET"]
         reserves._pacer = self._real["pacer"]
@@ -108,7 +115,7 @@ def test_helius_ok_never_touches_public():
         pacer = _FakePacer(True)
         att = _FakeAttempt({"helius": [({"ok": 1}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: Helius ok returns result", got == {"ok": 1})
         check("fallback: Helius ok never calls public",
               att.calls == ["helius"])
@@ -123,7 +130,7 @@ def test_helius_429_falls_back_to_public_once():
             "helius": [(None, "429")],
             "public": [({"ok": 2}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: Helius 429 -> public returns result",
               got == {"ok": 2})
         check("fallback: Helius 429 tried public exactly once",
@@ -141,7 +148,7 @@ def test_public_429_hard_stop_no_retry():
             "helius": [(None, "429")],
             "public": [(None, "429"), ({"ok": 9}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: public 429 returns None", got is None)
         check("fallback: public 429 is NOT retried",
               att.calls == ["helius", "public"])
@@ -156,7 +163,7 @@ def test_public_transport_failure_retried_once():
             "helius": [(None, "429")],
             "public": [(None, "fail"), ({"ok": 7}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: public transport failure retried once",
               got == {"ok": 7})
         check("fallback: retry used exactly two public attempts",
@@ -172,7 +179,7 @@ def test_public_transport_failure_twice_returns_none():
             "helius": [(None, "429")],
             "public": [(None, "fail"), (None, "fail")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: two public transport failures return None",
               got is None)
         check("fallback: no third public attempt after retry fails",
@@ -186,7 +193,7 @@ def test_no_token_falls_back_to_public():
         pacer = _FakePacer(False)
         att = _FakeAttempt({"public": [({"ok": 3}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: no Helius token -> public returns result",
               got == {"ok": 3})
         check("fallback: no token makes zero Helius attempts",
@@ -202,8 +209,8 @@ def test_public_budget_blocks_second_rapid_fallback():
             "helius": [(None, "429"), (None, "429")],
             "public": [({"ok": 4}, "ok")]})
         c.patch(pacer, att)
-        first = reserves.rpc("getSignaturesForAddress", ["X"])
-        second = reserves.rpc("getSignaturesForAddress", ["X"])
+        first = reserves._rpc_impl("getSignaturesForAddress", ["X"])
+        second = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: first fallback succeeds", first == {"ok": 4})
         check("fallback: second fallback inside 2s is skipped",
               second is None)
@@ -217,7 +224,7 @@ def test_helius_non429_failure_tries_next_key():
         att = _FakeAttempt({
             "helius": [(None, "fail"), ({"ok": 5}, "ok")]})
         c.patch(pacer, att)
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: non-429 failure tries next key",
               got == {"ok": 5})
         check("fallback: next-key success never calls public",
@@ -231,7 +238,7 @@ def test_keyless_still_tries_public():
         pacer = _FakePacer(True)
         att = _FakeAttempt({"public": [({"ok": 6}, "ok")]})
         c.patch(pacer, att, keys=())
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("fallback: no keys configured still tries public",
               got == {"ok": 6})
         check("fallback: keyless public stamps source public-rpc",
@@ -260,7 +267,7 @@ def test_source_resets_on_failure():
         pacer = _FakePacer(True)
         att = _FakeAttempt({"helius": [({"ok": 1}, "ok")]})
         c.patch(pacer, att)
-        reserves.rpc("getSignaturesForAddress", ["X"])
+        reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("source: ok call stamps helius",
               reserves.last_rpc_source() == "helius")
         att2 = _FakeAttempt({
@@ -268,7 +275,7 @@ def test_source_resets_on_failure():
             "public": [(None, "fail")]})
         reserves._rpc_attempt = att2
         reserves._PUBLIC_BUDGET = None
-        got = reserves.rpc("getSignaturesForAddress", ["X"])
+        got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
         check("source: failing call returns None", got is None)
         check("source: failing call clears stale source",
               reserves.last_rpc_source() is None)
@@ -278,7 +285,10 @@ def test_rpc_url_pairs_vault_key():
     """rpc_url_pairs includes the vault URL when the surrogate is
     available, and is disk-keys-only when it is not (2026-11-20).
 
-    No network, no live state: _vault_url is patched to a fake
+    Modern reserves.rpc uses central routine allocation; these tests prove only
+the retained compatibility transport, not current caller routing.
+
+No network, no live state: _vault_url is patched to a fake
     surrogate URL or None; the real helius_vault is never called."""
     with _Ctx() as c:
         c.patch(_FakePacer(True), _FakeAttempt({}),
@@ -337,3 +347,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

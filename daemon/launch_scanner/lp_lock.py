@@ -238,19 +238,13 @@ def token_supply(chain: str, mint: str, timeout: float = 10) -> str:
     try:
         chain = (chain or "").lower()
         if chain == "solana":
-            for rpc in _SOL_RPCS:
-                res = _post_json(rpc, {"jsonrpc": "2.0", "id": 1,
-                                       "method": "getTokenSupply",
-                                       "params": [mint]}, timeout)
-                val = ((res or {}).get("result") or {}).get("value") or {}
-                amt = val.get("amount")
-                if amt is None:
-                    continue
-                try:
-                    dec = int(val.get("decimals", 0) or 0)
-                    return _fmt_supply(int(amt) / (10 ** dec))
-                except (TypeError, ValueError):
-                    continue
+            from daemon.intelligence.acquisition.routine import read
+            res = read('getTokenSupply', [mint], timeout=timeout)
+            val = (res or {}).get('value') or {}
+            amt = val.get('amount')
+            if amt is not None:
+                dec = int(val.get('decimals',0) or 0)
+                return _fmt_supply(int(amt)/(10**dec))
         elif chain in _RPCS:
             if not _ADDR_RE.match(mint or ""):
                 return ""

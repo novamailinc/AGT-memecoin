@@ -92,22 +92,22 @@ def _fake_ok(*a, **k):
 
 
 def test_smartmoney_rpc_respects_pacer_cooldown(monkeypatch):
-    import daemon.launch_scanner.smartmoney as sm
-    monkeypatch.setattr(sm, "api_key", lambda: "k")
+    import daemon.launch_scanner.reserves as sm
+    monkeypatch.setattr(sm, "rpc_url_pairs", lambda: [("https://mainnet.helius-rpc.com/?api-key=k", rl.bucket_id_for_key("k"))])
     bucket = rl.bucket_id_for_key("k")
     rl.pacer_report(bucket, False)  # engage pacer cooldown (~30s)
     calls = []
     monkeypatch.setattr(sm.urllib.request, "urlopen",
                         lambda *a, **k: calls.append(1) or _fake_ok())
-    assert sm._rpc("getSignaturesForAddress", []) is None
+    assert sm.helius_rpc_typed("getSignaturesForAddress", []) == (None, "error")
     assert calls == []  # no HTTP during pacer cooldown
 
 
 def test_smartmoney_rpc_429_engages_pacer_cooldown(monkeypatch):
-    import daemon.launch_scanner.smartmoney as sm
-    monkeypatch.setattr(sm, "api_key", lambda: "k")
-    monkeypatch.setattr(sm.urllib.request, "urlopen", _fake_429)
-    assert sm._rpc("getSignaturesForAddress", []) is None
+    import daemon.launch_scanner.reserves as sm
+    monkeypatch.setattr(sm, "rpc_url_pairs", lambda: [("https://mainnet.helius-rpc.com/?api-key=k", rl.bucket_id_for_key("k"))])
+    monkeypatch.setattr(sm, "_rpc_attempt", lambda *a,**k: (None,"429",.001))
+    assert sm.helius_rpc_typed("getSignaturesForAddress", []) == (None, "error")
     bucket = rl.bucket_id_for_key("k")
     st = rl.pacer()._read_state()[bucket]
     assert st["cooldown_until"] > time.time()  # pacer backoff engaged
@@ -115,32 +115,25 @@ def test_smartmoney_rpc_429_engages_pacer_cooldown(monkeypatch):
 
 
 def test_smartmoney_rpc_success_clears_pacer_backoff(monkeypatch):
-    import daemon.launch_scanner.smartmoney as sm
-    monkeypatch.setattr(sm, "api_key", lambda: "k")
+    import daemon.launch_scanner.reserves as sm
+    monkeypatch.setattr(sm, "rpc_url_pairs", lambda: [("https://mainnet.helius-rpc.com/?api-key=k", rl.bucket_id_for_key("k"))])
     bucket = rl.bucket_id_for_key("k")
     rl.pacer_report(bucket, False)  # 30s ladder
     _expire_pacer_cooldown(bucket)
     rl.pacer_report(bucket, False)  # doubles to 60s (probe 429)
     assert rl.pacer()._read_state()[bucket]["backoff_s"] == 60.0
     _expire_pacer_cooldown(bucket)
-    monkeypatch.setattr(sm.urllib.request, "urlopen",
-                        lambda *a, **k: _fake_ok())
-    assert sm._rpc("getSignaturesForAddress", []) == {"ok": True}
+    monkeypatch.setattr(sm, "_rpc_attempt", lambda *a,**k: ({"ok":True},"ok",.001))
+    assert sm.helius_rpc_typed("getSignaturesForAddress", []) == ({"ok": True}, "ok")
     # ladder was reset by success: the next 429 engages base 30s again
     rl.pacer_report(bucket, False)
     assert rl.pacer()._read_state()[bucket]["backoff_s"] == 30.0
 
 
-def test_deployer_rpc_shares_pacer_bucket(monkeypatch):
+def test_deployer_ordinary_rpc_uses_central_budget_not_helius_bucket(monkeypatch):
     import daemon.launch_scanner.deployers as dp
-    import daemon.launch_scanner.smartmoney as sm
-    monkeypatch.setattr(dp, "api_key", lambda: "k")
-    monkeypatch.setattr(sm, "api_key", lambda: "k")
-    # 429 via smartmoney engages the pacer cooldown deployers must respect
-    monkeypatch.setattr(sm.urllib.request, "urlopen", _fake_429)
-    assert sm._rpc("getSignaturesForAddress", []) is None
-    calls = []
-    monkeypatch.setattr(dp.urllib.request, "urlopen",
-                        lambda *a, **k: calls.append(1) or _fake_ok())
-    assert dp._rpc("getSignaturesForAddress", []) is None
-    assert calls == []  # deployer skipped: pacer cooldown, shared bucket
+    from daemon.intelligence.acquisition import routine
+    calls=[]
+    monkeypatch.setattr(routine,'read',lambda *a,**k: calls.append((a,k)) or {'ok':True})
+    assert dp._rpc('getSignaturesForAddress',[])=={'ok':True}
+    assert calls[0][1]['background'] is True

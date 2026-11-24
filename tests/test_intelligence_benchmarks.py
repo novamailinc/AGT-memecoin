@@ -431,7 +431,7 @@ GAP = {"from_slot": 472499400, "to_slot": 472499532}
 def _direct_rpc(method, params):
     if method == "getSignaturesForAddress":
         return {"kind": "ok", "result": bf_transport._sig_page()}
-    return {"kind": "ok", "result": FIXTURES.get("getTransaction")}
+    return {"kind": "ok", "result": bf_transport.synthetic_transaction(params[0])}
 
 
 def _recover_primitives_once():
@@ -462,12 +462,14 @@ def _recover_router_once():
     router = fresh_router(transport=TRANSPORT)
     driver = BackfillDriver(
         router, home=tempfile.mkdtemp(prefix="bench_test_bf_"))
-    return driver.recover_gap("bench", ADDRESS, GAP)
+    report = driver.recover_gap("bench", ADDRESS, GAP)
+    assert len(report['fetch_failed']) == 1 and report['unrecovered_gap'] is not None
+    return report
 
 
 bf_router = B.benchmark_backfill_driver(_recover_router_once, runs=3)
-check("backfill router-mediated: 2 events/run (recorded page)",
-      bf_router["events_new_per_run"] == [2, 2, 2]
+check("backfill router-mediated: one bound event, unrelated recorded row refused",
+      bf_router["events_new_per_run"] == [1, 1, 1]
       and bf_router["events_per_s"]["p50_s"] > 0)
 
 # --------------------------------------------------------------------------

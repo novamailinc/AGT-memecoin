@@ -460,6 +460,9 @@ def _ff_tx_price(engine, sig, mint):
         return None, "migration tx fetch failed: %s" % e
     if not isinstance(res, dict):
         return None, "migration tx not available yet"
+    from daemon.launch_scanner import tx_guards as source_guard
+    if not source_guard.response_signature_matches(res,sig):
+        return None, "migration tx response signature mismatch"
     t.join(timeout=6)
     return _ff_parse_tx_price(res, mint,
                               sol_usd=holder.get("sol", 0.0))

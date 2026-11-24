@@ -8,6 +8,9 @@ of any kind, including the armed-watch WSS handshake. After
 `until`, exactly one caller claims the single probe: a success
 clears quiet, a 429 re-enters quiet for 12h.
 
+Reserves checks target retained _rpc_impl compatibility, not central routine
+allocation. Watcher guard is tested on an explicit fake Helius URL.
+
 No network, no live state: temp home dir, fake _rpc_attempt.
 Run: python3 tests/test_helius_quiet.py
 """
@@ -316,6 +319,10 @@ class _RCtx:
         self._real["pacer"] = reserves._pacer
         self._real["attempt"] = reserves._rpc_attempt
         self._real["keys"] = reserves._helius_keys
+        self._real["alchemy_key"] = reserves._alchemy_key
+        self._real["vault_url"] = reserves._vault_url
+        reserves._alchemy_key = lambda: ""
+        reserves._vault_url = lambda: None
         reserves.HOME = self.home
         reserves._PUBLIC_BUDGET = None
         reserves._pacer = lambda: rl.pacer()
@@ -323,6 +330,8 @@ class _RCtx:
         return self
 
     def __exit__(self, *exc):
+        reserves._alchemy_key = self._real["alchemy_key"]
+        reserves._vault_url = self._real["vault_url"]
         reserves.HOME = self._real["HOME"]
         reserves._PUBLIC_BUDGET = self._real["BUDGET"]
         reserves._pacer = self._real["pacer"]
@@ -340,7 +349,7 @@ def test_reserves_public_only_while_quiet():
             att = _FakeAttempt({"public": [({"ok": 1}, "ok")]})
             rc.patch_attempt(att)
             rl.quiet_set(12, "test")
-            got = reserves.rpc("getSignaturesForAddress", ["X"])
+            got = reserves._rpc_impl("getSignaturesForAddress", ["X"])
             check("reserves-quiet: quiet routes to public",
                   got == {"ok": 1})
             check("reserves-quiet: zero Helius attempts while quiet",
@@ -352,7 +361,7 @@ def test_reserves_public_only_while_quiet():
             rl.quiet_clear("done")
             att2 = _FakeAttempt({"helius": [({"ok": 2}, "ok")]})
             rc.patch_attempt(att2)
-            got2 = reserves.rpc("getSignaturesForAddress", ["X"])
+            got2 = reserves._rpc_impl("getSignaturesForAddress", ["X"])
             check("reserves-quiet: clear restores Helius",
                   got2 == {"ok": 2})
             check("reserves-quiet: clear makes a Helius attempt",
@@ -368,7 +377,8 @@ def test_armed_watch_paused_while_quiet():
               and armed_watch._helius_quiet_active() is True)
         calls = []
         watcher = armed_watch.ArmedWatcher(
-            on_price=lambda *a: None)
+            on_price=lambda *a: None,
+            ws_url="wss://mainnet.helius-rpc.com/?api-key=FAKE-QUIET-TEST")
         watcher._serve = lambda: calls.append(1)
         watcher.start()
         try:
@@ -455,3 +465,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

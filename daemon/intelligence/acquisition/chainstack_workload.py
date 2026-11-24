@@ -84,6 +84,8 @@ or logs. Backfill is detection-only, never enters (Rule 1).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -459,6 +461,49 @@ def select_for_verification(events, budget=DEFAULT_VERIFY_BUDGET):
             "budget": budget}
 
 
+def _complete_transaction(tx, signature=None):
+    if not isinstance(tx, dict) or type(tx.get("slot")) is not int:
+        return False
+    body = tx.get("transaction")
+    meta = tx.get("meta")
+    if not isinstance(body, dict) or not isinstance(meta, dict):
+        return False
+    signatures = body.get("signatures")
+    message = body.get("message")
+    if (not isinstance(signatures, list) or not signatures or
+            not all(isinstance(x, str) and x for x in signatures) or
+            (signature is not None and signatures[0] != signature) or
+            not isinstance(message, dict)):
+        return False
+    accounts = message.get("accountKeys")
+    instructions = message.get("instructions")
+    if (not isinstance(accounts, list) or not accounts or
+            not isinstance(instructions, list) or
+            "err" not in meta or type(meta.get("fee")) is not int):
+        return False
+    for name in ("preBalances", "postBalances"):
+        balances = meta.get(name)
+        if (not isinstance(balances, list) or len(balances) != len(accounts) or
+                any(type(x) is not int or x < 0 for x in balances)):
+            return False
+    for account in accounts:
+        address = account.get("pubkey") if isinstance(account, dict) else account
+        if not isinstance(address, str) or not address:
+            return False
+    inner = meta.get("innerInstructions", [])
+    if inner is not None and not isinstance(inner, list):
+        return False
+    all_instructions = list(instructions)
+    for group in inner or []:
+        if (not isinstance(group, dict) or type(group.get("index")) is not int or
+                not 0 <= group["index"] < len(instructions) or
+                not isinstance(group.get("instructions"), list)):
+            return False
+        all_instructions.extend(group["instructions"])
+    return all(isinstance(ix, dict) and isinstance(ix.get("programId"), str)
+               and ix["programId"] for ix in all_instructions)
+
+
 def canonical_tx_digest(tx_result):
     """Comparable digest of a getTransaction result (jsonParsed).
 
@@ -469,7 +514,7 @@ def canonical_tx_digest(tx_result):
     digest; any field difference is a conflict, never a rounding
     artifact (no floats are compared — fee/balances are ints).
     """
-    if not isinstance(tx_result, dict):
+    if not _complete_transaction(tx_result):
         return None
     meta = tx_result.get("meta") or {}
     message = (tx_result.get("transaction") or {}).get("message") or {}
@@ -489,6 +534,8 @@ def canonical_tx_digest(tx_result):
                 programs.add(ins["programId"])
     err = meta.get("err")
     return {
+        "signature": tx_result["transaction"]["signatures"][0],
+        "slot": tx_result["slot"],
         "blockTime": tx_result.get("blockTime"),
         "fee": meta.get("fee"),
         "err": json.dumps(err, sort_keys=True) if err is not None
@@ -497,6 +544,11 @@ def canonical_tx_digest(tx_result):
         "programs": sorted(programs),
         "preBalances": list(meta.get("preBalances") or []),
         "postBalances": list(meta.get("postBalances") or []),
+        # Preserve ordered identities, instructions and all returned execution
+        # economics. Set projections above are labels only, not equality proof.
+        "transaction": tx_result["transaction"],
+        "meta": meta,
+        "version_evidence": ["version" in tx_result, tx_result.get("version")],
     }
 
 
@@ -539,17 +591,24 @@ def verify_transaction(router, signature, primary_tx,
         priority=priority, hints=hints)
     verdict = {"signature": signature, "verified": False,
                "match": None, "status": "unverified",
-               "differences": [], "provider": result.get("provider"),
+               "differences": [], "provider": (result or {}).get("provider"),
                "workload": INDEPENDENT_VERIFICATION, "error": None}
     if result is None or result.get("kind") != "ok":
         verdict["error"] = "%s: %s" % (
             (result or {}).get("kind") or "no_result",
             (result or {}).get("note") or "re-read failed")
         return verdict
+    if result.get("provider") != "chainstack":
+        verdict["error"] = "independent Chainstack source unavailable"
+        return verdict
+    if not _complete_transaction(primary_tx, signature) or not _complete_transaction(result.get("result"), signature):
+        verdict["error"] = "transaction comparison evidence incomplete or identity mismatch"
+        return verdict
     primary_digest = canonical_tx_digest(primary_tx)
     verify_digest = canonical_tx_digest(result.get("result"))
     diffs = _digest_differences(primary_digest, verify_digest)
     verdict["verified"] = True
+    verdict["comparison_scope"] = "returned transaction/signature/slot/blockTime/meta/version equality, not completeness of chain history"
     verdict["differences"] = diffs
     if diffs:
         verdict["status"] = "conflict"
@@ -578,11 +637,39 @@ def verify_account_state(router, address, primary_account,
         hints={"workload": INDEPENDENT_VERIFICATION})
     verdict = {"address": address, "verified": False, "match": None,
                "status": "unverified", "differences": [],
-               "provider": result.get("provider"), "error": None}
+               "provider": (result or {}).get("provider"), "error": None}
     if result is None or result.get("kind") != "ok":
         verdict["error"] = "%s: %s" % (
             (result or {}).get("kind") or "no_result",
             (result or {}).get("note") or "re-read failed")
+        return verdict
+    if result.get("provider") != "chainstack":
+        verdict["error"] = "independent Chainstack source unavailable"
+        return verdict
+    def complete_account(payload):
+        value = payload.get("value") if isinstance(payload, dict) else None
+        if not (isinstance(value, dict) and
+                all(k in value for k in ("lamports", "owner", "executable", "rentEpoch", "data")) and
+                type(value["lamports"]) is int and value["lamports"] >= 0 and
+                isinstance(value["owner"], str) and bool(value["owner"]) and
+                type(value["executable"]) is bool and type(value["rentEpoch"]) is int and value["rentEpoch"] >= 0):
+            return False
+        data = value["data"]
+        # jsonParsed request can return parsed known-account data, or base64
+        # for an account the server cannot parse. Arbitrary dicts are invalid.
+        if isinstance(data, dict):
+            return (isinstance(data.get("program"), str) and bool(data["program"]) and
+                    isinstance(data.get("parsed"), dict) and
+                    isinstance(data["parsed"].get("type"), str) and bool(data["parsed"]["type"]) and
+                    isinstance(data["parsed"].get("info"), dict) and
+                    type(data.get("space")) is int and data["space"] >= 0)
+        if isinstance(data, list) and len(data) == 2 and data[1] == "base64" and isinstance(data[0], str):
+            try:base64.b64decode(data[0], validate=True)
+            except (binascii.Error, ValueError):return False
+            return True
+        return False
+    if not complete_account(primary_account) or not complete_account(result.get("result")):
+        verdict["error"] = "account comparison evidence incomplete"
         return verdict
     primary = (primary_account or {}).get("value") or {}
     verify = (result.get("result") or {}).get("value") or {}
@@ -594,6 +681,7 @@ def verify_account_state(router, address, primary_account,
         diffs.append("data")
     verdict["verified"] = True
     verdict["differences"] = sorted(diffs)
+    verdict["comparison_scope"] = "returned owner/lamports/executable/rentEpoch/data fields only, separate read slots not atomic state proof"
     verdict["status"] = "conflict" if diffs else "match"
     verdict["match"] = not diffs
     return verdict

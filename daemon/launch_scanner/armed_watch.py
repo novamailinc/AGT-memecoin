@@ -36,11 +36,11 @@ import time
 try:
     from daemon.launch_scanner import reserves as _res
     from daemon.launch_scanner import reserve_monitor as _resmon
-    from daemon.launch_scanner.logstream import WSClient, WSError
+    from daemon.launch_scanner.logstream import WSClient, WSError, WSHandshakeError
 except Exception:  # pragma: no cover - script-style import path
     import reserves as _res  # type: ignore
     import reserve_monitor as _resmon  # type: ignore
-    from logstream import WSClient, WSError  # type: ignore
+    from logstream import WSClient, WSError, WSHandshakeError  # type: ignore
 
 try:
     from daemon.launch_scanner import helius_ratelimit as _guard_mod
@@ -195,6 +195,8 @@ class ArmedWatcher:
         self._vault_cache = {}  # pool -> vaults (resolution is stable)
         self._subs = {}        # subid -> (mint, role, pool, generation)
         self._pending = {}     # request id -> (mint, role, pool, gen)
+        self._active_ws = None
+        self._request_sequence = 0  # never reuse IDs across resubscription/restart
         self._amounts = {}     # mint -> {"base": int, "quote": int}
         self._monitor_amounts = {}  # isolated measurement capture state
         self._generation = 0   # armed-identity generation; a
@@ -330,10 +332,8 @@ class ArmedWatcher:
     def _url(self):
         if self._ws_url:
             return self._ws_url
-        k = _res._helius_key()
-        if k:
-            return "wss://mainnet.helius-rpc.com/?api-key=" + k
-        return "wss://api.mainnet-beta.solana.com"
+        from daemon.intelligence.acquisition.routine import websocket_url
+        return websocket_url()
 
     def _run(self):
         backoff = 2.0
@@ -350,7 +350,7 @@ class ArmedWatcher:
             # lanes fall back to polled quotes
             # (reserves.price_for_position, public fallback
             # during quiet).
-            if _helius_quiet_active():
+            if self._url() and "helius-rpc.com" in self._url() and _helius_quiet_active():
                 if not quiet_logged:
                     logger.warning(
                         "armed_watch: Helius quiet active — pausing "
@@ -372,7 +372,7 @@ class ArmedWatcher:
             # and the single probe is unclaimed — let an RPC caller
             # claim and resolve it first. The probe must be a cheap
             # RPC read, not a WSS handshake.
-            if _quiet_probe_pending():
+            if self._url() and "helius-rpc.com" in self._url() and _quiet_probe_pending():
                 if not probe_logged:
                     logger.warning(
                         "armed_watch: Helius quiet probe pending — "
@@ -385,7 +385,7 @@ class ArmedWatcher:
                 continue
             probe_logged = False
             guard = _shared_guard()
-            bucket = _wss_bucket() if guard is not None else ""
+            bucket = _wss_bucket() if guard is not None and self._url() and "helius-rpc.com" in self._url() else ""
             if bucket:
                 try:
                     remaining = guard.cooldown_remaining(bucket)
@@ -446,6 +446,15 @@ class ArmedWatcher:
             try:
                 self._serve()
             except Exception as e:
+                if isinstance(e, WSHandshakeError) and e.status_code in (401,403):
+                    self._set_state("STALE")
+                    with self._lock:
+                        self._down_since = time.time()
+                        self._subs = {}
+                        self._pending = {}
+                        self._active_ws = None
+                    logger.warning('armed_watch access denied; stopping WS attempts until explicit restart, exit pricing remains polled')
+                    return
                 if "429" in str(e) and bucket:
                     # The handshake itself was rate-limited: engage
                     # the fleet-wide cooldown so this and every other
@@ -474,6 +483,8 @@ class ArmedWatcher:
             with self._lock:
                 self._down_since = time.time()
                 self._subs = {}
+                self._pending = {}
+                self._active_ws = None
             # Jittered backoff (2026-11-22 herd fix): watchers that
             # fail together share the same backoff ladder and would
             # otherwise retry in lockstep.
@@ -482,9 +493,28 @@ class ArmedWatcher:
             backoff = min(backoff * 2, 60.0)
 
     def _serve(self):
-        ws = WSClient(self._url(), timeout=_RECV_TICK_S)
-        ws.connect()
+        from daemon.intelligence.acquisition import routine
+        url = self._url()
+        routine.websocket_admit(url, critical=True)
+        ws = WSClient(url, timeout=_RECV_TICK_S)
+        with self._lock:
+            self._subs = {}
+            self._pending = {}
+            self._active_ws = ws
         try:
+            ws.connect()
+        except Exception as exc:
+            try:
+                ws.close()
+            finally:
+                with self._lock:
+                    self._subs = {}
+                    self._pending = {}
+                    self._active_ws = None
+                routine.websocket_result(url, exc)
+            raise
+        try:
+            routine.websocket_result(url)
             self._subscribe_all(ws)
             gap_s = time.time() - self._down_since \
                 if self._down_since else 0.0
@@ -508,21 +538,29 @@ class ArmedWatcher:
                 if msg is None:
                     raise WSError("server closed the stream")
         finally:
+            with self._lock:
+                self._subs = {}
+                self._pending = {}
+                self._active_ws = None
             try:
                 ws.close()
             except Exception:
                 pass
 
     def _subscribe_all(self, ws):
-        rid = int(time.time() * 1000) % 100000
         with self._lock:
+            if ws is not self._active_ws:
+                return
+            self._pending = {}
             want = dict(self._want)
             gen = self._generation
             self._subs = {}
         for mint, w in want.items():
             for role, vault in (("base", w["base_vault"]),
                                 ("quote", w["quote_vault"])):
-                rid += 1
+                with self._lock:
+                    self._request_sequence += 1
+                    rid = self._request_sequence
                 # Identity bound at capture time: pool and generation
                 # travel with the subscription, so a delayed
                 # notification can never be stored against a newer
@@ -541,12 +579,16 @@ class ArmedWatcher:
             d = json.loads(msg)
         except Exception:
             return
+        with self._lock:
+            if ws is not self._active_ws:
+                return  # Late ACK/notification from a closed connection.
         if "id" in d and "result" in d:
-            pend = getattr(self, "_pending", {}) or {}
-            key = pend.pop(d["id"], None)
-            if key:
-                with self._lock:
-                    self._subs[d["result"]] = key
+            if type(d['id']) is not int or type(d['result']) is not int or d['result']<0:
+                return
+            with self._lock:
+                key = self._pending.pop(d['id'], None)
+                if key and ws is self._active_ws and d['result'] not in self._subs:
+                    self._subs[d['result']] = key
             return
         if d.get("method") != "accountNotification":
             return

@@ -71,7 +71,7 @@ preflight() {
     else
         COMMIT_SRC="no git checkout in this deploy (tarball); record main HEAD by hand"
     fi
-    printf '{"branch":"main","commit":%s,"commit_source":"%s","generated_at_utc":"%s","repo":"https://github.com/olamoreA/meme-project"}\n' \
+    printf '{"branch":"main","commit":%s,"commit_source":"%s","generated_at_utc":"%s","repo":"https://github.com/novamailinc/AGT-memecoin"}\n' \
         "$( [ -n "$COMMIT" ] && printf '"%s"' "$COMMIT" || printf 'null' )" \
         "$COMMIT_SRC" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "$FOREX_AGENT_HOME/agt_version.json"

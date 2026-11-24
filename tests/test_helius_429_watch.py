@@ -135,48 +135,32 @@ def test_shed_logged_once_per_episode():
               len(log.warnings) == 2)
 
 
-def test_deployers_shed_makes_zero_http_attempts():
+def _central_route_while_helius_shed(module, key):
+    from unittest.mock import patch
+    from daemon.intelligence.acquisition import routine
     with _Ctx():
-        from daemon.launch_scanner import deployers
-        bucket = rl.bucket_id_for_key("KEY-SHED-TEST")
-        rl.shared_guard().report_ratelimited(bucket)
-        called = []
-        real_open = urllib.request.urlopen
-        real_key = deployers.api_key
-        try:
-            deployers.api_key = lambda: "KEY-SHED-TEST"
-            urllib.request.urlopen = lambda *a, **k: called.append(
-                1) or (_ for _ in ()).throw(AssertionError(
-                    "urlopen must not be called while shed"))
-            check("shed: deployers returns None in backoff",
-                  deployers._rpc("getSignaturesForAddress", []) is None)
-            check("shed: deployers made zero HTTP attempts",
-                  called == [])
-        finally:
-            urllib.request.urlopen = real_open
-            deployers.api_key = real_key
+        rl.shared_guard().report_ratelimited(rl.bucket_id_for_key(key))
+        # Helius-specific shed is not a ban on Alchemy/central allocation.
+        with patch.object(routine, 'call', return_value={
+                'kind': 'ok', 'result': {'routed': True},
+                'provider': 'alchemy', 'decision_usable': True}) as call, \
+             patch('urllib.request.urlopen', side_effect=AssertionError('direct bypass')) as direct:
+            check('central: caller preserves eligible alternate response',
+                  module._rpc('getSignaturesForAddress', []) == {'routed': True})
+            check('central: one background request through facade',
+                  call.call_count == 1 and call.call_args.args[:2] == ('getSignaturesForAddress', [])
+                  and call.call_args.args[4] is True)
+            check('central: no direct HTTP bypass', direct.call_count == 0)
+
+
+def test_deployers_shed_makes_zero_http_attempts():
+    from daemon.launch_scanner import deployers
+    _central_route_while_helius_shed(deployers, 'KEY-SHED-TEST')
 
 
 def test_smartmoney_shed_makes_zero_http_attempts():
-    with _Ctx():
-        from daemon.launch_scanner import smartmoney
-        bucket = rl.bucket_id_for_key("KEY-SHED-TEST2")
-        rl.shared_guard().report_ratelimited(bucket)
-        called = []
-        real_open = urllib.request.urlopen
-        real_key = smartmoney.api_key
-        try:
-            smartmoney.api_key = lambda: "KEY-SHED-TEST2"
-            urllib.request.urlopen = lambda *a, **k: called.append(
-                1) or (_ for _ in ()).throw(AssertionError(
-                    "urlopen must not be called while shed"))
-            check("shed: smartmoney returns None in backoff",
-                  smartmoney._rpc("getSignaturesForAddress", []) is None)
-            check("shed: smartmoney made zero HTTP attempts",
-                  called == [])
-        finally:
-            urllib.request.urlopen = real_open
-            smartmoney.api_key = real_key
+    from daemon.launch_scanner import smartmoney
+    _central_route_while_helius_shed(smartmoney, 'KEY-SHED-TEST2')
 
 
 def test_alert_file_active_and_quiet():
@@ -359,3 +343,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

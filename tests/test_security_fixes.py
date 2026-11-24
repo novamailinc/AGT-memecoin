@@ -309,8 +309,10 @@ def test_repair():
 
         # No allowlist configured: nobody may repair, never open.
         _set_allowlist(None, None)
-        sec4 = tg_security.SecurityContext({})
-        sec4.try_pair(CHAT, USER)
+        sec4 = tg_security.SecurityContext({"paired_chat_id": CHAT,
+                                            "paired_user_id": USER})
+        check("repair: preexisting pairing exists before no-allowlist repair",
+              sec4.is_paired())
         fx5 = _FakeCtx(sec4)
         tg_commands.handle_message(fx5.ctx, CHAT, USER, 5, "/repair")
         check("repair: denied with no allowlist configured",
@@ -515,3 +517,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

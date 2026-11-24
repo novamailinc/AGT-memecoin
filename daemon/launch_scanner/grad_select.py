@@ -801,7 +801,7 @@ def _creator_from_oldest_tx(oldest_sig):
         # meta.err gate (2026-11-17, Batch 3): a CreateEvent can
         # survive in a REVERTED tx's logs, and a reverted create
         # names no deployer — the mint doesn't exist. Refuse.
-        if not _txg.tx_succeeded(tx):
+        if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,oldest_sig):
             return None
         return _deployers._first_signer(tx)
     except Exception:
@@ -925,7 +925,7 @@ def _canonical_pool_from_chain(curve_addr, pool, created_ts):
                 "maxSupportedTransactionVersion": 1}])
             if not tx:
                 continue
-            if _txg is not None and not _txg.tx_succeeded(tx):
+            if _txg is None or not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,mig_sig):
                 continue
             logs = ((tx.get("meta") or {}).get("logMessages") or [])
             if not any("Instruction: Migrate" in str(l)

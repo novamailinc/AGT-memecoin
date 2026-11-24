@@ -65,8 +65,10 @@ def check(name, cond):
 
 
 # ---------------- router modes ----------------
-r_shadow = ROUTER.ProviderRouter(home=HOME)
-check("router default mode is shadow, helius enabled",
+r_default = ROUTER.ProviderRouter(home=HOME)
+check("default is end_state without routine Helius",r_default.mode=="end_state" and not r_default.helius_enabled)
+r_shadow = ROUTER.ProviderRouter(home=HOME,mode="shadow",helius_enabled=True)
+check("explicit shadow mode retains Helius diagnostic support",
       r_shadow.mode == "shadow" and r_shadow.helius_enabled is True)
 dec = r_shadow.route("getAccountInfo", ["addr"])
 check("shadow route() carries mode + helius primary",
@@ -335,17 +337,22 @@ s.record("alchemy", "alchemy", "getSlot", "routine_account",
          "background", cost=int(daily_cap), kind="ok")
 trk2 = UsageTracker(home=HOME_BUDGETS, store=s)
 ok, reason = trk2.nonessential_allowed("alchemy", "background")
-check("daily budget stop blocks nonessential only",
-      ok is False and reason == "daily_budget_stop_nonessential")
+check("daily exhausted budget blocks nonessential",
+      ok is False and reason == "daily_budget_exhausted")
 ok_e, _r = trk2.nonessential_allowed("alchemy", "critical")
-check("daily budget stop never blocks essential (critical)",
-      ok_e is True)
+check("daily exhausted budget also blocks essential (critical)",
+      ok_e is False and _r == "daily_budget_exhausted")
 status = trk2.budget_status("alchemy")
 check("budget_status reports daily fields + essential_over_budget "
       "flag present",
       status["daily_spent"] >= int(daily_cap)
       and status["daily_amount"] == daily_cap
       and "essential_over_budget" in status)
+PU.BUDGET_OVERRIDES["alchemy"] = {"daily_amount": 1_050_000}
+check("daily below exhaustion still sheds nonessential at95percent",
+      trk2.nonessential_allowed("alchemy","background")[0] is False)
+check("daily below exhaustion still allows essential",
+      trk2.nonessential_allowed("alchemy","critical")[0] is True)
 del PU.BUDGET_OVERRIDES["alchemy"]
 # Feature budget stop.
 PU.set_feature_budget("helius_main", "parsed_events", 20,
@@ -359,16 +366,22 @@ trk3.record("helius_main", "helius", "parsed_events/transactions",
 ok_f, reason_f = trk3.nonessential_allowed(
     "helius_main", "background", workload="complex_tx_parse",
     provider="helius")
-check("feature budget stop (95% of 20) blocks nonessential",
+check("feature exhausted budget (20 of 20) blocks nonessential",
       ok_f is False
-      and reason_f == "feature_budget_stop_nonessential:parsed_events")
-ok_fe, _ = trk3.nonessential_allowed(
+      and reason_f == "feature_budget_exhausted:parsed_events")
+ok_fe, reason_fe = trk3.nonessential_allowed(
     "helius_main", "card", workload="complex_tx_parse",
     provider="helius")
-check("feature budget stop never blocks essential (card)",
-      ok_fe is True)
+check("feature exhausted budget also blocks essential (card)",
+      ok_fe is False and reason_fe == "feature_budget_exhausted:parsed_events")
 check("feature_status reports enforced spend",
       trk3.feature_status("helius_main", "parsed_events")["pct"] == 1.0)
+# Raising the test-only limit to 21 leaves20/21 above95% but below exhaustion.
+PU.set_feature_budget("helius_main", "parsed_events", 21, reason="below-exhaustion fixture")
+check("feature below exhaustion still sheds nonessential at95percent",
+      trk3.nonessential_allowed("helius_main","background",workload="complex_tx_parse",provider="helius")[0] is False)
+check("feature below exhaustion still allows essential",
+      trk3.nonessential_allowed("helius_main","card",workload="complex_tx_parse",provider="helius")[0] is True)
 del PU.FEATURE_BUDGETS[("helius_main", "parsed_events")]
 
 # ---------------- health persistence ----------------
@@ -430,38 +443,15 @@ check("D-16 probe math: confirmed lag 30, finalized lag 5",
 check("D-16 probe math: vs public lag processed 29",
       lag["processed"]["vs_public"]["median"] == 29)
 
-# ---------------- reserves shadow hook ----------------
+# Routine reserves no longer invokes the retired Helius shadow hook.
 import daemon.launch_scanner.reserves as reserves
-from daemon.intelligence.acquisition import shadow_observer as SO
-old_impl = reserves._rpc_impl_typed
-old_last = reserves.last_rpc_source
-calls = []
-_shadow_off = os.environ.pop("ROUTER_SHADOW_OFF", None)
-try:
-    reserves._rpc_impl_typed = lambda m, p, timeout=12, exempt=False: (
-        "RES", "ok")
-    reserves.last_rpc_source = lambda: "helius"
-    SO._OBSERVER = ShadowObserver(home=HOME, router=FakeRouter())
-    out = reserves.rpc("getSlot", [])
-    check("reserves wrapper returns the live result unchanged",
-          out == "RES")
-    j = ShadowObserver(home=HOME, router=FakeRouter()).summarize()
-    check("reserves wrapper observed the call in the journal",
-          j["total"] == 5 and j["counts"]["exact"] == 2)
-    # Observer failure never breaks the live call.
-    class _Boom:
-        def observe(self, *a, **k):
-            raise RuntimeError("boom")
-    SO._OBSERVER = _Boom()
-    out2 = reserves.rpc("getSlot", [])
-    check("observer exception never breaks reserves.rpc",
-          out2 == "RES")
-finally:
-    reserves._rpc_impl_typed = old_impl
-    reserves.last_rpc_source = old_last
-    SO._OBSERVER = None
-    if _shadow_off is not None:
-        os.environ["ROUTER_SHADOW_OFF"] = _shadow_off
+from daemon.intelligence.acquisition import routine
+from unittest.mock import patch
+with patch.object(routine,'call',return_value={"provider":"alchemy","kind":"ok","result":"RES","decision_usable":True}) as rpc:
+    check("reserves central wrapper preserves result",reserves.rpc("getSlot",[])=="RES")
+    check("reserves central wrapper called once",rpc.call_count==1)
+with patch.object(routine,'call',side_effect=RuntimeError('fixture failure')):
+    check("reserves acquisition exception returns None",reserves.rpc("getSlot",[]) is None)
 
 print("\n%d checks, %d failed" % (total[0], len(fails)))
 if fails:

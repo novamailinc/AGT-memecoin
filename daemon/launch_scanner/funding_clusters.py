@@ -462,49 +462,10 @@ def _helius_key():
 
 
 def _rpc(method, params, timeout=_RPC_TIMEOUT):
-    """One JSON-RPC call: Helius (keyed) first, public endpoint as
-    fallback. Result or None. Never raises. Module-level so tests
-    can monkeypatch the transport wholesale.
+    """Routine first-funder lookup via Alchemy-first capability routing."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=timeout, background=True)
 
-    Pacing (2026-11-17): the Helius leg takes a pacer token for
-    its key's bucket first; no token -> the public leg carries the
-    read. A 429 reports to the pacer (progressive backoff + single
-    probe); a success clears the cooldown."""
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
-                       "params": params}).encode()
-    urls = []
-    k = _helius_key()
-    bucket = ""
-    if k:
-        urls.append("https://mainnet.helius-rpc.com/?api-key=" + k)
-        if _helius_ratelimit is not None:
-            bucket = _helius_ratelimit.bucket_id_for_key(k)
-    urls.append("https://api.mainnet-beta.solana.com")
-    for url in urls:
-        is_helius = "helius-rpc.com" in url
-        if is_helius and bucket and _helius_ratelimit is not None:
-            if not _helius_ratelimit.pacer_acquire(bucket):
-                continue  # pacer: no token — public leg carries it
-        try:
-            req = urllib.request.Request(
-                url, data=body,
-                headers={"Content-Type": "application/json",
-                         "User-Agent": "Mozilla/5.0",
-                         "Connection": "close"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read())
-            if isinstance(d, dict) and d.get("result") is not None:
-                if is_helius and bucket \
-                        and _helius_ratelimit is not None:
-                    _helius_ratelimit.pacer_report(bucket, True)
-                return d["result"]
-        except Exception as exc:
-            if is_helius and bucket \
-                    and _helius_ratelimit is not None \
-                    and getattr(exc, "code", None) == 429:
-                _helius_ratelimit.pacer_report(bucket, False)
-            continue
-    return None
 
 
 def parse_funder_from_tx(tx, wallet):
@@ -600,6 +561,8 @@ def resolve_first_funder(wallet, rpc=None, max_pages=_MAX_PAGES):
         tx = rpc("getTransaction",
                  [sig, {"encoding": "jsonParsed",
                         "maxSupportedTransactionVersion": 0}])
+        if not _txg.response_signature_matches(tx, sig):
+            return None
         funder = parse_funder_from_tx(tx, wallet)
         if funder and not is_plausible_wallet(funder):
             return None

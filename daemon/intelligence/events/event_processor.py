@@ -219,10 +219,33 @@ class EventProcessor(object):
                 return "duplicate", event.event_id
         self.dedup.add(event.event_id)
         self.store.upsert_event(event)
-        if stream_key is not None:
+        outcome, event_id = self._apply_or_hold(event)
+        # Checkpoint AFTER store AND apply. A crash before this line
+        # leaves the checkpoint behind the durable data, so recovery
+        # replays (deduped) instead of skipping an unapplied event.
+        if stream_key is not None and outcome in ("applied", "held") \
+                and event.slot is not None \
+                and self._durably_applied_or_held(event):
             self.store.set_checkpoint(stream_key, event.slot,
                                       event.signature)
-        return self._apply_or_hold(event)
+        return outcome, event_id
+
+    def _durably_applied_or_held(self, event):
+        """True when the event's end state is durable: held events are
+        stored; applied events must also be in the durable applied set
+        (the apply step swallows a failed mark_applied, so the outcome
+        alone is not proof). Stores without is_applied (duck-typed
+        fakes) fall back to the outcome."""
+        if not event.may_update_market_state():
+            return True
+        store_applied = getattr(self.store, "is_applied", None)
+        if not callable(store_applied):
+            return True
+        try:
+            return bool(store_applied(event.event_id))
+        except Exception as exc:
+            logger.warning("durable applied check failed: %s", exc)
+            return False
 
     def process_transaction(self, provider, tx, commitment="confirmed",
                             kind="getTransaction", stream_key=None,

@@ -237,6 +237,14 @@ def router_rpc_call(router, priority=None, hints=None):
 CHECKPOINT_FILE = "backfill_checkpoints.json"
 
 
+class CorruptCheckpointStoreError(Exception):
+    """The backfill checkpoint file exists but cannot be trusted.
+
+    The file is preserved untouched. The caller must not treat this as
+    an empty store: recorded checkpoints and unrecovered gaps are
+    unknown until a person or a reviewed migration resolves it."""
+
+
 class BackfillCheckpointStore:
     """Persistent per-key backfill checkpoints + unrecovered gaps.
 
@@ -263,12 +271,22 @@ class BackfillCheckpointStore:
             with open(self._path) as fh:
                 data = json.load(fh)
             if not isinstance(data, dict):
-                return {"checkpoints": {}, "unrecovered_gaps": []}
+                raise ValueError("not an object")
             data.setdefault("checkpoints", {})
             data.setdefault("unrecovered_gaps", [])
+            if not isinstance(data["checkpoints"], dict) \
+                    or not isinstance(data["unrecovered_gaps"], list):
+                raise ValueError("wrong member types")
             return data
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {"checkpoints": {}, "unrecovered_gaps": []}
+        except (OSError, ValueError, AttributeError, TypeError) as exc:
+            # An unreadable or malformed file is NOT "no checkpoints":
+            # silently starting empty would drop recorded gaps and
+            # resume from nothing. Leave the file untouched and raise.
+            raise CorruptCheckpointStoreError(
+                "backfill checkpoint file %s unreadable or malformed: %s"
+                % (self._path, type(exc).__name__))
 
     def _save(self):
         tmp = "%s.tmp.%d" % (self._path, os.getpid())

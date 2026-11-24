@@ -205,7 +205,7 @@ def main():
     live = live_select.make_live_engine(tmp, fake)
     live.ensure_ledger()
     live.quote_price = lambda chain, m: ENTRY
-    live._fresh_tape = lambda m: {"usd_liquidity": 50000.0,
+    live._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
                                   "usd_market_cap": 100000.0,
                                   "tape_source": "test"}
     fake.current_px = ENTRY
@@ -246,7 +246,7 @@ def main():
     live2 = live_select.make_live_engine(tmp2, fake)
     live2.ensure_ledger()
     live2.quote_price = lambda chain, m: ENTRY
-    live2._fresh_tape = lambda m: {"usd_liquidity": 50000.0,
+    live2._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
                                    "usd_market_cap": 100000.0,
                                    "tape_source": "test"}
     with live2._ledger_lock():
@@ -375,7 +375,7 @@ def main():
     dry_fake = SafetyFakeExecutor(dry_run=True)
     dry_live = live_select.make_live_engine(tmp, dry_fake)
     dry_live.quote_price = lambda chain, m: ENTRY
-    dry_live._fresh_tape = lambda m: {"usd_liquidity": 50000.0,
+    dry_live._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
                                       "usd_market_cap": 100000.0,
                                       "tape_source": "test"}
     dry_fake.current_px = ENTRY

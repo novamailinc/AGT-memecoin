@@ -42,6 +42,18 @@ from daemon.launch_scanner import grad_select as _sel
 from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
 admit_in_script_process(_sel)
 from daemon.launch_scanner import live_select
+
+# DISCLOSED TEST EDIT (CI run 147, stale vs the mandatory entry guard): entries are refused unless the shared paper account
+# is enabled with every mandatory limit set. TEST-FIXTURE limits (not owner values); no guard waived or patched; the
+# executor in this file is its own fake (no live executor constructed).
+import importlib as _il
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import tests._guard_fixture as _GF
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
 from daemon.launch_scanner import saturation as _sat
 
 _PASSED = 0
@@ -306,7 +318,7 @@ def main():
     births[mint_d] = {"trader": "creator_ok", "ts": now - 2400}
     curve_for(mint_d)
     live.quote_price = lambda chain, m: ENTRY
-    live._fresh_tape = lambda m: {"usd_liquidity": 50000.0,
+    live._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
                                   "usd_market_cap": 100000.0,
                                   "tape_source": "test"}
     fake.current_px = ENTRY

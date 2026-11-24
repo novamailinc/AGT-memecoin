@@ -28,6 +28,9 @@ from test_discovery import is_script_test
 
 
 def main():
+    if os.environ.get("AGT_CONTAINED") != "1":
+        print("REFUSING: run via scripts/contained.sh (networkless namespace); coverage UNQUALIFIED")
+        return 2
     selected = sys.argv[1:]
     scripts = sorted(p for p in glob.glob(os.path.join(REPO, "tests", "test_*.py"))
                      if is_script_test(p)

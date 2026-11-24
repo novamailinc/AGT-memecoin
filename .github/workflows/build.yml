@@ -17,15 +17,23 @@ jobs:
       # pyyaml: config falls back to forex symbols without it;
       # solders: devnet signing tests.
       - run: pip install pytest pyyaml solders
+      # Tests run in a networkless user/PID namespace (scripts/contained.sh). Some
+      # ubuntu-24.04 images restrict unprivileged user namespaces via AppArmor; lift that
+      # on this ephemeral runner only. If containment still cannot be verified the steps
+      # below FAIL (coverage unqualified); there is no unwrapped fallback.
+      - name: Allow unprivileged user namespaces (ephemeral runner)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Verify containment works
+        run: scripts/contained.sh sh -c 'test "$AGT_CONTAINED" = 1 && ! (python3 -c "import socket;socket.create_connection((\"1.1.1.1\",53),2)" 2>/dev/null)'
       - name: Agent subsystem suite (pytest modules)
-        run: python -m pytest tests -q
+        run: scripts/contained.sh python -m pytest tests -q
       - name: Agent subsystem suite (script tests)
         # About half of tests/ are plain scripts that pytest cannot
         # collect; this runner executes each one and fails on any
         # nonzero exit. Nothing is skipped.
-        run: python scripts/run_script_tests.py
+        run: scripts/contained.sh python scripts/run_script_tests.py
       - name: Manifest freshness check
-        run: python3 scripts/gen_manifest.py --check
+        run: scripts/contained.sh python3 scripts/gen_manifest.py --check
 
   worker-contract-tests:
     name: Worker contract tests
@@ -42,4 +50,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash installer/test_idempotent.sh
+      - name: Allow unprivileged user namespaces (ephemeral runner)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: scripts/contained.sh bash installer/test_idempotent.sh

@@ -85,6 +85,60 @@ def _default_curve_price(mint):
     return _reserves.curve_price_observed(mint)
 
 
+def _lane_legacy_hook(lane):
+    """The lane's legacy_unproven_pos_ids callable, or None for lanes without legacy accounting. Lanes register their own
+    hook (paper_account.register_legacy_hook) from their own module instance, which covers engine-loaded variants
+    (grad_raw, grad_select, tranche, ...) with their own ledger; the base "grad" lane also falls back to a direct import
+    for the window before it has touched the account."""
+    try:
+        f = (pa.legacy_hooks() or {}).get(lane)
+        if callable(f):
+            return f
+    except Exception:
+        return lambda: None
+    if lane != "grad":
+        return None
+    try:
+        try:
+            from daemon.launch_scanner import grad as _g
+        except ImportError:
+            import grad as _g
+        f = getattr(_g, "legacy_unproven_pos_ids", None)
+        return f if callable(f) else (lambda: None)
+    except Exception:
+        return lambda: None
+
+
+def omit_unproven(marks):
+    """The ACCOUNT-BOUNDARY form of the legacy omission: the same lane truth collect_marks applies, applied to ANY marks map
+    (caller-supplied, observer-supplied, future callers). A mark for a position the lane cannot prove consistent is removed
+    (absent -> marks_status "no mark": no baseline/peak, entry gates fail closed). If the account cannot enumerate its
+    positions, or a lane's hook says it cannot tell (None), nothing for that lane is trusted. Never raises into the caller
+    with a trusting result: any failure returns {} (no marks)."""
+    try:
+        if not marks:
+            return marks
+        snap = pa.snapshot(marks={})
+        if snap is None:
+            return {}
+        out = {ln: dict(m) for ln, m in marks.items() if isinstance(m, dict)}
+        for ln, st in (snap.get("lanes") or {}).items():
+            hook = _lane_legacy_hook(ln)
+            if hook is None:
+                continue
+            unp = hook()
+            for p in st.get("positions") or []:
+                if unp is None or str(p.get("pos_id")) in unp:
+                    key = p.get("mark_key") or p.get("mint")
+                    if (out.get(ln) or {}).pop(key, None) is not None:
+                        logger.warning("account marks: %s/%s supplied mark dropped (legacy position evidence unproven)",
+                                       ln, str(p.get("mint"))[:8])
+        return out
+    except Exception as e:
+        logger.warning("account marks: boundary check failed, supplied marks dropped: %s", type(e).__name__)
+        return {}
+
+
 def collect_marks(price_fn=None, curve_price_fn=None, now=None):
     """{lane: {mint: mark}} for every open account position.
 
@@ -128,6 +182,37 @@ def collect_marks(price_fn=None, curve_price_fn=None, now=None):
         logger.warning("account marks: bad snapshot shape: %s",
                        type(e).__name__)
         return {}
+    # Legacy-position truth (grad lane): a position that predates the per-tranche marker and has sold legs is still
+    # carried by the account at its FULL qty/basis, so any mark for it overstates equity. Omit those marks (absent ->
+    # marks_status "no mark": no baseline/peak update, entry gates fail closed; exits are not gated by marks). If the
+    # lane cannot say, every lane position is treated as unprovable.
+    try:
+        wanted_lanes = {w[0] for w in wanted}
+        _unp = {}
+        for _ln in wanted_lanes:
+            _mod = _lane_legacy_hook(_ln)
+            if _mod is not None:
+                _unp[_ln] = _mod()
+        if _unp:
+            _kept = []
+            for w in wanted:
+                u = _unp.get(w[0], set())
+                if u is None or w[3] in u:
+                    logger.warning("account marks: %s/%s not marked (legacy position evidence unproven)", w[0], w[1][:8])
+                    continue
+                _kept.append(w)
+            wanted = _kept
+            mints = []
+            for w in wanted:
+                if w[1] not in mints:
+                    mints.append(w[1])
+    except Exception as e:
+        logger.warning("account marks: legacy check failed, lane unmarked: %s", type(e).__name__)
+        wanted = [w for w in wanted if _lane_legacy_hook(w[0]) is None]
+        mints = []
+        for w in wanted:
+            if w[1] not in mints:
+                mints.append(w[1])
     from daemon.solana_ids import WSOL_MINT
     for pending in snap.get("pending_sol") or []:
         qty = pending.get("proceeds_sol")

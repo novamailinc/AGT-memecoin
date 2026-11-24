@@ -355,7 +355,7 @@ class DemoFiller:
                                 self._jup.last or {})
         return self._save(op_id, fill)
 
-    def sell(self, op_id, mint, qty_tokens, impact_cap_pct, slippage_bps=100):
+    def sell(self, op_id, mint, qty_tokens, impact_cap_pct, slippage_bps=100, meta=None):
         rec = self._existing(op_id)
         if rec is not None:
             return rec
@@ -374,6 +374,8 @@ class DemoFiller:
         fill = self._build_fill(op_id, "sell", mint, res, {"qty_tokens": float(qty_tokens),
                                 "total_fee": total_fee, "dec": dec, "asof": asof, "px": px},
                                 self._jup.last or {})
+        if meta:
+            fill["intent"] = dict(meta)   # original reason/kind/legs/ts: durable atomically WITH the fill (no crash window)
         return self._save(op_id, fill)
 
     def _build_fill(self, op_id, side, mint, res, c, q, reconciled=False):

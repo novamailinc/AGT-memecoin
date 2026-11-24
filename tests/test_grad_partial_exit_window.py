@@ -261,7 +261,12 @@ ok, why = lanes["grad"](1); assert ok, why
 c0 = cash(PA); gm = list(GR.open_positions())[0]
 _d = GR._read(); _d["positions"][gm].pop("tranche_credit", None); _d["positions"][gm].pop("tranche_credited", None); GR._write(_d)
 FakeJup.mult = 3.0; GR.poll_exits(price_fn=gpf(3.0)); FakeJup.mult = 1.0
-check("W4c legacy: legs A+B sold, shared cash unchanged (deferred, as before) (%.4f -> %.4f)" % (c0, cash(PA)), _cents(cash(PA)) == _cents(c0) and gm in GR.open_positions())
+# CONTRACT CHANGE (legacy tranche migration, disclosed test edit): the legacy position is migrated in the SAME poll its legs
+# sell: A+B net is credited once, the account keeps exactly the lane's unsold tokens. Was: "cash unchanged (deferred)".
+_lp = GR.open_positions()[gm]
+check("W4c legacy MIGRATED: legs A+B net credited once (%.4f -> %.4f, want +%.4f), marker set, account qty == lane unsold tokens" % (c0, cash(PA), A3 + B3),
+      _cents(cash(PA) - c0) == _cents(A3 + B3) and gm in GR.open_positions() and _lp.get("tranche_credit") and not _lp.get("tranche_migrating")
+      and abs(PA.snapshot()["lanes"]["grad"]["positions"][0]["qty"] - 0.25 * _lp["tokens"]) < 1e-6)
 FakeJup.mult = 2.0; GR.poll_exits(price_fn=gpf(2.0)); FakeJup.mult = 1.0
 check("W4c legacy: full close credits the independent total once (%.4f vs %.4f)" % (cash(PA) - c0, TOTAL), gm not in GR.open_positions() and _cents(cash(PA) - c0) == _cents(TOTAL))
 
@@ -444,14 +449,17 @@ finally:
 # ---- W13. an applied credit that cannot be reconciled structurally REFUSES the combined remainder sale (no re-sell)
 PA, F, gm = crash_after_leg_credit()
 c13 = cash(PA); pos13 = copy.deepcopy(GR.open_positions()[gm])
-nfills0 = len(F._locked(lambda j: list(j["fills"])))
+nfills0 = len(F._locked(lambda j: list(j["fills"]))); _fk13_pre = set(F._locked(lambda j: list(j["fills"])))
 PA.op_receipts = lambda ops: dict({o: None for o in ops}, _unreadable=True)
 FakeJup.mult = 0.4
 r13 = GR._close_remaining(pos13, pos13["entry_price"] * 0.4, "hard_stop"); FakeJup.mult = 1.0
 PA.op_receipts = _ro
 nfills1 = len(F._locked(lambda j: list(j["fills"])))
-check("W13 unreadable journal + credited-but-unreconciled legs: combined stop sale REFUSED (ret %.4f, no new fill %d->%d, pending %s, cash unchanged)" % (r13, nfills0, nfills1, (pos13.get("pending_exit") or {}).get("why")),
-      r13 == 0.0 and nfills1 == nfills0 and (pos13.get("pending_exit") or {}).get("why") == "applied_credit_unreconciled" and _cents(cash(PA)) == _cents(c13))
+# TEST EDIT (disclosed, legacy-fix6 leg-scoped stop): the stop no longer refuses the WHOLE position. It sells ONLY the legs the fill journal proves were
+# never sold (b,c: one combined fill), never touches leg a (which has its own journaled fill, credit unknown), and keeps a visibly pending.
+_fk13 = F._locked(lambda j: sorted(j["fills"]))
+check("W13 unreadable journal + credited-but-unreconciled leg a: stop sells ONLY the proven-unsold leg(s) (one new combined fill %d->%d, no new a fill %s), leg a untouched and visibly pending (%s legs %s), cash unchanged by the stop" % (nfills0, nfills1, not any(":exit:" in k and ":a:" in k and k not in _fk13_pre for k in _fk13), (pos13.get("pending_exit") or {}).get("why"), (pos13.get("pending_exit") or {}).get("legs")),
+      nfills1 == nfills0 + 1 and not pos13["legs"]["a"]["done"] and (pos13.get("pending_exit") or {}).get("why") == "applied_credit_unreconciled" and (pos13.get("pending_exit") or {}).get("legs") == sorted(l for l in "abc" if any(":exit:%s:%s:" % (pos13["mint"], l) in k for k in _fk13_pre)) and pos13["legs"]["c"]["done"] and _cents(cash(PA)) == _cents(c13))
 PA, F, gm = crash_after_leg_credit()
 pos13 = copy.deepcopy(GR.open_positions()[gm]); pa_id = pos13["pa_pos_id"]
 PA.op_receipts = lambda ops: {o: dict((_ro([o])[o] or {}), proceeds=123.0) if _ro([o])[o] else None for o in ops}

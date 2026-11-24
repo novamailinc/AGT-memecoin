@@ -102,6 +102,7 @@ def _unpatch(ps):
 def _fresh(price=0.00007):
     if os.path.exists(G.LEDGER_PATH):
         os.remove(G.LEDGER_PATH)
+        import shutil as _shl; _shl.rmtree(PA.ACCOUNT_DIR, ignore_errors=True)  # DISCLOSED TEST EDIT: reset the account with the lane ledger (see test_regime)
     FAKE_KS.halted = set()
     FAKE_KS.recorded = []
     ps, m_veto, m_safety = _patch_all(price=price)

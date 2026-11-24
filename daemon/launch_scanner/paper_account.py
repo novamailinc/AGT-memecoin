@@ -180,6 +180,37 @@ def gates_enabled() -> bool:
     return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
 
 
+_LEGACY_HOOKS: Dict[str, Any] = {}
+
+
+def register_legacy_hook(lane: str, fn) -> None:
+    """A lane that can carry LEGACY positions (account units out of step with the lane's own books) registers a callable
+    returning the set of its account pos_ids whose marks are unprovable, or None when it cannot tell. Engine-loaded lane
+    variants (separate module instances with their own ledger) register under their own lane name. account_marks omits
+    those marks (no peak/baseline update, entry gate fails closed). In-process only; never persisted."""
+    if isinstance(lane, str) and lane and callable(fn):
+        _LEGACY_HOOKS[lane] = fn
+
+
+def legacy_hooks() -> Dict[str, Any]:
+    return dict(_LEGACY_HOOKS)
+
+
+def _boundary_marks(marks):
+    """Caller-supplied marks win over the central collector, but they never bypass the lanes' legacy truth: a mark for a
+    position its lane cannot prove consistent is dropped HERE, at the account boundary, whatever supplied it."""
+    if not marks:
+        return marks
+    try:
+        try:
+            from daemon.launch_scanner import account_marks
+        except ImportError:
+            import account_marks  # sibling import context (scripts)
+        return account_marks.omit_unproven(marks)
+    except Exception:
+        return {}
+
+
 def _central_marks() -> Dict[str, Dict[str, Any]]:
     """Marks from the central marker (account_marks.collect_marks),
     collected by try_debit BEFORE the account lock when the caller
@@ -1473,6 +1504,8 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         return False, "caller op_id is required", None
     if gates_enabled() and marks is None:
         marks = _central_marks()
+    elif marks is not None:
+        marks = _boundary_marks(marks)
     def _refuse(*a):
         return _debit_refused(*a, durable=durable_refusal)
     with _lock():
@@ -1589,6 +1622,8 @@ def hold_stake(lane: str, amount: float, op_id: str,
         return False, "caller op_id is required"
     if gates_enabled() and marks is None:
         marks = _central_marks()
+    elif marks is not None:
+        marks = _boundary_marks(marks)
     with _lock():
         led, healthy, degraded = _load_locked()
         if not healthy or led is None:
@@ -2320,6 +2355,19 @@ def op_outcome(op_id: str) -> str:
     return outcome
 
 
+def position_debit(pos_id: str):
+    """Read-only: the journaled DEBIT event {qty, stake, lane, mint} that opened `pos_id`, or None when absent or the
+    journal is truncated/corrupt (unknown is never proof). Also None when more than one debit carries the pos_id."""
+    entries, status, _ = _journal_read()
+    if status is not None or not pos_id:
+        return None
+    hits = [ev for ev in entries if ev.get("event") == "debit" and ev.get("pos_id") == pos_id]
+    if len(hits) != 1:
+        return None
+    ev = hits[0]
+    return {"qty": ev.get("qty"), "stake": ev.get("stake"), "lane": ev.get("lane"), "mint": ev.get("mint")}
+
+
 def pos_ever_existed(pos_id: Optional[str] = None,
                      lane: Optional[str] = None,
                      mint: Optional[str] = None) -> bool:
@@ -2666,6 +2714,8 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
     drawdown_pct report None so a gate fails closed. Both are None
     until the first trustworthy mark.
     """
+    if marks:
+        marks = _boundary_marks(marks)
     try:
         with _lock():
             led, healthy, degraded = _load_locked()

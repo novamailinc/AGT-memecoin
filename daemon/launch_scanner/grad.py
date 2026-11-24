@@ -35,6 +35,7 @@ Free-only: GeckoTerminal + DexScreener public endpoints, Solana RPC
 via the existing safety modules.
 """
 import json
+import threading
 import logging
 import os
 import time
@@ -286,6 +287,10 @@ def _paper_account():
             from daemon.launch_scanner import paper_account
         except ImportError:
             import paper_account
+        try:   # unproven-legacy marks hook for THIS module instance's lane/ledger (engine variants register their own)
+            paper_account.register_legacy_hook(LANE, legacy_unproven_pos_ids)
+        except Exception:
+            pass
         return paper_account
     except Exception:
         logger.exception("grad: paper account unavailable; shared "
@@ -520,15 +525,21 @@ def _lock_path():
     return LEDGER_PATH + ".lock"
 
 
+_LOCK_DEPTH = {"n": 0, "tid": None, "pid": None}   # in-process: >0 while THIS process holds the ledger lock (flock on a second fd would self-deadlock)
+
+
 class _ledger_lock:
     """Exclusive inter-process lock spanning a read-modify-write section."""
 
     def __enter__(self):
         self._lf = open(_lock_path(), "w")
         fcntl.flock(self._lf, fcntl.LOCK_EX)
+        _LOCK_DEPTH["n"] += 1; _LOCK_DEPTH["tid"] = threading.get_ident(); _LOCK_DEPTH["pid"] = os.getpid()
         return self
 
     def __exit__(self, *a):
+        _LOCK_DEPTH["n"] = max(0, _LOCK_DEPTH["n"] - 1)
+        if _LOCK_DEPTH["n"] == 0: _LOCK_DEPTH["tid"] = None; _LOCK_DEPTH["pid"] = None
         try:
             fcntl.flock(self._lf, fcntl.LOCK_UN)
         finally:
@@ -718,6 +729,9 @@ def account_state():
             "n_closes": len(d["closes"]),
             "verdict": d.get("verdict"),
             "created_ts": d["created_ts"],
+            # operator-visible reconciliation state (recon notes, pending exits and their ages, settlement_pending, aborted poll cycles);
+            # None means the ledger could not be read (unknown, never "clean")
+            "recon_health": recon_health(),
         }
     except Exception:
         return {}
@@ -1404,10 +1418,14 @@ def _consider_candidate(cand, now):
             # Pin the open instance so the close can never settle
             # a later reopen of the same mint.
             pos["pa_pos_id"] = _pid
+            _INFLIGHT_OPEN.add(str(_pid))   # account holds it, lane books do not yet: not "unknown" for the marks hook
         d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
         d["positions"][mint] = pos
         d["watchlist"].pop(mint, None)
-        _write(d)
+        try:
+            _write(d)
+        finally:
+            _INFLIGHT_OPEN.discard(str(pos.get("pa_pos_id")))
         if _demo_mode():
             try:
                 _demo_filler().consume_intent(LANE, mint)
@@ -1474,7 +1492,221 @@ def _exit_cap():
     return _EXIT_IMPACT_CAP_PCT, "fallback_unset_or_invalid"
 
 
-def _demo_sell(pos, leg_tokens, key):
+def _fill_key(pos, key):
+    _fk = "%s:exit:%s:%s" % (LANE, pos["mint"], key)
+    if pos.get("tranche_credit") and pos.get("pa_pos_id"):
+        _fk += ":%s" % pos["pa_pos_id"]
+    return _fk
+
+
+def _journaled_fills(pos):
+    """{leg-key-suffix: fill record} for this position instance's journaled exit fills, or None if unreadable."""
+    try:
+        _df = _demo_filler()
+        if _df is None:
+            return None
+        pre = "%s:exit:%s:" % (LANE, pos["mint"])
+        suf = ":%s" % pos["pa_pos_id"] if (pos.get("tranche_credit") and pos.get("pa_pos_id")) else ""
+        allf = _df._locked(lambda j: dict(j["fills"]))
+        out = {}
+        for k, v in allf.items():
+            if k.startswith(pre) and (not suf or k.endswith(suf)):
+                out[k[len(pre):len(k) - len(suf)] if suf else k[len(pre):]] = v
+        return out
+    except Exception:
+        return None
+
+
+def _replay_identity(rec, reason, pkind, receipt_kind):
+    """(reason, kind, ts) for the replay of an executed sale. Reason and timestamp are ALWAYS the original fill's stamp (the retry's
+    or the reconcile sentinel's reason never overwrites history). Kind: the account RECEIPT's kind when the reconcile path supplies one
+    (receipt_kind is a dedicated parameter only reconcile sets; a reason string grants nothing), else the original stamp's kind.
+    An unstamped (older) fill keeps the caller's reason and gets kind UNKNOWN unless a receipt kind exists, never upgraded."""
+    it = (rec or {}).get("intent") or {}
+    stamped = bool(it.get("reason") or it.get("kind") is not None)
+    r0 = it.get("reason") if stamped and it.get("reason") else reason
+    k0 = it.get("kind") if stamped else (_pk.UNKNOWN if _pk is not None else None)
+    return r0, (receipt_kind if receipt_kind is not None else k0), (it.get("ts") if stamped else None)
+
+
+def _intent_of(rec, reason, pkind):
+    """Original economics of a journaled fill win over whatever the retry carries: a write-down (or any other) retry can
+    never relabel or re-price a sale that already happened. A fill with no stamped intent (older journal) keeps the
+    retry's reason but its kind is UNKNOWN, never upgraded."""
+    it = (rec or {}).get("intent") or {}
+    if it.get("kind") is not None or it.get("reason"):
+        return it.get("reason") or reason, it.get("kind")
+    return "reconciled_journaled_fill", (_pk.UNKNOWN if _pk is not None else None)
+
+
+def _receipt_state(pos, key):
+    """('ok', receipt) | ('none', None) (journal readable, no credit for this stable op id) | ('unreadable', None) | ('na', None)."""
+    if not pos.get("tranche_credit") or not pos.get("pa_pos_id"):
+        return "na", None
+    _pa = _paper_account()
+    if _pa is None:
+        return "na", None
+    _op = "%s:leg:%s:%s:%s" % (LANE, key, pos["mint"], pos["pa_pos_id"])
+    try:
+        r = _pa.op_receipts([_op])
+    except Exception:
+        return "unreadable", None
+    if r.get("_unreadable"):
+        return "unreadable", None
+    rc = r.get(_op)
+    return ("ok", rc) if rc is not None else ("none", None)
+
+
+def _unstamped_receipt_kind(pos, key, rec, receipt_kind):
+    """Upgrade compatibility: a journaled fill with NO intent stamp predates the stamp, and its credit (if any) was recorded under the OLD
+    code's kind. The account refuses a credit whose kind differs from the recorded op, so the replay must use the ACTUAL receipt's kind.
+    Returns (ok, receipt_kind): ok False means the receipt journal is unreadable (caller must stay pending, never invent UNKNOWN);
+    a readable journal with no receipt proves nothing was credited, so UNKNOWN (never upgraded) is honest."""
+    if receipt_kind is not None or rec is None:
+        return True, receipt_kind
+    it = (rec or {}).get("intent") or {}
+    if it.get("reason") or it.get("kind") is not None:
+        return True, receipt_kind
+    st, rc = _receipt_state(pos, key)
+    if st == "unreadable":
+        return False, None
+    if st == "ok":
+        return True, (rc.get("price_kind") or (_pk.UNKNOWN if _pk is not None else None))
+    return True, None
+
+
+def _sim_twap_sale(pos, key, tokens, reason, pkind, receipt_kind, default_kind=None):
+    """ONE identity path for the sim TWAP slice and remainder (same rules as the ladder): the fill journal must be readable; an
+    existing fill for this key is REPLAYED with its ORIGINAL stamp (reason, kind, ts) whatever the retry carries (a write-down or a
+    different reason cannot relabel or skip it; the explicit receipt_kind, set only by reconcile, wins for kind); no fill and a
+    write-down kind means no sale is made (returns "writedown"). Returns None (refused, visible pending / filler skip),
+    "writedown", or (fill, cap, src, reason, kind, ts)."""
+    _jfs = _journaled_fills(pos)
+    if _jfs is None:
+        pos["pending_exit"] = {"leg": key, "why": "fill_journal_unreadable", "ts": time.time()}
+        return None
+    _jf = _jfs.get(key)
+    _ots = None
+    if _jf is not None:
+        _okr, receipt_kind = _unstamped_receipt_kind(pos, key, _jf, receipt_kind)
+        if not _okr:
+            pos["pending_exit"] = {"leg": key, "why": "receipt_journal_unreadable", "ts": time.time()}
+            return None
+        reason, _k, _ots = _replay_identity(_jf, reason, pkind, receipt_kind)
+    else:
+        _k = pkind if pkind else (receipt_kind if receipt_kind is not None else (default_kind if default_kind is not None else _pkind(reason, None)))
+        if _k == "write_down_zero":
+            return "writedown"
+    _r = _demo_sell(pos, tokens, key, meta={"reason": reason, "kind": _k, "legs": [key], "ts": time.time()})
+    if _r is None:
+        return None
+    return _r[0], _r[1], _r[2], reason, _k, _ots, (_jf is not None)
+
+
+def _recon_note(pos, key, what, **detail):
+    """Visible (never silent) reconciliation note on the position: both values and a warning. Deduped by (key, what)."""
+    notes = pos.setdefault("recon_notes", [])
+    if not any(n.get("key") == key and n.get("what") == what for n in notes):
+        notes.append(dict(key=key, what=what, ts=time.time(), **detail))
+        _warn_throttled(("recon", pos.get("mint", ""), key, what), "grad RECON (needs operator review) %s %s %s %s",
+                        pos.get("mint", "")[:12], key, what, detail)
+
+
+def _sim_settle(pos, key, tokens, fill, replayed=True):
+    """ONE receipt-governed settlement for every sim credit site (ladder leg, TWAP slice, TWAP remainder).
+    Returns None when the leg must stay pending (pending_exit set with a SPECIFIC why: no fallback recompute), else a dict
+    {gross, fee, kind (account kind, may be None), lane_kind, acct_qty (None = recompute), price}.
+    - 'na' (unmarked / no account): the fill's own economics, unchanged behaviour.
+    - 'unreadable': pending receipt_journal_unreadable (the sale is journaled; the retry replays it).
+    - 'none': the fill's economics, credited fresh (the caller's kind).
+    - 'ok': the receipt is the account's recorded fact. When its proceeds, fee and qty AGREE with the journaled fill (technical tolerance) the
+      credit uses the receipt's exact kind/qty (including a legitimate old qty None / kind None). A money or qty DISAGREEMENT is QUARANTINED
+      (pending receipt_fill_money_mismatch / receipt_qty_mismatch, no credit, no booking): it never governs silently. An incomplete receipt
+      (no proceeds or no qty) is pending receipt_incomplete. The ORIGINAL fill gross/price are kept (fill_gross/fill_price)
+      next to the receipt economics; differences beyond tolerance leave a visible recon note, never silent."""
+    out = {"gross": fill["gross_usd"], "fee": fill["fee_usd"], "kind": None, "acct_qty": None, "price": fill["price_usd"],
+           "fill_gross": fill["gross_usd"], "fill_price": fill["price_usd"], "receipt": False}
+    if not replayed:
+        return out   # a FRESH sale (no pre-existing journaled fill) has no earlier receipt to consult: credit it from its own fill (stable op id keeps retries idempotent)
+    st, rc = _receipt_state(pos, key)
+    if st == "unreadable":
+        pos["pending_exit"] = {"leg": key, "why": "receipt_journal_unreadable", "ts": time.time()}
+        return None
+    if st != "ok":
+        return out
+    if rc.get("proceeds") is None:
+        pos["pending_exit"] = {"leg": key, "why": "receipt_incomplete", "ts": time.time()}
+        return None
+    # qty None is a LEGITIMATE old receipt (credit journaled with qty None): it is passed through exactly (sentinel), never recomputed.
+    _rq = rc.get("qty")
+    out.update(receipt=True, gross=float(rc["proceeds"]), fee=float(rc.get("fee") or 0.0), kind=rc.get("price_kind"),
+               acct_qty=(float(_rq) if _rq is not None else None), qty_none=(_rq is None))
+    out["price"] = out["gross"] / tokens if tokens else out["price"]
+    # Technical rounding tolerance (scale-aware), NOT an owner risk threshold: 1e-6 USD absolute or 1e-4 relative, whichever is larger.
+    def _tol(x): return max(1e-6, 1e-4 * abs(float(x)))
+    _gd = abs(out["gross"] - float(fill["gross_usd"])) > _tol(fill["gross_usd"])
+    _fd = abs(out["fee"] - float(fill["fee_usd"])) > _tol(fill["fee_usd"])
+    if _gd:
+        _recon_note(pos, key, "receipt_proceeds_differ_from_fill", receipt_gross=out["gross"], fill_gross=float(fill["gross_usd"]))
+    if _fd:
+        _recon_note(pos, key, "receipt_fee_differs_from_fill", receipt_fee=out["fee"], fill_fee=float(fill["fee_usd"]))
+    _qd = False
+    try:
+        _want = _acct_qty(pos, key, tokens)
+        if _rq is None:
+            _recon_note(pos, key, "receipt_qty_none", recomputed_qty=_want, lane_tokens=tokens)
+        elif _want and abs(out["acct_qty"] - _want) > max(1e-9, 1e-6 * abs(_want)):
+            _qd = True
+            _recon_note(pos, key, "receipt_qty_mismatch", receipt_qty=out["acct_qty"], recomputed_qty=_want, lane_tokens=tokens)
+    except Exception as e:
+        _recon_note(pos, key, "qty_check_failed", error=repr(e)[:120])
+        pos["pending_exit"] = {"leg": key, "why": "qty_check_failed", "ts": time.time()}
+        return None
+    if _gd or _fd or _qd:
+        # QUARANTINE, never silently govern: a receipt whose money or qty disagrees with the journaled fill is an unproven economic
+        # difference (corruption, a different sale, or an old formula we have not proven). No credit, no lane booking, no second sale;
+        # the leg stays open with both values on the pending record and the recon note, until a proven resolution exists.
+        pos["pending_exit"] = {"leg": key, "why": "receipt_fill_money_mismatch" if (_gd or _fd) else "receipt_qty_mismatch",
+                               "receipt": {"gross": out["gross"], "fee": out["fee"], "qty": out["acct_qty"]},
+                               "fill": {"gross": float(fill["gross_usd"]), "fee": float(fill["fee_usd"]), "tokens": tokens}, "ts": time.time()}
+        return None
+    return out
+
+
+def _credit_st(pos, key, tokens, st, kind):
+    """Credit from a _sim_settle result. acct_qty is passed ONLY when a receipt governs (call shape otherwise unchanged)."""
+    if st.get("qty_none"):
+        return _tranche_credit(pos, key, tokens, st["gross"], st["fee"], kind, acct_qty=_QTY_NONE)
+    if st.get("acct_qty") is not None:
+        return _tranche_credit(pos, key, tokens, st["gross"], st["fee"], kind, acct_qty=st["acct_qty"])
+    return _tranche_credit(pos, key, tokens, st["gross"], st["fee"], kind)
+
+
+def recon_health(now=None):
+    """Operator summary (read-only, no thresholds invented): open positions with recon notes or a pending_exit, with ages in seconds.
+    Returns {"n_recon": int, "n_pending": int, "items": [{mint, why, age_s, notes}]} or None if the ledger is unreadable (visible, never empty)."""
+    now = time.time() if now is None else now
+    try:
+        ps = open_positions()
+    except Exception:
+        return None
+    items = []
+    for m, p in ps.items():
+        pe = p.get("pending_exit") or {}
+        ns = [n.get("what") for n in (p.get("recon_notes") or [])]
+        sp = p.get("settlement_pending") or {}
+        mb = p.get("migration_blocked") or {}
+        if pe or ns or sp or mb:
+            items.append({"mint": m, "migration_blocked": mb.get("code"), "migration_blocked_age_s": (now - float(mb["since"])) if mb.get("since") else None,
+                          "migration_tries": mb.get("tries"), "why": pe.get("why"), "age_s": (now - float(pe["ts"])) if pe.get("ts") else None, "notes": ns,
+                          "settlement_pending": sp.get("why"), "settlement_age_s": (now - float(sp["since"])) if sp.get("since") else None,
+                          "settlement_tries": sp.get("tries")})
+    return {"poll_aborts": dict(_POLL_ABORTS), "n_recon": sum(1 for i in items if i["notes"]), "n_pending": sum(1 for i in items if i["why"]),
+            "n_settlement_pending": sum(1 for i in items if i["settlement_pending"]),
+            "n_migration_blocked": sum(1 for i in items if i.get("migration_blocked")), "items": items}
+
+
+def _demo_sell(pos, leg_tokens, key, meta=None):
     """Sell through the quote sim. Returns (fill, cap, src) or None (leg stays PENDING with
     diagnostics; nothing invented)."""
     _df = _demo_filler()
@@ -1486,11 +1718,9 @@ def _demo_sell(pos, leg_tokens, key):
         # Marked (per-tranche) positions scope the fill op to the position instance, so a same-mint RE-ENTRY can
         # never replay an older position's journaled fill. Legacy positions keep the original key (their
         # journaled fills stay addressable); only positions created after this change carry the marker.
-        _fk = "%s:exit:%s:%s" % (LANE, pos["mint"], key)
-        if pos.get("tranche_credit") and pos.get("pa_pos_id"):
-            _fk += ":%s" % pos["pa_pos_id"]
+        _fk = _fill_key(pos, key)
         return _df.sell(_fk, pos["mint"], leg_tokens,
-                        cap), cap, src
+                        cap, meta=meta), cap, src
     except _demo.DemoSkip as e:
         pos["pending_exit"] = {"leg": key, "why": e.reason, "detail": e.detail, "ts": time.time()}
         logger.warning("grad demo exit pending %s %s: %s", pos["mint"][:12], key, e.reason)
@@ -1661,7 +1891,10 @@ def _warn_throttled(key, msg, *args):
     logger.warning(msg, *args)
 
 
-def _tranche_credit(pos, leg_key, qty, gross, fee, kind):
+_QTY_NONE = object()   # acct_qty sentinel: the receipt itself recorded qty=None, so the credit must pass None EXACTLY
+
+
+def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
     """Credit the shared account for ONE ladder leg sold through the quote sim, so the account's
     qty/basis shrink with the lane (marks, equity and the drawdown peak then see the true remaining
     units). Idempotent by op_id (position instance + leg), so a replayed leg fill (the DemoFiller
@@ -1675,6 +1908,11 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind):
     if _pa is None:
         return True
     _op = "%s:leg:%s:%s:%s" % (LANE, leg_key, pos["mint"], pos["pa_pos_id"])
+    # ACCOUNT units = lane units, plus (migrated legacy position only, ONE leg) the opening-unit dust: a legacy entry
+    # debited stake/price units while the lane holds net-of-gas tokens, so the first migrated leg also removes that
+    # difference and the account then holds exactly the lane's unsold tokens. The lane tally stays in LANE units.
+    _lane_qty = qty
+    qty = (None if acct_qty is _QTY_NONE else (acct_qty if acct_qty is not None else _acct_qty(pos, leg_key, qty))) if qty is not None else qty
     ok, why = _pa.credit(LANE, pos["mint"], gross, _op, pos_id=pos["pa_pos_id"], qty=qty, fee=fee, price_kind=kind)
     if not ok:
         # Same convergence rule as the final close: an orphan (the account never held these units, and never did
@@ -1723,14 +1961,17 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind):
             if _iid:
                 pos["pending_exit"]["intent_id"] = _iid
             return False
-        pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_refused", "detail": str(why)[:200], "ts": time.time()}
+        # a credit larger than the account's remaining units (receipt qty on an earlier leg was smaller than a recompute) is a QTY
+        # DIVERGENCE with a specific why, not a generic refusal
+        pos["pending_exit"] = {"leg": leg_key, "why": ("account_remaining_qty_mismatch" if "exceeds remaining" in str(why) else "tranche_credit_refused"),
+                               "detail": str(why)[:200], "ts": time.time()}
         _warn_throttled(("refused", pos["mint"], leg_key, str(why)[:60]), "grad: tranche credit %s %s refused: %s (leg stays pending)", pos["mint"][:12], leg_key, why)
         return False
     tc = pos.setdefault("tranche_credited", {"net": 0.0, "qty": 0.0})
     # the ledger credit is idempotent; the lane-side tally is keyed per leg so a replay never double counts
     seen = tc.setdefault("legs", {})
     if leg_key not in seen:
-        seen[leg_key] = {"net": round(gross - fee, 6), "qty": qty}
+        seen[leg_key] = {"net": round(gross - fee, 6), "qty": _lane_qty}
         tc["net"] = round(sum(v["net"] for v in seen.values()), 6)
         tc["qty"] = sum(v["qty"] for v in seen.values())
     return True
@@ -1797,26 +2038,49 @@ def _tranche_receipt(pos, leg_key):
     return r.get(_op)
 
 
-def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
+def _close_leg(pos, leg_key, exit_price, reason, pkind=None, receipt_kind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     leg = pos["legs"][leg_key]
     if leg["done"]:
         return 0.0
     leg_tokens = pos["tokens"] * leg["frac"]
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
-    if _sim and _pkind(reason, pkind) != "write_down_zero":
-        _r = _demo_sell(pos, leg_tokens, leg_key)
+    _jfs_l = _journaled_fills(pos) if _sim else {}
+    if _sim and _jfs_l is None and pos.get("tranche_credit") and pos.get("pa_pos_id"):
+        # the fill journal is unreadable: whether this leg was already sold is unknown. Never fall through to a fresh sale.
+        pos["pending_exit"] = {"leg": leg_key, "why": "fill_journal_unreadable", "ts": time.time()}
+        return 0.0
+    _jf = (_jfs_l or {}).get(leg_key) if _sim else None
+    if _sim and (_pkind(reason, pkind) != "write_down_zero" or _jf is not None):
+        _ots = None
+        if _jf is not None:
+            _okr, receipt_kind = _unstamped_receipt_kind(pos, leg_key, _jf, receipt_kind)
+            if not _okr:
+                pos["pending_exit"] = {"leg": leg_key, "why": "receipt_journal_unreadable", "ts": time.time()}
+                return 0.0
+            reason, pkind, _ots = _replay_identity(_jf, reason, pkind, receipt_kind)   # executed sale: original reason/ts, original (or receipt) kind; the retry never relabels it
+        elif receipt_kind is not None and not pkind:
+            pkind = receipt_kind
+        _r = _demo_sell(pos, leg_tokens, leg_key, meta={"reason": reason, "kind": _pkind(reason, pkind), "legs": [leg_key], "ts": time.time()})
         if _r is None:
             return 0.0
         _fill, _cap, _src = _r
         pos.pop("pending_exit", None)
         _kind = _pkind(reason, pkind)
         filled_exit, gross, gas_out = _fill["price_usd"], _fill["gross_usd"], _fill["fee_usd"]
+        _st = _sim_settle(pos, leg_key, leg_tokens, _fill, replayed=(_jf is not None))
+        if _st is None:
+            return 0.0
+        gross, gas_out, filled_exit = _st["gross"], _st["fee"], _st["price"]
+        _ckind = _st["kind"] if _st["receipt"] else _kind
+        if _st["receipt"]:
+            _kind = _ckind or (_pk.UNKNOWN if _pk is not None else None)
         net = gross - gas_out
-        if not _tranche_credit(pos, leg_key, leg_tokens, gross, gas_out, _kind):
+        if not _credit_st(pos, leg_key, leg_tokens, _st, _ckind):
             return 0.0   # account side not applied: the leg stays PENDING and replays the journaled fill
         leg.update(done=True, exit_price=filled_exit, realized_usd=round(net, 6),
-                   exit_reason=reason, exit_price_kind=_kind,
+                   exit_reason=reason, exit_price_kind=_kind, fill_gross=round(_st["fill_gross"], 6), fill_price=_st["fill_price"],
+                   **({"exit_ts": _ots} if _ots else {}),
                    exit_execution={"source": _fill["execution_source"], "signature": _fill["signature"],
                                    "synthetic_signature": True, "effective_impact_cap_pct": _cap,
                                    "impact_cap_source": _src, "provenance": _fill["provenance"]})
@@ -1827,7 +2091,7 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
         # crash replay: the account already holds this leg's credit; finish the lane side from the RECEIPT.
         # The receipt must describe THIS leg (qty agrees) and the idempotent credit must be accepted; anything
         # else leaves the leg pending and loud (the lane never books what the account did not accept).
-        if not _receipt_qty_ok(_rc, leg_tokens):
+        if not _receipt_qty_ok(_rc, _acct_qty(pos, leg_key, leg_tokens)):
             pos["pending_exit"] = {"leg": leg_key, "why": "receipt_qty_mismatch", "ts": time.time()}
             logger.warning("grad: receipt for %s %s disagrees with the leg quantity; leg stays pending", pos["mint"][:12], leg_key)
             return 0.0
@@ -1897,18 +2161,24 @@ def _close_twap_slice(pos, exit_price):
         return 0.0
     slice_tokens = pos["tokens"] / n
     if (pos.get("execution") or {}).get("source") == "jupiter_quote_sim":
-        _r = _demo_sell(pos, slice_tokens, "twap%d" % (tw["done"] + 1))
-        if _r is None:
+        _sk = "twap%d" % (tw["done"] + 1)
+        _r = _sim_twap_sale(pos, _sk, slice_tokens, "twap_slice", None, None, default_kind=_pk.CURRENT if _pk is not None else None)
+        if _r is None or _r == "writedown":
             return 0.0
-        _fill, _cap, _src = _r
+        _fill, _cap, _src, _rs, _kd, _ots, _rp = _r
         pos.pop("pending_exit", None)
-        net = _fill["gross_usd"] - _fill["fee_usd"]
-        if not _tranche_credit(pos, "twap%d" % (tw["done"] + 1), slice_tokens, _fill["gross_usd"], _fill["fee_usd"], _pk.CURRENT if _pk is not None else None):
+        _st = _sim_settle(pos, _sk, slice_tokens, _fill, replayed=_rp)
+        if _st is None:
+            return 0.0
+        if _st["receipt"]:
+            _kd = _st["kind"] or (_pk.UNKNOWN if _pk is not None else None)
+        net = _st["gross"] - _st["fee"]
+        if not _credit_st(pos, _sk, slice_tokens, _st, _st["kind"] if _st["receipt"] else _kd):
             return 0.0   # account side not applied: slice stays pending, replays the journaled fill
         tw["done"] += 1
         if _pk is not None:
             _pks = set(tw.get("price_kinds") or [])
-            _pks.add(_pk.CURRENT)
+            _pks.add(_kd)
             tw["price_kinds"] = sorted(_pks)
         tw["sold_tokens"] = round(tw["sold_tokens"] + slice_tokens, 6)
         tw["sold_usd"] = round(tw["sold_usd"] + net, 6)
@@ -1954,13 +2224,73 @@ def _close_twap_slice(pos, exit_price):
     return net
 
 
-def _close_remaining(pos, exit_price, reason, pkind=None):
+_WD0 = "write_down_zero"
+
+
+def _rebuild_tally_from_receipts(pos):
+    """A position still marked MIGRATING (marker + sold legs, some legs credited to the account, tally possibly lagging
+    because the process died or the migration could not resume) must never reach the final close with the lane tally
+    out of step with the account: the close credits `realized - tally`, so a credited leg missing from the tally would be
+    credited twice. Rebuild the per-leg tally from the ACCOUNT's own receipts (ground truth). Returns False when the
+    receipts cannot be read (the caller defers the close: fail closed, retried next poll)."""
+    try:
+        _pa = _paper_account()
+        if _pa is None or not pos.get("pa_pos_id"):
+            return True
+        mint, pid = pos["mint"], pos["pa_pos_id"]
+        legs = [(lk, lv) for lk, lv in pos["legs"].items()
+                if lv.get("done") and lv.get("exit_price_kind") != "write_down_zero"]
+        ops = {lk: "%s:leg:%s:%s:%s" % (LANE, lk, mint, pid) for lk, _ in legs}
+        rc = _pa.op_receipts(list(ops.values()))
+        if rc.get("_unreadable"):
+            return False
+        tc = pos.setdefault("tranche_credited", {"net": 0.0, "qty": 0.0})
+        seen = tc.setdefault("legs", {})
+        for lk, lv in legs:
+            r = rc.get(ops[lk])
+            if r is None or lk in seen:
+                continue
+            seen[lk] = {"net": round(float(r["proceeds"]) - float(r.get("fee") or 0.0), 6),
+                        "qty": pos["tokens"] * lv["frac"]}
+        tc["net"] = round(sum(v["net"] for v in seen.values()), 6)
+        tc["qty"] = sum(v["qty"] for v in seen.values())
+        return True
+    except Exception:
+        return False
+
+
+def _migration_receipts_unreadable(pos):
+    """True when a migrating position's per-leg account receipts cannot be read (no side effects beyond the tally rebuild)."""
+    try:
+        import copy as _cp
+        return not _rebuild_tally_from_receipts(_cp.deepcopy(pos))
+    except Exception:
+        return True
+
+
+def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
     """Close all remaining legs as ONE combined exit (one tx cost) —
     same rule as ceo.py/mirror.py."""
     # Any stop/time/TWAP exit path lands here: first finish lane legs whose account credit is already durable
     # (crash window), so a credited leg is never sold a second time inside the combined remainder.
-    if _reconcile_credited_legs(pos) is False:
-        pos["pending_exit"] = {"leg": "remaining", "why": "applied_credit_unreconciled", "ts": time.time()}
+    _migrate_legacy_tranches(pos)
+    if receipt_kind is not None and not pkind:
+        pkind = receipt_kind   # reconcile of a credited TWAP remainder: the account RECEIPT's kind (never re-derived from the reason string)
+    _only_legs = None
+    _rc_ok = _reconcile_credited_legs(pos)
+    if _rc_ok is False and _RECON_WHY.get((pos["mint"], pos.get("pa_pos_id"))) == "unreadable" and not _no_unrecorded_sale_proof(pos):
+        _part = _partition_open_legs(pos)
+        if _part and _part[0]:
+            # leg-scoped stop: sell ONLY the legs the fill journal proves were never sold; the uncertain legs stay open and
+            # visible (pending_exit below) until the account journal is readable and reconciles them.
+            _only_legs = set(_part[0])
+            _rc_ok = True
+            _pend_unc = {"leg": "uncertain", "why": "applied_credit_unreconciled", "legs": _part[1], "ts": time.time()}
+    elif _rc_ok is False and _RECON_WHY.get((pos["mint"], pos.get("pa_pos_id"))) == "unreadable":
+        _rc_ok = True   # proof holds: nothing unrecorded
+    if _rc_ok is False:
+        _spec = any(n.get("what") == "receipt_fill_money_mismatch" and n.get("key") == "twap_remainder" for n in (pos.get("recon_notes") or []))
+        pos["pending_exit"] = {"leg": "remaining", "why": ("receipt_fill_money_mismatch" if _spec else "applied_credit_unreconciled"), "ts": time.time()}
         return 0.0   # structural refusal: a combined sale could sell an already-credited leg again
     if pos.get("twap") is not None:
         # TWAP positions never touch the ladder legs: close ONLY
@@ -1970,16 +2300,21 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
         remaining = _twap_remaining_tokens(pos)
         if remaining <= 0:
             return 0.0
-        if (pos.get("execution") or {}).get("source") == "jupiter_quote_sim" \
-                and _pkind(reason, pkind) != "write_down_zero":
-            _r = _demo_sell(pos, remaining, "twap_remainder")
-            if _r is None:
+        _tsr = None
+        if (pos.get("execution") or {}).get("source") == "jupiter_quote_sim":
+            _tsr = _sim_twap_sale(pos, "twap_remainder", remaining, reason, pkind if pkind else None, receipt_kind)
+            if _tsr is None:
                 return 0.0
-            _fill, _cap, _src = _r
+        if _tsr is not None and _tsr != "writedown":
+            _fill, _cap, _src, reason, _kind, _ots, _rp = _tsr
             pos.pop("pending_exit", None)
-            _kind = _pkind(reason, pkind)
-            net = _fill["gross_usd"] - _fill["fee_usd"]
-            if not _tranche_credit(pos, "twap_remainder", remaining, _fill["gross_usd"], _fill["fee_usd"], _kind):
+            _st = _sim_settle(pos, "twap_remainder", remaining, _fill, replayed=_rp)
+            if _st is None:
+                return 0.0
+            if _st["receipt"]:
+                _kind = _st["kind"] or (_pk.UNKNOWN if _pk is not None else None)
+            net = _st["gross"] - _st["fee"]
+            if not _credit_st(pos, "twap_remainder", remaining, _st, _st["kind"] if _st["receipt"] else _kind):
                 return 0.0
             tw["remainder"] = {"tokens": round(remaining, 6), "exit_price": _fill["price_usd"],
                                "realized_usd": round(net, 6), "exit_reason": reason,
@@ -2032,18 +2367,56 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
         pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
         return net
     open_legs = [k for k in ("a", "b", "c") if not pos["legs"][k]["done"]]
+    if _only_legs is not None:
+        open_legs = [k for k in open_legs if k in _only_legs]
     if not open_legs:
         return 0.0
     total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"]
                        for k in open_legs)
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
-    if _sim and _pkind(reason, pkind) != "write_down_zero":
-        _rkey = "remaining:%s" % "".join(open_legs)
-        _r = _demo_sell(pos, total_tokens, _rkey)
+    _cjf = None
+    if _sim and pos.get("tranche_credit") and pos.get("pa_pos_id"):
+        _jfs = _journaled_fills(pos)
+        if _jfs is None:
+            pos["pending_exit"] = {"leg": "remaining", "why": "fill_journal_unreadable", "ts": time.time()}
+            return 0.0
+        if _jfs:
+            _open_all = {k for k in ("a", "b", "c") if not pos["legs"][k]["done"]}
+            _comb = {k: v for k, v in _jfs.items() if k.startswith("remaining:") and set(k[10:]) & _open_all}
+            _own = [k for k in open_legs if k in _jfs]
+            _conf = [k for k, v in _comb.items() if set(k[10:]) != set(open_legs) or [o for o in _own if o in set(k[10:])]]
+            if _conf or len(_comb) > 1:
+                # the ORIGINAL combined sale covered a different group than what is open now (or overlaps a per-leg fill):
+                # never regenerate a key and sell the same units again, never guess which group is credited: explicit conflict.
+                pos["pending_exit"] = {"leg": "remaining", "why": "combined_fill_group_conflict",
+                                       "covered": sorted(_comb), "own": sorted(_own), "ts": time.time()}
+                return 0.0
+            if _comb:
+                _cjf = (list(_comb)[0], list(_comb.values())[0])
+            elif _own:
+                # per-leg fills exist for open legs: settle them from their ORIGINAL fills (stable per-leg op id credit),
+                # never inside a new "remaining:" sale; sell only the legs that have no fill.
+                _pre_net = 0.0
+                for k in _own:
+                    _pre_net += _close_leg(pos, k, exit_price, reason, pkind, receipt_kind=receipt_kind)
+                open_legs = [k for k in open_legs if k not in _jfs and not pos["legs"][k]["done"]]
+                if not open_legs:
+                    return _pre_net
+                total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"] for k in open_legs)
+    if _sim and (_pkind(reason, pkind) != "write_down_zero" or _cjf is not None):
+        _rkey = _cjf[0] if _cjf is not None else "remaining:%s" % "".join(open_legs)
+        _ots = None
+        if _cjf is not None:
+            reason, pkind, _ots = _replay_identity(_cjf[1], reason, pkind, receipt_kind)
+        elif receipt_kind is not None and not pkind:
+            pkind = receipt_kind
+        _r = _demo_sell(pos, total_tokens, _rkey, meta={"reason": reason, "kind": _pkind(reason, pkind), "legs": list(open_legs), "ts": time.time()})
         if _r is None:
             return 0.0
         _fill, _cap, _src = _r
         pos.pop("pending_exit", None)
+        if _only_legs is not None:
+            pos["pending_exit"] = _pend_unc
         _kind = _pkind(reason, pkind)
         filled_exit, gross, gas_out = _fill["price_usd"], _fill["gross_usd"], _fill["fee_usd"]
         net = gross - gas_out
@@ -2051,7 +2424,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
             leg = pos["legs"][key]
             share = (pos["tokens"] * leg["frac"]) / total_tokens if total_tokens else 0
             leg.update(done=True, exit_price=filled_exit, realized_usd=round(net * share, 6),
-                       exit_reason=reason, exit_price_kind=_kind,
+                       exit_reason=reason, exit_price_kind=_kind, **({"exit_ts": _ots} if _ots else {}),
                        exit_execution={"source": _fill["execution_source"], "signature": _fill["signature"],
                                        "synthetic_signature": True, "effective_impact_cap_pct": _cap,
                                        "impact_cap_source": _src, "provenance": _fill["provenance"]})
@@ -2203,11 +2576,224 @@ def _verdict_check(d):
     return halt
 
 
+def _all_exits_executed(pos):
+    """True when every lane unit has been sold or written down on the lane side (ladder legs all done, or a TWAP position
+    with no remaining tokens): only then is a deferred close a pure SETTLEMENT wait."""
+    try:
+        if pos.get("twap") is not None:
+            return _twap_remaining_tokens(pos) <= 0
+        return all(v.get("done") for v in pos["legs"].values())
+    except Exception:
+        return False
+
+
+def _account_residue(mint, pos_id, pos):
+    """(why, residue_qty) for a lane-flat marked position: (None, 0.0) when the account holds no units for this pos_id (flat) or the
+    residue is within technical rounding (max(1e-9, 1e-6 * tokens)); ("account_remaining_qty_mismatch", qty) for a residue;
+    ("account_snapshot_unreadable", None) when the account view cannot be read (unknown is never proof of flat)."""
+    _pa = _paper_account()
+    if _pa is None:
+        return None, 0.0
+    try:
+        snap = _pa.snapshot()
+    except Exception:
+        snap = None
+    if snap is None or snap.get("degraded"):
+        return "account_snapshot_unreadable", None   # a degraded (untrusted WAL) view may omit positions: unknown is never flat
+    q = sum(float(p.get("qty") or 0.0) for p in ((snap.get("lanes") or {}).get(LANE) or {}).get("positions") or []
+            if str(p.get("pos_id")) == str(pos_id))
+    if q > max(1e-9, 1e-6 * abs(float(pos.get("tokens") or 0.0))):
+        return "account_remaining_qty_mismatch", q
+    return None, 0.0
+
+
+def legit_receipt_qty(pos, key, lane_qty, receipt_qty, receipt_kind):
+    """PURE. Which HISTORICAL receipt-qty form a credit matches (design G5; evidence = published 2b26710 `_tranche_credit` passing the lane leg
+    qty, plus the migration's stored dust leg): "L1" receipt qty == lane leg qty (exact within rounding 1e-9 relative); "L2" == lane qty + stored
+    dust on pos["tranche_dust_leg"] (only when tranche_dust_leg AND tranche_dust_qty are persisted: absence is unknown, never zero dust);
+    "L3" qty None with kind None (older credit journaled without qty); None = matches no historical formula (unexplained). NO tolerance widening."""
+    if receipt_qty is None:
+        return "L3" if receipt_kind is None else None
+    try:
+        rq, lq = float(receipt_qty), float(lane_qty)
+    except Exception:
+        return None
+    tol = max(1e-9, 1e-9 * abs(lq))
+    if abs(rq - lq) <= tol:
+        return "L1"
+    if pos.get("tranche_dust_leg") == key and pos.get("tranche_dust_qty") is not None:
+        try:
+            if abs(rq - (lq + float(pos["tranche_dust_qty"]))) <= tol:
+                return "L2"
+        except Exception:
+            return None
+    return None
+
+
+def diagnose_position(mint):
+    """READ-ONLY diagnostics for a SIM position's account/lane qty divergence (design G1-G7 evidence). Writes nothing of its own (it reads the lane
+    ledger, the fill journal, the account journal and ledger op, and one snapshot() WITHOUT marks, which records no baseline); byte immutability of
+    the lane ledger, account ledger+journal and fill journal is asserted by test P7z2. Returns {mint, gates, keys, extra_fills, residue, scale,
+    verdict}. Verdicts: "consistent" ONLY when every core gate (G1-G6) was evaluated and passed, the residue is nil, the position is a ladder
+    (not TWAP), and no journaled fill lacks a done leg; "unsupported:twap" (TWAP keys are not examined, so never a pass);
+    "pending_crash_window:<keys>" (a journaled fill with no done leg: the crash-window state, not corruption and not consistent);
+    "quarantine:<gate>:<why>"; "evidence_missing:<field>" (an input is absent: never defaulted); or
+    "explained_residue:stored_dust" when the account residue equals the persisted dust record exactly (label only; unexplained residue is
+    "quarantine:G5:unexplained_residue"). NOT a repair and NOT an authority to apply one."""
+    out = {"mint": mint, "gates": {}, "keys": [], "extra_fills": [], "residue": None, "scale": None, "verdict": None}
+    def gate(g, ok, why=None, unavailable=False):
+        out["gates"][g] = {"ok": bool(ok), "why": why, "unavailable": bool(unavailable) and not ok}
+        return ok
+    try:
+        pos = open_positions().get(mint)
+    except Exception:
+        pos = None
+    if not pos:
+        out["verdict"] = "evidence_missing:position"; return out
+    pid = pos.get("pa_pos_id")
+    if not gate("G1", _is_sim(pos), "not_sim"):
+        out["verdict"] = "quarantine:G1:not_sim"; return out
+    if pos.get("twap") is not None:
+        out["verdict"] = "unsupported:twap"; return out      # slice/remainder keys are not examined: explicit, never "consistent"
+    _df, _pa = _demo_filler(), _paper_account()
+    if _df is None or _pa is None or not pid or not pos.get("tranche_credit"):
+        miss = "fill_journal" if _df is None else ("account" if _pa is None else ("pa_pos_id" if not pid else "tranche_marker"))
+        gate("G1", False, "evidence_missing:" + miss); out["verdict"] = "evidence_missing:" + miss; return out
+    if not (pos.get("execution") or {}).get("entry_op"):
+        gate("G1", False, "evidence_missing:entry_op"); out["verdict"] = "evidence_missing:entry_op"; return out
+    toks = float(pos.get("tokens") or 0.0)
+    dbt = None
+    try: dbt = _pa.position_debit(pid)
+    except Exception: dbt = None
+    if not dbt or not (float(dbt.get("qty") or 0.0) > 0) or not (toks > 0):
+        out["scale"] = "evidence_missing:scale"
+    else:
+        r = float(dbt["qty"]) / toks
+        out["scale"] = 1.0 if abs(r - 1.0) <= 1e-9 else "evidence_missing:scale"   # scale 1 only when the stored debit EQUALS the lane tokens; otherwise unknown
+        out["entry_qty_ratio"] = r
+    legs = [(k, v) for k, v in (pos.get("legs") or {}).items() if v.get("done") and v.get("exit_price_kind") != "write_down_zero"]
+    ops = ["%s:leg:%s:%s:%s" % (LANE, k, mint, pid) for k, _ in legs]
+    # crash window: journaled fills for this position with no done leg (never listed by the done-flag selection above)
+    try:
+        for k, v in (pos.get("legs") or {}).items():
+            if v.get("done"): continue
+            fl = _df.get_fill(_fill_key(pos, k)) or _df.get_fill("%s:exit:%s:%s" % (LANE, mint, k))
+            if fl: out["extra_fills"].append({"key": k, "why": "fill_without_done", "fill_qty": fl.get("qty_tokens"), "gross": fl.get("gross_usd")})
+    except Exception:
+        gate("G1", False, "fill_journal_unreadable"); out["verdict"] = "quarantine:G1:fill_journal_unreadable"; return out
+    try: rc = _pa.op_receipts(ops)
+    except Exception: rc = {"_unreadable": True}
+    if rc.get("_unreadable"):
+        gate("G3", False, "journal_unreadable"); out["verdict"] = "quarantine:G3:journal_unreadable"; return out
+    fsum, g1ok, g2ok, g3ok, g4ok, g5ok = 0.0, True, True, True, True, True
+    g3_unavail = False
+    for (k, v), op in zip(legs, ops):
+        ltok = toks * float(v.get("frac") or 0.0)
+        fl = _df.get_fill(_fill_key(pos, k)) or _df.get_fill("%s:exit:%s:%s" % (LANE, mint, k)); r = rc.get(op)   # instance-scoped key, else the legacy unstamped key
+        row = {"key": k, "lane_qty": ltok, "fill": None if not fl else {"qty": fl.get("qty_tokens"), "gross": fl.get("gross_usd"), "fee": fl.get("fee_usd")},
+               "receipt": None if r is None else {"qty": r.get("qty"), "proceeds": r.get("proceeds"), "fee": r.get("fee"), "kind": r.get("price_kind")}}
+        if not fl: g1ok = False; row["why"] = "no_journaled_fill"
+        else:
+            fq = float(fl.get("qty_tokens") or 0.0); fsum += fq
+            row["fill_qty_vs_lane"] = fq - ltok
+            if abs(fq - ltok) > max(1e-9, 1e-6 * abs(ltok)): g2ok = False; row["why"] = "fill_qty_differs_from_lane"
+        if r is None: g3ok = False; row["why"] = row.get("why") or "no_receipt"
+        else:
+            row["form"] = legit_receipt_qty(pos, k, ltok, r.get("qty"), r.get("price_kind"))
+            if row["form"] is None: g5ok = False; row["why"] = row.get("why") or "receipt_qty_no_historical_signature"
+            # G3: the account LEDGER op (what credit's conflict check compares) must equal the JOURNAL credit event
+            try: lop, lerr = _pa.operation_receipt(op)
+            except Exception as e: lop, lerr = None, "exception:%r" % (e,)
+            row["ledger_op"] = None if lop is None else {x: lop.get(x) for x in ("proceeds", "fee", "qty", "price_kind")}
+            if lerr and "no exact instance contract" in str(lerr):
+                g3_unavail = True; row["why"] = row.get("why") or "ledger_op_no_instance_contract"   # the lane debits through legacy try_debit: its ops carry no params to compare
+            elif lerr or lop is None:
+                g3ok = False; row["why"] = row.get("why") or ("ledger_op_unreadable:%s" % lerr if lerr else "ledger_op_missing")
+            elif any(lop.get(x) != r.get(x) for x in ("proceeds", "fee", "qty", "price_kind")):
+                g3ok = False; row["why"] = row.get("why") or "ledger_op_differs_from_journal"
+            if fl:
+                pr, fe = float(r.get("proceeds") or 0.0), float(r.get("fee") or 0.0)
+                if abs(pr - float(fl.get("gross_usd") or 0.0)) > max(1e-6, 1e-4 * abs(pr)) or abs(fe - float(fl.get("fee_usd") or 0.0)) > max(1e-6, 1e-4 * abs(fe)):
+                    g4ok = False; row["why"] = "receipt_money_differs_from_fill"
+        out["keys"].append(row)
+    gate("G1", g1ok, None if g1ok else "fill_missing")
+    gate("G3", g3ok and not g3_unavail, None if (g3ok and not g3_unavail) else ("receipt_or_ledger_op_fault" if not g3ok else "ledger_op_no_instance_contract"), unavailable=(g3ok and g3_unavail))
+    gate("G4", g4ok, None if g4ok else "money_differs"); gate("G5", g5ok, None if g5ok else "no_historical_signature")
+    all_done = bool(pos.get("legs")) and all(v.get("done") for v in pos["legs"].values())
+    g2ok = g2ok and ((not all_done) or abs(fsum - toks) <= max(1e-9, 1e-6 * toks))
+    gate("G2", g2ok, None if g2ok else "fill_qty_does_not_prove_flat")
+    # G6 identity: exactly one open account instance for this mint in the lane, its pos_id == the lane's, instance contract, no unresolved entry
+    rwhy, rq = _account_residue(mint, pid, pos); out["residue"] = {"why": rwhy, "qty": rq}
+    try: snap = _pa.snapshot()
+    except Exception: snap = None
+    g6why = None; g6_unavail = False
+    if snap is None or snap.get("degraded"): g6why = "account_snapshot_unreadable"
+    else:
+        lanepos = [x for x in (((snap.get("lanes") or {}).get(LANE) or {}).get("positions") or []) if x.get("mint") == mint]
+        mine = [x for x in lanepos if str(x.get("pos_id")) == str(pid)]
+        unres = [x for x in (snap.get("unresolved") or []) if str(x.get("pos_id")) == str(pid)]
+        if len(lanepos) > 1: g6why = "second_open_instance_for_mint"
+        elif lanepos and not mine: g6why = "account_open_position_has_other_pos_id"
+        elif unres: g6why = "unresolved_register_entry"
+        elif mine and not mine[0].get("instance"): g6why = "account_position_not_instance"; g6_unavail = True
+        out["g6_evidence"] = {"open_instances": len(lanepos), "own_open": len(mine), "unresolved_entries": len(unres)}
+    gate("G6", g6why is None, g6why, unavailable=g6_unavail)
+    for g in ("G1", "G2", "G3", "G4", "G5", "G6"):
+        if not out["gates"][g]["ok"] and not out["gates"][g]["unavailable"]:
+            out["verdict"] = "quarantine:%s:%s" % (g, out["gates"][g]["why"]); return out
+    for g in ("G3", "G6"):
+        if not out["gates"][g]["ok"]:     # evidence the lane never writes (non-instance account ops/positions): the gate CANNOT be evaluated, so no positive verdict
+            out["verdict"] = "evidence_unavailable:%s:%s" % (g, out["gates"][g]["why"]); return out
+    if out["extra_fills"]:
+        out["verdict"] = "pending_crash_window:" + ",".join(x["key"] for x in out["extra_fills"]); return out
+    if out["scale"] != 1.0: out["verdict"] = "evidence_missing:scale"; return out
+    # expected account units = the lane's still-open legs (all legs done: 0). Any other quantity is a residue; it is labelled "explained" ONLY
+    # when the delta equals the persisted dust record exactly, otherwise "unexplained" (no other class is invented).
+    expect = toks * sum(float(v.get("frac") or 0.0) for v in (pos.get("legs") or {}).values() if not v.get("done"))
+    acct_q = float(rq or 0.0) if rwhy == "account_remaining_qty_mismatch" else 0.0
+    delta = acct_q - expect
+    tol = max(1e-9, 1e-6 * toks)
+    out["residue"].update(expected_qty=expect, account_qty=acct_q, delta=delta)
+    if abs(delta) <= tol:
+        out["residue"]["label"] = "none"; out["verdict"] = "consistent"
+    else:
+        dq = pos.get("tranche_dust_qty")
+        expl = dq is not None and abs(delta - float(dq)) <= tol
+        out["residue"]["label"] = "explained:stored_dust" if expl else "unexplained"
+        out["verdict"] = "explained_residue:stored_dust" if expl else "quarantine:G5:unexplained_residue"
+    return out
+
+
 def _finalize(d, mint, pos, closed_reason):
     """Move an open position to closes, settle cash, record the lane
     trade, evaluate the pre-registered verdict. Must be called with
     _ledger_lock held; writes via _write."""
     _recover_close_intents()
+    # SETTLEMENT PENDING (crash-recovery / unreadable-journal state). A half-migrated position whose per-leg account
+    # receipts cannot be read cannot be SETTLED: the close credits `realized - tally` and the tally is unknowable, so
+    # booking either way would invent cash (double credit or lost cash). The ECONOMIC exit has already run (legs sold,
+    # stops never frozen); only the settlement waits. Nothing below is touched before this check (no bankroll, no tally,
+    # no credit, no close record): the position stays OPEN in the lane books in a visible settlement_pending state, is
+    # persisted, and the next poll retries once the journal is readable. Returns None (no close record yet).
+    if pos.get("tranche_credit") and pos.get("tranche_migrating") and not _rebuild_tally_from_receipts(pos):
+        if not _all_exits_executed(pos):
+            # The economic exit did NOT run (e.g. _close_remaining refused because the account journal could not prove
+            # which legs were already credited, so a combined sale could sell them twice). That is NOT a pending
+            # settlement: label it truthfully so it is never mistaken for "sold, only the settlement waits".
+            pos["pending_exit"] = {"leg": "remaining", "why": "exit_not_executed_journal_unreadable", "ts": time.time()}
+            logger.error("grad: %s exit NOT executed (%s): account journal unreadable, unsold legs remain; no cash booked", mint[:12], closed_reason)
+            _write(d)
+            return None
+        _sp = pos.get("settlement_pending") or {}
+        pos["settlement_pending"] = {"why": "migration_receipts_unreadable", "closed_reason": closed_reason,
+                                     "since": _sp.get("since") or time.time(), "last_try": time.time(),
+                                     "tries": int(_sp.get("tries") or 0) + 1}
+        pos["pending_exit"] = {"leg": "settlement", "why": "migration_receipts_unreadable", "ts": time.time()}
+        logger.error("grad: %s SETTLEMENT PENDING (%s): economic exit done, account receipts unreadable; position kept "
+                     "open, no cash booked, retry next poll", mint[:12], closed_reason)
+        _write(d)
+        return None
+    pos.pop("settlement_pending", None)
     realized = round(float(pos["realized_usd"]), 6)
     # CLOSE DENOMINATION (2026-10-27 fix): a close is denominated
     # at the stake the position actually opened with, never at the
@@ -2293,6 +2879,17 @@ def _finalize(d, mint, pos, closed_reason):
                   if (_pk is not None and _sold_kinds) else None)
     # Legs already credited per tranche are NOT credited again: the close credits only the remainder
     # (lane realized/bankroll/pnl keep the full total). Legacy positions have no marker: nothing credited.
+    if pos.get("tranche_credit") and pos.get("tranche_migrating"):
+        # Half-migrated position reaching its final close (the migration could not resume): the lane tally may lag the
+        # account, and the close credits `realized - tally`, so rebuild the tally from the account's own receipts. If the
+        # journal cannot be read, assume EVERY sold leg was credited: the close then under-credits (loud) and can never
+        # credit an already-credited leg twice.
+        if not _rebuild_tally_from_receipts(pos):
+            # Never book unknown credits as settled: the poll loop defers a migrating position whose receipts are
+            # unreadable BEFORE any close path, so reaching here means a caller bypassed that guard. Refuse loudly;
+            # nothing is written (no tally, no credit, no close).
+            raise RuntimeError("grad: %s final close refused: legacy migration unresolved and account receipts "
+                               "unreadable (deferred, no credit booked)" % mint[:12])
     _tc = pos.get("tranche_credited") if pos.get("tranche_credit") else None
     _cr_net = float((_tc or {}).get("net") or 0.0)
     _cr_qty = float((_tc or {}).get("qty") or 0.0)
@@ -2321,7 +2918,7 @@ def _finalize(d, mint, pos, closed_reason):
             # units: the close is final, and grad leg fractions
             # can leave dust the per-leg qty would strand.
             _plan = [{"kind": "credit", "op_id": _op, "mint": mint,
-                      "amount": round(realized - _cr_net, 6), "qty": max(_sold_qty - _cr_qty, 0.0),
+                      "amount": round(realized - _cr_net, 6), "qty": max(_sold_qty - _cr_qty, 0.0) + (_dust(pos) if pos.get("tranche_dust_leg") and pos["tranche_dust_leg"] not in ((_tc or {}).get("legs") or {}) else 0.0),
                       "price_kind": _sold_kind, "pos_id": _pos_id},
                      {"kind": "write_down", "op_id": _op + ":wd",
                       "mint": mint, "pos_id": _pos_id,
@@ -2349,6 +2946,21 @@ def _finalize(d, mint, pos, closed_reason):
                           "amount": _rem, "qty": None,
                           "price_kind": _rem_kind,
                           "pos_id": _pos_id}]
+        if not _plan and pos.get("tranche_credit") and _pos_id:
+            # FLAT RECONCILIATION: every sold leg was credited per tranche, so the lane is flat. The account must be flat too: read its
+            # ACTUAL remaining units for this pos_id. A residue (an earlier receipt qty smaller than the lane's) or an unreadable account
+            # leaves the position open in a visible settlement_pending state (the economic exit already ran; nothing is sold again and no
+            # cash is invented). Never silently closed with units stranded in the account.
+            _res, _resq = _account_residue(mint, _pos_id, pos)
+            if _res is not None:
+                _sp = pos.get("settlement_pending") or {}
+                pos["settlement_pending"] = {"why": _res, "closed_reason": closed_reason, "residue_qty": _resq,
+                                             "since": _sp.get("since") or time.time(), "last_try": time.time(),
+                                             "tries": int(_sp.get("tries") or 0) + 1}
+                pos["pending_exit"] = {"leg": "settlement", "why": _res, "residue_qty": _resq, "ts": time.time()}
+                _warn_throttled(("settle_pending", mint, _res), "grad: %s SETTLEMENT PENDING (%s): %s residue_qty=%s; position kept open, no cash booked (see recon_health)", mint[:12], closed_reason, _res, _resq)
+                _write(d)
+                return None
         _ci = _close_intents() if _plan else None
         _iid = None
         if _ci is not None:
@@ -2486,6 +3098,8 @@ def _finalize(d, mint, pos, closed_reason):
     # select-side vendor stamps already inside entry_features.
     if isinstance(pos.get("vendor_chain"), dict):
         rec["vendor_chain"] = dict(pos["vendor_chain"])
+    if pos.get("recon_notes"):
+        rec["recon_notes"] = [dict(n) for n in pos["recon_notes"]]
     d["closes"].append(rec)
     d["closes"] = d["closes"][-MAX_CLOSES:]
     del d["positions"][mint]
@@ -2607,6 +3221,7 @@ def poll_time_exits():
     unpriced branch). Trader loops call this BEFORE poll_exits
     so the stop fires even if the pricing path then stalls.
     Returns close records. Never raises."""
+    _POLL_SEQ["n"] += 1   # one identity per time-exit cycle too (migration marker tries count cycles)
     try:
         with _ledger_lock():
             d = _read()
@@ -2639,7 +3254,7 @@ def poll_time_exits():
                     logger.warning("grad poll_time_exits %s failed: "
                                    "%s", mint, e)
                     continue
-            return closes
+            return [c for c in closes if c]  # None = settlement pending (position kept open)
     except Exception as e:
         logger.warning("grad poll_time_exits failed: %s", e)
         return []
@@ -2663,9 +3278,337 @@ def _is_sim(pos):
     return (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
 
 
+def _dust(pos):
+    try:
+        v = float(pos.get("tranche_dust_qty") or 0.0)
+    except Exception:
+        return 0.0
+    return v if v > 0 and v == v and v != float("inf") else 0.0
+
+
+def _acct_qty(pos, leg_key, lane_qty):
+    """Account units for one leg credit: the lane qty, plus the one-time opening-unit dust on the migration's
+    designated leg (pos["tranche_dust_leg"]); identity for every position opened with the marker."""
+    if pos.get("tranche_dust_leg") == leg_key:
+        return lane_qty + _dust(pos)
+    return lane_qty
+
+
 def _receipt_qty_ok(r, qty):
     q = r.get("qty")
     return r.get("proceeds") is not None and q is not None and abs(float(q) - qty) <= max(1e-6, 1e-9 * abs(qty))
+
+
+def _sold_any(pos):
+    """True when ANY part of the lane position has been sold or written down (ladder leg done, or TWAP slice/remainder)."""
+    if any(lv.get("done") for lv in (pos.get("legs") or {}).values()):
+        return True
+    tw = pos.get("twap")
+    if tw is not None:
+        tw = tw or {}
+        return bool(int(tw.get("done") or 0) > 0 or float(tw.get("sold_tokens") or 0) > 0 or tw.get("remainder"))
+    return False
+
+
+# Account pos_ids this process has debited but not yet written to the lane ledger (the debit precedes the ledger write).
+# Only the window inside one entry: a crash there leaves an account position the lane books never learned of, which the
+# NEXT process correctly reads as unprovable (the set is in-memory, never persisted).
+_INFLIGHT_OPEN = set()
+
+
+def legacy_unproven_pos_ids():
+    """Account pos_ids of lane positions whose ACCOUNT view is not provably consistent with the lane: positions that
+    predate the per-tranche marker (or are mid-migration) and have sold something, so the account still carries units
+    the lane has already sold. Their marks would overstate equity (and could inflate the persisted peak), so the
+    account marker OMITS them: the account then reports marks_status "no mark", records no baseline/peak, and the
+    entry gates fail closed. Exits are untouched. A position leaves this set only when the migration has proven and
+    credited its sold legs. Returns None when the lane ledger cannot be read (callers must treat every lane position
+    as unprovable): unknown evidence is never read as zero."""
+    try:
+        # Read the file DIRECTLY: _read() turns a corrupt ledger into a blank one (moving the file aside), which would
+        # read as "no legacy positions". A corrupt/unparseable ledger, or one a past corruption moved aside, is UNKNOWN.
+        import glob
+        if glob.glob(LEDGER_PATH + ".corrupt-*"):
+            return None
+        try:
+            with open(LEDGER_PATH) as _f:
+                _raw = json.load(_f)
+            if not isinstance(_raw, dict):
+                return None
+        except FileNotFoundError:
+            pass                      # missing: _read() below returns a blank ledger; the account cross-check catches held positions
+        d = _read()                   # content via the lane's own reader (corruption was ruled out above)
+        out = set()
+        _lp = {}   # lane positions by account pos_id, and by mint for positions that predate pa_pos_id
+        _by_mint = {}
+        for mint, pos in (d.get("positions") or {}).items():
+            if not isinstance(pos, dict):
+                continue
+            if pos.get("pa_pos_id"):
+                _lp[str(pos["pa_pos_id"])] = pos
+            _by_mint[mint] = pos
+        def _legacy_unproven(pos):
+            if pos.get("tranche_credit") and not pos.get("tranche_migrating"):
+                return False
+            return _sold_any(pos)
+        _pa = _paper_account()
+        if _pa is None:
+            return {pid for pid, pos in _lp.items() if _legacy_unproven(pos)}
+        _snap = _pa.snapshot()
+        if _snap is None:
+            return None
+        for _p in ((_snap.get("lanes") or {}).get(LANE) or {}).get("positions") or []:
+            _id = str(_p.get("pos_id"))
+            if _id in _INFLIGHT_OPEN:
+                continue
+            pos = _lp.get(_id)
+            if pos is None and not _p.get("instance"):
+                pos = _by_mint.get(_p.get("mint"))
+            # An account position of THIS lane that the lane's own books do not know (ledger missing, blanked, restored from
+            # an older copy) cannot be proven consistent either: unprovable.
+            if pos is None or _legacy_unproven(pos):
+                out.add(_id)
+        return out
+    except Exception:
+        return None
+
+
+_MIGRATING = set()   # in-memory re-entrancy guard (never persisted)
+
+
+_POLL_SEQ = {"n": 0, "boot": "%d-%d" % (os.getpid(), time.time_ns())}   # incremented once per _poll_exits cycle: "tries" counts POLLS that found the position blocked, not calls
+
+
+def _lock_owned_by_me():
+    """True only when THIS thread of THIS process currently holds the ledger flock (a different thread, or a forked child that inherited the
+    counter, does not own it and must take the flock normally, i.e. block until the owner releases)."""
+    return _LOCK_DEPTH["n"] > 0 and _LOCK_DEPTH["tid"] == threading.get_ident() and _LOCK_DEPTH["pid"] == os.getpid()
+
+
+def _stamp_migration_blocked(pos, code, why):
+    """DURABLE, visible record that a legacy position could not be migrated: {code, why, since, tries, last_try, poll_seq}.
+    - tries counts polls (one per _poll_exits cycle via _POLL_SEQ), not calls: the migration is invoked several times per poll.
+    - A ledger write happens ONLY when the marker is new or its code/why changed (a transition); an unchanged marker only
+      updates tries/last_try in memory, which the caller's normal position write persists.
+    - Persistence is a fresh read-modify-write of THIS position only. Every production caller (_poll_exits, poll_time_exits)
+      already holds _ledger_lock for the whole loop (audited: grad.py _poll_exits `with _ledger_lock()` spans every
+      _close_remaining/_migrate call). flock is not re-entrant across file descriptors, so the lock is taken here ONLY when
+      this process does not already hold it (direct non-poll callers, tests). Never raises."""
+    try:
+        now = time.time(); seq = "%s:%d" % (_POLL_SEQ["boot"], _POLL_SEQ["n"]); prev = pos.get("migration_blocked") or {}
+        changed = (not prev) or prev.get("code") != code or prev.get("why") != str(why)[:300]
+        counted = changed or prev.get("poll_seq") != seq
+        mb = {"code": code, "why": str(why)[:300], "since": (prev.get("since") if not changed or prev else None) or now,
+              "tries": int(prev.get("tries") or 0) + (1 if counted else 0), "last_try": now, "poll_seq": seq}
+        pos["migration_blocked"] = mb
+        if not changed:
+            return
+        def _persist():
+            d = _read(); cur = (d.get("positions") or {}).get(pos.get("mint"))
+            if cur is not None:
+                cur["migration_blocked"] = dict(mb)
+                _write(d)
+        if _lock_owned_by_me():
+            _persist()   # THIS thread in THIS process holds the lock (a forked child or another thread takes the lock normally)
+        else:
+            with _ledger_lock():
+                _persist()
+    except Exception as e:
+        logger.warning("grad: migration_blocked marker could not be persisted: %r", e)
+
+
+def _migrate_legacy_tranches(pos):
+    """LEGACY LADDER MIGRATION. A position opened before the tranche marker keeps the account at its FULL qty/basis
+    until the final close, so marks overstate equity (and can inflate the persisted peak) once legs have sold. Bring
+    it onto the per-tranche contract: credit each ALREADY-SOLD leg to the account (same op_id scheme as the marked
+    path, so idempotent and receipt-replayable), scale credit qty by account_units/lane_units so the account keeps
+    the same fraction as the lane, then set the marker. Best effort and NEVER blocks an exit: the final close already
+    credits only `realized - tranche tally`, so a partial or skipped migration can never double count or lose value.
+    Evidence order: existing receipt, then the lane leg record (net, price, tokens) and, for the quote sim, the
+    JOURNALED fill (read-only get_fill; never a fresh quote). Anything unknown leaves the position legacy (no credit)
+    with a loud throttled warning. Ladder positions only. TWAP legacy positions (and any ladder position this cannot prove) stay unmigrated and are
+    NOT MARKED by the account marker (see legacy_unproven_pos_ids): exits remain possible, equity/peak/entry gates fail closed.
+    DUST TOLERANCE: the opening-unit difference must equal gas_in_usd/entry_price (both recorded on the lane position) within
+    1e-4 x the opening account qty (float/rounding slack of the recorded gas figures only; it is not a risk limit). Anything
+    larger is unexplained provenance and the position stays legacy.
+    Returns True when the position is (now) on the tranche contract."""
+    try:
+        if pos.get("twap") is not None or not pos.get("pa_pos_id"):
+            return False
+        if pos.get("tranche_credit") and not pos.get("tranche_migrating"):
+            return True
+        mint, pid = pos["mint"], pos["pa_pos_id"]
+        key = (mint, pid)
+        if key in _MIGRATING or key in _RECONCILING:
+            return False
+        legs = [(lk, lv) for lk, lv in pos["legs"].items()
+                if lv.get("done") and lv.get("exit_price_kind") != "write_down_zero"]
+        if not legs:
+            return False                      # nothing sold: stays legacy; adopted the poll after a leg sells
+        _pa = _paper_account()
+        if _pa is None:
+            return False
+        def _stay(why, code="unspecified"):
+            _warn_throttled(("migrate", mint, str(why)[:40]), "grad: legacy tranche migration for %s skipped (stays legacy, no credit): %s", mint[:12], why)
+            _stamp_migration_blocked(pos, code, why)
+            return False
+        close_op = "%s:close:%s:%s" % (LANE, mint, pid)
+        ops = ["%s:leg:%s:%s:%s" % (LANE, lk, mint, pid) for lk, _ in legs]
+        rc = _pa.op_receipts(ops + [close_op])
+        if rc.get("_unreadable"):
+            return _stay("account journal unreadable", "journal_unreadable")
+        if rc.get(close_op) is not None or _pa.op_outcome(close_op) != "unknown":
+            return _stay("a final-close op already exists for this position", "final_close_exists")
+        _ci = _close_intents()
+        if _ci is None:
+            return _stay("close-intent journal unavailable", "close_intent_journal_unavailable")
+        for it in (_ci.pending(LANE) or []):
+            if str((it.get("intent") or {}).get("pos_id")) == str(pid):
+                return _stay("a close intent is open for this position", "close_intent_open")
+        if pos.get("tranche_dust_leg") is None:
+            dbt = _pa.position_debit(pid)
+            q0 = float((dbt or {}).get("qty") or 0.0)
+            toks = float(pos.get("tokens") or 0.0)
+            if not dbt or dbt.get("mint") != mint or dbt.get("lane") != LANE or not (q0 > 0) or not (toks > 0):
+                return _stay("opening debit not provable from the journal", "opening_debit_unprovable")
+            dust = q0 - toks
+            # The ONLY lawful source of a difference is the entry gas paid in tokens (stake/price units debited vs net
+            # tokens held): expected dust = gas_in_usd / entry_price, both recorded on the lane position. Anything else is
+            # unexplained provenance and stays legacy (no bound is invented; the evidence must explain the number).
+            try:
+                exp_dust = float(pos.get("gas_in_usd") or 0.0) / float(pos["entry_price"])
+            except Exception:
+                exp_dust = None
+            _equal = abs(dust) <= max(1e-9, 1e-9 * q0)      # account qty already equals the lane tokens (net-token debit): nothing to explain, nothing to remove
+            if not _equal and (exp_dust is None or dust < 0 or abs(dust - exp_dust) > max(1e-9, 1e-4 * q0)):
+                return _stay("opening-unit difference %.9f not explained by entry gas (%s)" % (dust, exp_dust), "dust_unexplained")
+            dust_leg = legs[0][0]
+        else:
+            dust, dust_leg = _dust(pos), pos["tranche_dust_leg"]
+        plan = []
+        _df = _demo_filler() if _is_sim(pos) else None
+        for (lk, lv), op in zip(legs, ops):
+            ltok = pos["tokens"] * lv["frac"]
+            r = rc.get(op)
+            if r is not None:
+                if not _receipt_qty_ok(r, ltok + (dust if lk == dust_leg else 0.0)):
+                    return _stay("receipt qty disagrees for leg %s" % lk, "receipt_qty_disagrees")
+                plan.append((lk, ltok, float(r["proceeds"]), float(r.get("fee") or 0.0),
+                             r.get("price_kind") or (_pk.UNKNOWN if _pk is not None else None)))
+                continue
+            net = float(lv.get("realized_usd") or 0.0)
+            gross = float(lv.get("exit_price") or 0.0) * ltok
+            fee = gross - net
+            if not (ltok > 0 and gross > 0) or fee < -1e-9 or fee > gross + 1e-9:
+                return _stay("leg %s evidence inconsistent" % lk, "leg_evidence_inconsistent")
+            if _df is not None:
+                jf = _df.get_fill("%s:exit:%s:%s" % (LANE, mint, lk))
+                if not jf or abs(float(jf.get("gross_usd", -1)) - gross) > 1e-6:
+                    return _stay("journaled fill missing or disagrees for leg %s" % lk, "fill_missing_or_disagrees")
+            plan.append((lk, ltok, gross, max(fee, 0.0), lv.get("exit_price_kind") or (_pk.UNKNOWN if _pk is not None else None)))
+        # intent-first: durable marker (+ scale) BEFORE the first account credit
+        pos["tranche_dust_qty"] = dust
+        pos["tranche_dust_leg"] = dust_leg
+        pos.pop("migration_blocked", None)   # evidence now proves the migration: the block is lifted
+        pos["tranche_credit"] = True
+        pos["tranche_migrating"] = True
+        pos.setdefault("tranche_credited", {"net": 0.0, "qty": 0.0})
+        d = _read(); d["positions"][mint] = pos; _write(d)
+        _MIGRATING.add(key)
+        try:
+            for lk, ltok, gross, fee, kind in plan:
+                if not _tranche_credit(pos, lk, ltok, gross, fee, kind):
+                    return False              # refusal persisted by _tranche_credit; marker stays, next poll resumes
+            pos.pop("tranche_migrating", None)
+            d = _read(); d["positions"][mint] = pos; _write(d)
+            return True
+        finally:
+            _MIGRATING.discard(key)
+    except Exception as e:
+        logger.warning("grad: legacy tranche migration failed (position left as is): %r", e)
+        try:
+            _stamp_migration_blocked(pos, "exception", repr(e)[:200])
+        except Exception:
+            pass
+        return False
+
+
+_RECON_WHY = {}
+
+
+def _no_unrecorded_sale_proof(pos):
+    """The account journal is unreadable, so credits cannot be read. A sale ALWAYS journals its fill BEFORE its account
+    credit (fill -> _tranche_credit -> lane mark), and fill keys are scoped to the position instance. So when the
+    fill journal is readable, DOES hold this position's own entry fill (a wiped or missing journal proves nothing),
+    and holds NO exit fill for any leg the lane has not marked done, no un-marked leg can have been credited and the
+    stop may sell the remainder. Any such fill is uncertain (credited or not): refuse (visible pending_exit), never
+    guess. Sim positions only: a non-sim leg leaves no fill evidence, so it is never proven. Residual: this binds the
+    fill-journal's durability, not the account's."""
+    try:
+        if not _is_sim(pos) or not pos.get("tranche_credit") or not pos.get("pa_pos_id"):
+            return False
+        _df = _demo_filler()
+        eop = (pos.get("execution") or {}).get("entry_op")
+        if _df is None or not eop:
+            return False
+        fills = _df._locked(lambda j: dict(j["fills"]))
+        if eop not in fills:
+            return False
+        pre, suf = "%s:exit:%s:" % (LANE, pos["mint"]), ":%s" % pos["pa_pos_id"]
+        done = {k for k, v in (pos.get("legs") or {}).items() if v.get("done")}
+        for k in fills:
+            if k.startswith(pre) and k.endswith(suf):
+                leg = k[len(pre):-len(suf)]
+                if leg in done:
+                    continue
+                # A COMBINED remainder fill ("remaining:<legs>") journaled by an interrupted stop is the SAME intent a
+                # retry regenerates, and it replays iff the legs still open are EXACTLY the legs it covered (the combined
+                # path books no per-leg credit, so nothing can already be credited for them). Any other shape (a different
+                # open set: a leg was sold or reconciled since; per-leg, TWAP slice or remainder fills) is uncertain.
+                if leg.startswith("remaining:") and set(leg[len("remaining:"):]) == {
+                        lk for lk, lv in (pos.get("legs") or {}).items() if not lv.get("done")}:
+                    continue
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _partition_open_legs(pos):
+    """Leg-scoped version of the fill-journal proof (ladder, sim, tranche-marked only). Returns (certain, uncertain) open leg
+    keys, or None when the fill journal cannot be trusted (no readable journal, no entry fill for THIS position, not sim,
+    TWAP). A leg is UNCERTAIN when any journaled exit fill for this position instance mentions it (its own key, or a combined
+    "remaining:<legs>" key that does not cover exactly the open set): it may or may not have been credited. Every other open
+    leg has NO fill and therefore cannot have been credited (fill precedes credit), so it is certain."""
+    try:
+        if not _is_sim(pos) or not pos.get("tranche_credit") or not pos.get("pa_pos_id") or pos.get("twap") is not None:
+            return None
+        _df = _demo_filler()
+        eop = (pos.get("execution") or {}).get("entry_op")
+        if _df is None or not eop:
+            return None
+        fills = _df._locked(lambda j: dict(j["fills"]))
+        if eop not in fills:
+            return None
+        pre, suf = "%s:exit:%s:" % (LANE, pos["mint"]), ":%s" % pos["pa_pos_id"]
+        open_ = {k for k, v in (pos.get("legs") or {}).items() if not v.get("done")}
+        unc = set()
+        for k in fills:
+            if not (k.startswith(pre) and k.endswith(suf)):
+                continue
+            leg = k[len(pre):-len(suf)]
+            if leg.startswith("remaining:"):
+                covered = set(leg[len("remaining:"):])
+                if covered == open_:
+                    continue   # exact replay of the interrupted combined stop
+                unc |= (covered & open_)
+            elif leg in open_:
+                unc.add(leg)
+            elif leg not in (pos.get("legs") or {}):
+                return None   # unknown key shape (twap etc.): cannot reason about it
+        return sorted(open_ - unc), sorted(unc)
+    except Exception:
+        return None
 
 
 def _reconcile_credited_legs(pos):
@@ -2695,11 +3638,14 @@ def _reconcile_credited_legs(pos):
         keys = [lk for lk, lv in pos["legs"].items() if not lv.get("done")]
     if not keys:
         return True
+    _RECON_WHY.pop((mint, pid), None)
     try:
         rc = _pa.op_receipts([_op(k) for k in keys])
     except Exception:
+        _RECON_WHY[(mint, pid)] = "unreadable"
         return False
     if rc.get("_unreadable"):
+        _RECON_WHY[(mint, pid)] = "unreadable"
         _warn_throttled(("unreadable", mint), "grad: account journal unreadable; cannot prove which legs were credited for %s", mint[:12])
         return False
     ok_all = True
@@ -2716,14 +3662,14 @@ def _reconcile_credited_legs(pos):
                 _ltok = pos["tokens"] * pos["legs"][lk]["frac"]
                 if _is_sim(pos):
                     f = _demo_sell(pos, _ltok, lk)
-                    _okm = f is not None and _receipt_matches(f[0], r, _ltok)
+                    _okm = f is not None and _receipt_matches(f[0], r, _acct_qty(pos, lk, _ltok))
                 else:   # non-sim: no journaled fill exists; the receipt is the only evidence, qty must agree
-                    _okm = _receipt_qty_ok(r, _ltok)
+                    _okm = _receipt_qty_ok(r, _acct_qty(pos, lk, _ltok))
                 if not _okm:
                     _warn_throttled(("unrec", mint, lk), "grad: credited leg %s %s cannot be reconciled with its receipt; leg stays pending", mint[:12], lk)
                     ok_all = False
                     continue
-                _close_leg(pos, lk, 0.0, "reconciled_credited_leg", pkind=_kind(r))
+                _close_leg(pos, lk, 0.0, "reconciled_credited_leg", receipt_kind=_kind(r))
                 if not pos["legs"][lk].get("done"):
                     # the replay was refused (credit refused / qty mismatch / divergence): the leg is NOT reconciled
                     ok_all = False
@@ -2749,9 +3695,13 @@ def _reconcile_credited_legs(pos):
                     _okm = _receipt_qty_ok(r, rem_tok)
                 if not _okm:
                     logger.warning("grad: credited TWAP remainder %s cannot be reconciled with its receipt", mint[:12])
+                    _fl = (f[0] if (_is_sim(pos) and f is not None) else {}) or {}
+                    _recon_note(pos, "twap_remainder", "receipt_fill_money_mismatch", receipt_proceeds=r.get("proceeds"), receipt_fee=r.get("fee"),
+                                receipt_qty=r.get("qty"), fill_gross=_fl.get("gross_usd"), fill_fee=_fl.get("fee_usd"), fill_qty=_fl.get("qty_tokens"),
+                                expected_qty=rem_tok, fill_found=bool(_fl))
                     ok_all = False
                     continue
-                _close_remaining(pos, 0.0, "reconciled_credited_leg", pkind=_kind(r))
+                _close_remaining(pos, 0.0, "reconciled_credited_leg", receipt_kind=_kind(r))
                 if not (pos.get("twap") or {}).get("remainder"):
                     ok_all = False
             else:
@@ -2784,9 +3734,100 @@ def poll_exits(price_fn=None):
     except Exception as e:
         logger.warning("grad poll_exits failed: %s", e)
         return []
+    finally:
+        _publish_health()
+
+
+def _health_path():
+    return LEDGER_PATH + ".health.json"
+
+
+_HEALTH_LAST = {"sig": None, "ts": 0.0, "fail": None}
+HEALTH_HEARTBEAT_S = 300.0   # TECHNICAL freshness interval (bounds fsync rate; not an owner policy, not an alert threshold)
+
+
+def _strip_volatile(x):
+    """recon_health content without time- or poll-derived counters (ages, tries, last_try), so the signature changes only on a real state transition."""
+    if isinstance(x, dict):
+        return {k: _strip_volatile(v) for k, v in x.items() if not (k.endswith("age_s") or k.endswith("tries") or k in ("last_try", "last_ts"))}
+    if isinstance(x, list):
+        return [_strip_volatile(v) for v in x]
+    return x
+
+
+def _publish_health():
+    """DURABLE operator file (no daemon status consumer of this lane exists in the repo): after every poll cycle, atomically write
+    {recon_health, heartbeat{boot_id, poll_seq, last_poll_ts}} to <ledger>.health.json when (a) the state signature (volatile ages excluded)
+    changed, (b) it has not been written for HEALTH_HEARTBEAT_S, or (c) the first poll of this boot. Freshness: a consumer must treat a file
+    whose last_poll_ts is older than its own poll cadence as STALE = UNKNOWN (poller stopped), never as clean. The file write fsyncs and CAN
+    block on a slow disk; no non-blocking claim is made. A write failure is logged, kept in memory and reported in the next successful file
+    as prior_write_failure. Pure diagnostics: no thresholds, no actions."""
+    try:
+        now = time.time()
+        h = recon_health()
+        sig = json.dumps(_strip_volatile({"recon_health": h}), sort_keys=True, default=str)
+        if sig == _HEALTH_LAST["sig"] and (now - _HEALTH_LAST["ts"]) < HEALTH_HEARTBEAT_S and os.path.exists(_health_path()):
+            return
+        body = {"recon_health": h, "heartbeat": {"boot_id": _POLL_SEQ["boot"], "poll_seq": _POLL_SEQ["n"], "last_poll_ts": now},
+                "heartbeat_interval_s": HEALTH_HEARTBEAT_S, "written_ts": now, "prior_write_failure": _HEALTH_LAST["fail"]}
+        tmp = _health_path() + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(body, fh, default=str); fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, _health_path())
+        _HEALTH_LAST.update(sig=sig, ts=now, fail=None)
+    except Exception as e:
+        _HEALTH_LAST["fail"] = "%s at %s" % (repr(e)[:200], time.time())
+        logger.warning("grad: health surface not written: %r", e)
+
+
+# In-process status of aborted poll cycles (no durable marker is possible when the I/O that failed is the ledger itself): surfaced by recon_health.
+_POLL_ABORTS = {"count": 0, "last_ts": None, "last_mint": None, "last_error": None}
+
+
+def _persist_poll_failure(d, mint, pos, exc):
+    """Make a per-position poll exception VISIBLE and durable without masking it or pretending success. The primary exception is already
+    logged (with traceback) by the caller. Here: (1) mark the in-memory position pending_exit "poll_exception" (a more specific existing
+    pending why is kept; the error rides along), so any later write of this cycle carries it; (2) best-effort durable write that re-reads
+    the ledger FRESH and stamps ONLY the marker and the recon notes onto that position, never the half-mutated in-memory state. Never
+    raises; a persistence failure is logged at error level. No close, no credit, no cash change, the position stays open and fail-closed.
+    Returns True only when the in-memory ledger was replaced by the persisted fresh view; False means the caller MUST abort the cycle.
+    LIMIT (stated, not closed): writes the failing position's own code path made BEFORE it raised (an unquotable-branch _write, _finalize's write)
+    may already have persisted partial state; the restore repairs that only when the fresh read and write succeed."""
+    err = repr(exc)[:200]
+    try:
+        _prior = pos.get("pending_exit") or {}
+        _mk = {"leg": "poll", "why": "poll_exception", "error": err, "ts": time.time()}
+        if not _prior:
+            pos["pending_exit"] = _mk
+        else:
+            _prior.setdefault("poll_error", err)
+    except Exception:
+        pass
+    try:
+        d2 = _read()
+        p2 = (d2.get("positions") or {}).get(mint)
+        if p2 is None:
+            return False
+        if not p2.get("pending_exit"):
+            p2["pending_exit"] = {"leg": "poll", "why": "poll_exception", "error": err, "ts": time.time()}
+        else:
+            p2["pending_exit"].setdefault("poll_error", err)
+        _ns = [n for n in ((pos or {}).get("recon_notes") or []) if isinstance(n, dict)]
+        if _ns:
+            have = {(n.get("key"), n.get("what")) for n in (p2.get("recon_notes") or [])}
+            p2["recon_notes"] = list(p2.get("recon_notes") or []) + [dict(n) for n in _ns if (n.get("key"), n.get("what")) not in have]
+        _write(d2)
+        # the in-memory ledger of THIS cycle held half-mutated state for the failed position: replace it with the freshly persisted view
+        # so no later write in the cycle can persist a partial mutation (all earlier closes were already persisted by their own writes).
+        d.clear(); d.update(d2)
+        return True
+    except Exception as e2:
+        logger.error("grad poll_exits %s: failure state could NOT be persisted (%r); original error %s", str(mint)[:12], e2, err)
+        return False
 
 
 def _poll_exits(price_fn):
+    _POLL_SEQ["n"] += 1
     # Phase 1: snapshot (locked read). Quotes happen outside the lock.
     with _ledger_lock():
         snapshot = {m: p for m, p in _read()["positions"].items()}
@@ -2855,7 +3896,12 @@ def _poll_exits(price_fn):
         d = _read()
         closes = []
         now = time.time()
-        for mint, pos in list(d["positions"].items()):
+        for mint in list(d["positions"]):
+            # fetch the CURRENT object each iteration: a failure restore replaces d with a fresh view, so objects captured before
+            # the loop would be stale (their mutations would never reach d or the ledger)
+            pos = d["positions"].get(mint)
+            if pos is None:
+                continue
             try:
                 q = quotes.get(mint) or {}
                 px = float(q.get("px") or 0)
@@ -2870,7 +3916,15 @@ def _poll_exits(price_fn):
                     pos.setdefault("twap", {
                         "slices": TWAP_SLICES, "done": 0,
                         "sold_tokens": 0.0, "sold_usd": 0.0})
+                _migrate_legacy_tranches(pos)
                 _reconcile_credited_legs(pos)
+                if pos.get("settlement_pending"):
+                    # The economic exit already ran on an earlier poll; only the account settlement is outstanding.
+                    # Retry it (the journal may be readable now). No second sale can happen: every leg is done.
+                    _sp_rec = _finalize(d, mint, pos, (pos["settlement_pending"] or {}).get("closed_reason") or "settlement_retry")
+                    if _sp_rec:
+                        closes.append(_sp_rec)
+                    continue
                 # F5: refresh exit-time liquidity from the quote
                 # that priced this eval.
                 if float(q.get("liq") or 0) > 0:
@@ -3200,11 +4254,20 @@ def _poll_exits(price_fn):
                     closes.append(_finalize(d, mint, pos,
                                             "ladder_complete"))
                 else:
+                    # a legacy position whose legs just sold on THIS poll is migrated in the same poll, so marks/gates
+                    # never observe the deferred full-qty account position between polls
+                    _migrate_legacy_tranches(pos)
                     _write(d)
             except Exception as e:
-                logger.warning("grad poll_exits %s failed: %s", mint, e)
+                logger.warning("grad poll_exits %s failed: %s", mint, e, exc_info=True)
+                if not _persist_poll_failure(d, mint, pos, e):
+                    # the in-memory ledger may hold half-mutated state and could not be replaced by a fresh persisted view: FAIL CLOSED,
+                    # abort the rest of this cycle so no later write can persist it. Positions not yet visited are retried next poll.
+                    _POLL_ABORTS["count"] += 1; _POLL_ABORTS.update(last_ts=time.time(), last_mint=str(mint), last_error=repr(e)[:200])
+                    _warn_throttled(("poll_abort", str(mint)), "grad poll_exits: cycle ABORTED after %s failed and its failure state could not be restored; no further writes this cycle (aborts so far: %d; see recon_health poll_aborts)", str(mint)[:12], _POLL_ABORTS["count"])
+                    break
                 continue
-        return closes
+        return [c for c in closes if c]  # None = settlement pending (position kept open)
 
 
 def open_positions():

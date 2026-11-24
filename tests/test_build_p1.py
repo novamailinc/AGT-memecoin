@@ -283,8 +283,12 @@ def _cand(mint="AAA111pump", age_s=60.0, **kw):
     return c
 
 
+# DISCLOSED TEST EDIT (legacy-unknown-marks hook): removing ONLY the lane ledger leaves the previous scenario's position
+# in the shared account, the "account position the lane books do not know" shape the hook correctly fails closed on.
+# The account is reset together with the lane ledger so each scenario starts from a consistent pair.
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
+    import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 ps = _patch_all()
 G.ensure_ledger()
 opened, _why, _fin = G.consider_candidate(
@@ -349,6 +353,7 @@ class _Feed:
 
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
+    import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 _FakeKS.halted = set()
 ps = _patch_all()
 G.ensure_ledger()
@@ -376,6 +381,7 @@ class _Dossiers:
 
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
+    import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 ps = _patch_all()
 G.ensure_ledger()
 with patch.object(G, "_dossiers", _Dossiers):

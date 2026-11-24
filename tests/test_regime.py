@@ -279,6 +279,11 @@ _TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("
 def _reg_fresh(price=0.00007):
     if os.path.exists(G.LEDGER_PATH):
         os.remove(G.LEDGER_PATH)
+        # DISCLOSED TEST EDIT (legacy-unknown-marks hook): resetting ONLY the lane ledger leaves the prior scenario's
+        # position in the shared account, which is exactly the "account position the lane books do not know" shape the
+        # hook correctly fails closed on. Reset the account WITH the lane so each scenario starts from a consistent pair.
+        import shutil as _sh
+        _sh.rmtree(_PA.ACCOUNT_DIR, ignore_errors=True)
     _FAKE_KS.halted = set()
     _FAKE_KS.recorded = []
     ps = []

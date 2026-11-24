@@ -107,15 +107,27 @@ eng._safety = _ExplodingSafety()
 # Refresh disabled; no network. Same stub shapes as
 # test_grad_select.py.
 SEL = GR._select
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: SEL.authoritative_proof(
+    c, _AUTH_HIST_RAW.get(c, 0), n)
+_AUTH_HIST_RAW = {}
 TRADER1 = "TraderRaw11111111111111111111111111111111"
+_AUTH_HIST_RAW[TRADER1] = 1
 TRADER2 = "TraderRaw21111111111111111111111111111111"
+_AUTH_HIST_RAW[TRADER2] = 1
 TRADER2B = "TraderRaw2B111111111111111111111111111111"
+_AUTH_HIST_RAW[TRADER2B] = 1
 TRADER3 = "TraderRaw31111111111111111111111111111111"
+_AUTH_HIST_RAW[TRADER3] = 1
 check("filter port: raw binds a grad_select module",
       SEL is not None and hasattr(SEL, "evaluate_candidate"))
 SEL._index_refresh = lambda now: None
 SEL._INDEX["available"] = True
 SEL._INDEX["coverage_start"] = NOW - 90000
+SEL._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 
 
 def _birth(mint, trader, ts, curve):
@@ -321,7 +333,9 @@ MINT4 = "RawMint44444444444444444444444444444444pump"
 MINT5 = "RawMint55555555555555555555555555555555pump"
 MINT6 = "RawMint66666666666666666666666666666666pump"
 TRADER4 = "TraderRaw41111111111111111111111111111111"
+_AUTH_HIST_RAW[TRADER4] = 1
 TRADER5 = "TraderRaw51111111111111111111111111111111"
+_AUTH_HIST_RAW[TRADER5] = 1
 TRADER6 = "TraderRaw61111111111111111111111111111111"
 _birth(MINT4, TRADER4, NOW - 600, "CurveM4")
 SEL._INDEX["by_trader"][TRADER4] = [NOW - 600]

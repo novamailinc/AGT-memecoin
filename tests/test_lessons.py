@@ -322,9 +322,16 @@ MINT1 = "LesMint11111111111111111111111111111111pump"
 SEL._index_refresh = lambda now: None
 SEL._INDEX["available"] = True
 SEL._INDEX["coverage_start"] = NOW - 90000
+SEL._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 SEL._INDEX["by_mint"][MINT1] = {"trader": TRADER1, "ts": NOW - 600,
                                 "bonding_curve": "CurveL1"}
 SEL._INDEX["by_trader"][TRADER1] = [NOW - 600]
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+    SEL.authoritative_proof(c, {TRADER1: 1}.get(c, 0), n)
 SEL._curve_stats = lambda addr: {"trades": 80,
                                  "created_ts": NOW - 600,
                                  "oldest_sig": "sig-l1",
@@ -427,6 +434,7 @@ check("reflector: every lesson carries resolved_at",
 GS._index_refresh = lambda now: None
 GS._INDEX["available"] = True
 GS._INDEX["coverage_start"] = NOW - 90000
+GS._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 TRADER_OK = "TraderOK1111111111111111111111111111111111"
 MINT_OK = "LesMintOK111111111111111111111111111111pump"
 MINT_SER = "LesMintSer11111111111111111111111111111pump"
@@ -439,6 +447,12 @@ GS._INDEX["by_mint"][MINT_SER] = {"trader": TRADER_SER,
                                   "ts": NOW - 300,
                                   "bonding_curve": "CurveSer"}
 GS._INDEX["by_trader"][TRADER_SER] = [NOW - 3600, NOW - 3500, NOW - 300]
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+    GS.authoritative_proof(c, {TRADER_OK: 1}.get(c, 0), n)
 _CURVE = {
     MINT_OK: {"trades": 80, "created_ts": NOW - 600,
               "oldest_sig": "sig-ok", "capped": False,

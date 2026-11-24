@@ -189,8 +189,14 @@ def main():
     _sel._index_refresh = lambda n: None
     _sel._INDEX = {"by_mint": births, "by_mig": migs,
                    "by_trader": {}, "files": {},
+                   "event_ts": [now - 86400 + i * 300 for i in range(289)],
                    "coverage_start": now - 86400, "available": True}
     _sel._trader_launches_24h = lambda c, n: launches.get(c, (0, 0))
+    # 2026-11-24 conservative contract: recorder-only sub-threshold
+    # counts never admit; stub the authoritative-history hook with the
+    # fixture's declared per-creator history (the `launches` table).
+    _sel._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+        _sel.authoritative_proof(c, launches.get(c, (0, 0))[0], n)
     _sel._curve_stats = lambda addr: curves.get(
         addr, {"trades": None, "reason": "no curve"})
     _sel._creator_from_oldest_tx = lambda sig: ""

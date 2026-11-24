@@ -63,12 +63,19 @@ eng.ensure_ledger()
 GS._index_refresh = lambda now: None
 GS._INDEX["available"] = True
 GS._INDEX["coverage_start"] = NOW - 90000
+GS._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 
 for mint in (MINT_A, MINT_B, MINT_C, MINT_D, MINT_E):
     GS._INDEX["by_mint"][mint] = {
         "trader": TRADER_OK, "ts": NOW - 600,
         "bonding_curve": CURVE_FB}
 GS._INDEX["by_trader"][TRADER_OK] = [NOW - 600]
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+    GS.authoritative_proof(c, {TRADER_OK: 1}.get(c, 0), n)
 
 GS._curve_stats = lambda addr: {
     "trades": 80, "created_ts": NOW - 600, "oldest_sig": "sig-fb",

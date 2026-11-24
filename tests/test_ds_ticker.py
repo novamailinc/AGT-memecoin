@@ -223,12 +223,19 @@ eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
 GS._index_refresh = lambda now: None
 GS._INDEX["available"] = True
 GS._INDEX["coverage_start"] = NOW - 90000
+GS._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 
 MINT_DS = "DsMintOK11111111111111111111111111111111pump"
 TRADER_DS = "TraderDS11111111111111111111111111111111"
 GS._INDEX["by_mint"][MINT_DS] = {
     "trader": TRADER_DS, "ts": NOW - 600, "bonding_curve": "Curve111"}
 GS._INDEX["by_trader"][TRADER_DS] = [NOW - 600]
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+    GS.authoritative_proof(c, {TRADER_DS: 1}.get(c, 0), n)
 GS._curve_stats = lambda addr: {"trades": 80, "created_ts": NOW - 600,
                                 "oldest_sig": "sig-ds", "capped": False,
                                 "exhausted": True}

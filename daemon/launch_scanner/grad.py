@@ -2741,12 +2741,12 @@ def diagnose_position(mint):
     for g in ("G1", "G2", "G3", "G4", "G5", "G6"):
         if not out["gates"][g]["ok"] and not out["gates"][g]["unavailable"]:
             out["verdict"] = "quarantine:%s:%s" % (g, out["gates"][g]["why"]); return out
-    for g in ("G3", "G6"):
-        if not out["gates"][g]["ok"]:     # evidence the lane never writes (non-instance account ops/positions): the gate CANNOT be evaluated, so no positive verdict
-            out["verdict"] = "evidence_unavailable:%s:%s" % (g, out["gates"][g]["why"]); return out
+    out["unavailable_gates"] = [g for g in ("G3", "G6") if not out["gates"][g]["ok"]]     # reported on EVERY verdict: an evaluable failure above or below is never masked by them
     if out["extra_fills"]:
         out["verdict"] = "pending_crash_window:" + ",".join(x["key"] for x in out["extra_fills"]); return out
     if out["scale"] != 1.0: out["verdict"] = "evidence_missing:scale"; return out
+    for g in out["unavailable_gates"]:     # evidence the lane never writes (non-instance account ops/positions): the gate CANNOT be evaluated, so no positive verdict
+        out["verdict"] = "evidence_unavailable:%s:%s" % (g, out["gates"][g]["why"]); return out
     # expected account units = the lane's still-open legs (all legs done: 0). Any other quantity is a residue; it is labelled "explained" ONLY
     # when the delta equals the persisted dust record exactly, otherwise "unexplained" (no other class is invented).
     expect = toks * sum(float(v.get("frac") or 0.0) for v in (pos.get("legs") or {}).values() if not v.get("done"))

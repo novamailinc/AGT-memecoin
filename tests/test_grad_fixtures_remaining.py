@@ -1311,7 +1311,40 @@ with GR._ledger_lock():
     _d = GR._read(); _d["positions"][gmc]["legs"]["b"]["done"] = False; GR._write(_d)   # the journaled leg-b fill stays: the state a crash leaves
 _dc = GR.diagnose_position(gmc)
 check("P7z5 crash window: a journaled fill with no done leg is reported (extra_fills %s) and the verdict is not consistent (%s)" % ([x["key"] for x in _dc["extra_fills"]], _dc["verdict"]),
-      any(x["key"] == "b" and x["why"] == "fill_without_done" for x in _dc["extra_fills"]) and _dc["verdict"] != "consistent")
+      any(x["key"] == "b" and x["why"] == "fill_without_done" for x in _dc["extra_fills"]) and _dc["verdict"] == "pending_crash_window:b" and "G3" in _dc["unavailable_gates"])
+# P7z5b: the evaluable crash-window state is NOT masked by the unavailable G3 (verdict above is pending_crash_window, G3 still reported unavailable).
+# P7za REAL non-instance lane position (entered through the lane's own try_debit): the ACCOUNT silently accepts a retried credit with a different kind/qty/proceeds
+# and keeps the ORIGINAL values; the LANE must reconcile from the original journal receipt, not from the retry.
+PAn, Fn, CTn = fresh(start="10"); go_sim(); _ln = dict(build(PAn, CTn)); _okn, _whn = _ln["grad"](1); assert _okn, _whn
+_gmn = list(GR.open_positions())[0]; sell_ab()
+_pn = GR.open_positions()[_gmn]; _opa = "%s:leg:a:%s:%s" % (GR.LANE, _gmn, _pn["pa_pos_id"]); _orig = PAn.op_receipts([_opa])[_opa]
+_an0 = _tree_bytes(PAn, GR.LEDGER_PATH); _cash0 = cash(PAn)
+_okr, _whr = PAn.credit(GR.LANE, _gmn, float(_orig["proceeds"]) * 2.0, _opa, pos_id=_pn["pa_pos_id"], qty=float(_orig["qty"]) * 0.5, fee=float(_orig["fee"]) + 1.0, price_kind="stale_price_estimate")
+_an1 = _tree_bytes(PAn, GR.LEDGER_PATH)
+_nonins = not (PAn.operation_receipt(_opa)[0] or {}).get("instance")
+check("P7za1 non-instance position (op instance flag %s): the account ACCEPTS a retried credit with different kind/qty/proceeds (%s, %s) and keeps the original values (cash %.6f -> %.6f, account bytes unchanged %s): the account is NOT a guard here" % (not _nonins, _okr, _whr, _cash0, cash(PAn), _an0 == _an1),
+      _nonins and _okr and "retry" in _whr and _an0 == _an1 and _cash0 == cash(PAn))
+with GR._ledger_lock():
+    _d = GR._read(); _lgn = _d["positions"][_gmn]["legs"]["a"]; _lgn["done"] = False
+    for _k in ("exit_price", "realized_usd", "exit_reason", "exit_price_kind", "exit_execution"): _lgn.pop(_k, None)
+    GR._write(_d)
+_fl0 = _fills_now(GR._demo_filler()); FakeJup.mult = 3.0; GR.poll_exits(price_fn=gpf(3.0)); FakeJup.mult = 1.0; _fl1 = _fills_now(GR._demo_filler())
+_ln2 = GR.open_positions()[_gmn]["legs"]["a"]
+check("P7za2 lane replay after the divergent account retry reconciles from the ORIGINAL receipt: leg a done with kind %s (original %s), no second fill (%s), account cash and the op receipt unchanged (%s; account FILE bytes may differ: poll_exits writes mark baselines)" % (_ln2.get("exit_price_kind"), _orig.get("price_kind"), _fl0 == _fl1, PAn.op_receipts([_opa])[_opa] == _orig and cash(PAn) == _cash0),
+      _ln2.get("done") and _ln2.get("exit_price_kind") == _orig.get("price_kind") and _fl0 == _fl1 and PAn.op_receipts([_opa])[_opa] == _orig and cash(PAn) == _cash0 and not GR.open_positions()[_gmn].get("pending_exit"))
+# P7zb REAL instance fixture, UNSTUBBED: the entry debit goes through the account's real try_debit_instance; G3 and G6 are evaluated by the real
+# operation_receipt/snapshot (nothing patched). This is a test-only entry route; the lane's production entry still uses try_debit.
+PAi, Fi, CTi = fresh(start="10"); go_sim(); _tdi = PAi.try_debit
+PAi.try_debit = lambda lane, mint, stake, qty, op_id, ts=None, marks=None, durable_refusal=False: PAi.try_debit_instance(lane, mint, stake, qty, op_id, ts, marks)
+try:
+    _li = dict(build(PAi, CTi)); _oki, _whi = _li["grad"](1)
+finally: PAi.try_debit = _tdi
+assert _oki, _whi
+_gmi = list(GR.open_positions())[0]; sell_ab()
+_bi0 = _tree_bytes(PAi, GR.LEDGER_PATH); _fi0 = json.dumps(_fills_now(GR._demo_filler()), sort_keys=True)
+_di = GR.diagnose_position(_gmi)
+check("P7zb REAL try_debit_instance position (no stubs): G3 and G6 are EVALUATED (not unavailable) and pass; verdict %s, residue %s; byte-immutable (%s)" % (_di["verdict"], _di["residue"], _tree_bytes(PAi, GR.LEDGER_PATH) == _bi0 and json.dumps(_fills_now(GR._demo_filler()), sort_keys=True) == _fi0),
+      not _di["unavailable_gates"] and _di["gates"]["G3"]["ok"] and _di["gates"]["G6"]["ok"] and _tree_bytes(PAi, GR.LEDGER_PATH) == _bi0)
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.
 _po, _r, _PAg, _ = _p7o("current"); _gmg = _po["mint"]
 _orec = _PAg.operation_receipt

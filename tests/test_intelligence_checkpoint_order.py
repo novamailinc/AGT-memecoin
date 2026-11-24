@@ -68,7 +68,7 @@ def test_crash_in_apply_leaves_checkpoint_behind(tmp_path):
     store = _store(tmp_path)
     proc = EventProcessor(store)
 
-    def crash(event, mint):
+    def crash(event):
         raise KeyboardInterrupt()
     proc.registry.update = crash
     with pytest.raises(KeyboardInterrupt):

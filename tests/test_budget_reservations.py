@@ -483,3 +483,41 @@ def test_router_zero_attempt_result_does_not_consume_budget(tmp_path,monkeypatch
     out=r.call('getBalance',['x'],max_attempts=1)
     assert calls==['alchemy','chainstack']  # starved before the fix
     assert out['kind']=='ok' and out['provider']=='chainstack'
+
+
+
+import math
+@pytest.mark.parametrize('marker,expected',[
+    (None,1),(0,0),(1,1),(3,3),
+    (-3,1),(0.5,1),(2.5,1),('0',1),('abc',1),(True,1),
+    (float('nan'),1),(float('inf'),1),
+])
+def test_router_transport_attempts_marker_validation(tmp_path,monkeypatch,marker,expected):
+    # v8 pin (reviewer Finding E): only true non-negative ints are
+    # honored; malformed markers conservatively count 1 (a real send),
+    # never crash, never under-count by truncation or sign. Observed
+    # via starvation: max_attempts=1, first candidate returns the
+    # marker; the second candidate is tried iff the marker consumed 0.
+    monkeypatch.setenv('ALCHEMY_API_KEY','fixture-a')
+    monkeypatch.setenv('CHAINSTACK_ENDPOINT','https://chainstack.example.invalid/n')
+    calls=[]
+    class FakeAdapter:
+        name='alchemy'
+        def supports(self,m):return True
+        def unverified(self,m):return False
+        def configured(self):return True
+        def cost(self,m):return 1
+        def call(self,method,params,timeout=12,**kw):
+            return {'kind':'error','result':None,'elapsed':0.0,
+                    'provider':'alchemy','note':'x','transport_attempts':marker}
+    class P2(FakeAdapter):
+        name='chainstack'
+        def call(self,method,params,timeout=12,**kw):
+            calls.append(1)
+            return {'kind':'ok','result':1,'elapsed':0.0,'provider':'chainstack','transport_attempts':1}
+    fa=FakeAdapter();fc=P2()
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=False,
+                     transport=lambda *a,**k:None)
+    r._adapter=lambda p:fa if p=='alchemy' else fc
+    out=r.call('getBalance',['x'],max_attempts=1)  # must not raise
+    assert (len(calls)==0) == (expected>=1)  # malformed/1+ starves; valid 0 does not

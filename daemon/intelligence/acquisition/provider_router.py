@@ -971,10 +971,18 @@ class ProviderRouter:
                 result = adapter.call(method, params, timeout=timeout)
             _ta = result.get("transport_attempts")
             # Explicit 0 (proven pre-I/O: nothing sent) consumes NO
-            # attempt budget; only a MISSING marker falls back to 1.
+            # attempt budget; a MISSING marker falls back to 1.
             # (2026-11-24 v7: `or 1` conflated the two and let a
             # pre-I/O refusal starve the next candidate.)
-            transport_attempts += int(_ta if _ta is not None else 1)
+            # (2026-11-24 v8, reviewer Finding E: validate the marker.
+            # Only a true non-negative int is honored; negative,
+            # fractional, bool, NaN/inf, string or otherwise malformed
+            # markers fall back to 1 - the conservative assumption that
+            # a real send happened - never crashing, never
+            # under-counting via truncation or sign.)
+            if isinstance(_ta, bool) or not isinstance(_ta, int) or _ta < 0:
+                _ta = 1
+            transport_attempts += _ta
             if result.get("outcome_unknown"):
                 # Unknown post-I/O outcome: an uncertain request is
                 # never retried - not on another key (adapter-internal)

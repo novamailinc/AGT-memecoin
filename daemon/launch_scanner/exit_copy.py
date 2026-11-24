@@ -239,7 +239,7 @@ def _wallet_sold_after(wallet: str, mint: str, after_ts: float,
             budget[0] -= 1
             tx = _rpc("getTransaction",
                       [sig, {"encoding": "jsonParsed",
-                             "maxSupportedTransactionVersion": 0}]) or {}
+                             "maxSupportedTransactionVersion": 1}]) or {}
             # meta.err gate (2026-11-17, Batch 3): a reverted
             # tx's balances never moved — skip it, don't count
             # its delta as a sale.
@@ -518,7 +518,9 @@ def _wallet_progress(wallet,mint,after_ts,budget,reserve,path):
             item=state['queue'][0]
             if reserve is not None:reserve()
             budget[0]-=1
-            tx=_rpc('getTransaction',[item['signature'],{'encoding':'jsonParsed','maxSupportedTransactionVersion':0}])
+            # v1: current-chain txs are version 1 (live census
+            # 2026-11-23); v0 options fail them with RPC -32015.
+            tx=_rpc('getTransaction',[item['signature'],{'encoding':'jsonParsed','maxSupportedTransactionVersion':1}])
             _verify_transaction_source(tx,item)
             status=_txg.tx_reverted_reason(tx)
             if status=='tx_unknown':raise ValueError('transaction execution unknown')

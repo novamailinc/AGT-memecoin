@@ -254,7 +254,7 @@ def resolve_deployer(mint: str, chain: str,
             return None
         tx = _rpc("getTransaction",
                   [oldest, {"encoding": "jsonParsed",
-                            "maxSupportedTransactionVersion": 0}]) or {}
+                            "maxSupportedTransactionVersion": 1}]) or {}
         # meta.err gate (2026-11-17, Batch 3): a reverted oldest
         # tx names no deployer — the launch never happened.
         if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,oldest):
@@ -1253,7 +1253,7 @@ def funder_for(deployer: str,
         funder = None
         if sig:
             tx = rpc("getTransaction",
-                     [sig, {"maxSupportedTransactionVersion": 0}])
+                     [sig, {"maxSupportedTransactionVersion": 1}])
             # meta.err gate (2026-11-17, Batch 3): a reverted tx
             # funds nothing — its balances never moved.
             if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,sig):

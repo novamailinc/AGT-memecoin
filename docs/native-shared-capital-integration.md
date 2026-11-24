@@ -1,5 +1,17 @@
 # Native scanner broker and shared demo capital
 
+> Addendum 2026-11-23 (status correction; the original text below is
+> preserved as the historical record): the integration described here as
+> not implemented has since LANDED IN THE TREE — account-wide holds
+> (paper_account.hold_stake/consume_hold_for_entry/settle_hold_fee/
+> release_hold), seal-time admission before effect, crash-pair repair,
+> and the shared-capital entry path in broker/memecoin/shared_capital.py
+> and adapter mode="demo"/"paper". It is covered by the broad-suite
+> evidence bundle published as branch checkpoint/combined-2307
+> (2026-11-23). This addendum asserts code presence and bundle coverage,
+> not a separate review verdict. The boundary rules below still apply
+> as written.
+
 Status: integration gap confirmed offline, not implemented or admitted.
 
 The owner's approved goal is one configurable $10 simulated starting balance for

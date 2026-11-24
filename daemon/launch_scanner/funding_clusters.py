@@ -560,7 +560,7 @@ def resolve_first_funder(wallet, rpc=None, max_pages=_MAX_PAGES):
             return None
         tx = rpc("getTransaction",
                  [sig, {"encoding": "jsonParsed",
-                        "maxSupportedTransactionVersion": 0}])
+                        "maxSupportedTransactionVersion": 1}])
         if not _txg.response_signature_matches(tx, sig):
             return None
         funder = parse_funder_from_tx(tx, wallet)

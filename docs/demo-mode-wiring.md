@@ -1,9 +1,15 @@
-# Demo mode wiring — seam analysis and requirements (in progress)
+# Demo mode wiring — seam analysis and requirements
 
-Status: analysis complete, wiring NOT yet applied. SimulationExecutor +
-DemoExecutionBridge are implemented and tested (tests/test_sim_executor.py,
-tests/test_demo_bridge.py; 17 pytest nodes green). This note is grounded in
-the actual adapter code, not a plan template.
+Status (corrected 2026-11-23): the wiring IS applied. mode="demo" is
+constructed in broker/memecoin/adapter.py (validator accepts "demo";
+bridge wiring in __init__; idempotency/UNKNOWN guard refusing blind
+retry before reconcile_demo_execution(); _demo_fill dispatch). The
+lifecycle matrix below is implemented and green in
+tests/test_demo_adapter_lifecycle.py, plus tests/test_sim_executor.py
+and tests/test_demo_bridge.py. SimulationExecutor + DemoExecutionBridge
+run the same execute_swap contract as MainnetExecutor over REAL Jupiter
+quotes with simulated settlement. The seam analysis below remains the
+design record.
 
 ## User-grounded semantics (from authenticated messages 2026-11-23)
 

@@ -114,7 +114,7 @@ def _funder_of(holder: str, signature: str) -> Optional[str]:
     into the holder; its source is the funder."""
     tx = _rpc("getTransaction",
               [signature, {"encoding": "jsonParsed",
-                           "maxSupportedTransactionVersion": 0}])
+                           "maxSupportedTransactionVersion": 1}])
     try:
         if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx, signature):
             return None
@@ -285,7 +285,7 @@ def _wallet_token_flow(wallet: str, mint: str,
         tx = _behavior_rpc(
             "getTransaction",
             [sig, {"encoding": "jsonParsed",
-                   "maxSupportedTransactionVersion": 0}])
+                   "maxSupportedTransactionVersion": 1}])
         if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx, sig):
             continue
         meta = tx.get("meta") or {}

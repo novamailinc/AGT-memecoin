@@ -100,7 +100,10 @@ def probe_public_get_transaction():
     sig = sigs["body"]["result"][0]["signature"]
     tx = _probe_call(rpc_mod.PUBLIC_URL, "getTransaction",
                      [sig, {"encoding": "jsonParsed",
-                            "maxSupportedTransactionVersion": 0}])
+                            # v1: current-chain txs are version 1 (live
+                            # census 2026-11-23); v0 fails them with
+                            # RPC -32015 and would misreport the probe.
+                            "maxSupportedTransactionVersion": 1}])
     err = (tx["body"] or {}).get("error") or {}
     if tx["http_status"] == 200 and (tx["body"] or {}).get("result") is not None:
         return {"probe": "public_getTransaction_403", "status": "ok",
@@ -384,7 +387,9 @@ def probe_chainstack_current(home=None):
     if sig:
         _one("getTransaction_recent", "getTransaction",
              [sig, {"encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0}])
+                    # v1: current-chain txs are version 1 (live census
+                    # 2026-11-23); v0 fails them with RPC -32015.
+                    "maxSupportedTransactionVersion": 1}])
     else:
         out.append({"probe": "chainstack_getTransaction_recent",
                     "method": "getTransaction", "status": "failed",

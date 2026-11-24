@@ -587,7 +587,10 @@ def _ff_tx_price(engine, sig, mint):
         import reserves as _res
         res = _res.rpc("getTransaction", [sig, {
             "encoding": "json", "commitment": "confirmed",
-            "maxSupportedTransactionVersion": 0}])
+            # v1: current-chain txs are version 1 (live census
+            # 2026-11-23: recent pump txs fail v0 with RPC -32015);
+            # v0 options would misreport them as fetch failures.
+            "maxSupportedTransactionVersion": 1}])
     except Exception as e:
         return None, "migration tx fetch failed: %s" % e
     if not isinstance(res, dict):

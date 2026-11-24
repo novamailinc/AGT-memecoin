@@ -144,7 +144,9 @@ def _f(value: Any) -> float:
 def _bought_mints(wallet: str, signature: str):
     """None is unavailable/invalid, set() is a successful no-increase."""
     from .wallet_transaction import wallet_balance_evidence
-    tx=_rpc('getTransaction',[signature,{'encoding':'jsonParsed','maxSupportedTransactionVersion':0}])
+    # v1: current-chain txs are version 1 (live census 2026-11-23);
+    # v0 options fail them with RPC -32015.
+    tx=_rpc('getTransaction',[signature,{'encoding':'jsonParsed','maxSupportedTransactionVersion':1}])
     evidence=wallet_balance_evidence(wallet,signature,tx)
     if evidence is None:return None
     return {mint for mint,amount in evidence['after'].items()

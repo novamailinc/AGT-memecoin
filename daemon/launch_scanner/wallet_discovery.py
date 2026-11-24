@@ -180,7 +180,7 @@ def early_buyers_for_mint(rpc: Callable[[str, List[Any]], Any],
             try:
                 tx = rpc("getTransaction",
                          [sig, {"encoding": "jsonParsed",
-                                "maxSupportedTransactionVersion": 0}]) or {}
+                                "maxSupportedTransactionVersion": 1}]) or {}
                 if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx, sig):
                     continue
                 response_time = tx.get("blockTime")

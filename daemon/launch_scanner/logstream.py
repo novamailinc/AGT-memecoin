@@ -641,7 +641,7 @@ class LogStream:
         self._last_tx_evidence = {"recorded": False, "completeness": "unrecorded", "method": "getTransaction"}
         tx = self._http_rpc("getTransaction",
                             [sig, {"encoding": "jsonParsed",
-                                    "maxSupportedTransactionVersion": 0}])
+                                    "maxSupportedTransactionVersion": 1}])
         if not isinstance(tx, dict):
             return None
         # meta.err gate (2026-11-17, Batch 3): the envelope

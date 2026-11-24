@@ -783,8 +783,19 @@ class ChainstackWorkload:
     def fetch_block(self, slot, recent=False, **kw):
         return fetch_block(self.router, slot, recent=recent, **kw)
 
-    def fetch_signatures(self, address, **kw):
+    def fetch_signatures(self, address, recent=False, **kw):
+        # ``recent`` is accepted for interface symmetry with
+        # fetch_block/fetch_transaction: the signatures API is
+        # inherently most-recent-first, so there is no recency window
+        # to declare and the flag intentionally goes no further.
         return fetch_signatures(self.router, address, **kw)
+
+    def fetch_account_state(self, address, priority=PRIORITY_CARD):
+        # Mirrors the module function's exact signature: no **kw, so
+        # unsupported kwargs fail loudly at the wrapper instead of
+        # being silently forwarded (reviewer contract note 2026-11-23).
+        return fetch_account_state(self.router, address,
+                                   priority=priority)
 
     def reconstruct(self, address, **kw):
         return reconstruct_market_activity(self.router, address, **kw)

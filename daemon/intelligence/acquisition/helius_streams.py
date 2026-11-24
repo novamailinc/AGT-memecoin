@@ -685,6 +685,9 @@ class HeliusParsedStreamClient:
         self._wss_url = wss_url  # never logged (carries the key)
         self._router = router
         self._factory = ws_factory or self._default_factory
+        # Real transport (no injected factory) must pass shared-account
+        # admission explicitly; injected factories are offline fakes.
+        self._real_transport = ws_factory is None
         self._on_event = on_event
         self._now = now
         # Persistent usage accounting (Phase 3, D-07): when a
@@ -716,6 +719,8 @@ class HeliusParsedStreamClient:
         self.last_connect_ts = None
         self.last_disconnect_ts = None
         self.last_message_ts = None
+        self.accounting_failures = 0
+        self._accounting_blocked = False
         self._backoff_s = RECONNECT_BASE_S
         self._pending = {}     # local_id -> label (subscribe acks)
 
@@ -911,7 +916,8 @@ class HeliusParsedStreamClient:
         self.last_connect_ts = self._time()
         self._backoff_s = RECONNECT_BASE_S
         # Shared-account handshake accounting (success).
-        self._report_ws_result(None)
+        if not self._report_ws_result(None):
+            return
         # Live records, not copies: _send_subscribe registers the
         # entry in _pending so the subscribe ack can record the
         # server id back onto the SAME dict.
@@ -922,20 +928,28 @@ class HeliusParsedStreamClient:
 
     def _report_ws_result(self, error):
         """Shared-account handshake accounting for this stream's URL.
-        Accounting must never break the stream, so failures here are
-        logged, not raised."""
+        Accounting must never break the stream: failures are counted
+        (accounting_failures, surfaced in stats()) and logged."""
         from . import routine as _routine
         try:
             _routine.websocket_result(self._wss_url, error)
+            return True
         except Exception:
+            self.accounting_failures += 1
+            self._accounting_blocked = True
+            self.stop()
             logger.warning("parsed-stream result accounting failed",
                            exc_info=True)
+            return False
 
     def _report_subscription_throttled(self):
         from . import routine as _routine
         try:
             _routine.websocket_subscription_throttled(self._wss_url)
         except Exception:
+            self.accounting_failures += 1
+            self._accounting_blocked = True
+            self.stop()
             logger.warning("parsed-stream throttle accounting failed",
                            exc_info=True)
 
@@ -947,6 +961,15 @@ class HeliusParsedStreamClient:
             self.handshake_429s += 1
             self._record_usage("parsed_streams/handshake",
                                "rate_limited")
+            # A shared-account rate limit is a HOLD: reflect it in
+            # connection state and close so the backoff reconnect
+            # applies the hold instead of marching on connected.
+            self.connected = False
+            try:
+                if self._ws is not None:
+                    self._ws.close()
+            except Exception:
+                pass
         else:
             logger.warning("parsed-stream WS error: %s", text[:200])
 
@@ -966,6 +989,8 @@ class HeliusParsedStreamClient:
         Subscriptions are sent from ``_on_open`` only, never from
         here. Refuses when unconfigured (no URL) or when the router
         refuses the stream."""
+        if self._accounting_blocked:
+            return False
         if not self.configured():
             return False
         decision = self.route_check()
@@ -981,7 +1006,13 @@ class HeliusParsedStreamClient:
         # an unrecognized host returns False = "no shared guard
         # applies" and proceeds unchanged (test fakes, diagnostics).
         from . import routine as _routine
-        _routine.websocket_admit(self._wss_url)
+        admitted = _routine.websocket_admit(self._wss_url)
+        if admitted is not True and self._real_transport:
+            # Fail closed: a real socket whose URL the shared-account
+            # guard does not recognize must NOT proceed.
+            logger.warning("parsed-stream connect refused: URL outside "
+                           "shared-account admission policy")
+            return False
         self.connect_attempts += 1
         try:
             self._ws = self._factory(
@@ -1019,9 +1050,25 @@ class HeliusParsedStreamClient:
 
     def run_forever(self, sleep=time.sleep):
         """Connect, then reconnect with backoff until stop() is
-        called. Intended for a daemon thread."""
+        called. Intended for a daemon thread. A shared-account
+        admission denial (budget hold, cooldown, account disabled)
+        backs off and keeps the worker alive; it never kills the
+        thread and never bypasses the hold."""
+        from .routine import WebsocketAdmissionError
         while not self._stop.is_set():
-            if self.connect():
+            try:
+                connected = self.connect()
+            except WebsocketAdmissionError as exc:
+                logger.warning("parsed-stream admission denied: %s "
+                               "— backing off", str(exc)[:160])
+                self.last_disconnect_ts = self._time()
+                wait = self._schedule_reconnect()
+                if sleep is time.sleep:
+                    self._stop.wait(wait)
+                else:
+                    sleep(wait)
+                continue
+            if connected:
                 try:
                     self._ws.run_forever()
                 except Exception:
@@ -1031,7 +1078,10 @@ class HeliusParsedStreamClient:
             if self._stop.is_set():
                 break
             wait = self._schedule_reconnect()
-            sleep(wait)
+            if sleep is time.sleep:
+                self._stop.wait(wait)
+            else:
+                sleep(wait)
 
     def stop(self):
         self._stop.set()
@@ -1045,6 +1095,8 @@ class HeliusParsedStreamClient:
     def stats(self):
         out = {"provider": "helius", "stream": "parsed_streams",
                 "connected": self.connected,
+                "accounting_failures": self.accounting_failures,
+                "accounting_blocked": self._accounting_blocked,
                 "connect_attempts": self.connect_attempts,
                 "reconnects": self.reconnects,
                 "handshake_429s": self.handshake_429s,

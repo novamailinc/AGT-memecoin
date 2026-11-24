@@ -1,3 +1,13 @@
+> STATUS CORRECTION (20:53 PST): Selected live calls and socket delivery
+> are evidence of provider capability only, NOT complete assigned-job
+> production integration. The initial patch was incomplete; v2 introduced
+> lifecycle defects caught by independent review. Current lifecycle edits
+> pass 8 causal offline tests and the existing 105 stream checks, but are
+> still pending independent review. Candidate-pipeline consumption and
+> continuous/recovery/speed qualification remain incomplete. Alchemy WSS
+> remains blocked; its app dashboard shows Solana WSS disabled, cause and
+> free remedy unestablished. HTTPS success is not push equivalence.
+
 # Provider assigned-job live validation — 2026-11-23
 
 Scope: read-only, free-tier/shared-quota live execution of each provider's
@@ -60,7 +70,7 @@ production defects.
   `940fa69f-ff15-4cba-b6a5-e2dba3b97fbc`, 2026-11-24 04:35:36 UTC.
 - The endpoint matches Alchemy's current Solana PubSub documentation
   exactly (`wss://solana-mainnet.streaming.alchemy.com/v2/<APP KEY>`),
-  so this is not a code/endpoint defect. Whether the cause is plan tier
+  so the tested URL matches the documented host. Whether the cause is plan tier
   or an app-side capability/setting cannot be distinguished from here —
   it needs an Alchemy dashboard/console check. No paid upgrade is
   recommended or authorized on this evidence alone.

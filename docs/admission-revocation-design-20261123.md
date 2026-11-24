@@ -82,7 +82,7 @@ re-validates it cheaply (cached verdict with explicit staleness bound,
 fail closed on unreadable). This converts post-qualification decay
 into automatic revocation.
 
-## Fix order and rationale
+## Candidate fix order, NOT an implementation plan
 
 1. **B** (send-time `armed` re-check): executor-local, fail-closed,
    closes the live revocation hole with the least surface change.
@@ -96,3 +96,16 @@ into automatic revocation.
 Non-goals for this pass: no mainnet activation, no marker or key
 material creation, no change to shared-quota/fail-closed limits, no
 weakening of any existing refusal to obtain a green test.
+
+
+## Blocking design constraints, unresolved
+
+The B -> C -> A ordering above is withdrawn as an executable plan.
+A blanket executor denial could strand verified reductions and exits.
+execute_swap currently has no trustworthy action/position/amount contract
+that distinguishes exposure increases from bounded reductions. Resolve
+that contract and recover the original revocation/exit policy before any
+send-time gate implementation. Do not invent qualification staleness,
+risk thresholds, exit authority or an automatic-close policy. This
+analysis grants no activation or implementation authority and changes
+no runtime gate. Entries and reductions need separate grounded decisions.

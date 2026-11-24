@@ -104,7 +104,12 @@ HELIUS_WSS_HOSTS = frozenset(
 
 
 def _is_helius_ws_host(host):
-    return host in HELIUS_WSS_HOSTS
+    """Recognize Helius WebSocket hosts for the shared-account guard.
+    Normalizes case and a trailing dot so a real Helius URL cannot
+    evade the guard as 'BETA.helius-rpc.com' or 'beta.helius-rpc.com.';
+    a lookalike ('beta.helius-rpc.com.evil.example') still fails."""
+    h = (host or '').strip().lower().rstrip('.')
+    return h in HELIUS_WSS_HOSTS
 
 
 def websocket_admit(url, critical=False):

@@ -1038,18 +1038,19 @@ class LaunchScanner(Daemon):
 
     # -- Helius Parsed Streams (selective enriched intelligence) ------
     def _ensure_parsed_stream(self, config) -> None:
-        """Construct and start the Helius parsed-stream client once per
-        daemon life. OFF unless ``config.degen.parsed_stream_enabled``:
-        how parsed events feed the candidate pipeline is an undecided
-        design question, so enabling is an explicit operator decision.
-        When enabled, routing, subscription validation, shared-account
-        admission and handshake accounting are all in force (the
-        client passes the same websocket_admit/result guard as the
-        logstream and armed-watch consumers)."""
-        if not getattr(config.degen, "parsed_stream_enabled", False):
+        """Start the Helius parsed-stream worker once per daemon life.
+        Requires ``config.degen.parsed_stream_enabled is True``
+        exactly — a truthy string like "false" must NOT enable it.
+        The worker owns the whole lifecycle (run_forever connects,
+        reconnects with backoff, and survives shared-account admission
+        holds); this method never connects directly. If the worker
+        exits unexpectedly the reference clears so a later cycle can
+        start a fresh one. Routing, subscription validation,
+        shared-account admission and handshake accounting are all in
+        force inside the client."""
+        if getattr(config.degen, "parsed_stream_enabled", False) is not True:
             return
-        st = getattr(self, "_parsed_stream", None)
-        if st is not None:
+        if getattr(self, "_parsed_stream", None) is not None:
             return
         from daemon.intelligence.acquisition import (
             helius_streams, routine)
@@ -1067,20 +1068,50 @@ class LaunchScanner(Daemon):
             logger.warning("parsed stream subscribe refused: %s", note)
             return
         import threading as _th
-        st.connect()
-        _th.Thread(target=st.run_forever, daemon=True,
-                   name="parsed-stream").start()
         self._parsed_stream = st
-        logger.warning("parsed stream: started (event consumer pending "
-                       "design decision)")
+
+        def _run():
+            try:
+                st.run_forever()
+            except Exception:
+                logger.exception("parsed stream worker exited")
+            finally:
+                # Clear the reference so the next cycle's ensure can
+                # start a fresh worker instead of retaining a dead one.
+                if getattr(self, "_parsed_stream", None) is st:
+                    self._parsed_stream = None
+
+        _th.Thread(target=_run, daemon=True,
+                   name="parsed-stream").start()
+        logger.warning("parsed stream: worker started")
+
+    def _stop_parsed_stream(self) -> None:
+        st = getattr(self, "_parsed_stream", None)
+        if st is not None:
+            st.stop()
+            self._parsed_stream = None
+
+    def _handle_signal(self, signum, frame):
+        super()._handle_signal(signum, frame)
+        self._stop_parsed_stream()
+
+    def run_forever(self):
+        try:
+            return super().run_forever()
+        finally:
+            self._stop_parsed_stream()
 
     def _on_parsed_stream_event(self, event) -> None:
-        """Placeholder consumer: count and log only. Routing parsed
-        events into detection is the pending design decision; until
-        then no event may influence candidates or trades."""
-        logger.info("parsed stream event slot=%s sig=%s",
+        """Diagnostic delivery only. Candidate integration is NOT
+        implemented: the existing acceptance matrix explicitly calls
+        this delivery evidence, not full intelligence integration.
+        A decoded event is not a raw Solana transaction and cannot be
+        passed to SelectiveEnrichment.submit as if it were one.
+        No candidate state or trade authority changes here."""
+        logger.info("parsed stream event slot=%s sig=%s status=%s",
                     event.get("slot"),
-                    str(event.get("signature") or "")[:12])
+                    str(event.get("signature") or "")[:12],
+                    event.get("verification_status"))
 
     def _drain_logstream(self, config, adapter,
                          state: Dict[str, Any]) -> None:

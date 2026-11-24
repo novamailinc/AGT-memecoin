@@ -13,6 +13,7 @@ from daemon.launch_scanner import LaunchScanner
 class Lifecycle(unittest.TestCase):
     def client(self):
         c=hs.HeliusParsedStreamClient(wss_url='wss://beta.helius-rpc.com/?api-key=fixture',usage_store=MagicMock(),account_home=tempfile.mkdtemp())
+        c._usage_store.record.return_value={}
         c._factory=MagicMock()
         return c
     def test_unknown_real_url_refused_before_factory(self):

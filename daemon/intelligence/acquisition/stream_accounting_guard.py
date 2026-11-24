@@ -5,6 +5,8 @@ must refuse admission until that evidence is reconciled, never erase it on
 restart. Markers contain no key or event payload. No automatic reset.
 """
 import contextlib
+import json
+import time
 import os
 from pathlib import Path
 import uuid
@@ -24,12 +26,15 @@ def allowed(home):
 
 
 @contextlib.contextmanager
-def recording(home):
+def recording(home, evidence=None):
     p=root(home); f=p/(uuid.uuid4().hex+'.pending')
     try:
         p.mkdir(parents=True,exist_ok=True)
+        parent=os.open(p.parent,os.O_RDONLY)
+        try:os.fsync(parent)
+        finally:os.close(parent)
         fd=os.open(f,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-        try:os.write(fd,b'accounting outcome unresolved\n');os.fsync(fd)
+        try:os.write(fd,json.dumps({'id':f.stem,'created':time.time(),'state':'unresolved','evidence':evidence or {}},allow_nan=False).encode());os.fsync(fd)
         finally:os.close(fd)
         directory=os.open(p,os.O_RDONLY)
         try:os.fsync(directory)

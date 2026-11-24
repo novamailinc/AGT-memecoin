@@ -835,12 +835,15 @@ class HeliusParsedStreamClient:
             return None
         from . import stream_accounting_guard
         try:
-            with stream_accounting_guard.recording(self._account_home):
-                return store.record(
+            with stream_accounting_guard.recording(self._account_home, {'method':method,'kind':kind,'cost':cost}):
+                result = store.record(
                     account="helius_main", provider="helius",
                     method=method, workload=PARSED_TX_STREAM,
                     priority=PRIORITY_CARD, helius_priority=None,
-                    cost=cost, kind=kind, elapsed=elapsed)
+                    cost=cost, kind=kind, elapsed=elapsed, strict=True)
+                if not isinstance(result, dict):
+                    raise OSError("usage write returned no durable record")
+                return result
         except Exception:
             self.accounting_failures += 1
             self._accounting_blocked = True

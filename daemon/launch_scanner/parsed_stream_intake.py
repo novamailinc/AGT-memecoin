@@ -69,7 +69,15 @@ class ParsedStreamIntake(StreamIntake):
     def drain(self):
         # Same bounded per-pass pending-detail batch as LogStream._retry_pending.
         for sig,rec in [(s,r) for s,r in self.pending().items() if not r.get('mint')][:10]:
-            self._resolve_pending(sig,rec)
+            try:
+                self._resolve_pending(sig,rec)
+            except (OSError,ValueError,TypeError):
+                # Preserve evidence and rotate: one poison/detail failure
+                # cannot starve independent signatures behind it.
+                pass
+            finally:
+                if not self.pending().get(sig,{}).get("mint"):
+                    self.defer(sig)
         return [dict(rec,signature=sig) for sig,rec in self.pending().items() if rec.get('mint')]
 
     def acknowledge(self,signatures):

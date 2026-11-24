@@ -163,7 +163,7 @@ def websocket_result(url, error=None):
         # Cost is unknown, never fabricated as zero or a standard RPC cost.
         r.usage.record('helius_main','helius','websocket/handshake',
                        'routine_websocket',PRIORITY_BACKGROUND,cost=None,
-                       kind='rate_limited' if throttled else ('ok' if error is None else 'transport'))
+                       kind='rate_limited' if throttled else ('ok' if error is None else 'transport'), strict=True)
         r.health.persist()
         return
     if not url or 'alchemy.com' not in (urlsplit(url).hostname or ''):

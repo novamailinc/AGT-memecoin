@@ -56,3 +56,13 @@ class CandidateIntake(unittest.TestCase):
         self.event['status']='error';self.assertFalse(self.q.receive_event(self.event));self.reader.assert_not_called()
 
 if __name__=='__main__':unittest.main()
+
+class FairRetry(CandidateIntake):
+    def test_ten_poison_records_cannot_starve_valid_eleventh(self):
+        for i in range(10):
+            bad=copy.deepcopy(self.event);bad['signature']='poison-%d'%i;self.q.receive_event(bad)
+        self.q.receive_event(self.event)
+        self.assertEqual(self.q.drain(),[])
+        rows=self.q.drain();self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['signature'],self.event['signature'])
+        self.assertEqual(len(self.q.pending()),11)

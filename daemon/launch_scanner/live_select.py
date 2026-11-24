@@ -124,8 +124,9 @@ def _preregistration():
             "max_grad_age_s": MAX_GRAD_AGE_S,
             "daily_loss_cap_usd": DAILY_LOSS_CAP_USD,
             "runner_rule_applies": False,
-            "safety_gate": "NONE (by design — mirrors paper grad_select)",
-            "veto": "NONE (by design — mirrors paper grad_select)",
+            "paper_equivalent": False,  # live carries mandatory safety/veto; paper grad_select does not
+            "safety_gate": "grad._safety_ok (RugCheck / on-chain fallback; unknown is not a pass). MANDATORY (directive 11/25)",
+            "veto": "grad._veto_ok, fail-closed when the veto engine is unavailable. MANDATORY",
             "ladder": "50%@2x / 25%@3x / 25% trail 30% / -50% stop / 24h",
             "execution": "mainnet Jupiter swaps via MainnetExecutor; "
                          "dry-run default; armed only on the "
@@ -513,6 +514,27 @@ def stamp_entry_execution(engine, mint, details):
 
 
 # -- engine factory -----------------------------------------------------
+
+def _install_mandatory_gates(eng):
+    """Keep the engine's real safety and veto, refuse the raw no-gate stubs, and make the veto fail CLOSED: grad._veto_ok
+    treats an engine exception as "no evidence" and passes, which is acceptable for paper research but not for a lane that
+    spends real money (directive section 25: never open positions when critical intelligence is unreliable)."""
+    stubs = set()
+    if _raw is not None:
+        stubs = {_raw._no_safety_gate, _raw._no_veto}
+    base_safety, base_veto = getattr(eng, "_safety_ok", None), getattr(eng, "_veto_ok", None)
+    if not callable(base_safety) or not callable(base_veto) or base_safety in stubs or base_veto in stubs:
+        raise BrokerError("config_invalid",
+                          "live engine refused: mandatory safety/veto gates missing or replaced by no-op stubs")
+
+    def _veto_fail_closed(mint, symbol, safety_report):
+        ok, why = base_veto(mint, symbol, safety_report)
+        if ok and str(why or "").startswith("veto unavailable"):
+            return False, "live lane: veto engine unavailable, entry refused (fail closed): %s" % why
+        return ok, why
+
+    eng._veto_ok = _veto_fail_closed
+
 def make_live_engine(home, executor):
     """Load grad.py as a fresh, isolated module and override its
     lane policy for the LIVE lane: live ledger/limits/
@@ -546,9 +568,13 @@ def make_live_engine(home, executor):
     eng.DAILY_ENTRY_CAP = DAILY_ENTRY_CAP
     eng.MAX_GRAD_AGE_S = MAX_GRAD_AGE_S
     eng.BANKROLL_START = BANKROLL_START
-    if _raw is not None:
-        eng._safety_ok = _raw._no_safety_gate
-        eng._veto_ok = _raw._no_veto
+    # MANDATORY SAFETY (original owner directive sections 11 and 25, recovered from the owner's own message
+    # 2026-11-22 14:25 PST): every proposed REAL-MONEY trade passes enforceable token-safety and veto checks, and the bot
+    # never opens positions on unreliable critical intelligence. This lane therefore keeps grad.py's real, fail-closed
+    # _safety_ok (RugCheck / on-chain fallback; unknown is not a pass) and _veto_ok. The raw no-gate stubs belong to the
+    # experimental research lanes only and are refused here. NOTE: this makes the live lane NOT equivalent to paper
+    # grad_select, so paper results must not be read as live evidence.
+    _install_mandatory_gates(eng)
     eng._preregistration = _preregistration
     fills = LiveFills(executor, fail_streak)
     eng._fills = fills

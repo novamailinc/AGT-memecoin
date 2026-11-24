@@ -34,6 +34,7 @@ from broker.memecoin.execution.mainnet_executor import (
     MainnetExecutor, SOL_MINT)
 from daemon.launch_scanner import killswitch as _ks
 from daemon.launch_scanner import live_select
+from daemon.launch_scanner import grad_raw as _raw  # fixture only (see _fixture_no_gates)
 
 # DISCLOSED TEST EDIT (CI run 146, stale vs the mandatory entry guard): entries are refused unless the shared paper account
 # is enabled with every mandatory limit set. TEST-FIXTURE limits (not owner values); no guard is waived or patched and no
@@ -201,12 +202,22 @@ def _seed_pos(engine, mint, entry_ts):
         engine._write(d)
 
 
+
+def _fixture_no_gates(eng):
+    """TEST FIXTURE ONLY (disclosed 2026-11-24): live_select now keeps the mandatory fail-closed safety and veto, which need
+    live RugCheck/on-chain data. These tests exercise size caps, halts and fail-streaks, not token safety, so they replace
+    ONLY the two gate callables on their own engine. The gates themselves are tested in test_live_select_gates."""
+    eng._safety_ok = _raw._no_safety_gate
+    eng._veto_ok = _raw._no_veto
+    return eng
+
+
 def main():
     tmp = _TMP
     now = time.time()
     trader = _load_trader()
     fake = SafetyFakeExecutor()
-    live = live_select.make_live_engine(tmp, fake)
+    live = _fixture_no_gates(live_select.make_live_engine(tmp, fake))
     live.ensure_ledger()
     live.quote_price = lambda chain, m: ENTRY
     live._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
@@ -247,7 +258,7 @@ def main():
     # with a topped-up ledger bankroll opens 6, and the 7th is
     # refused for MAX_OPEN, not bankroll.
     tmp2 = tempfile.mkdtemp(prefix="live_safety_maxopen_")
-    live2 = live_select.make_live_engine(tmp2, fake)
+    live2 = _fixture_no_gates(live_select.make_live_engine(tmp2, fake))
     live2.ensure_ledger()
     live2.quote_price = lambda chain, m: ENTRY
     live2._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
@@ -377,7 +388,7 @@ def main():
 
     # -- dry-run: simulates, never sends, never opens -------------------
     dry_fake = SafetyFakeExecutor(dry_run=True)
-    dry_live = live_select.make_live_engine(tmp, dry_fake)
+    dry_live = _fixture_no_gates(live_select.make_live_engine(tmp, dry_fake))
     dry_live.quote_price = lambda chain, m: ENTRY
     dry_live._fresh_tape = lambda m: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 50000.0,
                                       "usd_market_cap": 100000.0,

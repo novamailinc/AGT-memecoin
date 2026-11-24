@@ -303,6 +303,17 @@ def _close_legs(eng):
              for k, v in c["legs"].items()})
 
 
+
+def _fixture_no_gates(eng):
+    """TEST FIXTURE ONLY (disclosed 2026-11-24): live_select now keeps the mandatory fail-closed safety and veto, which need
+    live RugCheck/on-chain data. This test exercises something else (see module docstring) and the paper engine it compares
+    against already runs with the no-gate stubs, so ONLY the two gate callables on this live engine are replaced. The gates
+    themselves are tested in test_live_select_gates."""
+    eng._safety_ok = _raw._no_safety_gate
+    eng._veto_ok = _raw._no_veto
+    return eng
+
+
 def main():
     tmp = _TMP
     now = time.time()
@@ -311,7 +322,7 @@ def main():
     # -- scenario 1: the ladder --------------------------------------
     mint1 = _mint("ladder")
     paper = _paper_engine(tmp)
-    live = live_select.make_live_engine(tmp, fake)
+    live = _fixture_no_gates(live_select.make_live_engine(tmp, fake))
     os.makedirs(os.path.dirname(paper.LEDGER_PATH), exist_ok=True)
     paper.ensure_ledger()
     live.ensure_ledger()

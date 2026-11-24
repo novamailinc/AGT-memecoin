@@ -166,8 +166,10 @@ check("distinct position instances per lane",
 # Retry dedupe is per-lane: replaying grad's exact entry op_id must
 # return grad's original outcome without touching grad_raw's debit.
 before = PA.snapshot()["cash"]
-qty_g = 1.0 / G._load()["positions"]["SAME11pump"]["entry_price"]
-qty_e = 25.0 / eng._load()["positions"]["SAME11pump"]["entry_price"]
+# Account units are the LANE's token units (net of entry gas), not stake/price:
+# the replay must present the same qty the entry recorded (commit c0e79a0 contract).
+qty_g = float(G._load()["positions"]["SAME11pump"]["tokens"])
+qty_e = float(eng._load()["positions"]["SAME11pump"]["tokens"])
 ok_r, why_r, pid_r = PA.try_debit(
     "grad", "SAME11pump", 1.0, qty_g,
     "grad:entry:SAME11pump:%d" % int(BORN * 1000))

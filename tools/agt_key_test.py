@@ -112,8 +112,9 @@ def build_probes(env):
 
 
 def host_of(url):
+    # parsed hostname only: userinfo, port, path and query never reach the output
     try:
-        return urlsplit(url).netloc
+        return urlsplit(url).hostname or "?"
     except ValueError:
         return "?"
 
@@ -154,9 +155,13 @@ def check(url, secrets, timeout=30):
         method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status, text = resp.status, resp.read().decode()[:200]
+            status, text = resp.status, resp.read().decode("utf-8", "replace")[:200]
     except urllib.error.HTTPError as exc:
-        status, text = exc.code, exc.read().decode()[:200]
+        try:
+            body = exc.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            body = ""
+        status, text = exc.code, body
     except Exception as exc:  # report, never crash the run
         status, text = None, "%s" % type(exc).__name__
     return status, redact(text, secrets)

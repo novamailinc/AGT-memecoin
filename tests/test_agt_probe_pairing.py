@@ -217,3 +217,47 @@ def test_pairing_envs_stay_out_of_the_manifest_inventory():
     listed = {e["name"] for e in manifest["required_env"]
               + manifest["optional_env"]}
     assert listed == names
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:pw-secret@node.example.invalid/path?key=qs-secret",
+    "https://pw-secret@node.example.invalid:8443/x",
+    "https://:pw-secret@node.example.invalid",
+])
+def test_host_of_never_returns_userinfo_port_path_or_query(url):
+    h = PROBE.host_of(url)
+    assert h == "node.example.invalid" and "secret" not in h and "@" not in h
+
+
+@pytest.mark.parametrize("url", ["not a url", "https://[bad", ""])
+def test_host_of_unparseable_is_placeholder(url):
+    assert PROBE.host_of(url) == "?"
+
+
+def test_userinfo_endpoint_secret_not_in_live_or_offline_output(capsys):
+    ep = "https://user:pw-secret@chainstack.example.invalid/tok-secret"
+    env = full_env(CHAINSTACK_ENDPOINT=ep)
+    PROBE.main([], env=env)
+    PROBE.main(["--live"], env=env, opener=_opener([OK] * 5))
+    out = capsys.readouterr().out
+    assert "pw-secret" not in out and "tok-secret" not in out and "user:" not in out
+
+
+def test_check_survives_non_utf8_http_error_body(monkeypatch):
+    import io, urllib.error
+    def err(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 502, "bad", {}, io.BytesIO(b"\xff\xfe bad key " + U1.encode()))
+    monkeypatch.setattr(PROBE.urllib.request, "urlopen", err)
+    status, text = PROBE.check("https://h.example.invalid/x", [U1])
+    assert status == 502 and U1 not in text
+
+
+def test_check_survives_non_utf8_200_body(monkeypatch):
+    import io
+    class R(io.BytesIO):
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(PROBE.urllib.request, "urlopen", lambda req, timeout=0: R(b"\xff\xfe"))
+    status, text = PROBE.check("https://h.example.invalid/x", [])
+    assert status == 200 and not PROBE.healthy(status, text)

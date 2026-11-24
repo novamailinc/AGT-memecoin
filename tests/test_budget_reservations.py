@@ -200,3 +200,62 @@ def test_exhausted_credit_budget_makes_no_transport_attempt(tmp_path,monkeypatch
         p.return_value.acquire.return_value=True
         r.call('getTransaction',['fixture'],max_attempts=1)
     assert calls==[]
+
+
+def test_unknown_outcome_blocks_cross_provider_failover(tmp_path,monkeypatch):
+    # Unknown post-I/O outcome on Helius: the router must NOT move to
+    # the next PROVIDER either, even with max_attempts>1. An uncertain
+    # request is never retried anywhere.
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    monkeypatch.setenv('ALCHEMY_API_KEY','fixture-alchemy')
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':100,'unit':'credits'}})
+    calls=[]
+    def transport(req,timeout=None):
+        calls.append(1)
+        raise TimeoutError('fixture uncertainty')
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=transport)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        out=r.call('getBalance',['fixture'],max_attempts=3)
+    assert out['kind']=='timeout'
+    assert len(calls)==1  # no second key, no second provider
+    attempted=[a for a in out['attempts'] if a['kind']!='skipped']
+    assert len(attempted)==1 and attempted[0]['provider']=='helius'
+
+
+def test_answered_rpc_error_still_fails_over(tmp_path,monkeypatch):
+    # An ANSWERED outcome (JSON-RPC error body: the vendor definitively
+    # processed and refused the request) is not uncertain; failover
+    # semantics for answered outcomes are unchanged.
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':100,'unit':'credits'}})
+    def transport(req,timeout=None):
+        return type('R',(),{'read':staticmethod(lambda:b'{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}'),'status':200,'headers':{},'__enter__':lambda s:s,'__exit__':lambda s,*a:False})()
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_REVISED,transport=transport)
+    with patch('daemon.launch_scanner.helius_ratelimit.pacer') as p:
+        p.return_value.acquire.return_value=True
+        out=r.call('getBalance',['fixture'],max_attempts=3)
+    # The answered outcome was NOT treated as uncertain: no unknown
+    # marker, no no-failover note. (An answered RPC-level refusal is
+    # terminal in the router's pre-existing semantics - every provider
+    # would answer identically - so no failover is expected here; the
+    # property under test is that it is not misclassified as unknown.)
+    assert out.get('outcome_unknown') is not True
+    assert all('no failover' not in (a.get('note') or '') for a in out['attempts'])
+
+
+def test_pre_io_attempts_counted_zero(tmp_path,monkeypatch):
+    # transport_attempts precision: pre-I/O outcomes (unconfigured,
+    # unsupported) consume zero attempt budget; a real send consumes
+    # exactly one. The router's remaining-budget handoff depends on it.
+    from daemon.intelligence.acquisition.providers.alchemy import AlchemyAdapter
+    monkeypatch.delenv('ALCHEMY_API_KEY',raising=False)
+    a=AlchemyAdapter(home=str(tmp_path))
+    a._transport=lambda req,timeout=None:(_ for _ in ()).throw(AssertionError('must not be called'))
+    out=a.call('getBalance',['x'])
+    assert out['kind']=='unconfigured' and out['transport_attempts']==0
+    a2=AlchemyAdapter(home=str(tmp_path))
+    monkeypatch.setattr('daemon.intelligence.acquisition.providers.base._alchemy_credential_key',lambda home=None:'fixture')
+    a2._transport=lambda req,timeout=None:(_ for _ in ()).throw(TimeoutError('fixture'))
+    out2=a2.call('getBalance',['x'])
+    assert out2['kind']=='timeout' and out2['transport_attempts']==1 and out2['outcome_unknown'] is True

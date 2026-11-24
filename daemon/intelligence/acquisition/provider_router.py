@@ -950,6 +950,32 @@ class ProviderRouter:
             else:
                 result = adapter.call(method, params, timeout=timeout)
             transport_attempts += int(result.get("transport_attempts") or 1)
+            if result.get("outcome_unknown"):
+                # Unknown post-I/O outcome: an uncertain request is
+                # never retried - not on another key (adapter-internal)
+                # and not on another provider. Fail over only on
+                # answered outcomes or proven pre-I/O skips.
+                result['budget_reservation_id']=reservation_id
+                result['budget_reservation_policy']=reservation_reason
+                attempts.append({"provider": provider,
+                                 "kind": result["kind"],
+                                 "elapsed_s": round(result["elapsed"], 4),
+                                 "note": (result.get("note") or "") + " [no failover: outcome unknown]",
+                                 "credential_source":result.get('credential_source'),
+                                 "account":account})
+                self.health.record_rpc(result)
+                self.breaker.record(provider, result)
+                self.usage.record(account, provider, method, workload,
+                                  priority, helius_priority=prio,
+                                  cost=adapter.cost(method),
+                                  kind=result["kind"],
+                                  elapsed=result["elapsed"],
+                                  fallback=provider != decision["primary"],
+                                  fallback_difference=fallback_difference(
+                                      decision["primary"], provider, method,
+                                      workload))
+                last = result
+                break
             result['budget_reservation_id']=reservation_id
             result['budget_reservation_policy']=reservation_reason
             attempts.append({"provider": provider,

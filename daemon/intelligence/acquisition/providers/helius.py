@@ -65,8 +65,10 @@ class HeliusAdapter(BaseProviderAdapter):
         try:
             from daemon.launch_scanner import reserves
         except Exception:
-            return _result(None, "unconfigured", time.monotonic() - start,
-                           self.name, note="reserves module unavailable")
+            out = _result(None, "unconfigured", time.monotonic() - start,
+                          self.name, note="reserves module unavailable")
+            out["transport_attempts"] = 0  # pre-I/O: nothing sent
+            return out
         try:
             out, rkind = reserves.helius_rpc_typed(method, params, timeout=timeout)
         except Exception:
@@ -210,6 +212,7 @@ def revised_call(adapter,method,params,timeout,max_transport_attempts=None):
             out['credential_source']=label
             out['account']='helius_main'
             out['transport_attempts']=transport_attempts
+            out['outcome_unknown']=True
             return out
         if kind=='rate_limited':helius_account.throttled(adapter.home,wait,rl_kind=='monthly_quota')
         if kind in ('ok','rate_limited'):pacer.report(bucket,kind=='ok')

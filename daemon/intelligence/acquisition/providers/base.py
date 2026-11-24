@@ -455,13 +455,17 @@ class _HttpAdapter(BaseProviderAdapter):
     def call(self, method, params, timeout=12):
         start = time.monotonic()
         if not self.supports(method):
-            return _result(None, "unsupported", 0.0, self.name,
-                           note="%s does not serve %s on its free tier"
-                           % (self.name, method))
+            out = _result(None, "unsupported", 0.0, self.name,
+                          note="%s does not serve %s on its free tier"
+                          % (self.name, method))
+            out["transport_attempts"] = 0  # pre-I/O: nothing sent
+            return out
         url = self._url()
         if not url:
-            return _result(None, "unconfigured", 0.0, self.name,
-                           note="no key/endpoint configured")
+            out = _result(None, "unconfigured", 0.0, self.name,
+                          note="no key/endpoint configured")
+            out["transport_attempts"] = 0  # pre-I/O: nothing sent
+            return out
         status, body, error_kind, retry_after = http_json_rpc(
             url, method, params, timeout=timeout, _opener=self._transport)
         elapsed = time.monotonic() - start
@@ -473,6 +477,13 @@ class _HttpAdapter(BaseProviderAdapter):
         if kind == "rate_limited":
             logger.warning("%s 429 on %s (%s)", _host_of(url), method,
                            rl_kind or "throughput")
-        return _result(result, kind, elapsed, self.name,
-                       http_status=status, wait_hint_s=wait,
-                       rate_limit_kind=rl_kind, note=note)
+        out = _result(result, kind, elapsed, self.name,
+                      http_status=status, wait_hint_s=wait,
+                      rate_limit_kind=rl_kind, note=note)
+        out["transport_attempts"] = 1  # exactly one request was sent
+        if error_kind in ("timeout", "transport"):
+            # Unknown post-I/O outcome: the request may have reached the
+            # vendor and been billed. An uncertain request is never
+            # retried - not on another key, not on another provider.
+            out["outcome_unknown"] = True
+        return out

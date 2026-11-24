@@ -178,10 +178,10 @@ class TestOrphanSweep:
         # Another book's hold (its own crash gap or in-flight
         # reservation) is outside this book's sweep prefix.
         pa.hold_stake("main", 1.0,
-                      "native-hold:" + b._shared_book_id + ":live")
+                      "native-hold:" + b._shared_book_id + ":live", mint="TKM")
         # This book's hold WITH a live sealed record survives.
         a_key_hold = ("native-hold:" + a._shared_book_id + ":k1")
-        pa.hold_stake("main", 1.0, a_key_hold)
+        pa.hold_stake("main", 1.0, a_key_hold, mint="TKM")
         a._unresolved["k1"] = {"signature": "s", "hold_op_id": a_key_hold,
                                "direction": "BUY"}
         a._save_state()

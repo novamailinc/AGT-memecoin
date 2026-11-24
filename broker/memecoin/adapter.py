@@ -1475,7 +1475,7 @@ class MemecoinAdapter(BrokerAdapter):
                 round(max_fee_lamports / 1e9 * px, 6))
 
     def _seal_shared_entry_hold(self, key: str, stake_usd: float,
-                                max_fee_usd: float) -> str:
+                                max_fee_usd: float, mint: str = None) -> str:
         """Account-wide seal-time admission: reserve stake + max fee in
         the SHARED ACCOUNT LEDGER itself (not a per-book snapshot
         estimate), so a fill that settles before this process learns
@@ -1486,7 +1486,9 @@ class MemecoinAdapter(BrokerAdapter):
         amount = round(stake_usd + max_fee_usd, 6)
         hold_op_id = "native-hold:" + self._shared_book_id + ":" + key
         ok, why = self._shared_account.hold_stake("main", amount,
-                                                  hold_op_id)
+                                                  hold_op_id,
+                                                  stake=float(stake_usd),
+                                                  mint=mint)
         if not ok:
             if "unreadable" in why or "degraded" in why:
                 raise BrokerError(
@@ -1615,7 +1617,7 @@ class MemecoinAdapter(BrokerAdapter):
             # startup sweep releases by book prefix; a crash after the
             # seal leaves a record whose hold adoption consumes.
             hold_op_id = self._seal_shared_entry_hold(
-                key, *shared_reserve)
+                key, *shared_reserve, mint=mint)
             self._pending_hold_op_id = hold_op_id
         record = {
             "signature": sig,

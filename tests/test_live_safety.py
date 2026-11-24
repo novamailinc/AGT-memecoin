@@ -40,6 +40,10 @@ from daemon.launch_scanner import live_select
 # live executor is constructed (the executor in this file is the file's own fake).
 import importlib as _il
 os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+# CI run 148: the first section drains the shared account ($1 x 6 hard-stopped at a loss), so the later "topped-up" entries on
+# a fresh live ledger found $0.00 spendable. The shared account's starting balance is a TEST-FIXTURE value (not an owner
+# value) large enough that the lane's own $6 bankroll/MAX_OPEN caps (the subject of this test) bind first.
+os.environ["PAPER_ACCOUNT_START"] = "1000"
 os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
 os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
 import tests._guard_fixture as _GF

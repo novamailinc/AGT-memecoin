@@ -112,3 +112,17 @@ re-seeded — by design.
 Preflight requires every source in this declared profile. It checks inventory and
 placeholders only, not endpoint access, payload correctness, feed completeness or
 qualification. A successful preflight does not authorize deployment or trading.
+
+## Telegram control-room pairing (optional, owner-supplied)
+
+Not part of the required credential set and not in `manifest.json`.
+`daemon/telegram/security.py` pairs fail closed: the control room is
+reachable only when the owner's own ids are set as BOTH
+`TELEGRAM_ALLOWED_CHAT_ID` and `TELEGRAM_ALLOWED_USER_ID` (one alone is
+refused), or a single-use `TELEGRAM_PAIR_CODE` (or `_SHA256` + `_SALT`,
+optionally `TELEGRAM_PAIR_CODE_EXPIRES` as a unix epoch) is set. With
+none of them, no chat can pair. Nothing in the build supplies these
+values; they come from the owner. `credentials.py --preflight` prints
+the status (`allowlist`, `pair_code`, `pair_code_expired`,
+`incomplete_allowlist` or `unconfigured`) and never a value. It does
+not fail the deployment.

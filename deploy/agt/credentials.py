@@ -138,6 +138,43 @@ FILE_ONLY_BRIDGE = (
 
 REQUIRED_ENVS = tuple(c["env"] for c in CREDENTIALS if c["required"])
 
+# Telegram control-room pairing inputs. NOT in CREDENTIALS on purpose:
+# the manifest/credential inventories must match one-to-one, and these
+# are an owner decision (the owner's real Telegram ids), never a value
+# the build can supply. daemon/telegram/security.py try_pair is fail
+# closed: with none of these set no chat can ever pair.
+PAIRING_ENVS = ("TELEGRAM_ALLOWED_CHAT_ID", "TELEGRAM_ALLOWED_USER_ID",
+                "TELEGRAM_PAIR_CODE", "TELEGRAM_PAIR_CODE_SHA256")
+
+
+def telegram_pairing_status(env=None, now=None):
+    """Mirror of security.try_pair's configuration rules, names only.
+
+    Returns one of: "allowlist" (chat AND user ids set), "pair_code"
+    (single-use code configured, not expired), "pair_code_expired",
+    "incomplete_allowlist" (only one of chat/user id set: pairing is
+    denied), "unconfigured" (nobody can pair). Never returns or prints
+    a value, never performs network I/O."""
+    import time
+    env = os.environ if env is None else env
+    chat = (env.get("TELEGRAM_ALLOWED_CHAT_ID") or "").strip()
+    user = (env.get("TELEGRAM_ALLOWED_USER_ID") or "").strip()
+    if bool(chat) != bool(user):
+        return "incomplete_allowlist"
+    if chat and user:
+        return "allowlist"
+    if (env.get("TELEGRAM_PAIR_CODE") or env.get(
+            "TELEGRAM_PAIR_CODE_SHA256") or "").strip():
+        exp = (env.get("TELEGRAM_PAIR_CODE_EXPIRES") or "").strip()
+        if exp:
+            try:
+                if (time.time() if now is None else now) > float(exp):
+                    return "pair_code_expired"
+            except ValueError:
+                return "pair_code_expired"
+        return "pair_code"
+    return "unconfigured"
+
 
 class CredentialError(Exception):
     """A required credential is missing. Fail closed, name the variable."""
@@ -288,6 +325,7 @@ def preflight(home=None, env=None):
         "configured": configured,
         "bridged": [b[0] for b in bridged],
         "vault_surrogate": vault_surrogate_available(),
+        "telegram_pairing": telegram_pairing_status(env),
     }
 
 
@@ -304,6 +342,14 @@ def main(argv=None):
                   ",".join(result["configured"]) or "(none)",
                   ",".join(result["bridged"]) or "(none)",
                   result["vault_surrogate"]))
+        # Non-fatal status: the trading daemons do not need pairing, the
+        # Telegram control room does. Say so instead of staying silent.
+        print("telegram control room pairing: %s%s" % (
+            result["telegram_pairing"],
+            "" if result["telegram_pairing"] in ("allowlist", "pair_code")
+            else " (NO chat can pair; alerts still work, control room is "
+                 "unreachable until the owner's ids or a pairing code are "
+                 "set)"))
         return 0
     if argv == ["--list"]:
         for cred in CREDENTIALS:

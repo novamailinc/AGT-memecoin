@@ -81,7 +81,7 @@ check("visibility: expectancy presentation marked",
 
 # ---- registered halt math preserved, record enriched ------------------
 def _drive_verdict(mod, lane, pnls, kinds):
-    d = {"closes": [{"pnl_usd": p,
+    d = {"closes": [{"pnl_usd": p, "notional_usd": 1.0,
                      "exit_price_kind": k}
                     for p, k in zip(pnls, kinds)],
          "positions": {}, "bankroll": 100.0}
@@ -125,6 +125,28 @@ for mod, lane in ((G, "grad"), (W, "watcher"), (M, "momentum")):
     halt2 = mod._verdict_check({"verdict": v, "closes": []})
     check("%s: verdict still runs exactly once" % lane,
           halt2 is False)
+
+
+# ---- grad SURVIVED requires a frozen-notional basis (negative contract) --
+def _grad_verdict_for(closes):
+    d = {"closes": closes, "positions": {}, "bankroll": 100.0}
+    G._verdict_check(d)
+    return d["verdict"]
+
+_base = [{"pnl_usd": 0.5, "exit_price_kind": "current_price_simulated_fill"}
+         for _ in range(N)]
+_v_unstamped = _grad_verdict_for([dict(c) for c in _base])
+check("grad: unstamped closes (no notional) never claim SURVIVED",
+      not _v_unstamped["action"].startswith("SURVIVED")
+      and _v_unstamped["qualified"] is False
+      and _v_unstamped["n_unknown_basis"] == N)
+_v_wrong = _grad_verdict_for([dict(c, notional_usd=2.0) for c in _base])
+check("grad: closes at a non-frozen notional never claim SURVIVED",
+      not _v_wrong["action"].startswith("SURVIVED")
+      and _v_wrong["n_incompatible_basis"] == N)
+_v_ok = _grad_verdict_for([dict(c, notional_usd=1.0) for c in _base])
+check("grad: closes at the frozen notional can claim SURVIVED",
+      _v_ok["action"].startswith("SURVIVED") and _v_ok["qualified"] is True)
 
 
 # ---- lessons: settled decisions carry provenance ----------------------

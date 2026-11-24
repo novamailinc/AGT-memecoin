@@ -21,6 +21,27 @@ REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard): this file was RED at
+# baseline 28499f5 because every entry was refused with "shared paper account
+# not enabled". It now runs entries through the shared account with
+# TEST-FIXTURE limits and a large fixture balance (not owner values).
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+
+
+def _fresh_shared_account():
+    os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+    os.environ["PAPER_ACCOUNT_START"] = "1000"
+    os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+    os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+    import daemon.launch_scanner.paper_account as _pa
+    _pa = _il.reload(_pa)
+    _GF.install(_pa)
+
+
+_fresh_shared_account()
+
 from daemon.launch_scanner import ceo as C
 from daemon.launch_scanner import killswitch as KS
 from daemon.launch_scanner import signal_bus as BUS
@@ -74,7 +95,8 @@ class FakeKS:
 FAKE_KS = FakeKS()
 
 
-_RUNNER_TAPE = {"dex": "pump", "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+_RUNNER_TAPE = {"fetched_at": time.time(), "received_at": time.time(),  # freshness stamps (TEST-FIXTURE)
+                "dex": "pump", "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
                 "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40}
 
 
@@ -84,7 +106,7 @@ def _patch_all(price=0.01, patch_quote=True):
     p3 = patch.object(C, "_ks", FAKE_KS)
     # patch_quote=False leaves the REAL quote_price in place so the
     # entry-quote tests can drive it via _http_json/_fresh_tape stubs.
-    p4 = (patch.object(C, "quote_price", return_value=price)
+    p4 = (patch.object(C, "quote_price", new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_const(C, price))
           if patch_quote else None)
     p5 = patch.object(C, "_fresh_tape", return_value=dict(_RUNNER_TAPE))
     # Consecutive-confirmation gap zeroed: the gate still performs both
@@ -114,6 +136,9 @@ def _fresh(price=0.01, patch_quote=True):
             os.remove(p)
     FAKE_KS.halted = set()
     FAKE_KS.recorded = []
+    _fresh_shared_account()
+    C._RECOVERY_DONE = False
+    C._ENTRY_BLOCKED = False
     ps = _patch_all(price=price, patch_quote=patch_quote)
     C.ensure_ledger()
     return ps
@@ -183,7 +208,7 @@ check("ceo: cash after solana entry + refused base = $99.00",
       C.account_cash() == 99.00)
 
 ok, why = C.consider_card(_sig(chain="hyperliquid", mint="HLCOIN",
-                               extra={"spot_index": 7, "mark_px": 2.0}))
+                               extra={"spot_index": 7, "mark_px": 2.0, "mark_asof": time.time()}))
 # quote_price is patched to 0.01 for all chains in this harness block is
 # false for HL below; here quote returns 0.01, still opens.
 check("ceo: hyperliquid card opens", ok)
@@ -191,10 +216,10 @@ _unpatch(ps)
 
 # HL fallback: no live quote -> listing mark_px on the event is used
 ps = _fresh()
-with patch.object(C, "quote_price", return_value=0.0):
+with patch.object(C, "quote_price", new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_const(C, 0.0)):
     ok, why = C.consider_card(_sig(chain="hyperliquid", mint="HLONLY",
                                    extra={"spot_index": 3,
-                                          "mark_px": 2.0}))
+                                          "mark_px": 2.0, "mark_asof": time.time()}))
 pos = C.open_positions().get("HLONLY")
 check("ceo: HL opens from event mark_px when quote is dark",
       ok and pos is not None and pos["quoted_price"] == 2.0)

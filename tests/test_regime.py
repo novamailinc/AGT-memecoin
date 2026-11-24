@@ -17,6 +17,8 @@ REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 
+import tests._guard_fixture as _gfb  # noqa: E402
+_gfb.block_network()  # before any daemon import
 from daemon.launch_scanner import regime as R  # noqa: E402
 
 fails = []
@@ -214,6 +216,24 @@ from unittest.mock import patch  # noqa: E402
 from importlib.machinery import SourceFileLoader  # noqa: E402
 import importlib.util  # noqa: E402
 
+# Mandatory-guard migration (DISCLOSED test edit, 2026-11-24): grad entries
+# now require the shared paper account + gates. This integration section
+# was never migrated and failed at baseline 28499f5/50367bb with "shared
+# paper account not enabled". Fixture values only, NOT owner values; the
+# starting balance is large so the regime stakes ($12.50/$25/$37.50) fit.
+os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(prefix="regime-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"  # TEST-FIXTURE value
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+for _k, _v in {"PAPER_ACCOUNT_GATES_ENABLED": "1", "PAPER_ACCOUNT_MAX_DAILY_LOSS_USD": "100000",
+               "PAPER_ACCOUNT_MAX_DRAWDOWN_PCT": "99", "PAPER_ACCOUNT_MAX_EXPOSURE_PCT": "100",
+               "PAPER_ACCOUNT_MAX_SIMULTANEOUS": "1000", "PAPER_ACCOUNT_MAX_POSITIONS": "1000", "PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD": "1000000",
+               "PAPER_ACCOUNT_MAX_SIMULTANEOUS": "100000", "PAPER_ACCOUNT_MAX_DATA_AGE_S": "100000", "PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD": "1000000",
+               "PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD": "1000000"}.items():
+    os.environ[_k] = _v  # TEST-FIXTURE values, not owner
+import importlib as _il  # noqa: E402
+import daemon.launch_scanner.paper_account as _PA  # noqa: E402
+_il.reload(_PA)
+_gfb.install_price_feed(at_cost=True)
 from daemon.launch_scanner import grad as G  # noqa: E402
 
 _TMPD = tempfile.mkdtemp(prefix="regime-grad-")
@@ -250,7 +270,8 @@ class _FakeKS:
 _FAKE_KS = _FakeKS()
 _SAFETY_OK = {"passed": True, "unknown": False, "score": 7,
               "flags": [], "fails": [], "source": "rugcheck"}
-_TAPE_OK = {"usd_liquidity": 8000.0, "usd_market_cap": 69000.0,
+_TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 8000.0, "usd_market_cap": 69000.0,
             "chg_m5": 3.0, "price_usd": 0.00007,
             "tape_source": "dexscreener"}
 

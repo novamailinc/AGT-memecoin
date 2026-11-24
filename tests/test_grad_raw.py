@@ -50,6 +50,21 @@ check("killswitch: grad_raw registered (window/min 100, halt)",
 _ks_tmp = tempfile.mkdtemp(prefix="gradraw-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Also isolates ALL killswitch paths.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 
 # ---------------- engine isolation + policy ----------------
 eng = GR.make_engine()
@@ -88,7 +103,7 @@ check("preregistration: terms declare no daily cap",
 
 # stub the price layer (no network); safety must NEVER be consulted
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
                                 "tape_source": "test"}
 
@@ -107,11 +122,13 @@ eng._safety = _ExplodingSafety()
 # Refresh disabled; no network. Same stub shapes as
 # test_grad_select.py.
 SEL = GR._select
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(SEL)
 # 2026-11-24 conservative contract: recorder-only sub-threshold
 # counts never admit; stub the authoritative-history hook with this
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
-SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: SEL.authoritative_proof(
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: fixture_proof(SEL, 
     c, _AUTH_HIST_RAW.get(c, 0), n)
 _AUTH_HIST_RAW = {}
 TRADER1 = "TraderRaw11111111111111111111111111111111"

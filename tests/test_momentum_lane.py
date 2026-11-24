@@ -53,6 +53,10 @@ check("momentum: $1 shots on a $100 bankroll",
 _ks_tmp = tempfile.mkdtemp(prefix="momentum-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
+check("killswitch isolation: every KS path (state, lock, shadow) lives under the temp dir, none under the default home",
+      all(str(getattr(KS, n, "")).startswith(_ks_tmp) for n in ("STATE_DIR", "STATE_FILE", "LOCK_FILE", "SHADOW_FILE")))
 
 _tmp = tempfile.mkdtemp(prefix="momentum-ledger-")
 M.LEDGER_PATH = os.path.join(_tmp, "momentum_ledger.json")
@@ -84,7 +88,8 @@ check("trials: registration is idempotent",
       len(T.trials_for("momentum")) == 1)
 
 # ---------------- stubs (no network) ----------------
-GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "price_usd": 0.001,
              "tape_source": "test"}
 TAPES = {}
@@ -100,6 +105,8 @@ def _tape(chain, mint):
 M._fresh_tape = _tape
 M.quote_price = lambda chain, mint, spot_index=None: \
     QUOTES.get(mint, 0.001)
+import tests._guard_fixture as _GFQ  # after sys.path setup
+M.quote_price = _GFQ.stamped_quote(M, M.quote_price)  # fixture: quote stamp at call time
 
 
 class _SafetyStub:
@@ -151,6 +158,20 @@ M9 = "MomMint9999999999999999999999999999999999999"
 M10 = "MomMint1010101010101010101010101010101010101"
 M11 = "MomMint1111111111111111111111111111111111112"
 M12 = "MomMint1212121212121212121212121212121212121"
+
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Same block as test_watcher_lane.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 
 # ---------------- qualify -> enter via the momentum feed ----------------
 res = M.scan_once(now=NOW, pools=[raw_pool(M1)])

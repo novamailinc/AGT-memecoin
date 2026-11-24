@@ -97,7 +97,8 @@ check("trials: registration is idempotent",
 # no bump-farm (avg trade > $2), no one-sided flow, pair older than
 # the swarm window. A tape missing these fields is unverifiable and
 # the lane fails closed on it.
-GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "price_usd": 0.001,
              "buys_m5": 10, "sells_m5": 8, "vol_m5": 500.0,
              "buys_h1": 40, "sells_h1": 20,
@@ -116,6 +117,8 @@ def _tape(chain, mint):
 W._fresh_tape = _tape
 W.quote_price = lambda chain, mint, spot_index=None: \
     QUOTES.get(mint, 0.001)
+import tests._guard_fixture as _GFQ  # after sys.path setup (this line runs below it)
+W.quote_price = _GFQ.stamped_quote(W, W.quote_price)  # fixture: quote stamp at call time
 
 
 class _SafetyStub:
@@ -152,6 +155,21 @@ def fire(mint, symbol="WATCH", groups=3, wallets=None, ts=None,
 def M(i):
     return "WatchMint%037d" % i
 
+
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red since f264c11 intake): entries are refused unless
+# the shared paper account is enabled and mandatory limits are set. Fixture uses TEST-FIXTURE limits (not owner values),
+# same as test_watcher_entry_age. No guard is waived or patched.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 
 # ---------------- convergence intake: fire -> entry, same cycle --------
 F1 = M(1)

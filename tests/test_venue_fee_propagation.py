@@ -27,6 +27,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
 
 TMPD = tempfile.mkdtemp(prefix="venue-fee-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(prefix="venue-fee-home-")
@@ -34,6 +35,7 @@ os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
 
 from daemon.launch_scanner import chain_costs as CC
 from daemon.launch_scanner import paper_account as PA
+_gfb.set_limits_env(); _gfb.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed): gates on + TEST-FIXTURE limits, mechanics-only marks via real pipeline
 from daemon.launch_scanner import watcher_lane as W
 
 importlib.reload(PA)
@@ -83,7 +85,8 @@ check("gate: $1 notional with 1.25% venue fee not cost-blocked",
 # ---- 3. watcher end-to-end -------------------------------------------
 # Verifiably CLEAN tape for the entry-time toxicity re-check
 # (2026-11-23): volume/h1 txns present, pairCreatedAt 1h old.
-GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "dex": "pump", "usd_liquidity": 100000.0,
              "usd_market_cap": 500000.0, "chg_m5": 5.0, "buys_m5": 100,
              "sells_m5": 40, "vol_m5": 9000.0, "buys_h1": 400,
              "sells_h1": 150,
@@ -118,6 +121,8 @@ W.LEDGER_PATH = os.path.join(TMPD, "watcher_ledger.json")
 W._safety = _SafetyStub()
 W._ks = _KSStub()
 W.quote_price = lambda chain, mint, spot_index=None: 0.001
+import tests._guard_fixture as _GFQ  # after sys.path setup (this line runs below it)
+W.quote_price = _GFQ.stamped_quote(W, W.quote_price)  # fixture: quote stamp at call time
 W._convergence = lambda sig: (2, ["w1", "w2"], True)
 W._fresh_tape = lambda chain, mint: dict(GOOD_TAPE)
 

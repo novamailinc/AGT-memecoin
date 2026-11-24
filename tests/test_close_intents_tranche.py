@@ -32,6 +32,7 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
 
 TMPD = tempfile.mkdtemp(prefix="ci-tranche-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
@@ -42,6 +43,7 @@ from daemon.launch_scanner import watcher_lane as W
 from daemon.launch_scanner import ceo as C
 from daemon.launch_scanner import momentum_lane as M
 from daemon.launch_scanner import paper_account as PA
+_gfb.set_limits_env(); _gfb.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed): gates on + TEST-FIXTURE limits, mechanics-only marks via real pipeline
 from daemon.launch_scanner import close_intents as CI
 from daemon.launch_scanner import killswitch as KS
 from daemon.launch_scanner import signal_bus as BUS
@@ -70,7 +72,8 @@ C.BUS_PATH = BUS.BUS_PATH
 
 # Verifiably CLEAN tape for the entry-time toxicity re-check
 # (2026-11-23): volume/h1 txns present, pairCreatedAt 1h old.
-GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "buys_m5": 100, "sells_m5": 40,
              "vol_m5": 9000.0, "buys_h1": 400, "sells_h1": 150,
              "pair_created_ms": (time.time() - 3600) * 1000,
@@ -94,9 +97,13 @@ class _VetoStub:
 # pattern). ceo: patched per entry (its suite's _patch_all pattern).
 W._fresh_tape = lambda chain, mint: dict(GOOD_TAPE)
 W.quote_price = lambda chain, mint, spot_index=None: 0.001
+import tests._guard_fixture as _GFQ  # after sys.path setup (this line runs below it)
+W.quote_price = _GFQ.stamped_quote(W, W.quote_price)  # fixture: quote stamp at call time
 W._safety = _SafetyStub()
 M._fresh_tape = lambda chain, mint: dict(GOOD_TAPE)
 M.quote_price = lambda chain, mint, spot_index=None: 0.001
+import tests._guard_fixture as _GFQ  # after sys.path setup
+M.quote_price = _GFQ.stamped_quote(M, M.quote_price)  # fixture: quote stamp at call time
 M._safety = _SafetyStub()
 M._veto = _VetoStub()
 
@@ -174,7 +181,7 @@ def _c_enter(mint):
     ps = (patch.object(C, "_veto"),
           patch.object(C, "_safety"),
           patch.object(C, "_ks", FAKE_KS),
-          patch.object(C, "quote_price", return_value=0.001),
+          patch.object(C, "quote_price", new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_const(C, 0.001)),
           patch.object(C, "_fresh_tape",
                        return_value=dict(GOOD_TAPE)),
           patch.object(C, "RUNNER_CONFIRM_GAP_S", 0.0))

@@ -24,6 +24,8 @@ sys.path.insert(0, REPO)
 
 from daemon.launch_scanner import grad as G
 from daemon.launch_scanner import grad_select as GS
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(GS)
 from daemon.launch_scanner import saturation as S
 from daemon.launch_scanner import vendors as V
 
@@ -61,7 +63,7 @@ GS._INDEX["by_trader"][TRADER_OK] = [NOW - 600]
 # hook with this fixture's INTENDED complete history (TRADER_OK: 1),
 # explicit, never derived from the recorder index.
 GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-    GS.authoritative_proof(c, {TRADER_OK: 1}.get(c, 0), n)
+    fixture_proof(GS, c, {TRADER_OK: 1}.get(c, 0), n)
 
 _CURVE = {
     MINT_OK: {"trades": 80, "created_ts": NOW - 600,
@@ -144,6 +146,20 @@ check("wire: public-RPC fallback stamps public_rpc",
 _CURVE[MINT_OK]["rpc_source"] = "helius"
 
 # ---------------- exit-side harness (from test_grad) -------------
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Same setup as the already-migrated tests/test_grad.py.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
+
 TMPD = tempfile.mkdtemp(prefix="vendors-wire-grad-")
 G.LEDGER_PATH = os.path.join(TMPD, "grad_ledger.json")
 
@@ -173,7 +189,8 @@ class FakeKS:
 FAKE_KS = FakeKS()
 SAFETY_OK = {"passed": True, "unknown": False, "score": 7,
              "flags": [], "fails": [], "source": "rugcheck"}
-TAPE_OK = {"usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
+TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
            "chg_m5": 3.0, "price_usd": 0.00007,
            "tape_source": "dexscreener"}
 
@@ -221,6 +238,19 @@ def _cand(mint="AAA111pump", age_s=60.0, dex="pumpswap", **kw):
 
 check("wire: vendors module imported in grad", G._vendors is not None)
 
+# DISCLOSED TEST EDIT (subject-specific negative control): the migration above enables the shared account; prove the mandatory
+# entry guard still refuses here when the account is NOT enabled, so the positive cases below cannot pass by a bypassed guard.
+ps = _fresh()
+os.environ["PAPER_ACCOUNT_ENABLED"] = "0"
+try:
+    _ok_neg, _why_neg = G.consider_candidate(_cand(mint="VNEG11pump"))[:2]
+finally:
+    os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+check("negative control: guard refuses entry with the shared account disabled (%s)" % str(_why_neg)[:60],
+      not _ok_neg and "VNEG11pump" not in G._load()["positions"])
+for _p in ps:
+    _p.stop()
+
 # price_fn prices -> caller_price_fn stamps the position.
 ps = _fresh()
 G.consider_candidate(_cand(mint="VND111pump"))
@@ -235,7 +265,10 @@ check("wire: price_fn eval stamps caller_price_fn",
 # with NO price_fn, so quote_price() prices the eval.
 G.consider_candidate(_cand(mint="VND222pump"))
 entry2 = G._load()["positions"]["VND222pump"]["entry_price"]
-G.poll_exits()
+# DISCLOSED TEST EDIT: the shared-account guard fixture installs an at-cost price feed under jup_price, which G._jup.get_prices
+# reads, so the no-price_fn exit poll was priced at cost instead of via the DS/GT path this case models. Jupiter returns nothing here.
+with patch.object(G._jup, "get_prices", return_value={}):
+    G.poll_exits()
 pos2 = G._load()["positions"].get("VND222pump") or {}
 vc2 = pos2.get("vendor_chain") or {}
 check("wire: ds/gt eval stamps ds_gt on a fresh position",

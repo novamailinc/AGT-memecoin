@@ -27,6 +27,8 @@ sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 
 from daemon.launch_scanner import grad_select as GS  # noqa: E402
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(GS)
 from daemon.launch_scanner import grad_raw as GR  # noqa: E402
 from daemon.launch_scanner import tranche as TR  # noqa: E402
 from daemon.launch_scanner import tranche_protect as TP  # noqa: E402
@@ -170,7 +172,7 @@ GS._creator_from_oldest_tx = lambda sig: None
 # never admit. Stub the authoritative-history hook with this fixture's
 # intended complete history (TRADER_B truly launched 1 in 24h).
 GS._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
-    GS.authoritative_proof(creator, 1, now)
+    fixture_proof(GS, creator, 1, now)
 
 
 class _FakeSat:

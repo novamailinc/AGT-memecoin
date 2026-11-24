@@ -38,6 +38,8 @@ sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 
 import grad_select as sel
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(sel)
 from daemon.launch_scanner import deployers as real_dep
 
 fails = []
@@ -214,7 +216,7 @@ try:
     sel._INDEX["by_trader"] = {"CREATOR_A": [NOW, NOW - 100]}
     # authoritative complete count below threshold -> admitted, stamped
     sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
-        sel.authoritative_proof(creator, 2, now)
+        fixture_proof(sel, creator, 2, now)
     rj = sel._serial_check("CREATOR_A", NOW, {})
     check("hook: authoritative 2 passes with measured stamp",
           rj is None)
@@ -225,7 +227,7 @@ try:
           and vals.get("launches_source") == "authoritative")
     # authoritative complete count at threshold -> serial_deployer
     sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
-        sel.authoritative_proof(creator, 3, now)
+        fixture_proof(sel, creator, 3, now)
     rj = sel._serial_check("CREATOR_A", NOW, {})
     check("hook: authoritative 3 rejects serial_deployer",
           rj is not None and rj.get("reason") == "serial_deployer"
@@ -248,31 +250,31 @@ try:
     # every malformed/partial/stale/wrong-subject shape fails closed
     bad = [
         ("bare int", 2),
-        ("bool count", dict(sel.authoritative_proof("CREATOR_A", 2, NOW),
+        ("bool count", dict(fixture_proof(sel, "CREATOR_A", 2, NOW),
                             count=True)),
-        ("negative count", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("negative count", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                         NOW), count=-1)),
-        ("string count", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("string count", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                       NOW), count="2")),
-        ("wrong creator", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("wrong creator", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                        NOW),
                                creator="CREATOR_B")),
-        ("short window", sel.authoritative_proof("CREATOR_A", 2, NOW,
+        ("short window", fixture_proof(sel, "CREATOR_A", 2, NOW,
                                                  window_start=NOW - 3600)),
-        ("stale enumeration", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("stale enumeration", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                            NOW),
                                    window_end=NOW - 3600)),
-        ("future enumeration", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("future enumeration", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                             NOW),
                                     window_end=NOW + 3600)),
-        ("not finalized", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("not finalized", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                        NOW),
                                finality="confirmed")),
-        ("partial history", dict(sel.authoritative_proof("CREATOR_A", 2,
+        ("partial history", dict(fixture_proof(sel, "CREATOR_A", 2,
                                                          NOW),
                                  complete="partial")),
         ("complete not literal True", dict(
-            sel.authoritative_proof("CREATOR_A", 2, NOW), complete=1)),
+            fixture_proof(sel, "CREATOR_A", 2, NOW), complete=1)),
     ]
     for name, proof in bad:
         sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now, p=proof: p
@@ -328,7 +330,7 @@ try:
     fake_live = FakeReserves(tx=CANNED_TX)
     sel._reserves, sel._deployers = fake_live, real_dep
     sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
-        sel.authoritative_proof(creator, 0, now)
+        fixture_proof(sel, creator, 0, now)
     v = sel.evaluate_candidate(None, cand, NOW)
     check("evaluate fallback resolves: reason is not unknown_serial",
           v.get("reason") != "unknown_serial")

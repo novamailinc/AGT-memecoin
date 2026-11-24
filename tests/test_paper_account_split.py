@@ -24,6 +24,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 
 FAILS = []
 
@@ -38,9 +39,14 @@ def fresh(home, start=10.0):
     os.environ["FOREX_AGENT_HOME"] = home
     os.environ["PAPER_ACCOUNT_START"] = str(start)
     os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
-    os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED", None)
     import daemon.launch_scanner.paper_account as pa
-    return importlib.reload(pa)
+    pa = importlib.reload(pa)
+    # mandatory-guard migration (disclosed): gates ON with fixture limits and
+    # marks through the REAL pipeline; only the price source is injected.
+    import tests._guard_fixture as _gf
+    _gf.set_limits_env()
+    _gf.install_price_feed(at_cost=True)
+    return pa
 
 
 CUR = "current_price_simulated_fill"
@@ -453,15 +459,18 @@ impairment_hits_conservative_equity()
 
 
 def mirror_exclusion_explicit():
-    """mirror is deliberately UNWIRED from the shared account
-    (design decision pending review). Keep that exclusion
-    structural and explicit: the module must not reference the
-    account at all."""
+    """CONTRACT CHANGE (disclosed, main's instruction 7:05): mirror was
+    deliberately unwired from the shared account (design decision pending).
+    It is now ROUTED through it: the module must reserve (try_debit),
+    pin the account position (pa_pos_id) and settle tranches. Behavior is
+    proven in tests/test_mirror_routed_account.py; this keeps the wiring
+    structural."""
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "daemon", "launch_scanner", "mirror.py")
     srcm = open(p).read()
-    check("mirror exclusion explicit: no account references",
-          "paper_account" not in srcm and "pa_pos_id" not in srcm)
+    check("mirror routed: references the shared account, pins pa_pos_id, debits and settles",
+          "paper_account" in srcm and "pa_pos_id" in srcm
+          and ".try_debit(" in srcm and "_pa_settle(" in srcm)
 
 
 mirror_exclusion_explicit()

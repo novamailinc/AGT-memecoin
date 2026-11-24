@@ -34,6 +34,7 @@ import time
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
 sys.path.insert(0, _REPO_ROOT)
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
 
 HOME = tempfile.mkdtemp(prefix="paper-e2e-home-")
 TMPD = tempfile.mkdtemp(prefix="paper-e2e-")
@@ -46,6 +47,7 @@ from daemon.launch_scanner import killswitch as KS
 
 from daemon.launch_scanner import watcher_lane as W
 from daemon.launch_scanner import paper_account as PA
+_gfb.set_limits_env(); _gfb.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed): gates on + TEST-FIXTURE limits, mechanics-only marks via real pipeline
 from daemon.launch_scanner import signal_bus as BUS
 from daemon.launch_scanner import lessons as LS
 from daemon.launch_scanner import f2 as F2
@@ -73,7 +75,8 @@ def finding(name, evidence):
 # re-check (2026-11-23): volume.m5 present (avg trade well above the $2
 # dust threshold), h1 txns present, pairCreatedAt present and 1h old
 # (past the 5-minute bot-swarm window).
-GOOD_TAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
              "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
              "vol_m5": 9000.0, "buys_h1": 400, "sells_h1": 150,
              "pair_created_ms": (time.time() - 3600) * 1000,
@@ -95,6 +98,8 @@ def _install_stubs(mod):
     mod._fresh_tape = _tape
     mod.quote_price = lambda chain, mint, spot_index=None: \
         PRICES.get(mint, 0.001)
+    import tests._guard_fixture as _GFQ  # after sys.path setup (this line runs below it)
+    mod.quote_price = _GFQ.stamped_quote(mod, mod.quote_price)  # fixture: quote stamp at call time
     mod._safety = _SafetyStub()
 
 

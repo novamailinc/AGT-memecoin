@@ -32,6 +32,20 @@ def check(name, cond):
         fails.append(name)
 
 
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Same setup as the already-migrated tests/test_grad.py.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
+
 TMPD = tempfile.mkdtemp(prefix="limit-wire-")
 G.LEDGER_PATH = os.path.join(TMPD, "grad_ledger.json")
 
@@ -61,7 +75,8 @@ class FakeKS:
 FAKE_KS = FakeKS()
 SAFETY_OK = {"passed": True, "unknown": False, "score": 7,
              "flags": [], "fails": [], "source": "rugcheck"}
-TAPE_OK = {"usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
+TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
            "chg_m5": 3.0, "price_usd": 0.00007,
            "tape_source": "dexscreener"}
 

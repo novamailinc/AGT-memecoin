@@ -61,10 +61,17 @@ check("unknown liquidity with env set fails closed",
 ok, why, cap = RC.check_slippage(1.0, 0, env=env)
 check("zero liquidity with env set fails closed", not ok)
 
-# ---------- unset env + unknown liquidity passes ----------
-ok, why, cap = RC.check_slippage(1.0, None, env={})
-check("unknown liquidity with env unset passes "
-      "(lane's own handling stands)", ok)
+# ---------- unknown liquidity REFUSES (CONTRACT CHANGE 2026-11-24, disclosed) ----------
+# Was: "unset env + unknown liquidity passes (lane's own handling stands)".
+# Directive: unknown slippage/impact input must never be treated as zero or reliable.
+for label, liq in (("None", None), ("zero", 0), ("negative", -5.0), ("nan", float("nan")), ("garbage", "x")):
+    ok, why, cap = RC.check_slippage(1.0, liq, env={})
+    check("unknown liquidity (%s) with env unset REFUSES entry fail-closed" % label,
+          not ok and "liquidity unknown" in why)
+ok, why, cap = RC.check_slippage(float("nan"), 1000.0, env={})
+check("non-finite size REFUSES", not ok)
+ok, why, cap = RC.check_slippage(1.0, 10000.0, env={})
+check("known deep liquidity still passes (no behavior change when known)", ok)
 
 # ---------- never raises on garbage ----------
 try:
@@ -102,6 +109,16 @@ for lane in ("ceo", "mirror"):
     if i_gate >= 0:
         check("%s verified liquidity precedes the slippage call" % lane,
               src.find("_risk.check_slippage(", i_gate) > i_gate)
+
+# positive-size boundary (2026-11-24): a zero/negative entry size with KNOWN
+# liquidity used to pass the slippage math; an entry must be a positive size.
+for _sz in (0, 0.0, -1.0, None, ""):
+    _ok, _why, _cap = RC.check_slippage(_sz, 100000.0, env={})
+    check("non-positive/unknown size %r refused with known liquidity (%s)" % (_sz, _why),
+          _ok is False)
+_ok, _why, _cap = RC.check_slippage(1.0, 100000.0, env={})
+check("positive size with known deep liquidity still admitted", _ok is True)
+
 
 print()
 if fails:

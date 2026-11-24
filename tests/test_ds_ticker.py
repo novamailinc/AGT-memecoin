@@ -27,6 +27,8 @@ sys.path.insert(0, REPO)
 
 import ds_ticker as DST
 from daemon.launch_scanner import grad_select as GS
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(GS)
 from daemon.launch_scanner import saturation as S
 
 fails = []
@@ -235,7 +237,7 @@ GS._INDEX["by_trader"][TRADER_DS] = [NOW - 600]
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
 GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-    GS.authoritative_proof(c, {TRADER_DS: 1}.get(c, 0), n)
+    fixture_proof(GS, c, {TRADER_DS: 1}.get(c, 0), n)
 GS._curve_stats = lambda addr: {"trades": 80, "created_ts": NOW - 600,
                                 "oldest_sig": "sig-ds", "capped": False,
                                 "exhausted": True}

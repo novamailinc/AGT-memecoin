@@ -145,7 +145,16 @@ def group_parsers(update):
 
 def group_curve_stats(update):
     stats, calls = curve_stats_fixture()
-    creator, info, why, ccalls = creator_and_tx_price_fixture()
+    # received_at is stamped with the wall clock by _ff_parse_tx_price;
+    # freeze it so the golden is deterministic (source_asof is the
+    # fixture blockTime and is pinned as-is).
+    import time as _time
+    _real_time = _time.time
+    _time.time = lambda: 1794787400.0
+    try:
+        creator, info, why, ccalls = creator_and_tx_price_fixture()
+    finally:
+        _time.time = _real_time
     actual = {
         "curve_stats": stats,
         "curve_stats_rpc_calls": [[m, p] for m, p in calls],

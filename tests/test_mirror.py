@@ -52,6 +52,29 @@ check("costs: unknown chain -> 0 tx cost, gate open",
 # ---------------- mirror: test harness ----------------
 TMPD = tempfile.mkdtemp(prefix="mirror-test-")
 M.LEDGER_PATH = os.path.join(TMPD, "degen_mirror_ledger.json")
+M._LOCK_PATH = os.path.join(TMPD, "degen_mirror_ledger.lock")
+
+# DISCLOSED TEST EDIT (mirror routing): mirror entries now pass the mandatory
+# guard and reserve cash from the shared paper account, so this harness runs
+# with the account enabled, TEST-FIXTURE limits (not owner values) and a fresh
+# account per test (the mirror ledger is reset per test, so the account must
+# be too). Before this edit every entry in this file was refused at baseline
+# (28499f5 / 50367bb: "opens on its own ledger and is not routed").
+import importlib
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _G
+
+
+def _fresh_account():
+    os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(prefix="mirror-home-")
+    os.environ["PAPER_ACCOUNT_START"] = "1000"
+    os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+    os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+    import daemon.launch_scanner.paper_account as _pa
+    _pa = importlib.reload(_pa)
+    _G.install(_pa)
+    M._RECOVERY_DONE = False
+    M._ENTRY_BLOCKED = False
 
 
 class FakeKS:
@@ -76,7 +99,8 @@ class FakeKS:
         return {"lane": lane}
 
 
-_RUNNER_TAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+_RUNNER_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
                 "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
                 "dex": "pump"}
 
@@ -89,7 +113,7 @@ def _patch_all(price=0.01, patch_quote=True):
     p1 = patch.object(M, "_veto")
     p2 = patch.object(M, "_safety")
     p3 = patch.object(M, "_ks", FakeKS())
-    p4 = (patch.object(M, "quote_price", return_value=price)
+    p4 = (patch.object(M, "quote_price", new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_const(M, price))
           if patch_quote else None)
     p5 = patch.object(M, "_fresh_tape", return_value=dict(_RUNNER_TAPE))
     # Consecutive-confirmation gap zeroed: both reads still happen,
@@ -105,6 +129,7 @@ def _patch_all(price=0.01, patch_quote=True):
     m_veto.veto_check.return_value = {"passed": True, "vetoes": []}
     m_safety.check_token.return_value = {"passed": True, "unknown": False}
     FakeKS.reset()
+    _fresh_account()
     # fresh ledger per test
     if os.path.exists(M.LEDGER_PATH):
         os.remove(M.LEDGER_PATH)
@@ -224,7 +249,7 @@ check("mirror: blocked ETH opens nothing",
       "MINTE" not in M.open_positions())
 ok, why = _open(chain="hyperliquid", mint="HLXYZ", price=0,
                 extra={"pair": "XYZ/USDC", "spot_index": 42,
-                       "mark_px": 1.25})
+                       "mark_px": 1.25, "mark_asof": time.time()})
 check("mirror: HL opens from listing mark price",
       ok and M.open_positions()["HLXYZ"]["lane"] == "hl_mirror")
 check("mirror: HL stores spot_index",
@@ -306,6 +331,15 @@ ok, why = M.mirror_card(chain="hyperliquid", source="hl-listing",
                         tier="listing",
                         extra={"pair": "XYZ/USDC", "spot_index": 7,
                                "mark_px": 1.25})
+check("mirror: HL with UNKNOWN liquidity is refused fail-closed (%s)" % why,
+      not ok and "liquidity" in str(why).lower())
+# DISCLOSED: unknown liquidity refuses entry (risk_controls.check_slippage,
+# 68ca633); the mark_px fallback is exercised with a known liquidity.
+ok, why = M.mirror_card(chain="hyperliquid", source="hl-listing",
+                        mint="HLFALL", symbol="XYZ", score=70.0,
+                        tier="listing", liquidity=50_000.0,
+                        extra={"pair": "XYZ/USDC", "spot_index": 7,
+                               "mark_px": 1.25, "mark_asof": time.time()})
 check("mirror: HL falls back to listing mark_px",
       ok and abs(M.open_positions()["HLFALL"]["entry_price"] - 1.25) < 0.2)
 _unpatch(ps)

@@ -63,6 +63,21 @@ MINT8 = "FireMint8888888888888888888888888888888pump"
 _ks_tmp = tempfile.mkdtemp(prefix="gradraw-ff-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Also isolates ALL killswitch paths.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 
 eng = GR.make_engine()
 check("fire-first installed on the raw engine only",
@@ -87,7 +102,7 @@ with eng._ledger_lock():
 LIVE = {"px": 0.001}
 eng._ff_orig_quote_price = \
     lambda chain, mint, spot_index=None: LIVE["px"]
-eng._ff_orig_fresh_tape = lambda mint: {
+eng._ff_orig_fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), 
     "usd_liquidity": 5000.0, "usd_market_cap": 60000.0,
     "tape_source": "test"}
 
@@ -106,11 +121,13 @@ eng._safety = _ExplodingSafety()
 # fast, single-launch graduation so the fire-first mechanics under
 # test are exercised, not the filters.
 SEL = GR._select
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(SEL)
 # 2026-11-24 conservative contract: recorder-only sub-threshold
 # counts never admit; stub the authoritative-history hook with this
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
-SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: SEL.authoritative_proof(
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: fixture_proof(SEL, 
     c, 1 if str(c).startswith("TraderFF") else 0, n)
 SEL._index_refresh = lambda now: None
 SEL._INDEX["available"] = True
@@ -165,7 +182,16 @@ PAYLOAD_INFO = {"price_usd": 8.0e-5, "liquidity_usd": 32300.0,
                 "mcap_usd": 80000.0,
                 "pool": "TxPool111111111111111111111111111111111",
                 "quote_sol": 85.0, "sol_usd": 190.0}
-eng._ff_tx_price_override = lambda sig, mint: (dict(PAYLOAD_INFO), "")
+# DISCLOSED fixture migration (TEST-FIXTURE): the payload carries the tx's own
+# observed time (source_asof) and a receipt stamp, taken at call time, so the
+# mandatory entry data-age gate sees a known-fresh row. Gate not lowered.
+def _payload_info():
+    import time as _t
+    d = dict(PAYLOAD_INFO)
+    d["source_asof"] = _t.time() - 1.0
+    d["received_at"] = _t.time()
+    return d
+eng._ff_tx_price_override = lambda sig, mint: (_payload_info(), "")
 
 
 class FakeFeed:
@@ -215,6 +241,18 @@ check("tx parse: mcap = price x fixed supply, inside bounds",
 unknown_tx = dict(fake_tx, meta=dict(fake_tx['meta']))
 del unknown_tx['meta']['err']
 unknown_info, unknown_reason = GR._ff_parse_tx_price(unknown_tx,MINT,sol_usd=100.0)
+# age stamps: blockTime -> source_asof; absent blockTime -> NO stamp (gate refuses, fail closed)
+_bt = int(__import__("time").time()) - 3
+info_bt, _ = GR._ff_parse_tx_price(dict(fake_tx, blockTime=_bt), MINT, sol_usd=200.0)
+check("tx parse: blockTime becomes source_asof + received_at",
+      info_bt is not None and info_bt.get("source_asof") == _bt
+      and isinstance(info_bt.get("received_at"), float))
+check("tx parse: no blockTime -> no freshness stamp (never invented)",
+      info is not None and "source_asof" not in info and "received_at" not in info)
+check("tx parse: fire-first tape row carries the stamps",
+      (lambda e: (setattr(e, "_ff_ctx", {"mint": MINT, "info": info_bt}),
+                  e._fresh_tape(MINT))[1])(eng).get("source_asof") == _bt)
+eng._ff_ctx = None
 check("tx parse: missing status stays unknown", unknown_info is None and 'tx_unknown' in unknown_reason)
 
 info2, why2 = GR._ff_parse_tx_price({"meta": {"err": None, "postTokenBalances": [
@@ -332,7 +370,7 @@ check("fallback: signature-less payload uses the classic path",
       == "PoolClassic11111111111111111111111")
 
 # ---------------- dedupe + killswitch on the instant path ----------------
-eng._ff_tx_price_override = lambda sig, mint: (dict(PAYLOAD_INFO), "")
+eng._ff_tx_price_override = lambda sig, mint: (_payload_info(), "")
 res = _scan_cycle(eng, feed=FakeFeed([mig_item(MINT)]),
                    now=time.time())
 check("dedupe: instant path never re-enters a mint", res["opened"] == 0)

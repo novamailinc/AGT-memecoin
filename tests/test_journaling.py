@@ -46,6 +46,27 @@ REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard): this file was RED at
+# baseline 28499f5 because every entry was refused with "shared paper account
+# not enabled". It now runs entries through the shared account with
+# TEST-FIXTURE limits and a large fixture balance (not owner values).
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+
+
+def _fresh_shared_account():
+    os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+    os.environ["PAPER_ACCOUNT_START"] = "1000"
+    os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+    os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+    import daemon.launch_scanner.paper_account as _pa
+    _pa = _il.reload(_pa)
+    _GF.install(_pa)
+
+
+_fresh_shared_account()
+
 from daemon.launch_scanner import ceo as C
 from daemon.launch_scanner import mirror as M
 from daemon.launch_scanner import grad as G
@@ -93,7 +114,8 @@ TMPD = tempfile.mkdtemp(prefix="journal-ceo-")
 C.LEDGER_PATH = os.path.join(TMPD, "ceo_ledger.json")
 C.BUS_PATH = os.path.join(TMPD, "signal_bus.jsonl")
 
-TAPE = {"usd_liquidity": 120_000.0, "usd_market_cap": 640_000.0,
+TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 120_000.0, "usd_market_cap": 640_000.0,
         "chg_m5": 12.0, "buys_m5": 137, "sells_m5": 52,
         "vol_m5": 9_876.0, "price_usd": 0.01,
         "dex": "pump",
@@ -102,7 +124,7 @@ TAPE = {"usd_liquidity": 120_000.0, "usd_market_cap": 640_000.0,
 ps = []
 for p in (patch.object(C, "_veto"), patch.object(C, "_safety"),
           patch.object(C, "_ks", FakeKS()),
-          patch.object(C, "quote_price", return_value=0.01),
+          patch.object(C, "quote_price", new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_const(C, 0.01)),
           patch.object(C, "_fresh_tape", return_value=dict(TAPE)),
           patch.object(C, "RUNNER_CONFIRM_GAP_S", 0.0)):
     p.start()
@@ -185,7 +207,8 @@ for p in ps:
 TMPM = tempfile.mkdtemp(prefix="journal-mirror-")
 M.LEDGER_PATH = os.path.join(TMPM, "degen_mirror_ledger.json")
 QUOTE = {"px": 0.01}
-MTAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+MTAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
          "chg_m5": 10.0, "buys_m5": 88, "sells_m5": 31,
          "vol_m5": 4_321.0, "price_usd": 0.01,
          "dex": "pump",
@@ -195,7 +218,7 @@ ps = []
 for p in (patch.object(M, "_veto"), patch.object(M, "_safety"),
           patch.object(M, "_ks", FakeKS()),
           patch.object(M, "quote_price",
-                       side_effect=lambda c, m, s=None: QUOTE["px"]),
+                       new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_quote(M, lambda c, m, s=None: QUOTE["px"])),
           patch.object(M, "_fresh_tape", return_value=dict(MTAPE)),
           patch.object(M, "RUNNER_CONFIRM_GAP_S", 0.0)):
     p.start()
@@ -293,7 +316,8 @@ DOSSIER = {
 with open(os.path.join(DOSSDIR, DMINT + ".json"), "w") as f:
     json.dump(DOSSIER, f)
 
-GTAPE = {"usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
+GTAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
          "chg_m5": 3.0, "price_usd": 0.00007,
          "dex": "pump",
          "tape_source": "dexscreener"}
@@ -383,7 +407,7 @@ eng = GR.make_engine()
 eng.LEDGER_PATH = os.path.join(TMPR, "grad_raw_ledger.json")
 eng._ks = FakeKS()
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
                                 "dex": "pump",
                                 "tape_source": "test"}

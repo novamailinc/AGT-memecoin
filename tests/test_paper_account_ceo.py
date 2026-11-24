@@ -23,16 +23,27 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 sys.path.insert(0, _REPO_ROOT)
 
 TMPD = tempfile.mkdtemp(prefix="paper-ceo-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
     prefix="paper-ceo-home-")
 os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"  # TEST FIXTURE (mandatory-guard edit): not owner values
+os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "1000"
+os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "90"
+os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "100"
+os.environ["PAPER_ACCOUNT_MAX_SIMULTANEOUS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_POSITIONS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
 os.environ["PAPER_ACCOUNT_START"] = "2"   # small: gate binds after 2
 
 from daemon.launch_scanner import ceo as C
 from daemon.launch_scanner import paper_account as PA
+_gfb.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed): mechanics-only marks via real pipeline
 from daemon.launch_scanner import signal_bus as BUS
 
 C.LEDGER_PATH = os.path.join(TMPD, "ceo_ledger.json")
@@ -66,7 +77,8 @@ class FakeKS:
 
 
 FAKE_KS = FakeKS()
-_RUNNER_TAPE = {"usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+_RUNNER_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
                 "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
                 "dex": "pump"}
 
@@ -75,7 +87,7 @@ def _patch_all(price=0.01):
     p1 = patch.object(C, "_veto")
     p2 = patch.object(C, "_safety")
     p3 = patch.object(C, "_ks", FAKE_KS)
-    p4 = patch.object(C, "quote_price", return_value=price)
+    p4 = patch.object(C, "quote_price", new=__import__("tests._guard_fixture", fromlist=["x"]).stamped_const(C, price))
     p5 = patch.object(C, "_fresh_tape", return_value=dict(_RUNNER_TAPE))
     p6 = patch.object(C, "RUNNER_CONFIRM_GAP_S", 0.0)
     m_veto, m_safety = p1.start(), p2.start()
@@ -222,13 +234,43 @@ os.environ.pop("PAPER_ACCOUNT_ENABLED")
 _reset_account()
 ps = _fresh()
 ok, why = C.consider_card(_sig("OFFM"))
-entry = C.open_positions()["OFFM"]["entry_price"]
-C.poll_exits(price_fn=_prices([entry * 0.4]))   # hard stop
 snap = PA.snapshot()
-check("flag off: entry+close leave the shared account pristine",
-      ok and snap["cash"] == 2.0
+# CONTRACT CHANGE (owner directive: one shared $10, no private capital):
+# flag off REFUSES entry; there is no private position to close.
+check("flag off: entry REFUSED by the mandatory guard, account pristine",
+      (not ok) and "mandatory entry guard" in str(why)
+      and "OFFM" not in C.open_positions() and snap["cash"] == 2.0
       and snap["lanes"].get("ceo", {}).get("open_count", 0) == 0
       and not C.open_positions())
+_unpatch(ps)
+
+# ---------------- exit/credit is NEVER blocked by the entry guard ----
+# (replaces the exit coverage of the old private-position close check)
+# A legitimately FUNDED position (opened with the mandatory gates on),
+# then gates turned OFF: the hard-stop exit must still close it and credit
+# the shared account. Entries are blocked fail-closed; exits never are.
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+_gfb.set_limits_env()
+_reset_account()
+ps = _fresh()
+ok_e, why_e = C.consider_card(_sig("EXITM"))
+funded = PA.snapshot()
+entry = C.open_positions()["EXITM"]["entry_price"] if ok_e else None
+check("control: funded entry opens through the guard (gates on)",
+      ok_e and abs(funded["cash"] - 1.0) < 1e-9)
+os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED")
+ok_b, why_b = C.consider_card(_sig("BLOCKM"))
+check("gates now off: a NEW entry is refused fail-closed",
+      (not ok_b) and "BLOCKM" not in C.open_positions())
+C.poll_exits(price_fn=_prices([entry * 0.4]))   # hard stop
+after = PA.snapshot()
+check("gates off: exit still closes the funded position",
+      "EXITM" not in C.open_positions()
+      and after["lanes"].get("ceo", {}).get("open_count", 0) == 0)
+check("gates off: exit credit reaches the shared account (cash = 2.00 + "
+      "realized P/L, a loss at the 0.4x hard stop)",
+      abs(after["cash"] - (2.0 + after["realized_pnl"])) < 1e-9
+      and after["realized_pnl"] < 0 and after["cash"] > 1.0 + 1e-9)
 _unpatch(ps)
 
 if FAILS:

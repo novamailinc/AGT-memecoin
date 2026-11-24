@@ -84,6 +84,8 @@ check("conversion: converted row passes the gated engine filter",
 # Seed the shared select index through GR._select (the exact object
 # the lane code calls), same shapes as test_grad_raw.py. No network.
 SEL = GR._select
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(SEL)
 SEL._index_refresh = lambda now: None
 SEL._INDEX["available"] = True
 SEL._INDEX["coverage_start"] = NOW - 90000
@@ -97,7 +99,7 @@ SEL._INDEX["by_trader"]["Trader111"] = [NOW - 60]
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
 SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-    SEL.authoritative_proof(c, {"Trader111": 1}.get(c, 0), n)
+    fixture_proof(SEL, c, {"Trader111": 1}.get(c, 0), n)
 SEL._INDEX["by_mig"][MINT] = {"pool": "PoolReal", "ts": NOW}
 SEL._curve_stats = lambda addr: {
     "trades": 80, "created_ts": NOW - 60, "oldest_sig": "sig-venue",
@@ -125,12 +127,27 @@ SEL._saturation = _FakeSat()
 _ks_tmp = tempfile.mkdtemp(prefix="venue-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 eng = GR.make_engine()
 _tmp = tempfile.mkdtemp(prefix="venue-ledger-")
 eng.LEDGER_PATH = os.path.join(_tmp, "grad_raw_ledger.json")
 eng.ensure_ledger()
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
                                 "tape_source": "test"}
 

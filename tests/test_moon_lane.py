@@ -28,8 +28,31 @@ REPO = _REPO_ROOT
 sys.path.insert(0, os.path.join(REPO, "daemon", "launch_scanner"))
 sys.path.insert(0, REPO)
 
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard): this file was RED at
+# baseline 28499f5 because every entry was refused with "shared paper account
+# not enabled". It now runs entries through the shared account with
+# TEST-FIXTURE limits and a large fixture balance (not owner values).
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+
+
+def _fresh_shared_account():
+    os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+    os.environ["PAPER_ACCOUNT_START"] = "1000"
+    os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+    os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+    import daemon.launch_scanner.paper_account as _pa
+    _pa = _il.reload(_pa)
+    _GF.install(_pa)
+
+
+_fresh_shared_account()
+
 from daemon.launch_scanner import grad as GATED
 from daemon.launch_scanner import grad_select as GS
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(GS)
 from daemon.launch_scanner import grad_raw as GR_RAW
 from daemon.launch_scanner import moon_lane as ML
 from daemon.launch_scanner import killswitch as KS
@@ -59,6 +82,8 @@ check("killswitch: moon registered (window/min 100, halt)",
 _ks_tmp = tempfile.mkdtemp(prefix="moon-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
 
 # ---------------- engine identity + exit params ----------------
 eng = ML.make_engine()
@@ -111,7 +136,7 @@ check("preregistration: terms declare NO safety gate / NO veto",
 
 # stub the price layer (no network); safety must NEVER be consulted
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
                                 "tape_source": "test"}
 
@@ -217,7 +242,7 @@ _rtmp = tempfile.mkdtemp(prefix="moon-control-")
 reng.LEDGER_PATH = os.path.join(_rtmp, "grad_raw_ledger.json")
 reng.ensure_ledger()
 reng.quote_price = lambda chain, mint, spot_index=None: 0.001
-reng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+reng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                  "usd_market_cap": 60000.0,
                                  "tape_source": "test"}
 reng._safety = _ExplodingSafety()
@@ -243,7 +268,7 @@ GS._saturation = None  # force the DexScreener path, deterministically
 # fixture creator (0 launches in 24h), scoped to this call and restored.
 _orig_auth = GS._AUTHORITATIVE_LAUNCHES_24H
 GS._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
-    GS.authoritative_proof(creator, 0, now)
+    fixture_proof(GS, creator, 0, now)
 if GS._ds_ticker is not None:
     GS._ds_ticker.count_24h = lambda symbol, now=None, self_mint=None: {
         "tally": 1, "others": 0, "top_mint": MINT3,

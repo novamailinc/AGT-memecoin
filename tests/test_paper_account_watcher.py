@@ -23,6 +23,7 @@ import time
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
 sys.path.insert(0, _REPO_ROOT)
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (after sys.path setup, before lane imports)
 
 TMPD = tempfile.mkdtemp(prefix="paper-watcher-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
@@ -32,6 +33,8 @@ os.environ["PAPER_ACCOUNT_START"] = "2"
 
 from daemon.launch_scanner import watcher_lane as W
 from daemon.launch_scanner import paper_account as PA
+_gfb.set_limits_env()  # mandatory-guard migration (disclosed): gates on + TEST-FIXTURE limits, not owner values
+_gfb.install_price_feed(at_cost=True)  # mechanics-only marks via real pipeline
 from daemon.launch_scanner import signal_bus as BUS
 
 W.LEDGER_PATH = os.path.join(TMPD, "watcher_ledger.json")
@@ -49,7 +52,8 @@ def check(name, cond):
 
 # Verifiably CLEAN DexScreener-shaped tape for the entry-time toxicity
 # re-check (2026-11-23): see test_paper_e2e GOOD_TAPE comment.
-GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "dex": "pump", "usd_liquidity": 100_000.0, "usd_market_cap": 500_000.0,
              "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
              "vol_m5": 9000.0, "buys_h1": 400, "sells_h1": 150,
              "pair_created_ms": (time.time() - 3600) * 1000,
@@ -71,6 +75,8 @@ def _install_stubs(mod):
     mod._fresh_tape = _tape
     mod.quote_price = lambda chain, mint, spot_index=None: \
         PRICES.get(mint, 0.001)
+    import tests._guard_fixture as _GFQ  # after sys.path setup (this line runs below it)
+    mod.quote_price = _GFQ.stamped_quote(mod, mod.quote_price)  # fixture: quote stamp at call time
     mod._safety = _SafetyStub()
 
 
@@ -209,8 +215,11 @@ _reset_account()
 _reset_lane()
 opened, why, final = W.consider_fire(fire(M(20)), time.time())
 snap = PA.snapshot()
+# CONTRACT CHANGE (owner directive: one shared $10, no private capital):
+# flag off REFUSES entry. Premise replaced, disclosed.
 check("flag off: entry leaves the shared account pristine",
-      opened and snap["cash"] == 2.0
+      (not opened) and "mandatory entry guard" in str(why)
+      and snap["cash"] == 2.0
       and snap["lanes"].get("watcher", {}).get("open_count", 0) == 0)
 
 if FAILS:

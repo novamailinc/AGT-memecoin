@@ -19,6 +19,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
 
 FAILS = []
 
@@ -33,7 +34,8 @@ def check(name, cond):
 def fresh(home, enabled=None, providers=None, mode=None):
     os.environ["FOREX_AGENT_HOME"] = home
     os.environ["PAPER_ACCOUNT_START"] = "10.0"
-    os.environ.pop("PAPER_ACCOUNT_GATES_ENABLED", None)
+    # mandatory-guard migration (disclosed): account gates can no longer be
+    # OFF; fixture limits are installed below so only the provider gate varies.
     if enabled:
         os.environ["PROVIDER_HEALTH_GATE_ENABLED"] = "1"
     else:
@@ -47,7 +49,8 @@ def fresh(home, enabled=None, providers=None, mode=None):
     else:
         os.environ["PROVIDER_HEALTH_GATE_MODE"] = mode
     import daemon.launch_scanner.paper_account as pa
-    return importlib.reload(pa)
+    import tests._guard_fixture as _gf
+    return _gf.install(importlib.reload(pa))
 
 
 def write_health(home, statuses, age_s=0.0):

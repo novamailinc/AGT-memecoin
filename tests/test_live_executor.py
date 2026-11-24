@@ -96,6 +96,7 @@ def _executor(tmp_home, provider, rpc, **kw):
 
 
 def main():
+    import tests._guard_fixture as _GF; _GF.admit_registry_for_fixture()  # disclosed fixture: registry admission for armed-path tests
     kp = _make_keypair()
     secret = json.dumps(list(bytes(kp.to_bytes())))
     provider = _StaticProvider(secret)
@@ -222,6 +223,13 @@ def main():
         with open(marker_path, "w") as f:
             json.dump({"machine": "test-vm", "armed": True}, f)
         os.chmod(marker_path, 0o000)
+        _restore_dir = False
+        try:
+            open(marker_path).close(); _still_readable = True   # root (e.g. the isolated runner's user namespace) bypasses chmod
+        except OSError:
+            _still_readable = False
+        if _still_readable:
+            os.remove(marker_path); os.mkdir(marker_path); _restore_dir = True   # root-proof unreadable marker: a directory
         try:
             ex.connect()
             raise AssertionError("connected with unreadable marker")
@@ -230,6 +238,9 @@ def main():
         except PermissionError:
             pass  # also fail-closed: no connect either way
         finally:
+            if _restore_dir:
+                os.rmdir(marker_path)
+                with open(marker_path, "w") as _f: json.dump({"machine": "test-vm", "armed": True}, _f)
             os.chmod(marker_path, 0o644)
         check("unreadable marker refuses", True)
 

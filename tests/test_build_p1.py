@@ -210,6 +210,20 @@ check("watcher: stale price withheld",
       w.price(MINT, max_age_s=15.0) == 0.0)
 
 # ---------------- grad engine: entry stamps + detection ----------------
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Same setup as the already-migrated tests/test_grad.py.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
+
 TMPD = tempfile.mkdtemp(prefix="p1-grad-")
 G.LEDGER_PATH = os.path.join(TMPD, "grad_ledger.json")
 
@@ -239,7 +253,8 @@ class _FakeKS:
         cls.halted.add(lane)
 
 
-TAPE_OK = {"price_usd": 0.00007, "usd_liquidity": 6000.0,
+TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "price_usd": 0.00007, "usd_liquidity": 6000.0,
            "usd_market_cap": 69000.0, "tape_source": "dexscreener"}
 SAFETY_OK = {"passed": True, "fails": [], "flags": [], "score": 90,
              "unknown": False, "source": "test"}
@@ -303,7 +318,10 @@ def _fake_quote(chain, mint, spot_index=None):
     G._LAST_QUOTE_LIQ = 4321.0
     return 0.00007 * 0.4  # below hard stop: forces a full close
 
-with patch.object(G, "quote_price", side_effect=_fake_quote):
+# DISCLOSED TEST EDIT: the shared-account guard fixture installs an at-cost price feed under jup_price, which G._jup.get_prices
+# reads, so the no-price_fn exit poll was priced at cost instead of via the DS/GT path this case models. Jupiter returns nothing here.
+with patch.object(G, "quote_price", side_effect=_fake_quote), \
+        patch.object(G._jup, "get_prices", return_value={}):
     closes = G.poll_exits()
 check("handler: close happened on hard stop", len(closes) == 1)
 rec = closes[0]

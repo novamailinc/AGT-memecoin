@@ -20,16 +20,27 @@ import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 sys.path.insert(0, _REPO_ROOT)
 
 TMPD = tempfile.mkdtemp(prefix="paper-mom-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
     prefix="paper-mom-home-")
 os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"  # TEST FIXTURE (mandatory-guard edit): not owner values
+os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "1000"
+os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "90"
+os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "100"
+os.environ["PAPER_ACCOUNT_MAX_SIMULTANEOUS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_POSITIONS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
 os.environ["PAPER_ACCOUNT_START"] = "2"
 
 from daemon.launch_scanner import momentum_lane as M
 from daemon.launch_scanner import paper_account as PA
+_gfb.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed): mechanics-only marks via real pipeline
 
 M.LEDGER_PATH = os.path.join(TMPD, "momentum_ledger.json")
 
@@ -42,7 +53,8 @@ def check(name, cond):
         FAILS.append(name)
 
 
-GOOD_TAPE = {"dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
+GOOD_TAPE = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0,
              "chg_m5": 5.0, "price_usd": 0.001,
              "tape_source": "test"}
 QUOTES = {}
@@ -51,6 +63,8 @@ QUOTES = {}
 M._fresh_tape = lambda chain, mint: dict(GOOD_TAPE)
 M.quote_price = lambda chain, mint, spot_index=None: \
     QUOTES.get(mint, 0.001)
+import tests._guard_fixture as _GFQ  # after sys.path setup
+M.quote_price = _GFQ.stamped_quote(M, M.quote_price)  # fixture: quote stamp at call time
 
 
 class _SafetyStub:
@@ -179,7 +193,8 @@ opened, why, final = M.consider_candidate(runner(MINT(20)),
                                           time.time())
 snap = PA.snapshot()
 check("flag off: entry leaves the shared account pristine",
-      opened and snap["cash"] == 2.0
+      (not opened) and "mandatory entry guard" in str(why)
+      and snap["cash"] == 2.0
       and snap["lanes"].get("momentum", {}).get("open_count", 0) == 0)
 
 if FAILS:

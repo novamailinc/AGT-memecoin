@@ -28,11 +28,21 @@ import time
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 
 TMPD = tempfile.mkdtemp(prefix="paper-eng-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
     prefix="paper-eng-home-")
 os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"  # TEST FIXTURE (mandatory-guard edit): not owner values
+os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "1000"
+os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "90"
+os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "100"
+os.environ["PAPER_ACCOUNT_MAX_SIMULTANEOUS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_POSITIONS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
 # Room for both stakes: grad $1 + grad_raw $25. The production
 # default stays $10; sizing across lanes is an open user decision,
 # not something this test prescribes.
@@ -41,6 +51,7 @@ os.environ["PAPER_ACCOUNT_START"] = "30"
 import daemon.launch_scanner.grad as G
 import daemon.launch_scanner.grad_raw as GR
 import daemon.launch_scanner.paper_account as PA
+_gfb.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed): mechanics-only marks via real pipeline
 
 G.LEDGER_PATH = os.path.join(TMPD, "grad_ledger.json")
 
@@ -70,7 +81,8 @@ class FakeKS:
         return {"lane": lane}
 
 
-TAPE_OK = {"usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
+TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
            "chg_m5": 3.0, "price_usd": 0.00007,
            "tape_source": "dexscreener"}
 

@@ -16,6 +16,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
+_gfb.set_limits_env()  # gates on + TEST-FIXTURE limits: setup debits are refused with gates off. No price feed: this file tests collect_marks itself.
 
 FAILURES = []
 
@@ -60,7 +62,8 @@ check("collected marks make the account view ok (equity 8+3=11)",
       and abs(snap["marked_equity"] - 11.0) < 1e-9)
 
 # Unpriced position: absent, view fails closed.
-m = am.collect_marks(price_fn=lambda mints: {})
+m = am.collect_marks(price_fn=lambda mints: {},
+                     curve_price_fn=lambda mint: (None, "stub"))
 check("unpriced position: absent from the map", m == {})
 snap = pa.snapshot(marks=m)
 check("absent mark: account view fails closed",
@@ -69,22 +72,29 @@ check("absent mark: account view fails closed",
 # Garbage prices are dropped, never coerced.
 for bad, label in [(0.0, "zero"), (-1.5, "negative"),
                    (float("nan"), "NaN"), ("0.003", "string")]:
-    m = am.collect_marks(price_fn=lambda mints, b=bad: {"MINTA": b})
+    m = am.collect_marks(price_fn=lambda mints, b=bad: {"MINTA": b},
+                         curve_price_fn=lambda mint: (None, "stub"))
     check("bad price dropped (%s)" % label, m == {})
 
 # Price function that raises: marker degrades to empty, never raises.
 def boom(mints):
     raise RuntimeError("network down")
 
-m = am.collect_marks(price_fn=boom)
+m = am.collect_marks(price_fn=boom,
+                     curve_price_fn=lambda mint: (None, "stub"))
 check("raising price source: empty map, no exception", m == {})
 
 # Two lanes, partial pricing coverage.
 H = tempfile.mkdtemp(prefix="marks-two-")
 pa, am = fresh(H)
 pa.try_debit("grad", "A", 2.0, 1000.0, "am-t1")
-pa.try_debit("ceo", "B", 1.0, 1000.0, "am-t2")
-m = am.collect_marks(price_fn=lambda mints: {"A": 0.004})
+# setup (mandatory-guard migration, disclosed): the 2nd entry needs a
+# trustworthy mark for the open position A; use the REAL collect_marks seam
+# at A's cost (2.00 / 1000 units) so the gated debit is admitted.
+pa.try_debit("ceo", "B", 1.0, 1000.0, "am-t2",
+             marks=am.collect_marks(price_fn=lambda mints: {"A": 0.002}))
+m = am.collect_marks(price_fn=lambda mints: {"A": 0.004},
+                     curve_price_fn=lambda mint: (None, "stub"))
 check("only the priced lane appears",
       "A" in m.get("grad", {}) and "ceo" not in m)
 snap = pa.snapshot(marks=m)
@@ -196,7 +206,10 @@ check("mark without a qty binding rejected",
 H = tempfile.mkdtemp(prefix="marks-src-")
 pa, am = fresh(H)
 pa.try_debit("grad", "LISTED", 1.0, 1000.0, "am-s1")
-pa.try_debit("watcher", "CURVED", 1.0, 500.0, "am-s2")
+# setup (disclosed): trustworthy at-cost mark for the open LISTED position
+# via the real collect_marks seam so the 2nd gated entry is admitted.
+pa.try_debit("watcher", "CURVED", 1.0, 500.0, "am-s2",
+             marks=am.collect_marks(price_fn=lambda mints: {"LISTED": 0.001}))
 m = am.collect_marks(price_fn=lambda mints: {"LISTED": 0.003},
                      curve_price_fn=lambda mint: (0.004, "c"))
 snap = pa.snapshot(marks=m)
@@ -216,6 +229,11 @@ os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"
 os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "5.0"
 os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "50.0"
 os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "60.0"
+os.environ["PAPER_ACCOUNT_MAX_SIMULTANEOUS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_POSITIONS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
 H = tempfile.mkdtemp(prefix="marks-auto-")
 pa, am = fresh(H)
 ok, why, pid = pa.try_debit("grad", "MINTA", 2.0, 1000.0, "g-1")

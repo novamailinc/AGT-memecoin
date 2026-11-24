@@ -39,6 +39,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
 
 FAILS = []
 
@@ -56,7 +57,8 @@ def fresh(home, start="100"):
     else:
         os.environ["PAPER_ACCOUNT_START"] = str(start)
     import daemon.launch_scanner.paper_account as pa
-    return importlib.reload(pa)
+    import tests._guard_fixture as _gf  # mandatory-guard migration (disclosed)
+    return _gf.install(importlib.reload(pa))
 
 
 HOME = tempfile.mkdtemp(prefix="assumed-sold-")

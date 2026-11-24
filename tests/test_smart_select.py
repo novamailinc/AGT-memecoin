@@ -60,12 +60,14 @@ from daemon.launch_scanner import killswitch as KS
 # reference (flat killswitch), so state isolation is set per
 # engine below, not only on the package KS.
 SEL = SS._sel
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(SEL)
 # 2026-11-24 conservative contract: recorder-only sub-threshold
 # counts never admit; stub the authoritative-history hook with this
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
 SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-    SEL.authoritative_proof(c, {"Trader1": 1, "TraderD": 1}.get(c, 0), n)
+    fixture_proof(SEL, c, {"Trader1": 1, "TraderD": 1}.get(c, 0), n)
 
 fails = []
 
@@ -153,6 +155,21 @@ check("killswitch: smart_select registered (window/min 100, halt)",
 _ks_tmp = tempfile.mkdtemp(prefix="smart-select-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 
 # ---------------- engine identity + policy ----------------
 eng = SS.make_engine()
@@ -227,7 +244,7 @@ with eng._ledger_lock():
 
 # stub the price layer (no network); safety must NEVER be consulted
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
                                 "tape_source": "test"}
 
@@ -460,7 +477,7 @@ with engD._ledger_lock():
     d["created_ts"] = NOW - 3600
     engD._write(d)
 engD.quote_price = lambda chain, mint, spot_index=None: 0.001
-engD._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+engD._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                  "usd_market_cap": 60000.0,
                                  "tape_source": "test"}
 engD._safety = _ExplodingSafety()
@@ -776,7 +793,7 @@ with eng2._ledger_lock():
     d["created_ts"] = NOW - 3600
     eng2._write(d)
 eng2.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng2._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng2._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                  "usd_market_cap": 60000.0,
                                  "tape_source": "test"}
 eng2._safety = _ExplodingSafety()

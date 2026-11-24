@@ -57,8 +57,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from email.utils import parsedate_to_datetime
 import os
 import time
+from urllib.parse import urlsplit
 import urllib.error
 import urllib.request
 
@@ -77,6 +80,12 @@ ALCHEMY_HTTPS_TMPL = "https://solana-mainnet.g.alchemy.com/v2/{key}"
 ALCHEMY_WSS_TMPL = "wss://solana-mainnet.streaming.alchemy.com/v2/{key}"
 CHAINSTACK_HTTPS_TMPL = "https://solana-mainnet.core.chainstack.com/{key}"
 HELIUS_WSS_TMPL = "wss://mainnet.helius-rpc.com/?api-key={key}"
+# Parsed Streams (parsedTransactionSubscribe) are served ONLY on the
+# Gatekeeper host, not on the standard mainnet WS host: a subscribe
+# sent to mainnet.helius-rpc.com is rejected with -32601 (Method not
+# found). Verified live 2026-11-23: same subscribe to this host is
+# ACKed and delivers parsedTransactionNotification events on Free.
+HELIUS_PARSED_STREAMS_WSS_TMPL = "wss://beta.helius-rpc.com/?api-key={key}"
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +123,12 @@ def classify_429(provider, http_status=None, rpc_error=None,
         try:
             wait_hint = float(retry_after)
         except (TypeError, ValueError):
-            pass
+            try:
+                wait_hint = max(0., parsedate_to_datetime(str(retry_after)).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if wait_hint is not None and (not math.isfinite(wait_hint) or wait_hint < 0):
+        wait_hint = None
     monthly_markers = ("monthly", "quota", "allowance", "limit exceeded",
                        "exceeded your", "upgrade", "billing")
     kind = "monthly_quota" if any(m in message for m in monthly_markers) \
@@ -218,6 +232,9 @@ def chainstack_endpoint(home=None):
     home = home or os.path.expanduser("~")
     endpoint = _read_key_file(os.path.join(
         home, ".forex-agent", "chainstack", "endpoint"))
+    if not endpoint:
+        # Runtime-home callers use the exact path seeded by AGT preflight.
+        endpoint = _read_key_file(os.path.join(home, "chainstack", "endpoint"))
     if endpoint:
         return endpoint
     key = _read_key_file(os.path.join(
@@ -234,18 +251,40 @@ def chainstack_endpoint(home=None):
     return CHAINSTACK_HTTPS_TMPL.format(key=key)
 
 
-def alchemy_url(home=None):
-    key = alchemy_key(home=home)
-    if not key:
+def _alchemy_credential_key(home=None):
+    """Accept a bare key or the exact supported Solana endpoint URL.
+
+    Never interpolate a full endpoint into another credential path.
+    Unrecognized URL-shaped values are refused without network access.
+    """
+    value = alchemy_key(home=home)
+    if not value:
         return None
-    return ALCHEMY_HTTPS_TMPL.format(key=key)
+    if "://" not in value:
+        return value if not any(c in value for c in "/?#@") else None
+    try:
+        parsed = urlsplit(value)
+        expected = {"https": "solana-mainnet.g.alchemy.com",
+                    "wss": "solana-mainnet.streaming.alchemy.com"}
+        if (parsed.scheme not in expected or
+                parsed.netloc != expected[parsed.scheme] or
+                parsed.query or parsed.fragment or
+                not parsed.path.startswith("/v2/")):
+            return None
+        key = parsed.path[len("/v2/"):]
+        return key if key and not any(c in key for c in "/?#@%") else None
+    except ValueError:
+        return None
+
+
+def alchemy_url(home=None):
+    key = _alchemy_credential_key(home=home)
+    return ALCHEMY_HTTPS_TMPL.format(key=key) if key else None
 
 
 def alchemy_wss_url(home=None):
-    key = alchemy_key(home=home)
-    if not key:
-        return None
-    return ALCHEMY_WSS_TMPL.format(key=key)
+    key = _alchemy_credential_key(home=home)
+    return ALCHEMY_WSS_TMPL.format(key=key) if key else None
 
 
 def chainstack_wss_url(home=None):
@@ -296,7 +335,7 @@ def chainstack_ru_table():
 # ---------------------------------------------------------------------------
 def http_json_rpc(url, method, params, timeout=12, _opener=None):
     """One JSON-RPC POST. Returns (http_status, parsed_body_or_None,
-    error_kind) where error_kind is None | "timeout" | "transport" |
+    error_kind, retry_after) where error_kind is None | "timeout" | "transport" |
     "rate_limited" | "http". Never raises. Never logs the URL."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                        "params": params}).encode()
@@ -307,6 +346,7 @@ def http_json_rpc(url, method, params, timeout=12, _opener=None):
         with opener(req, timeout=timeout) as resp:
             raw = resp.read()
             status = getattr(resp, "status", 200)
+            retry_after = (getattr(resp,"headers",None) or {}).get("Retry-After")
     except urllib.error.HTTPError as exc:
         raw = exc.read() if hasattr(exc, "read") else b""
         status = exc.code
@@ -315,30 +355,30 @@ def http_json_rpc(url, method, params, timeout=12, _opener=None):
         except ValueError:
             parsed = {}
         if status == 429:
-            return status, parsed, "rate_limited"
-        return status, parsed, "http"
+            return status, parsed, "rate_limited", (exc.headers or {}).get("Retry-After")
+        return status, parsed, "http", None
     except (TimeoutError, urllib.error.URLError, OSError) as exc:
         # urllib raises URLError wrapping timeouts; distinguish by text.
         if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
-            return None, None, "timeout"
-        return None, None, "transport"
+            return None, None, "timeout", None
+        return None, None, "transport", None
     except Exception:
-        return None, None, "transport"
+        return None, None, "transport", None
     try:
         parsed = json.loads(raw.decode("utf-8", "replace"))
     except ValueError:
-        return status, None, "http"
-    return status, parsed, None
+        return status, None, "http", None
+    return status, parsed, None, retry_after
 
 
-def _parse_rpc_body(provider, status, body, error_kind):
+def _parse_rpc_body(provider, status, body, error_kind, retry_after=None):
     """Turn (status, body, error_kind) into (result, kind, wait, rl_kind)."""
     if error_kind == "timeout":
         return None, "timeout", None, None
     if error_kind == "rate_limited":
         err = (body or {}).get("error") or {}
         kind, wait = classify_429(provider, http_status=429,
-                                  rpc_error=err or None)
+                                  rpc_error=err or None, retry_after=retry_after)
         return None, "rate_limited", wait, kind
     if error_kind in ("transport", "http"):
         return None, "error", None, None
@@ -348,7 +388,7 @@ def _parse_rpc_body(provider, status, body, error_kind):
         err = body["error"]
         if is_rate_limit_error(provider, http_status=status, rpc_error=err):
             kind, wait = classify_429(provider, http_status=status,
-                                      rpc_error=err)
+                                      rpc_error=err, retry_after=retry_after)
             return None, "rate_limited", wait, kind
         return None, "error", None, None
     return body.get("result"), "ok", None, None
@@ -422,11 +462,11 @@ class _HttpAdapter(BaseProviderAdapter):
         if not url:
             return _result(None, "unconfigured", 0.0, self.name,
                            note="no key/endpoint configured")
-        status, body, error_kind = http_json_rpc(
+        status, body, error_kind, retry_after = http_json_rpc(
             url, method, params, timeout=timeout, _opener=self._transport)
         elapsed = time.monotonic() - start
         result, kind, wait, rl_kind = _parse_rpc_body(
-            self.name, status, body, error_kind)
+            self.name, status, body, error_kind, retry_after=retry_after)
         note = None
         if self.unverified(method):
             note = "%s support on %s is UNVERIFIED" % (method, self.name)

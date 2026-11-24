@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import statistics
 import time
@@ -211,21 +212,32 @@ def load_outcomes(path: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _is_runner(rec: Dict[str, Any]) -> bool:
-    return (not rec.get("rug")) and _f(rec.get("peak_mult")) >= RUNNER_MULT
+def _known_mult(value):
+    if type(value) not in (int,float):return False
+    try:return math.isfinite(value) and value>=0
+    except (OverflowError,ValueError):return False
+
+
+def _cohort_known(recs):
+    return all(isinstance(r,dict) and _known_mult(r.get('peak_mult'))
+               and _known_mult(r.get('realized_mult')) and type(r.get('rug')) is bool for r in recs)
+
+
+def _is_runner(rec: Dict[str, Any]) -> Optional[bool]:
+    if not _known_mult(rec.get('peak_mult')) or type(rec.get('rug')) is not bool:return None
+    return (not rec.get("rug")) and rec['peak_mult'] >= RUNNER_MULT
 
 
 def _stats(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Win-rate snapshot: runner rate + average realized multiple."""
-    n = len(recs)
-    if not n:
-        return {"n": 0, "runner_rate": 0.0, "avg_realized": 0.0}
-    realized = [_f(r.get("realized_mult"), 1.0) for r in recs]
-    return {
-        "n": n,
-        "runner_rate": round(sum(1 for r in recs if _is_runner(r)) / n, 3),
-        "avg_realized": round(sum(realized) / n, 3),
-    }
+    """Whole cohort snapshot; unknown evidence is never a dead/breakeven fill."""
+    n=len(recs)
+    unknown=sum(not _cohort_known([r]) for r in recs)
+    if unknown:
+        return {'n':n,'runner_rate':None,'avg_realized':None,
+                'unavailable_count':unknown,'evidence_state':'unavailable'}
+    if not n:return {"n":0,"runner_rate":0.0,"avg_realized":0.0}
+    return {'n':n,'runner_rate':round(sum(_is_runner(r) is True for r in recs)/n,3),
+            'avg_realized':round(math.fsum(r['realized_mult']/n for r in recs),3)}
 
 
 # -- proposal store -----------------------------------------------------------
@@ -416,7 +428,12 @@ def grade_applied(path: Any, recs: List[Dict[str, Any]],
                 continue
             cur = _stats(after)
             p["followup_stats"] = cur
-            br = float(base.get("runner_rate") or 0)
+            if cur.get('runner_rate') is None or base.get('runner_rate') is None:
+                p['followup']='unclear'
+                p['followup_evidence_state']='unavailable'
+                n+=1
+                continue
+            br = float(base['runner_rate'])
             cr = cur["runner_rate"]
             if cr >= br + 0.10:
                 p["followup"] = "helped"
@@ -462,6 +479,7 @@ def _min_n(degen: Any) -> int:
 def analyze_ranking(degen: Any, recs: List[Dict[str, Any]], now: float,
                     day: str, min_n: int) -> List[Dict[str, Any]]:
     """Original #6: sniper threshold + narrative-heat boost proposals."""
+    if not _cohort_known(recs):return []
     proposals: List[Dict[str, Any]] = []
     # --- raise the sniper tier threshold --------------------------------
     scored = [r for r in recs
@@ -545,6 +563,7 @@ def analyze_entry(degen: Any, recs: List[Dict[str, Any]], now: float,
                   day: str, min_n: int) -> List[Dict[str, Any]]:
     """Entry learner: re-weight sniper signals toward what predicted
     runners. Max 2 proposals per scan (strongest first)."""
+    if not _cohort_known(recs):return []
     sig = [r for r in recs if isinstance(r.get("entry_signals"), dict)]
     if len(sig) < min_n:
         return []
@@ -592,6 +611,7 @@ def analyze_exits(degen: Any, recs: List[Dict[str, Any]], now: float,
                   day: str, min_n: int) -> List[Dict[str, Any]]:
     """Exit learner: trailing / TP / hold / stop proposals from real
     exit reasons, giveback (peak vs realized), and dead-money analysis."""
+    if not _cohort_known(recs):return []
     ex = [r for r in recs if r.get("exit_reason") in EXIT_REASONS]
     if len(ex) < min_n:
         return []
@@ -759,7 +779,7 @@ def analyze_exits(degen: Any, recs: List[Dict[str, Any]], now: float,
 def analyze_context(recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Context learner — informational only. No knobs, no proposals:
     which hours, sources, lanes, and narratives actually ran."""
-    if len(recs) < 10:
+    if len(recs) < 10 or not _cohort_known(recs):
         return []
     insights: List[Dict[str, Any]] = []
     overall = _bucket_rate(recs)
@@ -847,7 +867,7 @@ def analyze(degen: Any, now: Optional[float] = None,
     day = datetime.fromtimestamp(now, WAT).date().isoformat()
     min_n = _min_n(degen)
     recs = load_outcomes(default_dataset_path(degen))
-    if len(recs) < min_n:
+    if len(recs) < min_n or not _cohort_known(recs):
         return []
     existing = existing if existing is not None else load_proposals()
     proposals: List[Dict[str, Any]] = []

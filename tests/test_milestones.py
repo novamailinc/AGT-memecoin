@@ -154,7 +154,7 @@ class PollTests(unittest.TestCase):
                              [])
 
     def test_expiry(self):
-        state, degen = {}, _degen()
+        state, degen = {}, _degen(deployer_tracking_enabled=False)
         milestones.track_signal(state, degen, _sig())
         state["milestone_watch"]["MINTAAA"]["card_ts"] = (
             time.time() - milestones._EXPIRY_S - 1)
@@ -268,3 +268,18 @@ class FilterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_expired_missing_deployer_context_retained_without_new_price():
+    state={};degen=_degen()
+    milestones.track_signal(state,degen,_sig())
+    rec=state['milestone_watch']['MINTAAA']
+    rec['card_ts']=time.time()-milestones._EXPIRY_S-1
+    rec['peak_mult']=2.75
+    before=dict(rec)
+    with unittest.mock.patch.object(milestones,'_batch_stats',side_effect=AssertionError('expired context must not fetch')) as batch:
+        assert milestones.poll(state,degen,time.time(),4)==[]
+    batch.assert_not_called()
+    assert state['milestone_watch']['MINTAAA']==before
+    assert not state.get('deployer_outcome_recorded')
+    assert 'deployer_grade_proposal' not in state['milestone_watch']['MINTAAA']

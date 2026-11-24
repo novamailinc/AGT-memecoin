@@ -67,10 +67,10 @@ METHOD_COSTS = {
     "getAccountInfo": (1, 10, 1, None),
     "getMultipleAccounts": (1, 20, 1, None),
     "getTokenAccountBalance": (1, 20, 1, None),
-    "getTokenAccountsByOwner": (1, None, None, None),  # Alchemy CU +
+    "getTokenAccountsByOwner": (1, 10, None, None),  # Alchemy CU +
     # Chainstack RU UNVERIFIED (router-owner addition 2026-11-22;
     # Helius 1 credit follows the standard-read convention).
-    "getTokenLargestAccounts": (1, None, None, None),  # Alchemy UNVERIFIED;
+    "getTokenLargestAccounts": (1, 20, None, None),  # Alchemy official CU table verified 2026-11-23;
     # Chainstack docs conflict (methods page: listed; limits page:
     # 0 RPS / Dedicated Nodes only). Do not route until verified.
     "getSignaturesForAddress": (10, 40, 2, None),  # Helius archival 10cr;
@@ -84,7 +84,7 @@ METHOD_COSTS = {
     "getRecentPrioritizationFees": (1, 20, 1, None),
     "sendTransaction": (1, 20, 1, None),  # Helius Free send limit 1/s.
     "simulateTransaction": (1, 20, 1, None),
-    "getTokenSupply": (1, None, 1, None),  # Alchemy CU UNVERIFIED.
+    "getTokenSupply": (1, 20, 1, None),  # Alchemy official CU table verified 2026-11-23.
 }
 
 # ---------------------------------------------------------------------------
@@ -312,8 +312,7 @@ ACCOUNTS = {
                          "(re-probed 2026-11-22 09:19 UTC via the connector "
                          "helper). User re-entering the key. Do NOT treat "
                          "Alchemy as verified until a health call returns ok.",
-                         "getTokenLargestAccounts CU UNVERIFIED (not in the "
-                         "published Solana CU table).",
+                         "getTokenLargestAccounts documented at 20 CU, rechecked 2026-11-23.",
                          "Historical account-state reads are paid-only; the "
                          "bot does not use them.",
                          "Jito bundle methods are paid-only; the live "
@@ -505,11 +504,16 @@ FREE_TIER_REFUSALS = {
     "public": set(),
 }
 
+# Alchemy official support and CU source rechecked 2026-11-23:
+# https://www.alchemy.com/docs/reference/compute-unit-costs.md
+# /docs/chains/solana/solana-api-endpoints/get-token-largest-accounts.md
+# /docs/chains/solana/solana-api-endpoints/get-token-supply.md
+# /docs/chains/solana/solana-api-endpoints/get-token-accounts-by-owner.md
+# These verify documented methods/costs, not the operator's credentials or uptime.
 # Methods whose cost/support is UNVERIFIED on a provider. A call may be
 # attempted only in shadow/probe mode and must be flagged provisional.
 UNVERIFIED_METHODS = {
-    "alchemy": {"getTokenLargestAccounts", "getTokenSupply",
-                "getTokenAccountsByOwner"},
+    "alchemy": set(),  # Official method + CU docs rechecked 2026-11-23.
     "chainstack": {"getTokenLargestAccounts", "getTokenAccountsByOwner"},
     "helius_main": set(),
     "helius_discovery": set(),

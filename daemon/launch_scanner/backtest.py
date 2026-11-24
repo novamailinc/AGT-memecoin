@@ -138,18 +138,83 @@ def _f(value: Any) -> float:
     return v
 
 
-def record_history(path: str, record: Dict[str, Any]) -> bool:
-    """Append one history record as a JSON line. Crash-safe: never raises.
+def _evidence_time(value):
+    """Numeric finite nonnegative event time, no coercion of missing evidence.
 
-    Returns True on success, False on any I/O trouble.
+    Zero remains valid for explicitly constructed relative-time fixtures.
+    """
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except (OverflowError, ValueError):
+        return False
+
+
+def record_history(path: str, record: Dict[str, Any]) -> bool:
+    """Append history. Stable outcome_id records use exact durable replacement.
+
+    Legacy records retain their existing append contract. An outcome_id opts in
+    to full-file integrity checks and exact replay under an interprocess lock;
+    it never infers an identity for old records or silently changes an outcome.
     """
     try:
         p = os.path.expanduser(str(path))
-        parent = os.path.dirname(p)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(p, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+        parent = os.path.dirname(p) or "."
+        os.makedirs(parent, exist_ok=True)
+        outcome_id = record.get("outcome_id")
+        if outcome_id is not None and (not isinstance(outcome_id, str) or not outcome_id):
+            raise ValueError("invalid history outcome identity")
+        import fcntl
+        import tempfile
+        with open(p + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if outcome_id is None:
+                with open(p, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, default=str) + "\n")
+                return True
+            records = []
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.strip():
+                            item = json.loads(line)
+                            if not isinstance(item, dict):
+                                raise ValueError("invalid history record")
+                            records.append(item)
+            seen_ids = set()
+            for item in records:
+                if "outcome_id" not in item:
+                    continue  # Old records retain their unkeyed contract.
+                prior_id = item["outcome_id"]
+                if not isinstance(prior_id, str) or not prior_id or prior_id in seen_ids:
+                    raise ValueError("invalid or duplicate history outcome identity")
+                seen_ids.add(prior_id)
+            matches = [r for r in records if r.get("outcome_id") == outcome_id]
+            if matches and (len(matches) != 1 or matches[0] != record):
+                raise ValueError("history outcome identity conflict")
+            if not matches:
+                records.append(record)
+                fd, tmp = tempfile.mkstemp(prefix=".history-", dir=parent)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        for item in records:
+                            fh.write(json.dumps(item, allow_nan=False) + "\n")
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.chmod(tmp, 0o600)
+                    os.replace(tmp, p)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+            # An exact visible replay still owes the file/directory barriers.
+            with open(p, "rb") as fh:
+                os.fsync(fh.fileno())
+            fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         return True
     except Exception:
         return False
@@ -162,10 +227,13 @@ class BacktestEngine:
                  exit_rules: Optional[Dict[str, Any]] = None,
                  costs: Optional[Dict[str, Any]] = None,
                  seed: int = 0,
-                 replay_model: str = REPLAY_MODEL_V2):
+                 replay_model: str = REPLAY_MODEL_V2,
+                 require_provider_inputs: bool = False):
         if replay_model not in REPLAY_MODELS:
             raise ValueError("unknown replay_model %r (want one of %s)"
                              % (replay_model, ", ".join(REPLAY_MODELS)))
+        if type(require_provider_inputs) is not bool:raise ValueError('provider qualification flag must be bool')
+        self.require_provider_inputs=require_provider_inputs
         self.replay_model = replay_model
         # Stage A cost model (request section 12). OFF by default so
         # historical reports stay comparable; when enabled every
@@ -182,7 +250,21 @@ class BacktestEngine:
         #                      position cost (ATA rent) in multiple terms
         # Fills are decided on OBSERVED prices and realized at dragged
         # prices: buys execute at price*(1+drag), sells at price*(1-drag).
+        if costs is not None and not isinstance(costs,dict):raise ValueError('costs must be a scenario dictionary')
         costs = dict(costs or {})
+        known_costs={'fee_bps','slippage_bps','price_impact_bps','fail_prob_entry','fail_prob_exit','trade_notional_usd','token_account_cost_usd'}
+        if set(costs)-known_costs:raise ValueError('unknown cost scenario field')
+        for name,value in costs.items():
+            if not _evidence_time(value):raise ValueError('cost scenario needs finite nonnegative numeric '+name)
+        if costs.get('fee_bps',0)>10000:raise ValueError('fee_bps cannot exceed 10000')
+        for name in ('fail_prob_entry','fail_prob_exit'):
+            if costs.get(name,0)>1:raise ValueError(name+' must be between 0 and 1')
+        try:
+            if not math.isfinite(float(costs.get('slippage_bps',0))+float(costs.get('price_impact_bps',0))):raise ValueError('combined cost drag unavailable')
+            if costs.get('token_account_cost_usd',0)>0:
+                notional=costs.get('trade_notional_usd',0)
+                if notional<=0 or not math.isfinite(costs['token_account_cost_usd']/notional):raise ValueError('fixed cost needs positive finite usable notional')
+        except OverflowError:raise ValueError('cost scenario cannot be represented')
         self.costs_enabled = bool(costs)
         if self.costs_enabled and costs.get("fee_bps") is None:
             # Fail closed: an unknown venue fee must never silently
@@ -251,7 +333,7 @@ class BacktestEngine:
                 prov = outcome.get("recorded_t")
                 if prov is None:
                     prov = outcome.get("end_t")
-                if prov is None or _f(prov) > first_t:
+                if not _evidence_time(prov) or prov > first_t:
                     info["rug_label_ignored"] = True
                 else:
                     return False, "rug", info
@@ -418,19 +500,28 @@ class BacktestEngine:
 
         Guards against malformed values; never raises.
         """
-        mult = _f(hist.get("realized_mult"))
-        if mult <= 0:
-            mult = 1.0
+        raw_mult = hist.get("realized_mult")
+        mult = float(raw_mult) if _evidence_time(raw_mult) else None
         paper["trades"] += 1
         paper["mults"] = paper.get("mults") or []
-        paper["mults"].append(mult)
-        paper["total_pnl_sol"] = round(
-            _f(paper.get("total_pnl_sol")) + _f(hist.get("pnl_sol")), 6)
+        if mult is None:
+            paper["unavailable_mult_count"] += 1
+        else:
+            paper["mults"].append(mult)
+        raw_pnl = hist.get("pnl_sol")
+        try:
+            pnl = float(raw_pnl) if type(raw_pnl) in (int,float) else None
+        except (OverflowError, ValueError):
+            pnl = None
+        if pnl is None or not math.isfinite(pnl):
+            paper["unavailable_pnl_count"] += 1
+        else:
+            paper["pnls"].append(pnl)
         if hist.get("rug"):
             paper["rugs"] += 1
-        if mult > 1.0:
+        if mult is not None and mult > 1.0:
             paper["wins"] += 1
-        elif mult < 1.0:
+        elif mult is not None and mult < 1.0:
             paper["losses"] += 1
         narrs = hist.get("narratives") or []
         if not isinstance(narrs, list):
@@ -440,20 +531,35 @@ class BacktestEngine:
             if not tag:
                 continue
             nar = paper["per_narrative"].setdefault(
-                tag, {"trades": 0, "wins": 0})
+                tag, {"trades": 0, "wins": 0, "unavailable_mult_count": 0})
             nar["trades"] += 1
-            if mult > 1.0:
+            if mult is None:
+                nar["unavailable_mult_count"] += 1
+            elif mult > 1.0:
                 nar["wins"] += 1
         reason = str(hist.get("exit_reason") or "unknown")
         er = paper["per_exit_reason"].setdefault(
-            reason, {"trades": 0, "wins": 0})
+            reason, {"trades": 0, "wins": 0, "unavailable_mult_count": 0})
         er["trades"] += 1
-        if mult > 1.0:
+        if mult is None:
+            er["unavailable_mult_count"] += 1
+        elif mult > 1.0:
             er["wins"] += 1
 
     # -- main entry ------------------------------------------------------
+    @staticmethod
+    def _provider_qualification(histories,required):
+        from daemon.launch_scanner import provider_inputs
+        statuses=[provider_inputs.record_status(h) for h in histories or []]
+        return {'required':required,'histories_by_state':{s:statuses.count(s) for s in set(statuses)},
+            'cohort_qualified':bool(statuses) and all(s=='provider-recorded' for s in statuses),
+            'scope':'adapter-consistency-not-authentication-freshness-or-completeness'}
+
     def run(self, histories: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Replay histories. Returns the report dict (never raises)."""
+        return self._run(histories,self._provider_qualification(histories,self.require_provider_inputs))
+
+    def _run(self, histories,provider_qualification):
+        """Replay a segment with its explicitly retained cohort boundary."""
         report: Dict[str, Any] = {
             "schema_version": HISTORY_SCHEMA_VERSION,
             # Cost-free replays are NEVER qualifying Stage A evidence;
@@ -529,6 +635,10 @@ class BacktestEngine:
                 "losses": 0,
                 "rugs": 0,
                 "total_pnl_sol": 0.0,
+                "pnls": [],
+                "unavailable_mult_count": 0,
+                "unavailable_pnl_count": 0,
+                "economics_complete": True,
                 "win_rate": 0.0,
                 "avg_mult": 0.0,
                 "median_mult": 0.0,
@@ -537,6 +647,7 @@ class BacktestEngine:
                 "per_exit_reason": {},
             },
         }
+        report['provider_input_qualification']=dict(provider_qualification)
         blocked = report["per_gate_blocked"]
 
         def _block(reason: str) -> None:
@@ -555,10 +666,29 @@ class BacktestEngine:
                 # Real paper close — tally as reported, never re-simulate.
                 self._tally_paper(report["paper"], hist)
                 continue
+            if self.require_provider_inputs and not report['provider_input_qualification']['cohort_qualified']:
+                _block('provider-input-cohort-unavailable')
+                continue
+            input_evidence=hist.get('snapshot_input_evidence')
+            if 'snapshot_input_evidence' not in hist:
+                report['n_snapshot_inputs_legacy_unrecorded']=report.get('n_snapshot_inputs_legacy_unrecorded',0)+1
+            if self.replay_model==REPLAY_MODEL_V2 and 'snapshot_input_evidence' in hist:
+                from daemon.launch_scanner import input_availability as inputs
+                recorded_t=(hist.get('outcome') or {}).get('recorded_t') if isinstance(hist.get('outcome'),dict) else None
+                valid=inputs.availability(recorded_t)=='recorded' and inputs.matches(hist.get('mint'),input_evidence,hist.get('snapshots'),until=recorded_t)
+                if not valid:
+                    _block('snapshot-input-unavailable')
+                    continue
             snaps = hist.get("snapshots")
             if not isinstance(snaps, list) or not snaps:
                 _block("no-snapshots")
                 continue
+            if self.replay_model == REPLAY_MODEL_V2:
+                times=[snap.get('t') for snap in snaps if isinstance(snap,dict)]
+                if (not times or any(not _evidence_time(t) for t in times)
+                        or any(later<earlier for earlier,later in zip(times,times[1:]))):
+                    _block('snapshot-timing-invalid')
+                    continue
             ok, reason, info = self._history_gate(hist, snaps)
             if not ok:
                 _block(reason)
@@ -578,10 +708,10 @@ class BacktestEngine:
                              and not saf.get("unknown"))
                 if has_score:
                     floor_raw = hist.get("safety_eval_t")
-                    if floor_raw is None:
+                    if not _evidence_time(floor_raw):
                         _block("safety-timing-unknown")
                         continue
-                    floor_t = _f(floor_raw)
+                    floor_t = float(floor_raw)
             entry_idx, floor_blocked = self._find_entry(snaps, floor_t)
             if entry_idx is None:
                 _block("safety-timing-no-eligible-snapshot"
@@ -715,15 +845,32 @@ class BacktestEngine:
         paper = report["paper"]
         mults = paper.pop("mults", None) or []
         pt = paper["trades"]
-        if pt:
+        pnls = paper.pop("pnls")
+        try:
+            pnl_total = math.fsum(pnls)
+            if not math.isfinite(pnl_total):pnl_total = None
+        except (OverflowError,ValueError):
+            pnl_total = None
+        paper["total_pnl_sol"] = (round(pnl_total,6)
+            if not paper["unavailable_pnl_count"] and pnl_total is not None else None)
+        paper["economics_complete"] = (not paper["unavailable_mult_count"]
+            and paper["total_pnl_sol"] is not None)
+        if not paper['economics_complete']:
+            for key in ('win_rate','avg_mult','median_mult','expectancy_mult'):
+                paper[key] = None
+        elif pt:
             paper["win_rate"] = round(paper["wins"] / pt, 4)
-            paper["avg_mult"] = round(sum(mults) / len(mults), 4) if mults else 1.0
-            paper["median_mult"] = round(statistics.median(mults), 4) if mults else 1.0
+            # Divide before summing to avoid overflowing finite means.
+            paper["avg_mult"] = round(math.fsum(x/len(mults) for x in mults),4)
+            ordered_mults=sorted(mults);mid=len(mults)//2
+            paper["median_mult"] = round(ordered_mults[mid] if len(mults)%2 else
+                ordered_mults[mid-1]/2+ordered_mults[mid]/2,4)
             paper["expectancy_mult"] = round(paper["avg_mult"] - 1.0, 4)
         for bucket in (paper["per_narrative"], paper["per_exit_reason"]):
             for key, agg in bucket.items():
                 t = agg["trades"]
-                agg["win_rate"] = round(agg["wins"] / t, 4) if t else 0.0
+                agg["win_rate"] = (None if agg['unavailable_mult_count'] else
+                    round(agg["wins"] / t, 4) if t else 0.0)
         return report
 
     # -- chronological dev/eval separation (Stage A) --------------------
@@ -731,22 +878,37 @@ class BacktestEngine:
                          holdout_fraction: float = 0.3) -> Dict[str, Any]:
         """Split histories CHRONOLOGICALLY and report dev and eval runs
         separately. The LATER segment is the evaluation holdout:
-        strategy development belongs on the dev segment, and the
-        holdout is touched only for final evaluation, so repeatedly
-        tuning against the report never overfits the eval data
-        (request Stage A: separate strategy development from final
-        evaluation data)."""
+        strategy development belongs on the dev segment. Calling this
+        function does not enforce an untouched evaluation set: repeatedly
+        tuning against its report can overfit. Snapshot boundary diagnostics
+        do not establish source completeness or full evidence separation."""
         def _first_t(h: Any) -> float:
             if not isinstance(h, dict):
                 return float("inf")
             snaps = h.get("snapshots")
+            if self.replay_model == REPLAY_MODEL_V2:
+                if not isinstance(snaps,list):return float('inf')
+                times=[snap.get('t') for snap in snaps if isinstance(snap,dict)]
+                if (not times or any(not _evidence_time(t) for t in times)
+                        or any(b<a for a,b in zip(times,times[1:]))):return float('inf')
+                return times[0] # zero is explicit relative time, not missing
             if isinstance(snaps, list):
                 for s in snaps:
                     if isinstance(s, dict) and _f(s.get("t")) > 0:
                         return _f(s.get("t"))
             return _f(h.get("t0"))
 
-        ordered = sorted(list(histories or []), key=_first_t)
+        supplied = list(histories or [])
+        rejected = []
+        if self.replay_model == REPLAY_MODEL_V2:
+            # Unknown chronology cannot move valid records across the split.
+            # Retain a separate accounting report, including paper economics.
+            rejected = [h for h in supplied if not math.isfinite(_first_t(h))]
+            supplied = [h for h in supplied if math.isfinite(_first_t(h))]
+        provider_cohort=self._provider_qualification(histories,self.require_provider_inputs)
+        def segment_qualification(rows):
+            return provider_cohort if self.require_provider_inputs else self._provider_qualification(rows,False)
+        ordered = sorted(supplied, key=_first_t)
         n = len(ordered)
         frac = min(max(_f(holdout_fraction), 0.0), 1.0)
         k = min(n, max(0, int(round(n * (1.0 - frac)))))
@@ -758,13 +920,52 @@ class BacktestEngine:
                                     exit_rules=self._cfg_exit,
                                     costs=self._cfg_costs,
                                     seed=self._seed + 1,
-                                    replay_model=self.replay_model)
+                                    replay_model=self.replay_model,
+                                    require_provider_inputs=self.require_provider_inputs)
         eval_engine = BacktestEngine(entry_rules=self._cfg_entry,
                                      exit_rules=self._cfg_exit,
                                      costs=self._cfg_costs,
                                      seed=self._seed + 2,
-                                     replay_model=self.replay_model)
+                                     replay_model=self.replay_model,
+                                    require_provider_inputs=self.require_provider_inputs)
+        # Sorting start times alone does not prevent dev evidence extending
+        # beyond eval start. Report that limitation without dropping losses,
+        # truncating histories, or claiming an untouched/calibrated holdout.
+        def _window(h: Any) -> Optional[Tuple[float, float]]:
+            if not isinstance(h,dict) or not isinstance(h.get('snapshots'),list):
+                return None
+            times=[snap.get('t') for snap in h['snapshots'] if isinstance(snap,dict)]
+            if (not times or any(not _evidence_time(t) for t in times)
+                    or any(b<a for a,b in zip(times,times[1:]))):
+                return None
+            return times[0],times[-1]
+        windows=[_window(h) for h in ordered]
+        unknown=len(rejected)+sum(w is None for w in windows)
+        dev_end=max((w[1] for w in windows[:k] if w is not None),default=None)
+        eval_start=min((w[0] for w in windows[k:] if w is not None),default=None)
+        status=('unknown-timing' if unknown else
+                'empty-segment' if dev_end is None or eval_start is None else
+                'overlap' if dev_end>=eval_start else 'separated')
+        boundary={
+            'status':status, 'unknown_history_count':unknown,
+            'dev_latest_snapshot_t':dev_end, 'eval_earliest_snapshot_t':eval_start,
+            'snapshot_windows_separated':status=='separated',
+            'scope':'retained snapshots only; safety, labels, source availability and tuning isolation not verified',
+            'stage_a_qualified':False,
+        }
         return {
+            "snapshot_boundary": boundary,
+            "provider_input_qualification":provider_cohort,
+            "cohort": {"input_count":len(ordered)+len(rejected),
+                       "admitted_count":len(ordered),
+                       "rejected_count":len(rejected),
+                       "rejection_reason":"unknown snapshot chronology; excluded from split, retained in rejected report"},
+            "rejected": BacktestEngine(entry_rules=self._cfg_entry,
+                                       exit_rules=self._cfg_exit,
+                                       costs=self._cfg_costs,
+                                       seed=self._seed+3,
+                                       replay_model=self.replay_model,
+                                    require_provider_inputs=self.require_provider_inputs)._run(rejected,segment_qualification(rejected)),
             "split_index": k,
             "holdout_fraction": frac,
             # Each segment is its OWN portfolio: capital resets at the
@@ -773,8 +974,8 @@ class BacktestEngine:
             "portfolio_note": ("independent segments: capital resets at "
                                "the split; no position or capital "
                                "carryover; not one portfolio"),
-            "dev": dev_engine.run(ordered[:k]),
-            "eval": eval_engine.run(ordered[k:]),
+            "dev": dev_engine._run(ordered[:k],segment_qualification(ordered[:k])),
+            "eval": eval_engine._run(ordered[k:],segment_qualification(ordered[k:])),
         }
 
 
@@ -909,11 +1110,18 @@ def _print_report(report: Dict[str, Any]) -> None:
     if paper.get("trades"):
         print("--- REAL PAPER OUTCOMES (%d closed positions) ---" % (
             paper["trades"],))
-        print("win rate %.1f%% (%dW/%dL)  avg %.3fx  expectancy %+.3fx" % (
-            paper["win_rate"] * 100.0, paper["wins"], paper["losses"],
-            paper["avg_mult"], paper["expectancy_mult"]))
-        print("realized P&L %+.6f SOL  rugs %d" % (
-            paper["total_pnl_sol"], paper["rugs"]))
+        if paper['win_rate'] is None:
+            print("return statistics unavailable: incomplete economics (%d invalid multipliers, %d invalid P&L records)" %
+                  (paper['unavailable_mult_count'],paper['unavailable_pnl_count']))
+        else:
+            print("win rate %.1f%% (%dW/%dL)  avg %.3fx  expectancy %+.3fx" % (
+                paper["win_rate"] * 100.0, paper["wins"], paper["losses"],
+                paper["avg_mult"], paper["expectancy_mult"]))
+        if paper['total_pnl_sol'] is None:
+            print("realized P&L unavailable: missing/invalid evidence or nonfinite aggregate")
+        else:
+            print("realized P&L %+.6f SOL  rugs %d" % (
+                paper["total_pnl_sol"], paper["rugs"]))
         # Stage-C visibility (owner-approved 2026-11-22): simulated
         # outcomes are never qualified performance; the fill model is
         # unvalidated and dataset paper closes predate price-kind
@@ -924,8 +1132,9 @@ def _print_report(report: Dict[str, Any]) -> None:
         for label, bucket in (("narrative", paper["per_narrative"]),
                               ("exit", paper["per_exit_reason"])):
             if bucket:
-                bits = ["%s: %d trades %.0f%%" % (
-                    k, v["trades"], v["win_rate"] * 100.0)
+                bits = ["%s: %d trades %s" % (
+                    k, v["trades"], 'unavailable' if v['win_rate'] is None else
+                    '%.0f%%' % (v['win_rate'] * 100.0))
                     for k, v in sorted(bucket.items())]
                 print("paper per %s — %s" % (label, " | ".join(bits)))
     else:
@@ -951,7 +1160,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--time-stop-h", type=float, default=None,
                     help="override time stop hours (default 6)")
     ap.add_argument("--with-costs", action="store_true",
-                    help="Stage A cost model: 125bps venue fee per leg, "
+                    help="uncalibrated scenario costs, explicit fee required; "
                          "50bps slippage, 100bps price impact (override "
                          "with --fee-bps/--slippage-bps/--impact-bps)")
     ap.add_argument("--fee-bps", type=float, default=None)
@@ -969,6 +1178,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(default) never enters before safety_eval_t and "
                          "ignores unprovenanced/future rug labels for "
                          "eligibility; v1-legacy reproduces prior output")
+    ap.add_argument("--require-provider-inputs", action="store_true",
+                    help="require adapter-consistency evidence across the entire supplied cohort; not Stage A qualification")
     ap.add_argument("--holdout", type=float, default=None,
                     help="chronological dev/eval split: the LATER "
                          "fraction (e.g. 0.3) is the evaluation holdout")
@@ -1019,17 +1230,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             "price_impact_bps": (100.0 if args.impact_bps is None
                                  else args.impact_bps),
         }
-    engine = BacktestEngine(entry_rules=entry_rules,
-                            exit_rules=exit_rules, costs=costs,
-                            replay_model=args.replay_model)
+    try:
+        engine = BacktestEngine(entry_rules=entry_rules,
+                                exit_rules=exit_rules, costs=costs,
+                                replay_model=args.replay_model,
+                                require_provider_inputs=args.require_provider_inputs)
+    except ValueError as exc:
+        print('invalid replay scenario: %s' % exc)
+        return 2
+    if args.require_provider_inputs:
+        q=engine._provider_qualification(histories,True)
+        print("PROVIDER INPUT COHORT: %s (adapter consistency only)" % ("qualified" if q["cohort_qualified"] else "unavailable"))
     if args.holdout is not None:
         split = engine.run_with_holdout(histories, args.holdout)
         print("SEGMENTS: %s" % split["portfolio_note"])
         print("=== DEV segment (%d histories) ===" % split["split_index"])
         _print_report(split["dev"])
-        print("=== EVAL holdout (later %d histories; final evaluation "
-              "only) ===" % (len(histories) - split["split_index"]))
+        print("SNAPSHOT BOUNDARY: %s; Stage A unqualified" %
+              split["snapshot_boundary"]["status"])
+        print("=== EVAL holdout (later %d admitted histories; not an "
+              "enforced untouched evaluation set) ===" %
+              (split["cohort"]["admitted_count"] - split["split_index"]))
         _print_report(split["eval"])
+        if split["cohort"]["rejected_count"]:
+            print("=== REJECTED COHORT (%d histories; not in split) ===" %
+                  split["cohort"]["rejected_count"])
+            _print_report(split["rejected"])
     else:
         _print_report(engine.run(histories))
     return 0

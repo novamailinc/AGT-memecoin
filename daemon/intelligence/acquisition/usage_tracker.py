@@ -12,15 +12,10 @@ store:
   budget the tracker emits ONE warning per month (``warned_at``)
   and reports it on every subsequent budget check until the month
   rolls over.
-- Stop nonessential requests at threshold: at
-  ``STOP_NONESSENTIAL_PCT`` (95%) NONESSENTIAL priorities
-  (deployer + background — research, batch scans, dossiers) are
-  refused with reason ``budget_stop_nonessential``. ESSENTIAL
-  priorities (critical entry/exit + card safety) are NEVER stopped
-  by this manager: silently dropping an entry-critical read would
-  change trading behaviour, and exhausting an essential budget is
-  an operator decision (disable the account, or accept the spend),
-  not an automatic drop.
+- Nonessential traffic stops at 95% of known monthly/daily/feature limits.
+  Every priority stops at recorded exhaustion. Critical/card labels do not
+  authorize spending past a limit. Projected-cost and concurrent admission
+  reservations remain outside this threshold check.
 - Per-feature consumption: recorded per workload/feature in the
   store (``standard_rpc`` vs Helius ``parsed_streams`` /
   ``parsed_events`` / ``laserstream_wss``).
@@ -64,27 +59,17 @@ from .request_scheduler import (
 logger = logging.getLogger(
     "forex_agent.daemon.intelligence.acquisition.usage_tracker")
 
-# Priorities that may be stopped at the budget threshold. CRITICAL
-# (entry/exit) and CARD (safety screening) are essential and are
-# never stopped here.
+# Below exhaustion, nonessential work is shed first.
 NONESSENTIAL_PRIORITIES = (PRIORITY_DEPLOYER, PRIORITY_BACKGROUND)
 ESSENTIAL_PRIORITIES = (PRIORITY_CRITICAL, PRIORITY_CARD)
 
-# Emergency policy (Phase 3, explicit): when a budget is exhausted,
-# NONESSENTIAL traffic stops and ESSENTIAL traffic CONTINUES — an
-# entry/exit-critical read or a safety screen is never silently
-# dropped by this manager. The over-budget essential spend is
-# visible in budget_status() (pct > 1.0, essential_over_budget True)
-# and is an OPERATOR decision: disable the account, accept the
-# spend, or move the workload. Essential traffic past 100% never
-# auto-disables an account and never silently degrades to a cheaper
-# provider (a substitute would change the meaning of the read).
+# Exhaustion never grants an emergency spending exception.
 EMERGENCY_POLICY = (
-    "budgets stop NONESSENTIAL traffic at 95% (monthly, daily, or "
-    "per-feature). ESSENTIAL traffic (critical/card) is never "
-    "stopped by this manager; over-budget essential spend is "
-    "reported (pct > 1.0) for an operator decision — disable the "
-    "account or accept the spend. No silent provider substitution.")
+    "nonessential requests stop at 95% of monthly, daily or feature budget; "
+    "every priority stops at known exhaustion. Critical/card labels never "
+    "authorize overspend. Local recorded counters are not projected-cost, "
+    "concurrent reservation, provider billing or external account spend proof.")
+
 
 
 class UsageTracker:
@@ -97,7 +82,7 @@ class UsageTracker:
     # -- recording ------------------------------------------------------
     def record(self, account, provider, method, workload, priority,
                helius_priority=None, cost=None, kind="ok", elapsed=0.0,
-               cached=False, fallback=False, fallback_difference=None):
+               cached=False, fallback=False, fallback_difference=None, strict=False):
         """Record one serviced request; returns the updated account
         record (or None when the store was unavailable). Also checks
         the warn threshold and marks the warning once per month."""
@@ -106,7 +91,9 @@ class UsageTracker:
             workload=workload, priority=priority,
             helius_priority=helius_priority, cost=cost, kind=kind,
             elapsed=elapsed, cached=cached, fallback=fallback,
-            fallback_difference=fallback_difference)
+            fallback_difference=fallback_difference, **({"strict":True} if strict else {}))
+        if strict and not isinstance(rec,dict):
+            raise OSError("usage write lacks durable record")
         if rec is not None:
             self._check_warn(account, rec)
         return rec
@@ -191,19 +178,32 @@ class UsageTracker:
 
     def nonessential_allowed(self, account, priority, workload=None,
                              provider=None):
-        """False when a NONESSENTIAL priority must be stopped: the
-        account is disabled, or its MONTHLY, DAILY, or per-FEATURE
-        spend passed the stop threshold. Essential priorities are
-        always allowed here (see module docstring + EMERGENCY_POLICY).
-        Returns (allowed, reason_or_None). Reasons:
-        account_disabled | budget_stop_nonessential |
-        daily_budget_stop_nonessential |
-        feature_budget_stop_nonessential:<feature>."""
+        """Known exhaustion refuses every priority, 95% sheds nonessential.
+
+        This reads recorded counters. It does not reserve projected costs or
+        prove a provider-side allowance or external usage is fully observed.
+        """
+        try:
+            self.store.validate_admission_state(account)
+        except (OSError, ValueError, TypeError):
+            return False, "usage_state_unavailable"
         if self.account_disabled(account):
             return False, "account_disabled"
+        status = self.budget_status(account)
+        # Exhaustion is a hard local stop for every priority. A critical
+        # label is not spending approval. This is NOT a projected-cost or
+        # concurrent reservation guarantee; callers must not claim one.
+        if status["amount"] is not None and status["spent"] >= status["amount"]:
+            return False, "budget_exhausted"
+        if status["daily_amount"] is not None and status["daily_spent"] >= status["daily_amount"]:
+            return False, "daily_budget_exhausted"
+        if workload is not None:
+            feature = feature_for(provider or "helius", workload)
+            fstatus = self.feature_status(account, feature)
+            if fstatus["amount"] is not None and fstatus["spent"] >= fstatus["amount"]:
+                return False, "feature_budget_exhausted:%s" % feature
         if priority not in NONESSENTIAL_PRIORITIES:
             return True, None
-        status = self.budget_status(account)
         if status["stop_nonessential"]:
             return False, "budget_stop_nonessential"
         if status["daily_stop_nonessential"]:

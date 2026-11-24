@@ -106,9 +106,16 @@ eng._safety = _ExplodingSafety()
 # fast, single-launch graduation so the fire-first mechanics under
 # test are exercised, not the filters.
 SEL = GR._select
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: SEL.authoritative_proof(
+    c, 1 if str(c).startswith("TraderFF") else 0, n)
 SEL._index_refresh = lambda now: None
 SEL._INDEX["available"] = True
 SEL._INDEX["coverage_start"] = NOW - 90000
+SEL._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 
 _ALL_MINTS = [MINT, MINT2, MINT3, MINT4, MINT5, MINT6, MINT7, MINT8]
 

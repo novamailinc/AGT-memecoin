@@ -42,6 +42,7 @@ Free-only: PumpPortal public stream + DexScreener/tape quotes.
 """
 import importlib.util
 import logging
+import math
 import os
 import threading
 import time
@@ -108,14 +109,25 @@ _GRAD_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # ---- launch filter -----------------------------------------------------
 
-def _pruned(lst, now):
-    """Timestamps inside the 24h window only. Pure: no I/O."""
-    try:
-        cutoff = now - FILTER_WINDOW_S
-        return [float(ts or 0) for ts in (lst or [])
-                if float(ts or 0) >= cutoff]
-    except Exception:
+def _pruned_strict(lst, now):
+    """Decision-path prune: corruption RAISES, never silently
+    becomes an empty window (a fail-open admit). A non-list entry
+    or a non-numeric/non-finite member is journal corruption."""
+    if lst is None:
         return []
+    if not isinstance(lst, (list, tuple)):
+        raise ValueError("corrupt journal entry")
+    cutoff = now - FILTER_WINDOW_S
+    out = []
+    for ts in lst:
+        if (isinstance(ts, bool) or not isinstance(ts, (int, float))
+                or not math.isfinite(ts)):
+            raise ValueError("corrupt journal entry")
+        if ts > now + 60.0:
+            raise ValueError("future-dated journal entry")
+        if ts >= cutoff:
+            out.append(float(ts))
+    return out
 
 
 def _filter_decision(journal, symbol, trader, now):
@@ -123,42 +135,65 @@ def _filter_decision(journal, symbol, trader, now):
     Returns (ok, reason): reject when the 24h occurrence count
     (including this launch) reaches FILTER_MAX_OCCUR for the
     ticker, or — when the trader is known — for the deployer.
-    A corrupt journal never blocks the lane (fail-open with an
-    empty decision); the ticker rule still gates every launch."""
+    A corrupt journal NEVER admits: any journal-read failure
+    rejects with unknown_serial_coverage (fail-closed, consistent
+    with the grad_select conservative contract). When the journal
+    is readable, the ticker rule still gates every launch."""
     try:
         j = journal or {}
-        tk = _pruned((j.get("tickers") or {}).get(symbol), now)
+        if j.get("_corrupt"):
+            return False, "unknown_serial_coverage"
+        tk = _pruned_strict((j.get("tickers") or {}).get(symbol), now)
         if len(tk) >= FILTER_MAX_OCCUR:
             return False, "copycat ticker"
         if trader:
-            dp = _pruned((j.get("deployers") or {}).get(trader), now)
+            dp = _pruned_strict((j.get("deployers") or {}).get(trader), now)
             if len(dp) >= FILTER_MAX_OCCUR:
                 return False, "serial deployer"
         return True, ""
     except Exception:
-        return True, ""
+        return False, "unknown_serial_coverage"
 
 
 def _record_launch(journal, symbol, trader, now):
     """Record one seen launch in the journal (caller holds
     JOURNAL_LOCK). Prunes to the window and caps each key's list
-    so the journal stays bounded at stream rates. Never raises."""
+    so the journal stays bounded at stream rates. Never raises.
+    Returns True on success, False on any failure: a launch that
+    cannot be recorded makes the count unfaithful, and the caller
+    poisons the journal so later decisions fail closed."""
     try:
+        # VALIDATE BEFORE MUTATION: strict-prune every list this
+        # call touches - the two mutated keys AND every key the
+        # expiry cleanup scans - before writing anything. Any
+        # corruption fails the whole record (caller poisons the
+        # journal); nothing is silently healed into a clean window.
+        plan = []
         for store, key in (("tickers", symbol), ("deployers", trader)):
             if not key:
                 continue
             d = journal.setdefault(store, {})
-            lst = _pruned(d.get(key), now)
-            lst.append(now)
-            d[key] = lst[-64:]
-        # Drop keys with nothing inside the window.
+            if not isinstance(d, dict):
+                raise ValueError("corrupt journal store")
+            plan.append((d, key, _pruned_strict(d.get(key), now)))
+        drops = []
         for store in ("tickers", "deployers"):
             d = journal.get(store) or {}
-            for k in [k for k, v in d.items()
-                      if not _pruned(v, now)]:
-                del d[k]
+            if not isinstance(d, dict):
+                raise ValueError("corrupt journal store")
+            for k, v in d.items():
+                if not _pruned_strict(v, now):
+                    drops.append((d, k))
+        # MUTATE only after everything validated: append bounded
+        # to 64, drop legitimately expired keys.
+        for d, key, lst in plan:
+            lst.append(now)
+            d[key] = lst[-64:]
+        for d, k in drops:
+            del d[k]
     except Exception:
-        pass
+        return False
+    return True
 
 
 def _filtered_consider(engine, cand, now):
@@ -185,7 +220,9 @@ def _filtered_consider(engine, cand, now):
                         {"seen": 0, "rejected_copycat": 0,
                          "rejected_serial": 0})
                     kind = ("rejected_copycat" if "copycat" in reason
-                            else "rejected_serial")
+                            else "rejected_serial"
+                            if "serial deployer" in reason
+                            else "rejected_unknown_coverage")
                     fs[kind] = int(fs.get(kind) or 0) + 1
                     engine._write(d)
             except Exception:
@@ -474,10 +511,12 @@ def _scan_once(engine, feed, out, now, on_items=None,
     try:
         with JOURNAL_LOCK:
             for cand in rows:
-                _record_launch(JOURNAL, str(cand.get("symbol") or ""),
-                               str(cand.get("trader") or ""), now)
+                if not _record_launch(
+                        JOURNAL, str(cand.get("symbol") or ""),
+                        str(cand.get("trader") or ""), now):
+                    JOURNAL["_corrupt"] = True
     except Exception:
-        pass
+        JOURNAL["_corrupt"] = True
 
     with engine._ledger_lock():
         d = engine._read()

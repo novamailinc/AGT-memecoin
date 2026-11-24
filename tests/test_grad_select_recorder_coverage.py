@@ -54,7 +54,7 @@ NOW = time.time()
 # meta.err gate fails closed without it, so the fixture carries
 # a success meta (err None).
 CANNED_TX = {"meta": {"err": None},
-             "transaction": {"message": {"accountKeys": [
+             "transaction": {"signatures":["SIG1"],"message": {"accountKeys": [
                  {"pubkey": "DEPLOYER1", "signer": True,
                   "writable": True},
                  {"pubkey": "OTHER1", "signer": False,
@@ -145,24 +145,155 @@ saved_index = {k: (dict(v) if isinstance(v, dict) else v)
                for k, v in sel._INDEX.items()}
 try:
     sel._INDEX["available"] = True
+    # 2026-11-24 CONSERVATIVE CONTRACT (reviewer + main): a LOW count
+    # NEVER passes from recorder activity alone - continuity of
+    # observed flow is telemetry, not completeness authority (a silent
+    # upstream birth drop leaves a continuous-looking stream). Only an
+    # authoritative complete launch history may admit a low count;
+    # none is wired, so every sub-threshold count fails closed.
+    CONT = [NOW - 86400 + i * 300 for i in range(289)]  # every 5 min
+    sel._INDEX["coverage_start"] = NOW - 90000
+    sel._INDEX["event_ts"] = list(CONT)
     sel._INDEX["by_trader"] = {"CREATOR_A": [NOW, NOW - 100]}
-    check("filter unchanged: 2 launches in 24h passes serial",
-          sel._serial_check("CREATOR_A", NOW, {}) is None)
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("conservative: 2 launches in 24h rejects unknown_serial_coverage even under continuous flow",
+          rj is not None and rj.get("reason") == "unknown_serial_coverage")
+    check("conservative: continuous flow journaled as telemetry, count not stamped",
+          bool((rj or {}).get("values", {}).get("recorder_flow_telemetry"))
+          and "deployer_launches_24h" not in (rj or {}).get("values", {}))
+    # ADVERSARIAL: old coverage_start but a 6h mid-window outage ->
+    # low count must NOT pass (elapsed time is not completeness)
+    sel._INDEX["event_ts"] = [NOW - 87000] + [NOW - 900, NOW - 600, NOW - 300]
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("adversarial: old start + 6h gap rejects unknown_serial_coverage",
+          rj is not None and rj.get("reason") == "unknown_serial_coverage")
+    check("adversarial: gap detail journaled, undercount not stamped",
+          bool((rj or {}).get("values", {}).get("recorder_coverage_gap"))
+          and "deployer_launches_24h" not in (rj or {}).get("values", {}))
+    sel._INDEX["event_ts"] = list(CONT)
     sel._INDEX["by_trader"] = {"CREATOR_A": [NOW, NOW - 100, NOW - 200]}
     rj = sel._serial_check("CREATOR_A", NOW, {})
     check("filter unchanged: 3 launches rejects serial_deployer",
           rj is not None and rj.get("reason") == "serial_deployer")
+    # definite >=3 reject holds even with PARTIAL coverage
+    sel._INDEX["coverage_start"] = NOW - 3600
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("partial coverage: definite >=3 still rejects serial_deployer",
+          rj is not None and rj.get("reason") == "serial_deployer")
+    # partial nonempty history: low count is an undercount risk -> fail closed
+    sel._INDEX["by_trader"] = {"CREATOR_A": [NOW]}
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("partial coverage: low count rejects unknown_serial_coverage",
+          rj is not None and rj.get("reason") == "unknown_serial_coverage")
+    check("partial coverage: undercount NOT stamped as measured",
+          "deployer_launches_24h" not in (rj or {}).get("values", {}))
+    # unbounded coverage (None) with low count -> fail closed too
+    sel._INDEX["coverage_start"] = None
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("coverage None + low count rejects unknown_serial_coverage",
+          rj is not None and rj.get("reason") == "unknown_serial_coverage")
     sel._INDEX["available"] = False
     rj = sel._serial_check("CREATOR_A", NOW, {})
     check("filter unchanged: no index data rejects unknown_serial",
           rj is not None and rj.get("reason") == "unknown_serial")
 finally:
     sel._INDEX.clear()
+
+# ---- 5. authoritative-history hook (2026-11-24 contract) ------------
+# Production default is None (no authoritative source wired): the hook
+# is the ONLY admission path for a sub-threshold count.
+check("hook default is None (production fail-closed)",
+      sel._AUTHORITATIVE_LAUNCHES_24H is None)
+try:
+    sel._index_refresh = lambda now: None
+    for k in ("by_mint", "by_mig", "by_trader"):
+        sel._INDEX[k] = {}
+    sel._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]
+    sel._INDEX["coverage_start"] = NOW - 90000
+    sel._INDEX["available"] = True
+    sel._INDEX["by_trader"] = {"CREATOR_A": [NOW, NOW - 100]}
+    # authoritative complete count below threshold -> admitted, stamped
+    sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
+        sel.authoritative_proof(creator, 2, now)
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("hook: authoritative 2 passes with measured stamp",
+          rj is None)
+    vals = {}
+    sel._serial_check("CREATOR_A", NOW, vals)
+    check("hook: authoritative count stamped with source",
+          vals.get("deployer_launches_24h") == 2
+          and vals.get("launches_source") == "authoritative")
+    # authoritative complete count at threshold -> serial_deployer
+    sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
+        sel.authoritative_proof(creator, 3, now)
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("hook: authoritative 3 rejects serial_deployer",
+          rj is not None and rj.get("reason") == "serial_deployer"
+          and rj.get("values", {}).get("deployer_launches_24h") == 3)
+    # authoritative source cannot answer -> fail closed
+    sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: None
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("hook: authoritative None rejects unknown_serial_coverage",
+          rj is not None and rj.get("reason") == "unknown_serial_coverage"
+          and rj.get("values", {}).get("launches_source")
+          == "authoritative-unavailable")
+    # hook raising -> fail closed, never raises into the pipeline
+    def _boom(creator, now):
+        raise RuntimeError("rpc down")
+    sel._AUTHORITATIVE_LAUNCHES_24H = _boom
+    rj = sel._serial_check("CREATOR_A", NOW, {})
+    check("hook: raising hook fails closed",
+          rj is not None and rj.get("reason") == "unknown_serial_coverage")
+    # typed-proof validation: a bare count is NEVER admitted, and
+    # every malformed/partial/stale/wrong-subject shape fails closed
+    bad = [
+        ("bare int", 2),
+        ("bool count", dict(sel.authoritative_proof("CREATOR_A", 2, NOW),
+                            count=True)),
+        ("negative count", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                        NOW), count=-1)),
+        ("string count", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                      NOW), count="2")),
+        ("wrong creator", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                       NOW),
+                               creator="CREATOR_B")),
+        ("short window", sel.authoritative_proof("CREATOR_A", 2, NOW,
+                                                 window_start=NOW - 3600)),
+        ("stale enumeration", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                           NOW),
+                                   window_end=NOW - 3600)),
+        ("future enumeration", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                            NOW),
+                                    window_end=NOW + 3600)),
+        ("not finalized", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                       NOW),
+                               finality="confirmed")),
+        ("partial history", dict(sel.authoritative_proof("CREATOR_A", 2,
+                                                         NOW),
+                                 complete="partial")),
+        ("complete not literal True", dict(
+            sel.authoritative_proof("CREATOR_A", 2, NOW), complete=1)),
+    ]
+    for name, proof in bad:
+        sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now, p=proof: p
+        rj = sel._serial_check("CREATOR_A", NOW, {})
+        check("hook: %s fails closed" % name,
+              rj is not None
+              and rj.get("reason") == "unknown_serial_coverage"
+              and "deployer_launches_24h" not in rj.get("values", {}))
+finally:
+    sel._AUTHORITATIVE_LAUNCHES_24H = None
+    sel._INDEX.clear()
+    sel._INDEX.update({"by_mint": {}, "by_mig": {}, "by_trader": {},
+                       "event_ts": [], "coverage_start": None,
+                       "available": True})
     sel._INDEX.update(saved_index)
 
-# ---- 5. _evaluate: missing birth + dead fallback -> unknown_serial --
+# ---- 6. _evaluate: missing birth + dead fallback -> unknown_serial --
 #      missing birth + working fallback -> creator resolved (serial
-#      passes; later stages may reject on other grounds, but the
+#      passes via the authoritative-history hook stub - 2026-11-24
+#      conservative contract: recorder-only sub-threshold counts never
+#      admit; later stages may reject on other grounds, but the
 #      reason must NOT be unknown_serial).
 tmp_home = tempfile.mkdtemp(prefix="gs-cov-test-")
 os.environ["FOREX_AGENT_HOME"] = tmp_home
@@ -196,6 +327,8 @@ try:
           v.get("reason") == "unknown_serial")
     fake_live = FakeReserves(tx=CANNED_TX)
     sel._reserves, sel._deployers = fake_live, real_dep
+    sel._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
+        sel.authoritative_proof(creator, 0, now)
     v = sel.evaluate_candidate(None, cand, NOW)
     check("evaluate fallback resolves: reason is not unknown_serial",
           v.get("reason") != "unknown_serial")
@@ -205,6 +338,7 @@ try:
     check("evaluate fallback resolves: creator is DEPLOYER1",
           (v.get("values") or {}).get("creator") == "DEPLOYER1")
 finally:
+    sel._AUTHORITATIVE_LAUNCHES_24H = None
     sel._saturation = _orig_sat5
     if sel._ds_ticker is not None and _orig_c24_5 is not None:
         sel._ds_ticker.count_24h = _orig_c24_5

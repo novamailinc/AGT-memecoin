@@ -157,8 +157,11 @@ def _evidence(home):
                                     "sources": set()})
 
     # 1. deployer_history counters + tracker flags.
-    hist = _load_json(os.path.join(
-        home, "launch_scanner", "deployer_history.json"), {})
+    from .deployer_registry import read
+    try:hist=read(os.path.join(home,"launch_scanner","deployer_history.json"))
+    except Exception:
+        logger.warning('deployer history unavailable',exc_info=True)
+        hist={}
     for dep, e in hist.items():
         if not dep or not isinstance(e, dict):
             continue

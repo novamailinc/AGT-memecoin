@@ -1,48 +1,17 @@
-# Helius Credential Roles (Phase 3)
+# Helius credential roles, revised November 23, 2026
 
-**No key values appear in this file, in any report, log, or commit —
-ever.** Key material lives only in its existing files / the vault
-connector. This file records ROLES (which source serves which
-workload), so a reader can audit attribution without touching a key.
+The owner revised the allocation: Helius is primary for routine RPC reads,
+WebSockets and transaction reads, with selective parsed intelligence and relevant
+events. Alchemy handles normal scanning. Chainstack complements supported recent
+reads and independent verification. All remain free-only; no service activation
+or spending approval follows from this document.
 
-## The three sources
+Numbered sources HELIUS_API_KEY_1, _2 and _3 are fixed sources sharing one
+helius_main allowance. Legacy HELIUS_API_KEY is slot1 fallback only. Routine
+requests use a deterministic method/params shard, never another key on denial.
+Routine WSS uses slot1. Missing sources remain missing. Source identity is not
+an independent billing account. Combined traffic qualification remains open.
 
-| Source | Location (path only, never the value) | Role |
-|---|---|---|
-| Main disk key | `~/.forex-agent/helius/api_key` (0600) | The live leg's primary key. `reserves.rpc_url_pairs()` rotates it first; the central router records Helius usage against the `helius_main` account. |
-| Discovery disk key | `~/.forex-agent/helius/discovery_api_key` (0600, per the Nov 22 rotation) | Second rotation key in `reserves.rpc_url_pairs()`. Same live leg, second source for pacer-bucket separation. |
-| Vault surrogate | Vault connector `custom.helius` via `daemon/launch_scanner/helius_vault.py` (`vault_surrogate_url()`) | Third Helius source, appended after the disk keys in `rpc_url_pairs()`. The surrogate rotates on every issuance; the pacer bucket is keyed on the credential identity (`vault:custom.helius`), NOT on the surrogate value. |
-
-All three were replaced/verified live on 2026-11-22 ~08:28–08:30 PST
-(vault via secure card, main + discovery disk files from values
-supplied in chat, used transiently, recorded nowhere; both verified
-live via getSlot).
-
-## Attribution caveat (standing)
-
-`reserves.rpc()` rotates across the three sources internally and the
-router/adapters cannot see which key served a given call. Usage is
-therefore recorded against the single `helius_main` account with a
-rotation caveat in the journal — per-key attribution is NOT visible
-from the router layer, and **no second allowance is assumed**: the
-two disk keys may belong to ONE Helius account (1M credits/month),
-so budgets are enforced against the single `helius_main` account.
-
-## Rules (standing, from the capability audit §7)
-
-- NEVER rotate keys / accounts to evade rate limits, quotas,
-  billing, or terms. A rate-limited account is backed off, quieted,
-  or failed over — never replaced by a fresh key.
-- A monthly-quota 429 disables the account until the allowance
-  renews (operator re-enable); a throughput 429 never does.
-- Do NOT rotate keys to evade limits (Phase 3 task 8 — restated,
-  not changed).
-
-## OPEN — not resolved in Phase 3
-
-**Whether the vault and discovery keys are the same underlying
-Helius key.** The discovery-only-leg experiment that would establish
-it changes live routing and needs the parent's word; it was NOT run
-in this phase. Until it is established, the program assumes the
-conservative position (one account, one allowance) for all budget
-enforcement.
+Older disk/vault rotation paths remain compatibility code for historical modes,
+not the revised routine facade. The old frozen phone-test tree is unqualified.
+Do not infer current installation, valid keys, or permission from this file.

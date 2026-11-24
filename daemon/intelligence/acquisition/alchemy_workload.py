@@ -1,8 +1,8 @@
 """Alchemy routine acquisition workload (Phase 5, spec section 4).
 
 Alchemy is the primary routine/live acquisition provider in the
-validated end-state allocation. This module is the ONLY entry point
-for routine acquisition traffic: every call goes through the central
+configured end-state allocation. This workload facade routes every call
+through the central router: every call goes through the central
 router (``provider_router.ProviderRouter.call``) — this module makes
 NO routing decision of its own, builds no second routing path, and
 never calls an adapter or ``rpc_client.rpc`` directly.
@@ -13,14 +13,9 @@ AlchemySubscriptions``). The router owns scheduling (via the shared
 quota scheduler), response caching, usage tracking, circuit
 breaking, and failover, so every call below honours them.
 
-Shadow phase honesty: while the router is constructed with
-``helius_enabled=True`` (the live leg today), the router puts
-Helius first for P0-P2 work and Alchemy-first is the END-STATE
-order, not the shadow order. This module never overrides that:
-``route_preview()`` reports exactly what the router decides, and
-the tests demonstrate Alchemy-first with ``helius_enabled=False``
-(the end state). Nothing here re-enables, disables, or reorders a
-provider.
+Default selection is end_state with routine Helius disabled. Explicit
+shadow diagnostic routers can retain their older Helius-first selection;
+route_preview() reports the supplied router's decision without overriding it.
 
 Routine methods covered (spec section 4A):
 - account lookups: getAccountInfo, getMultipleAccounts,
@@ -28,11 +23,7 @@ Routine methods covered (spec section 4A):
 - transaction retrieval: getTransaction, getSignaturesForAddress
 - slot/block reads: getSlot, getBlock, getLatestBlockhash,
   getSignatureStatuses
-- getTokenLargestAccounts: PROVISIONAL — support and CU cost are
-  UNVERIFIED on Alchemy (``provider_capabilities.
-  UNVERIFIED_METHODS``). It is callable through the router but
-  every result is flagged ``provisional=True`` and
-  ``verify_methods()`` reports it as provisional, never supported.
+- getTokenLargestAccounts: documented support, 20 CU.
 
 Batching: getMultipleAccounts is chunked at 100 accounts per call
 (the Solana per-request limit) and getSignatureStatuses at 256
@@ -90,11 +81,10 @@ SLOT_BLOCK_METHODS = (
     "getLatestBlockhash",
     "getSignatureStatuses",
 )
-ROUTINE_METHODS = ACCOUNT_METHODS + TX_METHODS + SLOT_BLOCK_METHODS
+ROUTINE_METHODS = ACCOUNT_METHODS + TX_METHODS + SLOT_BLOCK_METHODS + ("getTokenLargestAccounts",)
 
-# Methods whose Alchemy support/cost is UNVERIFIED — callable, but
-# every result is flagged provisional (see module docstring).
-PROVISIONAL_METHODS = ("getTokenLargestAccounts",)
+# Reserved for methods whose support or cost remains unverified.
+PROVISIONAL_METHODS = ()
 
 # Client-side batching caps (per router call).
 MAX_ACCOUNTS_PER_CALL = 100
@@ -123,7 +113,7 @@ class AlchemyWorkload:
     store location).
     """
 
-    def __init__(self, router=None, home=None, helius_enabled=True,
+    def __init__(self, router=None, home=None, helius_enabled=False,
                  transport=None, now=None):
         if router is not None:
             self.router = router
@@ -152,9 +142,7 @@ class AlchemyWorkload:
         Returns [{"method", "status", "alchemy_cost_cu",
         "router_primary_end_state", "note"}]. ``status`` is
         "supported" (confirmed in provider_capabilities),
-        "provisional" (UNVERIFIED — currently
-        getTokenLargestAccounts and getTokenAccountsByOwner, whose
-        Alchemy CU cost is unverified), "refused" (free-tier
+        "provisional" (support or cost remains unverified), "refused" (free-tier
         refusal), or "unroutable" (the router cannot classify the
         method at all — no method is unroutable today; the
         getTokenAccountsByOwner gap found by Phase 5 was fixed by
@@ -240,12 +228,7 @@ class AlchemyWorkload:
                                     commitment="confirmed",
                                     encoding="jsonParsed",
                                     priority=PRIORITY_CARD, hints=None):
-        """PROVISIONAL: Alchemy CU cost is UNVERIFIED (router-owner
-        addition 2026-11-22 put the method in the router's
-        METHOD_WORKLOADS as ROUTINE_ACCOUNT, closing the Phase 5
-        gap). Callable through the router; the returned result is
-        provisional, do not treat it as confirmed. See
-        verify_methods()."""
+        """Documented token-owner account lookup, 10 Alchemy CU."""
         if mint is not None:
             filt = {"mint": mint}
         else:
@@ -258,20 +241,10 @@ class AlchemyWorkload:
 
     def get_token_largest_accounts(self, mint, commitment="confirmed",
                                    priority=PRIORITY_CARD, hints=None):
-        """PROVISIONAL: Alchemy support and CU cost are UNVERIFIED.
-        Callable through the router, but the returned result always
-        carries ``provisional=True`` and a note — callers must not
-        treat it as a confirmed capability."""
-        result = self.router.call(
+        """Documented largest-token-account lookup, 20 Alchemy CU."""
+        return self.router.call(
             "getTokenLargestAccounts", [mint, {"commitment": commitment}],
             priority=priority, hints=hints)
-        result = dict(result)
-        result["provisional"] = True
-        note = ("getTokenLargestAccounts support on Alchemy is "
-                "UNVERIFIED — result is provisional")
-        result["note"] = ((result.get("note") + "; ") if result.get("note")
-                          else "") + note
-        return result
 
     # -- transaction retrieval ------------------------------------------
     def get_transaction(self, signature, commitment="confirmed",

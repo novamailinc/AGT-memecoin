@@ -455,11 +455,13 @@ def test_helius_429_storm():
            and t.by_host.get("alchemy", 0) == before
            and any(a["kind"] == "rate_limited"
                    for a in res2["attempts"]))
-    # Recovery: one success clears the backoff fleet-wide.
+    # An in-flight success cannot cancel an active server cooldown.
     q = SharedQuota("alchemy", home=home)
+    before_until = q.status()['backoff_until']
     q.report_success()
-    check("429 storm: one success clears scheduler backoff",
-          q.status().get("backoff_remaining_s", 0) == 0)
+    check("429 storm: in-flight success preserves active scheduler backoff",
+          q.status().get("backoff_remaining_s", 0) > 0
+          and q.status()['backoff_until'] == before_until)
     # Direct scheduler proof (fresh bucket, fake clock).
     clock = [1000.0]
     home2 = tempfile.mkdtemp(prefix="fm_429b_")
@@ -1360,3 +1362,7 @@ if __name__ == "__main__":
     finally:
         os.environ.pop("ALCHEMY_API_KEY", None)
         os.environ.pop("CHAINSTACK_ENDPOINT", None)
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

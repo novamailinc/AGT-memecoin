@@ -61,7 +61,8 @@ def get_active_wallets() -> list:
     # Fallback: smartmoney registry
     try:
         reg_file = os.path.join(HOME, "launch_scanner", "smart_wallets.json")
-        reg = json.load(open(reg_file))
+        from wallet_registry import read
+        reg = read(reg_file)
         return list(reg.keys())[:20]
     except Exception:
         return []

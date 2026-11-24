@@ -312,7 +312,9 @@ def main():
         print("no helius key found")
         return 1
 
-    registry = _load_json(REGISTRY, {})
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'daemon', 'launch_scanner'))
+    from wallet_registry import read
+    registry = read(REGISTRY)
     buyers = trace_early_buyers(mint, api_key, early_min=early_min)
     print("distinct early buyers in window: %d" % len(buyers))
     if not buyers:

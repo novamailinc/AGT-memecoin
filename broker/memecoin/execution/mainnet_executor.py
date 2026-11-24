@@ -155,6 +155,14 @@ class MainnetExecutor:
                  sol_price_fn=None,
                  fee_policy=None,
                  jito=None):
+        # Construction is always dry-run. Only arm_live() may enable
+        # sends after checking the exact deployment-marker arming flag.
+        # Do not coerce false/truthy configuration into a sending mode.
+        if dry_run is not True:
+            raise BrokerError(
+                CONFIG_INVALID,
+                "executor construction requires dry_run=True; "
+                "use explicit arm_live() for the arming checks")
         # Phase 2 (optional, default None = today's behavior):
         # fee_policy is a fee_policy.PriorityFeePolicy and jito is a
         # jito.JitoClient. Both must be set for use_bundle=True in
@@ -180,7 +188,7 @@ class MainnetExecutor:
         self._chain = chain
         self._expected_pubkey = (expected_pubkey or "").strip()
         self._live_home = live_home
-        self._dry_run = bool(dry_run)
+        self._dry_run = True
         self._sol_price_fn = sol_price_fn
         self._fee_policy = fee_policy
         self._jito = jito

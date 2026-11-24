@@ -84,7 +84,8 @@ def main():
         print("rotation not due (14d cadence); use --force to override")
         return 0
 
-    registry = _load_json(REGISTRY, {})
+    from wallet_registry import read, mute
+    registry = read(REGISTRY)
     grades = _load_json(GRADES, {})
     per_wallet = grade_followers(grades, window_days=WINDOW_DAYS)
     now = time.time()
@@ -131,11 +132,8 @@ def main():
         except Exception as exc:
             logger.warning("registry backup failed: %s", exc)
         try:
-            tmp = REGISTRY + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(registry, f)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, REGISTRY)
+            changes={w:{k:registry[w][k] for k in ('muted','muted_ts','muted_reason')} for w in muted_now}
+            mute(REGISTRY,changes,'rotation-'+str(now))
         except Exception as exc:
             logger.error("registry save failed: %s", exc)
             return 1

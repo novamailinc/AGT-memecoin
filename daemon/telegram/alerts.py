@@ -1362,12 +1362,17 @@ def _tuning_weekly_review(e: Dict[str, Any]) -> str:
     lines = ["📰 DIGEST · weekly learner review — week of %s" % week]
     st = e.get("stats") or {}
     n = int(st.get("n") or 0)
-    if n:
+    if n and (st.get('runner_rate') is None or st.get('avg_realized') is None):
+        lines.append("How the week went: %d closes; return/runner statistics unavailable (%d records lack evidence)" %
+                     (n,int(st.get('unavailable_count') or 0)))
+    elif n:
         lines.append("How the week went: %d closes · %.0f%% runners · "
                      "avg x%.2f (prev week: %.0f%%)" % (
                          n, 100.0 * float(st.get("runner_rate") or 0),
                          float(st.get("avg_realized") or 0),
                          100.0 * float(st.get("prev_runner_rate") or 0)))
+        if st.get('prev_runner_rate') is None:
+            lines[-1]=lines[-1].rsplit('(prev week:',1)[0]+'(prev week: unavailable)' 
     else:
         lines.append("No closes this week yet — the learner is waiting "
                      "on fresh paper outcomes.")

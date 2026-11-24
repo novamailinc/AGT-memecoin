@@ -42,6 +42,23 @@ from types import SimpleNamespace
 _TEST_HOME = tempfile.mkdtemp(prefix="forex-test-secondwave-")
 os.environ["FOREX_AGENT_HOME"] = _TEST_HOME
 os.environ["FOREX_AGENT_TESTING"] = "1"
+
+# Import-order guard: if an earlier test module already imported
+# killswitch in this pytest process, its import-time HOME snapshot
+# points at the default home (unreadable under the test env, and the
+# gate fails CLOSED = halted). Realign its paths to this file's
+# redirected home; the dir is fresh and empty either way.
+from daemon.launch_scanner import killswitch as _killswitch_mod
+if _killswitch_mod.HOME != _TEST_HOME:
+    _killswitch_mod.HOME = _TEST_HOME
+    _killswitch_mod.STATE_DIR = os.path.join(_TEST_HOME, "killswitch")
+    _killswitch_mod.STATE_FILE = os.path.join(
+        _killswitch_mod.STATE_DIR, "state.json")
+    _killswitch_mod.SHADOW_FILE = os.path.join(
+        _killswitch_mod.STATE_DIR, "state.json.bak")
+    _killswitch_mod.LOCK_FILE = os.path.join(
+        _killswitch_mod.STATE_DIR, "state.lock")
+    os.makedirs(_killswitch_mod.STATE_DIR, exist_ok=True)
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "daemon", "launch_scanner"))

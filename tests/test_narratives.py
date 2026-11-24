@@ -172,7 +172,8 @@ class PersistenceTest(unittest.TestCase):
             bad = os.path.join(td, "bad.json")
             with open(bad, "w") as fh:
                 fh.write("{not json")
-            self.assertEqual(len(NarrativeHeat.load(bad)), 0)
+            with self.assertRaises(ValueError):NarrativeHeat.load(bad)
+            self.assertEqual(open(bad).read(), "{not json")
 
     def test_default_heat_path(self):
         # Isolation: other test modules set FOREX_AGENT_HOME at import

@@ -1,3 +1,55 @@
+# Stage A replay audit, current status November 23, 2026
+
+This is an engineering audit, not Stage A qualification. The original findings
+below are preserved as a historical audit. Their proposed-remediation section
+is not the current implementation status and is not an execution grant.
+
+## Current implementation and evidence boundaries
+
+- Explicit `v1-legacy` preserves the old replay model. Default
+  `v2-timestamp-correct` refuses malformed, missing, boolean, string,
+  nonfinite, negative or numerically unrepresentable safety timestamps when
+  a safety score would otherwise admit entry. Numeric zero is retained for
+  explicit relative-time fixtures. Entries cannot precede that validated time.
+- V2 uses rug labels to block entry only when validated label availability
+  proves the label existed at the first snapshot. Invalid or future labels
+  remain out of eligibility, not a reason to remove later losses. An explicit
+  malformed recorded time cannot fall back to a different outcome time.
+- V2 validates dictionary-observation timestamps before replay: finite numeric
+  nonnegative times in original nondecreasing order. It refuses invalid series,
+  never silently sorts or repairs them. Equal times remain as recorded.
+  Non-dictionary placeholders retain the existing skip behavior, which does
+  not authenticate missing-observation coverage.
+- Holdout splitting now excludes unknown snapshot chronology before calculating
+  the valid split and reports rejected records separately, including their
+  paper accounting. Invalid records cannot move valid records across a split.
+  Sorting history starts is not enough: retained-window overlap or touching,
+  unknown chronology, and empty segments are diagnosed. Even separated
+  retained windows are always Stage A unqualified.
+- Snapshot-window diagnostics do not establish safety/label/source availability
+  embargoes, immutable evaluation sets or tuning isolation. Repeatedly tuning
+  against evaluation results can overfit. Representative histories, calibrated
+  fills and execution failures, and effectiveness evidence remain absent.
+- Snapshot journal recovery and truncation/gap diagnostics exist. A label such
+  as journal-whole-no-detected-gaps is not proof that every required source
+  observation was acquired, recorded or available at its recorded timestamp.
+
+The timing, chronology, cohort and overflow fixes have independently reviewed
+focused evidence. The refreshed scoped checkpoint is 3,384 unique pytest nodes
+in nine isolated partitions and 179 script processes, including an explicit
+zero-check opt-in live skip. Those are code-validation evidence, not completed
+live provider, phone, reboot, signing, execution or trading qualification.
+The subsequent paper-summary correction is separately bounded accepted after
+159 independent focused passes for numeric reporting only; that change makes
+earlier broad coverage historical for its affected source. `realized_mult` is a
+recorded price ratio, not verified net account return. `economics_complete`
+means typed numeric availability only, not basis/fee/partial-close/FX consistency.
+Source-level receipt provenance and legacy missing-basis handling are under
+further correction and are not qualified by those 159 passes.
+No trading, charges or automatic deployment follow from these checks.
+
+## Historical audit, preserved below
+
 # Stage A lookahead audit — backtest dataset + replay (2026-11-23)
 
 Scope: `daemon/launch_scanner/backtest.py` (replay engine), the history

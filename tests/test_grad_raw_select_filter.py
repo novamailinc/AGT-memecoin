@@ -95,6 +95,7 @@ eng._safety = _ExplodingSafety()
 GS._index_refresh = lambda now: None
 GS._INDEX["available"] = True
 GS._INDEX["coverage_start"] = NOW - 90000
+GS._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 
 
 def _birth(mint, trader, ts, curve):
@@ -120,6 +121,13 @@ GS._INDEX["by_trader"][TRADER_FB] = [NOW - 500]
 GS._INDEX["by_mig"][MINT_FB] = {"pool": "PoolFB", "ts": NOW - 60}
 _birth(MINT_FB2, TRADER_FB2, NOW - 500, "CurveFB2")
 GS._INDEX["by_trader"][TRADER_FB2] = [NOW - 500]
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: GS.authoritative_proof(
+    c, {TRADER_OK: 1, TRADER_COPY: 1, TRADER_SLOW: 1, TRADER_MANY: 1,
+        TRADER_NC: 1, TRADER_FB: 1, TRADER_FB2: 1}.get(c, 0), n)
 GS._INDEX["by_mig"][MINT_FB2] = {"pool": "PoolFB2", "ts": NOW - 60}
 # MINT_UNK deliberately has NO birth record (unknown everything).
 

@@ -70,8 +70,8 @@ check("preprocessed tx assignment is None (paid, out of scope)",
 check("method_cost getTransaction is (10,40,1,None)",
       mod.method_cost("helius", "getTransaction") == (10, 40, 1, None),
       str(mod.method_cost("helius", "getTransaction")))
-check("method_cost getTokenLargestAccounts alchemy CU is None (unverified)",
-      mod.method_cost("alchemy", "getTokenLargestAccounts")[1] is None)
+check("method_cost getTokenLargestAccounts alchemy CU is official 20",
+      mod.method_cost("alchemy", "getTokenLargestAccounts")[1] == 20)
 check("unknown account returns None", mod.get_account("nope") is None)
 check("unknown capability returns None",
       mod.supports("alchemy", "no_such_capability") is None)

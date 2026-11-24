@@ -189,3 +189,69 @@ class TestScannerCloseOutbox:
         identity=a.scanner_close_identity(1);a.close_position(1)
         with pytest.raises(ValueError,match='identity conflict'):
             a.scanner_close_receipt(dict(identity,book_id='another-book'))
+
+    def test_actual_scanner_pinned_backtest_recovers_after_close_crash(self,account,tmp_path,monkeypatch):
+        from daemon.launch_scanner import backtest
+        a,store,state,scanner,cfg=setup(tmp_path)
+        cfg.degen.backtest_dataset_path=str(tmp_path/'history.jsonl')
+        a._market.usd['BONK']=.00005
+        original=a.close_position
+        def crash(ticket):
+            original(ticket);raise SystemExit('after actual close')
+        monkeypatch.setattr(a,'close_position',crash)
+        with pytest.raises(SystemExit):scanner._manage_exits(cfg,a,state)
+        assert not (tmp_path/'history.jsonl').exists()
+        store.close();fresh=Store(tmp_path/'scanner.db')
+        scanner=LaunchScanner.__new__(LaunchScanner);scanner._close_store=fresh
+        # Changing config after decision cannot redirect or disable accepted evidence.
+        cfg.degen.backtest_dataset_path=str(tmp_path/'wrong.jsonl')
+        cfg.degen.backtest_enabled=False
+        monkeypatch.setattr(a,'_price_sol_quiet',lambda symbol:(_ for _ in ()).throw(AssertionError('no quote')))
+        loaded=get_daemon_state(fresh,'launch_scanner')
+        scanner._manage_exits(cfg,a,loaded)
+        rows=[json.loads(line) for line in (tmp_path/'history.jsonl').read_text().splitlines()]
+        assert len(rows)==1 and rows[0]['pnl_sol']==-.01
+        assert rows[0]['outcome_id']==close_outbox.key(a.scanner_close_identity(1))
+        assert not (tmp_path/'wrong.jsonl').exists()
+        # Even with no positions, lost projection acknowledgments recover exactly.
+        fresh._conn.execute("DELETE FROM journal WHERE kind='scanner_backtest_projected'");fresh._conn.commit()
+        scanner._manage_exits(cfg,a,{'degen_positions':{}})
+        assert len((tmp_path/'history.jsonl').read_text().splitlines())==1
+
+    def test_backtest_write_failure_keeps_pinned_pending_projection(self,account,tmp_path,monkeypatch):
+        from daemon.launch_scanner import backtest
+        a,store,state,scanner,cfg=setup(tmp_path)
+        cfg.degen.backtest_dataset_path=str(tmp_path/'history.jsonl')
+        real=backtest.record_history
+        with patch.object(backtest,'record_history',return_value=False),patch.object(scanner,'_grade_deployer_close'),patch.object(scanner,'_record_narrative_close'):
+            scanner._manage_exits(cfg,a,state)
+        assert not state['degen_positions']
+        assert len(store.journal_query(kind='scanner_close_committed'))==1
+        assert not store.journal_query(kind='scanner_backtest_projected')
+        close_outbox.project_backtests(store)
+        assert len((tmp_path/'history.jsonl').read_text().splitlines())==1
+        assert len(store.journal_query(kind='scanner_backtest_projected'))==1
+
+    def test_projection_ack_failure_does_not_block_second_economic_exit(self,account,tmp_path,monkeypatch):
+        a,store,state,scanner,cfg=setup(tmp_path)
+        cfg.degen.backtest_dataset_path=str(tmp_path/'history.jsonl')
+        # Commit first close but fail every analytics ACK; never fake success.
+        original_add=store.journal_add
+        def failing_ack(entry):
+            if entry.get('kind')=='scanner_backtest_projected':raise OSError('ACK disk fault')
+            return original_add(entry)
+        monkeypatch.setattr(store,'journal_add',failing_ack)
+        with patch.object(scanner,'_grade_deployer_close'),patch.object(scanner,'_record_narrative_close'):
+            scanner._manage_exits(cfg,a,state)
+        a.submit_order(_req('BONK','BUY',.02,'entry-two'))
+        pos=dict(get_daemon_state(store,'launch_scanner')['degen_positions']['M'],ticket=2)
+        state={'degen_positions':{'M2':pos}}
+        with patch.object(scanner,'_grade_deployer_close'),patch.object(scanner,'_record_narrative_close'):
+            scanner._manage_exits(cfg,a,state)
+        assert not a.positions() and len(pa.snapshot()['pending_sol'])==2
+        assert len((tmp_path/'history.jsonl').read_text().splitlines())==2
+        assert not store.journal_query(kind='scanner_backtest_projected')
+        monkeypatch.setattr(store,'journal_add',original_add)
+        close_outbox.project_backtests(store)
+        assert len((tmp_path/'history.jsonl').read_text().splitlines())==2
+        assert len(store.journal_query(kind='scanner_backtest_projected'))==2

@@ -23,11 +23,9 @@ be zero.
 Thresholds (module constants; override per account in
 ``BUDGET_OVERRIDES`` only with a recorded reason):
 - ``WARN_PCT = 0.80`` — warn before exhaustion (once per month).
-- ``STOP_NONESSENTIAL_PCT = 0.95`` — stop NONESSENTIAL requests
-  (deployer + background priorities; entry/exit-critical and card
-  traffic is essential and is never stopped by this manager —
-  exhaustion of an essential budget is an operator decision, not a
-  silent drop).
+- ``STOP_NONESSENTIAL_PCT = 0.95`` stops nonessential requests.
+- At known recorded monthly/daily/feature exhaustion, every priority stops.
+  Threshold checks are not projected-cost or concurrent reservations.
 
 Files (under FOREX_AGENT_HOME, atomic replace, flock-guarded):
 - ``acquisition_provider_usage.json`` — per-account counters for the
@@ -78,8 +76,8 @@ BUDGET_OVERRIDES = {}
 # is no safe invented default: parsed-events at 10 credits/call and
 # parsed-streams at unknown per-message cost cannot share one
 # number). When set, nonessential traffic for that feature stops at
-# STOP_NONESSENTIAL_PCT of the feature budget; essential traffic is
-# never stopped (see usage_tracker.EMERGENCY_POLICY).
+# STOP_NONESSENTIAL_PCT of the feature budget; every priority stops
+# at recorded exhaustion (see usage_tracker.EMERGENCY_POLICY).
 FEATURE_BUDGETS = {}
 
 
@@ -110,7 +108,7 @@ def daily_budget_for(account):
     that deployer traffic stays allowed at 80% of the monthly
     budget. When an operator sets a daily amount, the tracker stops
     nonessential traffic at 95% of it, exactly like the monthly
-    stop; essential traffic is never stopped."""
+    stop; every priority stops at recorded exhaustion."""
     override = BUDGET_OVERRIDES.get(account, {})
     daily = override.get("daily_amount")
     if daily is not None:
@@ -206,9 +204,10 @@ class UsageStore:
 
     All mutations go through a flock-guarded read-modify-write so
     several processes (fleet daemons) can record against one file
-    without losing counts. A corrupt/empty file reseeds to empty
-    counters (usage history is accounting, not financial state —
-    the journal lines survive independently; a reseed is logged).
+    without losing counts. Reports may return empty on unreadable
+    data for legacy compatibility; mutations never reseed corrupt or
+    unreadable counters. Helius account writers always use strict
+    durability because every credential shares the same allowance.
     """
 
     def __init__(self, home=None):
@@ -219,14 +218,20 @@ class UsageStore:
         self._lock_path = os.path.join(self.home, USAGE_FILE + ".lock")
 
     # -- internals ------------------------------------------------------
-    def _load(self):
+    def _load(self, strict=False):
         try:
             with open(self._path) as fh:
                 data = json.load(fh)
             if not isinstance(data, dict):
                 raise ValueError("usage file is not an object")
             return data
+        except FileNotFoundError:
+            if strict and os.path.exists(self._journal_path):
+                raise ValueError("usage counters absent with journal")
+            return {}
         except (OSError, ValueError):
+            if strict:
+                raise
             return {}
 
     def _save(self, data):
@@ -236,8 +241,11 @@ class UsageStore:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, self._path)
+        directory=os.open(os.path.dirname(self._path) or ".",os.O_RDONLY)
+        try:os.fsync(directory)
+        finally:os.close(directory)
 
-    def _transact(self, fn):
+    def _transact(self, fn, strict=False):
         """Read-modify-write under an exclusive flock. Returns
         fn(data)'s return value. On lock failure, degrades to an
         in-memory pass (the journal append below still records the
@@ -246,14 +254,18 @@ class UsageStore:
             lock_fh = open(self._lock_path, "w")
             fcntl.flock(lock_fh, fcntl.LOCK_EX)
             try:
-                data = self._load()
+                data = self._load(strict=True)
                 result = fn(data)
                 self._save(data)
+                if strict and self._load(strict=True) != data:
+                    raise OSError("usage readback differs after save")
                 return result
             finally:
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 lock_fh.close()
         except OSError:
+            if strict:
+                raise
             logger.warning("usage store lock unavailable; counters "
                            "not updated for this call")
             return None
@@ -262,7 +274,7 @@ class UsageStore:
     def record(self, account, provider, method, workload, priority,
                helius_priority=None, cost=None, kind="ok", elapsed=0.0,
                cached=False, fallback=False, fallback_difference=None,
-               ts=None):
+               ts=None, strict=False):
         """Record one serviced request. Returns the updated account
         record (or None when the store was unavailable). The journal
         line is appended even when the counters cannot be updated.
@@ -272,6 +284,10 @@ class UsageStore:
         unknown cost is recorded as unknown (cost_spent unchanged),
         never assumed to be 0 or 1.
         """
+        # All Helius credentials/writers share one allowance. Ordinary
+        # RPC writers must obey the same preservation contract as streams;
+        # opting out would allow corrupt counters to be silently reseeded.
+        strict = strict or account == "helius_main"
         ts = ts if ts is not None else time.time()
         month = _month_key(ts)
         entry = {
@@ -293,13 +309,26 @@ class UsageStore:
             entry["account_note"] = (
                 "reserves.rpc rotates Helius key sources internally; "
                 "per-key attribution not visible from this layer")
-        try:
+        def _append_journal():
             with open(self._journal_path, "a") as fh:
                 fh.write(json.dumps(entry) + "\n")
-        except OSError:
-            logger.warning("could not append usage journal")
+                if strict:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            if strict:
+                directory=os.open(os.path.dirname(self._journal_path) or ".",os.O_RDONLY)
+                try:os.fsync(directory)
+                finally:os.close(directory)
 
         def _do(data):
+            # Mutations never reseed damaged accounting, even for legacy
+            # writers. Fail-soft reporting _load() remains unchanged.
+            self.validate_admission_state(account)
+            if strict:
+                _append_journal()
+            else:
+                try:_append_journal()
+                except OSError:logger.warning("could not append usage journal")
             rec = data.get(account)
             if rec is None:
                 rec = _default_account_record(account)
@@ -357,9 +386,63 @@ class UsageStore:
             rec["last_call_ts"] = ts
             return dict(rec)
 
-        return self._transact(_do)
+        return self._transact(_do, strict=strict)
 
     # -- reads ----------------------------------------------------------
+    def validate_admission_state(self, account):
+        """Strict integrity read for admission, separate from fail-soft reports.
+
+        An absent brand-new store is allowed. Existing journal with lost
+        counters, unreadable/corrupt counters or invalid numeric evidence is
+        unavailable, never interpreted as a fresh zero budget. This does not
+        make read/check/write atomic or reconstruct external billed spend.
+        """
+        import math
+        try:
+            with open(self._path) as fh:
+                data=json.load(fh)
+        except FileNotFoundError:
+            if os.path.exists(self._journal_path):
+                raise ValueError('usage counters missing with retained journal')
+            return
+        if not isinstance(data,dict):raise ValueError('usage root invalid')
+        if account not in data:
+            # Distinguish another account's legitimate history from loss of
+            # this account. This legacy audit scan is bounded; beyond the
+            # bound admission remains unavailable, never guessed empty.
+            try:
+                with open(self._journal_path) as journal:
+                    for index,line in enumerate(journal):
+                        if index>=10000:raise ValueError('usage admission journal audit limit')
+                        entry=json.loads(line)
+                        if not isinstance(entry,dict) or not isinstance(entry.get('account'),str) or not entry['account'].strip():raise ValueError('usage journal attribution unavailable')
+                        if entry.get('account')==account:raise ValueError('usage account counters missing')
+            except FileNotFoundError:pass
+            return
+        rec=data[account]
+        if not isinstance(rec,dict):raise ValueError('usage account invalid')
+        for key in ('cost_spent','daily_cost_spent','calls','daily_calls'):
+            value=rec.get(key)
+            if type(value) not in (int,float) or not math.isfinite(value) or value<0:
+                raise ValueError('usage numeric evidence invalid')
+        if type(rec.get('disabled')) is not bool:raise ValueError('usage disabled evidence invalid')
+        import datetime
+        for key,fmt in (('month','%Y-%m'),('day','%Y-%m-%d')):
+            if not isinstance(rec.get(key),str):raise ValueError('usage window invalid')
+            if datetime.datetime.strptime(rec[key],fmt).strftime(fmt)!=rec[key]:raise ValueError('usage window invalid')
+        features=rec.get('by_feature')
+        if not isinstance(features,dict):raise ValueError('usage features invalid')
+        for feature,row in features.items():
+            if not isinstance(feature,str) or not isinstance(row,dict):raise ValueError('usage feature invalid')
+            for key in ('cost','calls'):
+                value=row.get(key)
+                if type(value) not in (int,float) or not math.isfinite(value) or value<0:
+                    raise ValueError('usage feature evidence invalid')
+        if not math.isclose(sum(row['cost'] for row in features.values()),rec['cost_spent'],rel_tol=1e-12,abs_tol=1e-9):
+            raise ValueError('usage feature cost conservation failed')
+        if sum(row['calls'] for row in features.values())!=rec['calls']:
+            raise ValueError('usage feature call conservation failed')
+
     def get(self, account):
         data = self._load()
         rec = data.get(account)
@@ -412,6 +495,12 @@ class UsageStore:
     # -- disablement (operator action) ----------------------------------
     def set_disabled(self, account, disabled, reason=None):
         def _do(data):
+            # Same admission contract as record: never re-create an account
+            # whose counters were lost (journal evidence retained). A refused
+            # disable still leaves traffic fail-closed, because admission
+            # validates before every record. Never auto-repairs, never
+            # re-enables a lost account.
+            self.validate_admission_state(account)
             rec = data.get(account)
             if rec is None:
                 rec = _default_account_record(account)
@@ -423,6 +512,9 @@ class UsageStore:
 
     def mark_warned(self, account, ts=None):
         def _do(data):
+            # Same admission contract as record: warning state must never
+            # reseed a missing account's counters to zero.
+            self.validate_admission_state(account)
             rec = data.get(account)
             if rec is None:
                 rec = _default_account_record(account)

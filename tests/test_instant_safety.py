@@ -218,175 +218,39 @@ check("non-list extensions flagged for review (score 90)",
       rep["passed"] and rep["score"] == 90
       and any("extensions data unreadable" in f for f in rep["flags"]))
 
-# --- Pacer-aware _rpc (2026-11-17, pacing fix) ---
-# _rpc skips Helius legs whose bucket is cooling down fleet-wide
-# (no dead-key attempts), still tries mainnet-beta, takes a pacer
-# token per Helius leg, reports a 429 (HTTP or JSON-RPC -32005) to
-# the pacer (progressive backoff + single probe), and clears the
-# cooldown on a success. The pacer mirrors outcomes into the
-# shared guard file, so the hot-bucket skip keeps working off
-# pacer state. Guard + pacer both live on a temp home per test —
-# never the live state files (an earlier version of these tests
-# polluted the live pacer/guard files with fake buckets).
+# Actual central router, no Helius fallback even with a configured old key.
 import json as _json
 import tempfile as _tempfile
-import time as _time
 import urllib.error as _urlerr
-import urllib.request as _urlreq
-from unittest.mock import patch as _patch
-
-import helius_ratelimit as _rl
-
-
+from daemon.intelligence.acquisition import routine as _routine
+from daemon.intelligence.acquisition.provider_router import ProviderRouter as _Router
 class _Resp:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def read(self):
-        return self._payload
-
-
-def _rpc_ok(result):
-    return _Resp(_json.dumps({"jsonrpc": "2.0", "id": 1,
-                              "result": result}).encode())
-
-
-def _rpc_err(code, message="Rate limit exceeded"):
-    return _Resp(_json.dumps({"jsonrpc": "2.0", "id": 1,
-                              "error": {"code": code,
-                                        "message": message}}).encode())
-
-
-_PAIRS = [("https://mainnet.helius-rpc.com/?api-key=K1", "gk1"),
-          ("https://mainnet.helius-rpc.com/?api-key=K2", "gk2"),
-          ("https://api.mainnet-beta.solana.com", None)]
-
-# One temp home per test: the guard + pacer state files are shared
-# by design, so tests must not share a home or one test's cooldown
-# leaks into the next (and must never touch the live files).
-_TMPS = []
-
-
-def _mk_home():
-    """Temp home for guard + pacer; singletons reset to it."""
-    tmp = _tempfile.TemporaryDirectory()
-    _TMPS.append(tmp)  # keep alive for the life of the test file
-    os.environ["FOREX_AGENT_HOME"] = tmp.name
-    _rl._PACER = None
-    _rl._SHARED_GUARD = None
-    return _rl.SharedGuard(home=tmp.name)
-
-
-def _pacer_backoff(bucket):
-    st = _rl.pacer()._read_state().get(bucket) or {}
-    return st.get("backoff_s")
-
-
-def _guard_file_until(bucket):
-    """Shared-file cooldown for a bucket (the pacer mirror writes
-    here; a patched guard instance's in-memory ladder is its own)."""
-    path = os.path.join(os.environ["FOREX_AGENT_HOME"],
-                        "helius_guard.json")
-    with open(path) as fh:
-        data = _json.load(fh)
-    return (data.get("buckets") or {}).get(bucket, {}).get("until", 0.0)
-
-
-def _expire_pacer_cooldown(bucket):
-    """Set one pacer bucket's cooldown into the past."""
-    home = os.environ["FOREX_AGENT_HOME"]
-    path = os.path.join(home, "helius_pacer.json")
-    with open(path) as fh:
-        data = _json.load(fh)
-    data["buckets"][bucket]["cooldown_until"] = _time.time() - 1.0
-    with open(path, "w") as fh:
-        _json.dump(data, fh)
-
-
-# Guard hot for both keys: Helius legs skipped, public still tried.
-_g = _mk_home()
-_g.report_ratelimited("gk1")
-_g.report_ratelimited("gk2")
-_calls = []
-with _patch.object(ins, "_rpc_endpoint_pairs", return_value=_PAIRS), \
-        _patch.object(ins, "_shared_guard", return_value=_g):
-    def _pub_only(req, timeout=None):
-        _calls.append(req.full_url)
-        return _rpc_ok({"value": "PUBLIC"})
-    with _patch.object(_urlreq, "urlopen", side_effect=_pub_only):
-        _r = ins._rpc("getAccountInfo", [MINT], 2)
-check("rpc: hot guard skips Helius legs, public still tried",
-      _r == {"value": "PUBLIC"} and len(_calls) == 1
-      and "mainnet-beta" in _calls[0])
-
-# HTTP 429 on a Helius leg engages that key's pacer backoff (mirrored
-# into the shared guard); the public leg still serves the call.
-_g = _mk_home()
-_calls = []
-with _patch.object(ins, "_rpc_endpoint_pairs", return_value=_PAIRS), \
-        _patch.object(ins, "_shared_guard", return_value=_g):
-    def _k1_429(req, timeout=None):
-        _calls.append(req.full_url)
-        if "api-key=K1" in req.full_url:
-            raise _urlerr.HTTPError(req.full_url, 429,
-                                    "Too Many Requests", {}, None)
-        return _rpc_ok({"value": "PUBLIC"})
-    with _patch.object(_urlreq, "urlopen", side_effect=_k1_429):
-        _r = ins._rpc("getAccountInfo", [MINT], 2)
-check("rpc: 429 leg skipped to public, result still served",
-      _r == {"value": "PUBLIC"} and len(_calls) == 2
-      and "api-key=K1" in _calls[0])
-check("rpc: HTTP 429 engages that key's pacer backoff",
-      _g.cooldown_remaining("gk1") > 20.0
-      and _g.cooldown_remaining("gk2") == 0.0
-      and _pacer_backoff("gk1") == 30.0)
-
-# Success on a Helius leg clears that key's fleet cooldown — once
-# the cooldown has expired (a hot leg is skipped, so the success can
-# only land after expiry) — and resets the pacer backoff ladder.
-_g = _mk_home()
-_rl.pacer_report("gk1", False)  # pacer backoff 30s
-_expire_pacer_cooldown("gk1")
-_rl.pacer_report("gk1", False)  # probe 429 doubles it to 60s
-_g.report_ratelimited("gk1")  # guard file hot too (60s ladder)
-_t0 = _time.time()
-with _patch.object(ins, "_rpc_endpoint_pairs", return_value=_PAIRS), \
-        _patch.object(ins, "_shared_guard", return_value=_g), \
-        _patch("time.time", return_value=_t0 + 61):
-    def _k1_ok(req, timeout=None):
-        return _rpc_ok({"value": "H1"})
-    with _patch.object(_urlreq, "urlopen", side_effect=_k1_ok):
-        _r = ins._rpc("getAccountInfo", [MINT], 2)
-check("rpc: Helius success returns the result",
-      _r == {"value": "H1"})
-check("rpc: Helius success after expiry clears the cooldown",
-      _guard_file_until("gk1") == 0.0)
-check("rpc: Helius success resets the pacer backoff ladder",
-      _pacer_backoff("gk1") == 30.0)
-
-# JSON-RPC rate-limit error (-32005, HTTP 200) engages the pacer.
-_g = _mk_home()
-_calls = []
-with _patch.object(ins, "_rpc_endpoint_pairs", return_value=_PAIRS), \
-        _patch.object(ins, "_shared_guard", return_value=_g):
-    def _k1_json429(req, timeout=None):
-        _calls.append(req.full_url)
-        if "api-key=K1" in req.full_url:
-            return _rpc_err(-32005)
-        return _rpc_ok({"value": "PUBLIC"})
-    with _patch.object(_urlreq, "urlopen", side_effect=_k1_json429):
-        _r = ins._rpc("getAccountInfo", [MINT], 2)
-check("rpc: JSON-RPC -32005 still serves via public",
-      _r == {"value": "PUBLIC"})
-check("rpc: JSON-RPC -32005 engages that key's pacer backoff",
-      _g.cooldown_remaining("gk1") > 20.0
-      and _pacer_backoff("gk1") == 30.0)
+    def __init__(self,result): self.result=result
+    def read(self): return _json.dumps({"jsonrpc":"2.0","id":1,"result":self.result}).encode()
+    def __enter__(self): return self
+    def __exit__(self,*a): return False
+_calls=[]
+def _transport(req,timeout=None):
+    _calls.append(req.full_url.split('?')[0])
+    if 'alchemy.com' in req.full_url:
+        raise _urlerr.URLError('fixture outage')
+    return _Resp({"value":"FALLBACK"})
+os.environ['ALCHEMY_API_KEY']='fixture-not-real'
+os.environ['HELIUS_API_KEY']='fixture-not-real'
+os.environ.pop('CHAINSTACK_ENDPOINT',None)
+_router=_Router(home=_tempfile.mkdtemp(),helius_enabled=False,transport=_transport)
+_previous=getattr(_routine._local,'router',None)
+_routine._local.router=_router
+_routine.clear_evidence()
+try:
+    _result=ins._rpc("getAccountInfo", [MINT], 2)
+    check("central router serves fallback account read",_result=={"value":"FALLBACK"})
+    check("Alchemy primary, no Helius request",len(_calls)==2 and 'alchemy.com' in _calls[0] and all('helius' not in x for x in _calls))
+    _ev=_routine.evidence_since()[-1]
+    check("fallback retains degraded consumer evidence",_ev['provider']=='public' and _ev['degraded'] and _ev['decision_usable'])
+finally:
+    if _previous is None: del _routine._local.router
+    else: _routine._local.router=_previous
 
 print("\n%d failures" % len(FAILS))
 sys.exit(1 if FAILS else 0)

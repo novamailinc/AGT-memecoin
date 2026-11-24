@@ -50,92 +50,74 @@ import sys
 # "required" means the paper bot cannot start without it on AGT.
 # "required_when" documents the condition for optional credentials.
 # ---------------------------------------------------------------------------
-CREDENTIALS = (
-    {
-        "env": "HELIUS_API_KEY",
-        # 2026-11-23: no longer REQUIRED. §9 (unified provider
-        # architecture) makes Alchemy the primary routine
-        # acquisition leg and Helius SELECTIVE enrichment; the lane
-        # RPC tiers use Helius when present and otherwise fail over
-        # to the budgeted public endpoint (reserves.py), so a
-        # deployment without a Helius key is a valid, labeled
-        # configuration - only the enriched capabilities refuse.
-        "required": False,
-        "required_when": "selective enriched Helius workloads "
-                         "(parsed streams / parsed events / "
-                         "enrichment) are enabled; lane RPC tiers "
-                         "use it when present",
-        "purpose": "Helius main RPC key (selective enriched "
-                   "intelligence + optional lane RPC tier).",
-        "file_fallback": "helius/api_key",
-        "env_first_in_code": ("daemon/launch_scanner/reserves.py",
-                              "daemon/launch_scanner/smartmoney.py"),
-    },
-    {
-        "env": "HELIUS_API_KEY_DISCOVERY",
-        "required": False,
-        "purpose": "Second Helius key for research/discovery traffic, "
-                   "kept off the live signals' quota.",
-        "file_fallback": "helius/api_key_discovery",
-        "env_first_in_code": ("daemon/launch_scanner/reserves.py",
-                              "daemon/launch_scanner/smartmoney.py",
-                              "daemon/launch_scanner/funding_clusters.py",
-                              "daemon/launch_scanner/instant_safety.py"),
-    },
-    {
-        "env": "ALCHEMY_API_KEY",
-        # 2026-11-23: REQUIRED - §9 makes Alchemy the PRIMARY
-        # routine acquisition leg (HTTP RPC, general transaction
-        # reads, normal scanning) and reserves.py now wires the
-        # lane entry-critical reads through it as the first keyed
-        # tier. The paper bot's declared provider policy cannot be
-        # honored without it.
-        "required": True,
-        "purpose": "Alchemy API key - PRIMARY routine acquisition "
-                   "(§9): HTTP RPC, general transaction reads "
-                   "(key only, never the endpoint URL).",
-        "file_fallback": "alchemy/api_key",
-        "env_first_in_code": ("daemon/intelligence/acquisition/"
-                              "providers/base.py",
-                              "daemon/launch_scanner/reserves.py"),
-    },
-    {
-        "env": "CHAINSTACK_ENDPOINT",
-        "required": False,
-        "required_when": "router enables the Chainstack provider "
-                         "(Phases 5-12 cutover; not the live leg today)",
-        "purpose": "Full Chainstack Solana mainnet endpoint URL "
-                   "(the key is its final path segment).",
-        "file_fallback": ".forex-agent/chainstack/endpoint",
-        "env_first_in_code": ("daemon/intelligence/acquisition/"
-                              "providers/base.py",),
-    },
-    {
-        "env": "TELEGRAM_BOT_TOKEN",
-        "required": True,
-        "purpose": "Telegram bot token (alerts + control bot).",
-        "file_fallback": "telegram/bot_token",
-        "env_first_in_code": ("daemon/telegram/__init__.py",),
-    },
-    {
-        "env": "HELIUS_ALERT_CHAT_ID",
-        "required": False,
-        "purpose": "Telegram chat id for Helius 429-spike alerts.",
-        "file_fallback": None,
-        "env_first_in_code": ("daemon/launch_scanner/helius_alerts.py",),
-    },
-    {
-        "env": "GITHUB_TOKEN",
-        "required": False,
-        "required_when": "github-repo-sync loop is enabled on AGT "
-                         "(FINALIZE pass: the VM sync script uses the "
-                         "authd vault credential, which does not exist "
-                         "on AGT)",
-        "purpose": "GitHub personal access token for the repo sync loop.",
-        "file_fallback": None,
-        "env_first_in_code": (),
-    },
-)
+CREDENTIALS = ({'env': 'HELIUS_API_KEY',
+  'required': False,
+  'required_when': 'legacy slot-1 fallback for selective Helius enrichment',
+  'purpose': 'Legacy slot-1 compatibility only; the declared three-source deployment requires '
+             'explicit numbered sources.',
+  'file_fallback': 'helius/api_key',
+  'env_first_in_code': ('daemon/launch_scanner/reserves.py',
+                        'daemon/launch_scanner/smartmoney.py')},
+ {'env': 'HELIUS_API_KEY_DISCOVERY',
+  'required': False,
+  'purpose': 'Legacy research credential, not an independent billing account or numbered source.',
+  'file_fallback': 'helius/api_key_discovery',
+  'env_first_in_code': ('daemon/launch_scanner/reserves.py',
+                        'daemon/launch_scanner/smartmoney.py',
+                        'daemon/launch_scanner/funding_clusters.py',
+                        'daemon/launch_scanner/instant_safety.py')},
+ {'env': 'HELIUS_API_KEY_1',
+  'required': True,
+  'purpose': 'Fixed routine RPC/WSS/transaction and selective intelligence source 1; all three '
+             'sources share one Helius account allowance, no denial rotation.',
+  'file_fallback': None,
+  'env_first_in_code': ('daemon/intelligence/acquisition/providers/helius.py',
+                        'daemon/intelligence/acquisition/selective_enrichment.py')},
+ {'env': 'HELIUS_API_KEY_2',
+  'required': True,
+  'purpose': 'Fixed routine RPC/WSS/transaction and selective intelligence source 2; all three '
+             'sources share one Helius account allowance, no denial rotation.',
+  'file_fallback': None,
+  'env_first_in_code': ('daemon/intelligence/acquisition/providers/helius.py',
+                        'daemon/intelligence/acquisition/selective_enrichment.py')},
+ {'env': 'HELIUS_API_KEY_3',
+  'required': True,
+  'purpose': 'Fixed routine RPC/WSS/transaction and selective intelligence source 3; all three '
+             'sources share one Helius account allowance, no denial rotation.',
+  'file_fallback': None,
+  'env_first_in_code': ('daemon/intelligence/acquisition/providers/helius.py',
+                        'daemon/intelligence/acquisition/selective_enrichment.py')},
+ {'env': 'ALCHEMY_API_KEY',
+  'required': True,
+  'purpose': 'Normal scanning through supported Alchemy HTTP/WSS endpoints; current plan access '
+             'must be qualified separately.',
+  'file_fallback': 'alchemy/api_key',
+  'env_first_in_code': ('daemon/intelligence/acquisition/providers/base.py',
+                        'daemon/launch_scanner/reserves.py')},
+ {'env': 'CHAINSTACK_ENDPOINT',
+  'required': True,
+  'purpose': 'Complementary supported recent transaction/block/account reads and independent '
+             'verification within plan limits.',
+  'file_fallback': 'chainstack/endpoint (runtime home), .forex-agent/chainstack/endpoint (user '
+                   'home)',
+  'env_first_in_code': ('daemon/intelligence/acquisition/providers/base.py',)},
+ {'env': 'TELEGRAM_BOT_TOKEN',
+  'required': True,
+  'purpose': 'Telegram bot token (alerts + control bot).',
+  'file_fallback': 'telegram/bot_token',
+  'env_first_in_code': ('daemon/telegram/__init__.py',)},
+ {'env': 'HELIUS_ALERT_CHAT_ID',
+  'required': False,
+  'purpose': 'Telegram chat id for Helius 429-spike alerts.',
+  'file_fallback': None,
+  'env_first_in_code': ('daemon/launch_scanner/helius_alerts.py',)},
+ {'env': 'GITHUB_TOKEN',
+  'required': False,
+  'required_when': 'github-repo-sync loop is enabled on AGT (FINALIZE pass: the VM sync script '
+                   'uses the authd vault credential, which does not exist on AGT)',
+  'purpose': 'GitHub personal access token for the repo sync loop.',
+  'file_fallback': None,
+  'env_first_in_code': ()})
 
 # Readers that take ONLY a file (no env fallback in the live code).
 # The start script bridges these from env at deployment start.

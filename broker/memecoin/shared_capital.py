@@ -27,7 +27,8 @@ def validate_fx(evidence, now=None, max_age=60.):
     return dict(evidence)
 
 
-def entry_plan(lane, mint, ticket, tokens, cost_sol, fx, op_id, now=None):
+def entry_plan(lane, mint, ticket, tokens, cost_sol, fx, op_id, now=None,
+               hold_op_id=None):
     fx = validate_fx(fx, now)
     if (type(ticket) is not int or ticket <= 0 or not lane or not mint or not op_id
             or any(isinstance(v,bool) or not isinstance(v,(int,float))
@@ -37,7 +38,8 @@ def entry_plan(lane, mint, ticket, tokens, cost_sol, fx, op_id, now=None):
     if stake <= 0:
         raise CapitalConflict('native entry below shared currency precision')
     return {'kind':'entry','lane':lane,'mint':mint,'ticket':ticket,
-            'qty':tokens,'cost_sol':cost_sol,'stake':stake,'fx':fx,'op_id':op_id}
+            'qty':tokens,'cost_sol':cost_sol,'stake':stake,'fx':fx,'op_id':op_id,
+            **({'hold_op_id': hold_op_id} if hold_op_id else {})}
 
 
 def apply_entry(plan, account):
@@ -56,9 +58,26 @@ def apply_entry(plan, account):
         if any(rec.get(k)!=v for k,v in expected_refusal.items()):
             raise CapitalConflict('refused entry receipt parameter conflict')
         return None, rec['reason']
+    if rec is not None and plan.get('hold_op_id'):
+        # Entry already applied: finish a crash-split consume (the
+        # hold's remainder may still be reserved). Idempotent no-op
+        # when the pair completed.
+        ok2, why2, _ = account.consume_hold_for_entry(
+            plan['hold_op_id'],plan['lane'],plan['mint'],
+            plan['stake'],plan['qty'],plan['op_id'])
+        if not ok2:
+            raise CapitalConflict(why2)
     if rec is None:
-        ok, why, _ = account.try_debit_instance(plan['lane'],plan['mint'],
-                                               plan['stake'],plan['qty'],plan['op_id'])
+        if plan.get('hold_op_id'):
+            # Seal-time admission: the hold already passed every gate and
+            # reserved the cash account-wide. Adoption recovers recorded
+            # truth; it is never a fresh admission that could be refused.
+            ok, why, _ = account.consume_hold_for_entry(
+                plan['hold_op_id'],plan['lane'],plan['mint'],
+                plan['stake'],plan['qty'],plan['op_id'])
+        else:
+            ok, why, _ = account.try_debit_instance(plan['lane'],plan['mint'],
+                                                   plan['stake'],plan['qty'],plan['op_id'])
         if not ok:
             # Failed fsync can throw, never masquerade as a refusal. A plain
             # refusal is rechecked against the authoritative durable outcome.

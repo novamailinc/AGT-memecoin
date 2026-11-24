@@ -455,7 +455,7 @@ def test_agent_tools_never_touch_broker_writes(monkeypatch):
                 top = name.split(".")[0]
                 assert (top in sys.stdlib_module_names
                         or top in {"agent", "broker", "config", "core",
-                                   "intelligence", "storage"}), \
+                                   "intelligence", "storage", "daemon"}), \
                     f"{path.name} imports third-party {name}"
     # The tool module the agent invokes must not import the broker package at all.
     tree = ast.parse((tools_dir / "trading.py").read_text())

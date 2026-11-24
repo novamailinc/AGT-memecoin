@@ -185,7 +185,7 @@ class FunderClusterTest(unittest.TestCase):
                 return [{"signature": oldest_sig}]
             if method == "getTransaction":
                 return {"meta": {"err": None},
-                        "transaction": {"message": {
+                        "transaction": {"signatures": [oldest_sig], "message": {
                             "accountKeys": [payer, DEP1]}}}
             return None
 
@@ -228,7 +228,7 @@ class FunderClusterTest(unittest.TestCase):
             if method == "getSignaturesForAddress":
                 return [{"signature": "s1"}]
             return {"meta": {"err": None},
-                    "transaction": {"message": {
+                    "transaction": {"signatures": ["s1"], "message": {
                         "accountKeys": [DEP1],
                         "instructions": [{
                             "program": "system",

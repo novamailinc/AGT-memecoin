@@ -140,7 +140,7 @@ check("resolver: empty/garbage wallet -> None without transport",
 W_NEW = _mk("Nn")
 FUNDER = _mk("Pp")
 assert FC.is_plausible_wallet(W_NEW) and FC.is_plausible_wallet(FUNDER)
-_TX = {"transaction": {"message": {
+_TX = {"transaction": {"signatures": ["sig-oldest"], "message": {
     "accountKeys": [{"pubkey": W_NEW, "signer": True}],
     "instructions": [{"parsed": {"type": "transfer", "info": {
         "source": FUNDER, "destination": W_NEW, "lamports": 1000000}}}]}},

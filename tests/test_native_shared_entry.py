@@ -186,6 +186,8 @@ class TestNativeSharedEntry:
         a=adapter(tmp_path)
         mint=a._market.mint_for('BONK')
         scanner=LaunchScanner.__new__(LaunchScanner)
+        from storage.store import Store
+        scanner._close_store=Store(tmp_path/'scanner.db')
         state={'degen_positions':{}}
         card={'entry':None,'note':'','tier':'early','source':'pumpfun',
               'extra':{'complete':True}}

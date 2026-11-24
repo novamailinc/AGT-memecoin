@@ -67,12 +67,16 @@ class StreamIntake:
     def pending(self):
         with self._locked():return self._read()['pending']
 
-    def resolve(self,sig,mint):
+    def resolve(self,sig,mint,acquisition_evidence=None):
         if not isinstance(mint,str) or not mint:raise ValueError('invalid mint')
         with self._locked():
             data=self._read();rec=data['pending'][sig]
             if rec.get('mint') not in (None,mint):raise ValueError('conflicting mint')
-            rec['mint']=mint;self._save(data)
+            rec['mint']=mint
+            if acquisition_evidence is not None:
+                import copy
+                rec['acquisition_evidence']=copy.deepcopy(acquisition_evidence)
+            self._save(data)
 
     def defer(self,sig):
         with self._locked():

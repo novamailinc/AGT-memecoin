@@ -120,7 +120,8 @@ LOCK_FILE = os.path.join(ACCOUNT_DIR, ".lock")
 DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
-_MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol", "debit_refused")
+_MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol", "debit_refused",
+                    "hold", "hold_released", "fee")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -400,6 +401,14 @@ def _new_ledger() -> Dict[str, Any]:
         "realized_pnl": 0.0,
         "day": time.strftime("%Y-%m-%d", time.gmtime(now)),
         "day_realized_pnl": 0.0,
+        # op_id -> {lane, amount, ts}: spendable cash RESERVED at seal
+        # time for an execution whose outcome is not yet known. Held
+        # cash is still ours (cash unchanged) but unspendable by every
+        # lane and book until consumed (entry/fee) or released
+        # (unlanded). Holds never expire silently: an unresolved
+        # execution's exposure is never freed without a recorded
+        # resolution.
+        "holds": {},
         "lanes": {},
         # op_id -> {"event": kind, "lane":, "mint":, "pos_id":,
         #           "event_id":, params...}: caller-retry dedupe.
@@ -851,6 +860,49 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                 return led, "invalid refused entry event"
             ops[op_id] = {k:v for k,v in ev.items() if k not in ("seq", "event_id", "ts")}
             replayed += 1
+        elif kind == "hold":
+            amount = float(ev.get("amount") or 0)
+            if amount <= 0 or not lane:
+                return led, "replay cannot apply hold (bad amount/lane)"
+            led.setdefault("holds", {})[op_id] = {
+                "lane": lane, "amount": amount, "ts": ev.get("ts")}
+            led["cash_spendable"] = round(
+                float(led.get("cash_spendable", 0.0)) - amount, 8)
+            if op_id:
+                ops[op_id] = {"event": "hold", "lane": lane,
+                              "amount": amount}
+            replayed += 1
+        elif kind == "hold_released":
+            hold_op = ev.get("hold_op_id")
+            amount = float(ev.get("amount") or 0)
+            held = led.setdefault("holds", {}).pop(hold_op, None)
+            if held is None:
+                # A release for a hold that never existed would MINT
+                # spendable cash: corrupt journal, fail closed.
+                return led, ("replay divergence: hold release for "
+                             "unknown hold %s" % hold_op)
+            if abs(float(held["amount"]) - amount) > 1e-9:
+                return led, ("replay divergence: hold release $%.8f "
+                             "but held $%.8f"
+                             % (amount, float(held["amount"])))
+            led["cash_spendable"] = round(
+                float(led.get("cash_spendable", 0.0)) + amount, 8)
+            if op_id:
+                ops[op_id] = {"event": "hold_released",
+                              "hold_op_id": hold_op, "amount": amount}
+            replayed += 1
+        elif kind == "fee":
+            amount = float(ev.get("amount") or 0)
+            if amount <= 0:
+                return led, "replay cannot apply fee (bad amount)"
+            led["cash"] = round(float(led.get("cash", 0.0)) - amount, 8)
+            led["cash_spendable"] = round(
+                float(led.get("cash_spendable", 0.0)) - amount, 8)
+            if op_id:
+                ops[op_id] = {"event": "fee",
+                              "hold_op_id": ev.get("hold_op_id"),
+                              "amount": amount}
+            replayed += 1
         elif kind in ("pending_sol", "settle_sol"):
             from daemon.launch_scanner import pending_sol
             reason = pending_sol.apply(led, ev, __import__(__name__, fromlist=["*"]))
@@ -921,6 +973,38 @@ def _derive_buckets_locked(led: Dict[str, Any],
                              "required" % (ev.get("op_id"), why))
         elif ev["event"] == "debit_refused":
             continue  # exact attempt refusal, no economics
+        elif ev["event"] == "hold":
+            amount = float(ev.get("amount") or 0)
+            if amount <= 0:
+                return led, ("cash-split migration: bad hold %s; "
+                             "manual reconciliation required"
+                             % ev.get("op_id"))
+            gen.setdefault("holds", {})[ev.get("op_id")] = {
+                "lane": lane, "amount": amount, "ts": ev.get("ts")}
+            gen["cash_spendable"] = round(
+                float(gen["cash_spendable"]) - amount, 8)
+        elif ev["event"] == "hold_released":
+            amount = float(ev.get("amount") or 0)
+            held = gen.setdefault("holds", {}).pop(ev.get("hold_op_id"), None)
+            if held is None:
+                return led, ("cash-split migration: hold release for "
+                             "unknown hold %s; manual reconciliation "
+                             "required" % ev.get("hold_op_id"))
+            if abs(float(held["amount"]) - amount) > 1e-9:
+                return led, ("cash-split migration: hold release "
+                             "mismatch %s; manual reconciliation "
+                             "required" % ev.get("op_id"))
+            gen["cash_spendable"] = round(
+                float(gen["cash_spendable"]) + amount, 8)
+        elif ev["event"] == "fee":
+            amount = float(ev.get("amount") or 0)
+            if amount <= 0:
+                return led, ("cash-split migration: bad fee %s; "
+                             "manual reconciliation required"
+                             % ev.get("op_id"))
+            gen["cash"] = round(float(gen["cash"]) - amount, 8)
+            gen["cash_spendable"] = round(
+                float(gen["cash_spendable"]) - amount, 8)
         elif ev["event"] in ("pending_sol", "settle_sol"):
             from daemon.launch_scanner import pending_sol
             reason = pending_sol.apply(gen, ev, __import__(__name__, fromlist=["*"]))
@@ -1243,6 +1327,308 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
         return True, "ok", pid
+
+
+def hold_stake(lane: str, amount: float, op_id: str,
+               ts: Optional[float] = None,
+               marks: Optional[Dict[str, Dict[str, Any]]] = None
+               ) -> Tuple[bool, str]:
+    """Reserve `amount` of spendable cash at SEAL time for an
+    execution whose outcome is not yet known (design: account-wide
+    hold so a fill that settles before this process learns of it is
+    always adoptable). ADMISSION HAPPENS HERE: the lane cap, gates
+    and provider-health checks run against the hold, so a later
+    consume is pure recovery of recorded truth, never a fresh
+    admission. Refusals are NOT journaled (a hold is not an entry
+    attempt; cash freeing up later may let a retry succeed).
+    Idempotent by op_id: a retry of an applied hold returns its
+    outcome; the same op_id with different parameters is a
+    conflict. Held cash stays part of `cash` (it is still ours)
+    but leaves `cash_spendable` until consumed or released. Holds
+    NEVER expire silently."""
+    if not _valid_amount(amount) or amount <= 0:
+        return False, "hold amount must be a positive finite number"
+    amount = float(amount)
+    if not lane:
+        return False, "lane is required"
+    if not op_id or not isinstance(op_id, str):
+        return False, "caller op_id is required"
+    if gates_enabled() and marks is None:
+        marks = _central_marks()
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return False, "account ledger unreadable (fail-closed)"
+        if degraded:
+            return False, "account degraded: %s" % degraded
+        prior = led.get("ops", {}).get(op_id)
+        if prior is not None:
+            if (prior.get("event") == "hold"
+                    and prior.get("lane") == lane
+                    and abs(float(prior.get("amount", -1)) - amount) < 1e-9):
+                return True, "ok (retry of applied op)"
+            return False, "hold op_id parameter conflict"
+        holds = led.setdefault("holds", {})
+        spendable = float(led.get("cash_spendable", 0.0))
+        if spendable < amount:
+            return (False, "account spendable cash $%.2f < hold "
+                    "$%.2f (total $%.2f incl. quarantined estimated "
+                    "proceeds)" % (spendable, amount,
+                                   float(led.get("cash", 0.0))))
+        st = _lane(led, lane)
+        cap = lane_cap()
+        if cap is not None:
+            open_basis = sum(_pos_basis(p) for p in st["open"].values())
+            open_basis += sum(float(p["basis"]) for p in
+                              led.get("pending_sol", {}).values()
+                              if p["lane"] == lane)
+            open_basis += sum(float(h["amount"]) for h in holds.values()
+                              if h["lane"] == lane)
+            if open_basis + amount > cap:
+                return (False, "lane cap $%.2f would be exceeded "
+                        "($%.2f open + $%.2f new incl. hold)"
+                        % (cap, open_basis, amount))
+        if gates_enabled():
+            view = _view_locked(led, marks, degraded)
+            _update_baselines_locked(led, view)
+            view.update(_gate_fields(led, view))
+            refusal = _gate_check_locked(led, view, amount)
+            if refusal is not None:
+                return False, refusal
+        if provider_health_gate_enabled():
+            refusal = _provider_health_refusal()
+            if refusal is not None:
+                return False, refusal
+        led["seq"] = int(led.get("seq") or 0) + 1
+        holds[op_id] = {"lane": lane, "amount": amount, "ts": ts}
+        led["cash_spendable"] = round(spendable - amount, 8)
+        led["ops"][op_id] = {"event": "hold", "lane": lane,
+                             "amount": amount}
+        _journal({"event": "hold", "event_id": "ev#%d" % led["seq"],
+                  "op_id": op_id, "lane": lane, "amount": amount,
+                  "seq": led["seq"], "ts": ts})
+        _save_locked(led)
+        return True, "ok"
+
+
+def release_hold(hold_op_id: str, reason: str,
+                 ts: Optional[float] = None) -> Tuple[bool, str]:
+    """Release a hold whose execution UNAMBIGUOUSLY did not happen
+    (provider reports the tx never landed / never existed). Never
+    call while the outcome is unknown: held exposure is freed only
+    by a recorded resolution. Idempotent."""
+    if not hold_op_id or not isinstance(hold_op_id, str):
+        return False, "hold_op_id is required"
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return False, "account ledger unreadable (fail-closed)"
+        if degraded:
+            return False, "account degraded: %s" % degraded
+        rel_op = hold_op_id + ":release"
+        if led.get("ops", {}).get(rel_op) is not None:
+            return True, "ok (retry of applied op)"
+        held = led.setdefault("holds", {}).get(hold_op_id)
+        if held is None:
+            if led.get("ops", {}).get(hold_op_id) is None:
+                return False, "no such hold"
+            return False, ("hold %s already consumed; refusing to "
+                           "release" % hold_op_id)
+        led["seq"] = int(led.get("seq") or 0) + 1
+        del led["holds"][hold_op_id]
+        led["cash_spendable"] = round(
+            float(led.get("cash_spendable", 0.0))
+            + float(held["amount"]), 8)
+        led["ops"][rel_op] = {"event": "hold_released",
+                              "hold_op_id": hold_op_id,
+                              "amount": float(held["amount"])}
+        _journal({"event": "hold_released",
+                  "event_id": "ev#%d" % led["seq"],
+                  "op_id": rel_op, "hold_op_id": hold_op_id,
+                  "amount": float(held["amount"]), "reason": reason,
+                  "seq": led["seq"], "ts": ts})
+        _save_locked(led)
+        return True, "ok"
+
+
+def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
+                           stake: float, qty: float, entry_op_id: str,
+                           ts: Optional[float] = None,
+                           instance: bool = True
+                           ) -> Tuple[bool, str, Optional[str]]:
+    """Adopt a SETTLED fill funded by a prior hold: apply the entry
+    debit and release the hold's remainder in one locked mutation.
+    NO admission gates run here: admission happened at hold time
+    (seal), and the fill is recorded economic truth — refusing it
+    would strand real exposure invisible to the account. The hold
+    must exist, cover the stake, and belong to the same lane. A
+    crash between the two journaled events is repaired by retry:
+    an applied entry with the hold still present finishes the
+    release."""
+    if not _valid_amount(stake) or stake <= 0:
+        return False, "stake must be a positive finite number", None
+    if not _valid_amount(qty) or qty <= 0:
+        return False, "qty must be a positive finite number", None
+    stake = float(stake)
+    qty = float(qty)
+    if not lane or not mint:
+        return False, "lane and mint are required", None
+    if not hold_op_id or not isinstance(hold_op_id, str):
+        return False, "hold_op_id is required", None
+    if not entry_op_id or not isinstance(entry_op_id, str):
+        return False, "caller entry_op_id is required", None
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return (False, "account ledger unreadable "
+                    "(fail-closed)", None)
+        if degraded:
+            return False, "account degraded: %s" % degraded, None
+        rec, conflict = _op_lookup(led, entry_op_id, "debit", lane, mint,
+                                   {"stake": stake, "qty": qty,
+                                    "instance": instance})
+        if conflict:
+            return False, conflict, None
+        held = led.setdefault("holds", {}).get(hold_op_id)
+        if rec is not None:
+            # Entry already applied; finish the release if a crash
+            # split the pair.
+            if held is not None:
+                led["seq"] = int(led.get("seq") or 0) + 1
+                del led["holds"][hold_op_id]
+                led["cash_spendable"] = round(
+                    float(led.get("cash_spendable", 0.0))
+                    + float(held["amount"]), 8)
+                rel_op = hold_op_id + ":release"
+                led["ops"][rel_op] = {"event": "hold_released",
+                                      "hold_op_id": hold_op_id,
+                                      "amount": float(held["amount"])}
+                _journal({"event": "hold_released",
+                          "event_id": "ev#%d" % led["seq"],
+                          "op_id": rel_op, "hold_op_id": hold_op_id,
+                          "amount": float(held["amount"]),
+                          "reason": "consumed (crash repair)",
+                          "seq": led["seq"], "ts": ts})
+                _save_locked(led)
+            return True, "ok (retry of applied op)", rec["pos_id"]
+        if held is None:
+            return False, "no such hold to consume", None
+        if held["lane"] != lane:
+            return False, ("hold lane %s != entry lane %s"
+                           % (held["lane"], lane)), None
+        if float(held["amount"]) + 1e-9 < stake:
+            return (False, "hold $%.8f does not cover stake $%.8f"
+                    % (float(held["amount"]), stake), None)
+        if float(led["cash"]) < stake:
+            return (False, "account cash $%.2f < stake $%.2f"
+                    % (float(led["cash"]), stake), None)
+        st = _lane(led, lane)
+        if mint in st["open"] or (not instance and any(
+                p.get("mint") == mint for p in st["open"].values())):
+            return False, "%s already has an open %s position" % (lane, mint), None
+        led["seq"] = int(led.get("seq") or 0) + 1
+        pid = _pos_id(lane, mint, led["seq"])
+        _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
+        led["ops"][entry_op_id] = {"event": "debit", "lane": lane,
+                                   "mint": mint, "pos_id": pid,
+                                   "stake": stake, "qty": qty,
+                                   **({"instance": True} if instance else {})}
+        _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
+                  "op_id": entry_op_id, "lane": lane, "mint": mint,
+                  "stake": stake, "qty": qty,
+                  **({"instance": True} if instance else {}),
+                  "cash_after": led["cash"],
+                  "seq": led["seq"], "pos_id": pid, "ts": ts,
+                  "hold_op_id": hold_op_id})
+        led["seq"] = int(led.get("seq") or 0) + 1
+        del led["holds"][hold_op_id]
+        led["cash_spendable"] = round(
+            float(led.get("cash_spendable", 0.0))
+            + float(held["amount"]), 8)
+        rel_op = hold_op_id + ":release"
+        led["ops"][rel_op] = {"event": "hold_released",
+                              "hold_op_id": hold_op_id,
+                              "amount": float(held["amount"])}
+        _journal({"event": "hold_released",
+                  "event_id": "ev#%d" % led["seq"],
+                  "op_id": rel_op, "hold_op_id": hold_op_id,
+                  "amount": float(held["amount"]), "reason": "consumed",
+                  "seq": led["seq"], "ts": ts})
+        _save_locked(led)
+        return True, "ok", pid
+
+
+def settle_hold_fee(hold_op_id: str, fee_amount: float, fee_op_id: str,
+                    ts: Optional[float] = None) -> Tuple[bool, str]:
+    """Book a REAL fee loss (settled failed tx) against a hold and
+    release the remainder: cash AND spendable fall by the fee, the
+    rest of the reservation returns. The shared ledger's fee
+    accounting is authoritative and crash-safe: the fee event and
+    the release are journaled before the state save, replayed
+    idempotently after a crash. Idempotent by fee_op_id."""
+    if not _valid_amount(fee_amount) or fee_amount <= 0:
+        return False, "fee amount must be a positive finite number"
+    fee_amount = float(fee_amount)
+    if not hold_op_id or not isinstance(hold_op_id, str):
+        return False, "hold_op_id is required"
+    if not fee_op_id or not isinstance(fee_op_id, str):
+        return False, "caller fee_op_id is required"
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return False, "account ledger unreadable (fail-closed)"
+        if degraded:
+            return False, "account degraded: %s" % degraded
+        if led.get("ops", {}).get(fee_op_id) is not None:
+            return True, "ok (retry of applied op)"
+        held = led.setdefault("holds", {}).get(hold_op_id)
+        if held is None:
+            return False, ("no such hold %s for fee settlement"
+                           % hold_op_id)
+        if fee_amount > float(held["amount"]) + 1e-9:
+            return False, ("fee $%.8f exceeds hold $%.8f"
+                           % (fee_amount, float(held["amount"])))
+        led["seq"] = int(led.get("seq") or 0) + 1
+        led["cash"] = round(float(led["cash"]) - fee_amount, 8)
+        led["cash_spendable"] = round(
+            float(led.get("cash_spendable", 0.0)) - fee_amount, 8)
+        led["ops"][fee_op_id] = {"event": "fee",
+                                 "hold_op_id": hold_op_id,
+                                 "amount": fee_amount}
+        _journal({"event": "fee", "event_id": "ev#%d" % led["seq"],
+                  "op_id": fee_op_id, "hold_op_id": hold_op_id,
+                  "amount": fee_amount, "seq": led["seq"], "ts": ts})
+        led["seq"] = int(led.get("seq") or 0) + 1
+        del led["holds"][hold_op_id]
+        led["cash_spendable"] = round(
+            float(led.get("cash_spendable", 0.0))
+            + float(held["amount"]), 8)
+        rel_op = hold_op_id + ":release"
+        led["ops"][rel_op] = {"event": "hold_released",
+                              "hold_op_id": hold_op_id,
+                              "amount": float(held["amount"])}
+        _journal({"event": "hold_released",
+                  "event_id": "ev#%d" % led["seq"],
+                  "op_id": rel_op, "hold_op_id": hold_op_id,
+                  "amount": float(held["amount"]), "reason": "fee settled",
+                  "seq": led["seq"], "ts": ts})
+        _save_locked(led)
+        return True, "ok"
+
+
+def list_holds(prefix: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Live holds, optionally filtered by op_id prefix. Lets a
+    book sweep reservations it sealed but never recorded (crash
+    between hold and seal save) so orphan holds are released by
+    their owner, never silently expired."""
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return {}
+        holds = dict(led.get("holds") or {})
+    if prefix is None:
+        return holds
+    return {k: v for k, v in holds.items() if k.startswith(prefix)}
 
 
 def credit(lane: str, mint: str, proceeds: float, op_id: str,
@@ -1752,7 +2138,11 @@ def _view_locked(led: Dict[str, Any],
     for pending_id, p in led.get("pending_sol", {}).items():
         open_positions.append((p["lane"], pending_id, p["proceeds_sol"], pending_id))
     cash = float(led["cash"])
+    holds = led.get("holds") or {}
     out = {
+        "holds": {k: dict(v) for k, v in holds.items()},
+        "held_cash": round(sum(float(h["amount"])
+                               for h in holds.values()), 6),
         "pending_sol": list(copy.deepcopy(led.get("pending_sol", {})).values()),
         "pending_sol_basis": round(sum(float(p["basis"]) for p in
                                        led.get("pending_sol", {}).values()), 6),

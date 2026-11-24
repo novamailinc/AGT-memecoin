@@ -129,8 +129,8 @@ def _collect_dossier_wallets(cands):
 
 
 def _collect_smart_wallets(cands):
-    d = _load_json(os.path.join(
-        HOME, "launch_scanner", "smart_wallets.json"), {})
+    from wallet_registry import read
+    d = read(os.path.join(HOME, "launch_scanner", "smart_wallets.json"))
     for w, e in d.items():
         if FC.is_plausible_wallet(w):
             ts = float((e or {}).get("added_ts") or 0) \
@@ -141,8 +141,8 @@ def _collect_smart_wallets(cands):
 
 
 def _collect_deployer_census(cands):
-    hist = _load_json(os.path.join(
-        HOME, "launch_scanner", "deployer_history.json"), {})
+    from deployer_registry import read
+    hist=read(os.path.join(HOME,"launch_scanner","deployer_history.json"))
     for w, e in hist.items():
         if FC.is_plausible_wallet(w):
             ts = float((e or {}).get("first_seen") or 0) \

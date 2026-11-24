@@ -103,34 +103,19 @@ class DiscoveryKeyTest(unittest.TestCase):
         smartmoney.reset_key_caches()
         self.assertEqual(smartmoney.discovery_api_key(), "k2")
 
-    def test_discovery_rpc_falls_back_without_key(self):
-        with unittest.mock.patch.object(
-                smartmoney, "_DISCOVERY_KEY_FILE") as f, \
-             unittest.mock.patch.object(
-                 smartmoney, "_rpc", return_value={"slot": 1}) as main_rpc:
-            f.read_text.side_effect = OSError("no file")
-            out = smartmoney.discovery_rpc("getSlot", [])
-        self.assertEqual(out, {"slot": 1})
-        main_rpc.assert_called_once_with("getSlot", [])
+    def test_discovery_rpc_without_helius_key_uses_central_routine(self):
+        from daemon.intelligence.acquisition import routine
+        with unittest.mock.patch.object(routine, 'read', return_value={'slot':1}) as read:
+            self.assertEqual(smartmoney.discovery_rpc('getSlot',[]), {'slot':1})
+            read.assert_called_once_with('getSlot',[],timeout=smartmoney._TIMEOUT,background=True)
 
-    def test_discovery_rpc_uses_own_bucket(self):
-        os.environ["HELIUS_API_KEY_DISCOVERY"] = "disc-key"
-        # trip the MAIN bucket: discovery must stay clear
-        helius_ratelimit.report_ratelimited()
-        try:
-            fake_resp = unittest.mock.MagicMock()
-            fake_resp.read.return_value = b'{"result": 99}'
-            fake_ctx = unittest.mock.MagicMock()
-            fake_ctx.__enter__.return_value = fake_resp
-            with unittest.mock.patch(
-                    "urllib.request.urlopen",
-                    return_value=fake_ctx) as uo:
-                out = smartmoney.discovery_rpc("getSlot", [])
-            self.assertEqual(out, 99)
-            called_url = uo.call_args[0][0].full_url
-            self.assertIn("api-key=disc-key", called_url)
-        finally:
-            helius_ratelimit.reset_for_tests()
+    def test_discovery_rpc_does_not_rotate_to_research_helius_bucket(self):
+        from daemon.intelligence.acquisition import routine
+        os.environ['HELIUS_API_KEY_DISCOVERY']='disc-key'
+        with unittest.mock.patch.object(routine,'read',return_value=99) as read:
+            self.assertEqual(smartmoney.discovery_rpc('getSlot',[]),99)
+            self.assertEqual(read.call_count,1)
+
 
 
 if __name__ == "__main__":

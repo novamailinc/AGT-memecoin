@@ -367,6 +367,10 @@ class LaunchScanner(Daemon):
         except Exception:
             logger.exception("launch_scanner: logstream start failed")
         try:
+            self._ensure_parsed_stream(config)
+        except Exception:
+            logger.exception("launch_scanner: parsed stream start failed")
+        try:
             # PumpPortal WebSocket discovery (free streams only: new
             # tokens + migrations). Fail-soft by design — a dead feed
             # never touches the rest of the cycle.
@@ -414,6 +418,10 @@ class LaunchScanner(Daemon):
                 self._drain_logstream(config, adapter, state)
             except Exception:
                 logger.exception("logstream drain failed")
+            try:
+                self._drain_parsed_stream(config, adapter, state)
+            except Exception:
+                logger.exception("parsed stream drain failed")
             try:
                 self._drain_pumpportal(config, adapter, state)
             except Exception:
@@ -770,25 +778,53 @@ class LaunchScanner(Daemon):
         gates, so a previously carded mint never reaches this trigger.
         """
         degen = config.degen
+        self._deployer_line_evaluated=False
         try:
             if not getattr(degen, "deployer_tracking_enabled", True):
+                self._deployer_line_evaluated=True
                 return None
             if not mint or not allow:
+                self._deployer_line_evaluated=True
                 return None
-            deployer = deployers.cached_deployer(
-                state, mint, chain or "", c, degen)
+            observation=c.get('_deployer_launch_operation')
+            if observation is not None:
+                import math
+                from pathlib import Path
+                if (not isinstance(observation,dict) or not {'id','observed_at'}.issubset(observation)
+                        or set(observation)-{'id','observed_at','deployer','path'}
+                        or not isinstance(observation['id'],str) or not observation['id']
+                        or type(observation['observed_at']) not in (int,float) or not math.isfinite(observation['observed_at'])
+                        or ('deployer' in observation)!=('path' in observation)):
+                    raise ValueError('staged deployer operation invalid')
+            if observation is not None and 'deployer' in observation:
+                deployer=observation['deployer'];path=observation['path']
+                if not isinstance(deployer,str) or not deployer or not isinstance(path,str) or not path or not Path(path).is_absolute():
+                    raise ValueError('staged deployer binding invalid')
+            else:
+                deployer=deployers.cached_deployer(state,mint,chain or '',c,degen)
+                if deployer and observation is not None:
+                    observation.update(deployer=deployer,path=str(deployers._REGISTRY_FILE.absolute()))
             if deployer:
                 try:
-                    deployers.record_launch(deployer)
+                    if observation is None:deployers.record_launch(deployer)
+                    else:deployers.record_launch(deployer,effect_id=observation['id'],observed_at=observation['observed_at'],registry_path=observation['path'])
                 except Exception:
-                    logger.warning("deployer record_launch failed",
-                                   exc_info=True)
+                    logger.warning('deployer record_launch failed',exc_info=True)
+                    return None
+            if not deployer:
+                return None  # Resolution unavailable/negative is not a completed evaluation.
             if mint in (state.get("smart_fasttracked") or {}):
                 # Smart-buy fast-track already evaluated this mint (pass
                 # or hold) — never a second fast-track card.
+                self._deployer_line_evaluated=True
                 return None
-            return deployers.evaluate_deployer_fasttrack(
-                state, degen, mint, deployer, safety_passed=allow)
+            if observation is None:
+                result=deployers.evaluate_deployer_fasttrack(state,degen,mint,deployer,safety_passed=allow)
+            else:
+                result=deployers.evaluate_deployer_fasttrack(state,degen,mint,deployer,safety_passed=allow,
+                    registry_path=observation['path'],strict=True)
+            self._deployer_line_evaluated=True
+            return result
         except Exception:
             logger.warning("deployer card line failed for %s", mint,
                            exc_info=True)
@@ -997,15 +1033,99 @@ class LaunchScanner(Daemon):
             return
         ls = getattr(self, "_logstream", None)
         if ls is None:
-            urls = list(getattr(config.degen, "logstream_rpc_urls", None)
-                        or logstream.HTTP_RPC_URLS)
-            helius = _helius_rpc_url()
-            if helius and helius not in urls:
-                urls.insert(0, helius)  # authenticated endpoint wins
-            ls = logstream.LogStream(http_rpcs=urls)
+            # Routine discovery reads belong to the central provider policy.
+            # Do not inject a direct Helius/public chain here.
+            ls = logstream.LogStream()
             self._logstream = ls
             ls.start()
             logger.warning("logstream: detection thread started")
+
+    # -- Helius Parsed Streams (selective enriched intelligence) ------
+    def _ensure_parsed_stream(self, config) -> None:
+        """Start the Helius parsed-stream worker once per daemon life.
+        Requires ``config.degen.parsed_stream_enabled is True``
+        exactly — a truthy string like "false" must NOT enable it.
+        The worker owns the whole lifecycle (run_forever connects,
+        reconnects with backoff, and survives shared-account admission
+        holds); this method never connects directly. If the worker
+        exits unexpectedly the reference clears so a later cycle can
+        start a fresh one. Routing, subscription validation,
+        shared-account admission and handshake accounting are all in
+        force inside the client."""
+        if getattr(config.degen, "parsed_stream_enabled", False) is not True:
+            self._stop_parsed_stream()
+            return
+        if getattr(self, "_stop", False):
+            return
+        if getattr(self, "_parsed_stream", None) is not None:
+            return
+        from daemon.intelligence.acquisition import (
+            helius_streams, routine)
+        url = routine.websocket_url('parsed_streams')
+        if not url:
+            logger.warning("parsed stream: no usable Helius key — "
+                           "stream disabled")
+            return
+        stream_router = routine.router()
+        st = helius_streams.HeliusParsedStreamClient(
+            wss_url=url, router=stream_router,
+            usage_store=stream_router.usage.store, account_home=stream_router.home,
+            on_event=self._on_parsed_stream_event)
+        ok, note = st.subscribe(helius_streams.pumpfun_filter(),
+                                "pumpfun")
+        if not ok:
+            logger.warning("parsed stream subscribe refused: %s", note)
+            return
+        import threading as _th
+        self._parsed_stream = st
+
+        def _run():
+            try:
+                st.run_forever()
+            except Exception:
+                logger.exception("parsed stream worker exited")
+            finally:
+                # Clear the reference so the next cycle's ensure can
+                # start a fresh worker instead of retaining a dead one.
+                if getattr(self, "_parsed_stream", None) is st:
+                    self._parsed_stream = None
+
+        _th.Thread(target=_run, daemon=True,
+                   name="parsed-stream").start()
+        logger.warning("parsed stream: worker started")
+
+    def _stop_parsed_stream(self) -> None:
+        st = getattr(self, "_parsed_stream", None)
+        if st is not None:
+            st.stop()
+            self._parsed_stream = None
+
+    def _handle_signal(self, signum, frame):
+        super()._handle_signal(signum, frame)
+        self._stop_parsed_stream()
+
+    def run_forever(self):
+        try:
+            return super().run_forever()
+        finally:
+            self._stop_parsed_stream()
+
+    def _parsed_intake(self):
+        intake = getattr(self, "_parsed_stream_intake", None)
+        if intake is None:
+            from .parsed_stream_intake import ParsedStreamIntake
+            intake = ParsedStreamIntake()
+            self._parsed_stream_intake = intake
+        return intake
+
+    def _on_parsed_stream_event(self, event) -> None:
+        self._parsed_intake().receive_event(event)
+
+    def _drain_parsed_stream(self, config, adapter, state):
+        if getattr(config.degen, "parsed_stream_enabled", False) is not True:
+            return
+        self._drain_stream_candidates(config, adapter, state,
+            self._parsed_intake(), 'parsed_stream', 'pumpfun-parsed-verified')
 
     def _drain_logstream(self, config, adapter,
                          state: Dict[str, Any]) -> None:
@@ -1013,10 +1133,14 @@ class LaunchScanner(Daemon):
         ls = getattr(self, "_logstream", None)
         if ls is None:
             return
+        self._drain_stream_candidates(config, adapter, state, ls,
+                                      'logstream', 'pumpfun-log')
+
+    def _drain_stream_candidates(self, config, adapter, state, ls, lane, source):
         # A loaded committed batch may need only ACK after a crash.
-        if state.get('logstream_committed_refs'):
-            ls.acknowledge(state['logstream_committed_refs'])
-            state['logstream_committed_refs']=[]
+        if state.get(lane+'_committed_refs'):
+            ls.acknowledge(state[lane+'_committed_refs'])
+            state[lane+'_committed_refs']=[]
         for item in ls.drain():
             if getattr(self, "_stop", False):
                 logger.warning("logstream drain stopping on SIGTERM — "
@@ -1029,11 +1153,12 @@ class LaunchScanner(Daemon):
             c = {
                 "mint": mint,
                 "symbol": "", "name": "",
-                "chain": "solana", "source": "pumpfun-log",
+                "chain": "solana", "source": source,
                 "created_ts": item.get("ts") or time.time(),
                 "usd_market_cap": 0.0,
                 "extra": {"complete": False, "banned": False,
-                          "signature": item.get("signature")},
+                          "signature": item.get("signature"),
+                          "acquisition_evidence": item.get("acquisition_evidence", {"recorded": False, "completeness": "unrecorded"})},
                 "url": "https://pump.fun/coin/%s" % mint,
             }
             import copy
@@ -1043,16 +1168,16 @@ class LaunchScanner(Daemon):
             try:
                 self._consider(config, adapter, state, c)
                 token=uuid.uuid4().hex
-                state['logstream_commit']=token
-                state['logstream_committed_refs']=[item['signature']]
+                state[lane+'_commit']=token
+                state[lane+'_committed_refs']=[item['signature']]
                 store=get_store()
                 store.journal_add({'kind':'daemon_state','symbol':self.name,'detail':dict(state)})
                 rows=store.journal_query(kind='daemon_state',symbol=self.name,limit=1)
-                if not rows or (rows[0].get('detail') or {}).get('logstream_commit')!=token:
+                if not rows or (rows[0].get('detail') or {}).get(lane+'_commit')!=token:
                     raise OSError('logstream handoff persistence not verified')
                 durable=True
                 ls.acknowledge([item['signature']])
-                state['logstream_committed_refs']=[]
+                state[lane+'_committed_refs']=[]
                 try:store.prune_journal(kind='daemon_state',symbol=self.name,keep=10)
                 except Exception:logger.warning('logstream state prune failed',exc_info=True)
             except Exception:
@@ -2470,8 +2595,10 @@ class LaunchScanner(Daemon):
         # safety verdict (allow) ran FIRST above — history never
         # overrides hard fails. Cross-dedup: mints already evaluated by
         # the smart-buy fast-track get no second fast-track card.
+        self._deployer_line_evaluated=False
         dtrig = self._deployer_card_line(
             config, state, mint, c.get("chain") or "", c, True)
+        dtrig_evaluated=bool(getattr(self,'_deployer_line_evaluated',False))
         if dtrig:
             evt["deployer"] = dtrig["deployer"]
             evt["deployer_line"] = dtrig["deployer_line"]
@@ -2491,7 +2618,7 @@ class LaunchScanner(Daemon):
             evt[_k] = _v
         if extra:
             evt.update(extra)
-        return evt, dtrig
+        return evt, dtrig,dtrig_evaluated
 
     def _sniper_stage(self, config, state: Dict[str, Any], degen,
                       c: Dict[str, Any], new_cand: Dict[str, Any],
@@ -2500,8 +2627,11 @@ class LaunchScanner(Daemon):
                       res: Dict[str, Any], now: float,
                       extra: Optional[Dict[str, Any]] = None) -> None:
         """Stage a tier-1 card for the end-of-cycle flush."""
+        import uuid
+        c=dict(c)
+        c['_deployer_launch_operation']={'id':'staged-launch-'+uuid.uuid4().hex,'observed_at':now}
         mint = c.get("mint")
-        evt, dtrig = self._build_early_evt(
+        evt,dtrig,dtrig_evaluated=self._build_early_evt(
             config, state, degen, c, new_cand, entry, mcap, tier,
             reason, report, res, now, extra=extra)
         state.setdefault("sniper_pending", []).append({
@@ -2509,6 +2639,7 @@ class LaunchScanner(Daemon):
             "mint": mint,
             "evt": evt,
             "dtrig": dtrig,
+            "dtrig_evaluated":dtrig_evaluated,
             "digest_args": {
                 "c": c, "new_cand": new_cand, "mcap": mcap, "tier": tier,
                 "reason": reason, "report": report, "res": res,
@@ -2524,14 +2655,17 @@ class LaunchScanner(Daemon):
                               report: Optional[Dict[str, Any]],
                               res: Dict[str, Any], now: float,
                               dtrig: Optional[Dict[str, Any]] = None,
-                              extra: Optional[Dict[str, Any]] = None
+                              extra: Optional[Dict[str, Any]] = None,
+                              dtrig_evaluated: bool = False
                               ) -> None:
         """Queue a quality-passed coin into the early digest.
 
         The sub-tier lane AND the cap-tripped tier-1 fallback share this
         path — nothing queued is ever silently discarded. ``dtrig`` is
         the precomputed deployer trigger when the caller already ran it
-        (staged tier-1 cards); otherwise it resolves here. ``extra``
+        (staged tier-1 cards); ``dtrig_evaluated`` preserves an evaluated
+        cold/unknown None without reprocessing this same staged observation.
+        Otherwise it resolves here. ``extra``
         injects caller-specific item fields (e.g. fast-track markers).
         """
         mint = c.get("mint")
@@ -2541,7 +2675,7 @@ class LaunchScanner(Daemon):
             logger.warning("EARLY DIGEST already queued for %s (%s) tier=%s",
                            c.get("symbol"), mint, tier)
             return
-        if dtrig is None:
+        if dtrig is None and not dtrig_evaluated:
             # Deployer tracking (#2): resolve + record the launch for
             # quality-passed coins; a hot deployer earns its 🏭 line on
             # the digest item.
@@ -2639,7 +2773,7 @@ class LaunchScanner(Daemon):
                         config, state, degen, d.get("c"),
                         d.get("new_cand"), d.get("mcap"), d.get("tier"),
                         d.get("reason"), d.get("report"), d.get("res"),
-                        now, dtrig=p.get("dtrig"),
+                        now, dtrig=p.get("dtrig"),dtrig_evaluated=bool(p.get('dtrig_evaluated')),
                         extra=d.get("extra"))
                     continue
                 logger.warning("SNIPER [early] %s %s score=%.1f tier=%s",
@@ -2668,7 +2802,7 @@ class LaunchScanner(Daemon):
                     config, state, degen, d.get("c"), d.get("new_cand"),
                     d.get("mcap"), d.get("tier"), d.get("reason"),
                     d.get("report"), d.get("res"), now,
-                    dtrig=p.get("dtrig"), extra=d.get("extra"))
+                    dtrig=p.get("dtrig"),dtrig_evaluated=bool(p.get('dtrig_evaluated')),extra=d.get("extra"))
 
     def _maybe_scout(self, config, adapter, state: Dict[str, Any],
                      degen, evt: Dict[str, Any],
@@ -3388,7 +3522,10 @@ class LaunchScanner(Daemon):
             path = narratives.default_heat_path()
             try:
                 tr = narratives.NarrativeHeat.load(path)
+                self._narr_heat_status = 'available'
             except Exception:
+                logger.warning('narrative heat unavailable; using ephemeral unpersisted view', exc_info=True)
+                self._narr_heat_status = 'unavailable'
                 tr = narratives.NarrativeHeat()
             self._narr_heat = tr
             self._narr_heat_path = path
@@ -3403,7 +3540,9 @@ class LaunchScanner(Daemon):
             try:
                 tr.save(self._narr_heat_path)
                 self._narr_heat_saved = now
+                self._narr_heat_status = 'available'
             except Exception:
+                self._narr_heat_status = 'unavailable'
                 logger.warning("narrative heat save failed", exc_info=True)
 
     def _narrative_attach(self, config, state: Dict[str, Any],
@@ -3489,10 +3628,10 @@ class LaunchScanner(Daemon):
         if not getattr(degen, "backtest_enabled", True):
             return
         try:
-            path = os.path.expanduser(str(
+            path = os.path.abspath(os.path.expanduser(str(
                 getattr(degen, "backtest_dataset_path",
                         "~/.forex-agent/launch_scanner/"
-                        "backtest_dataset.jsonl")))
+                        "backtest_dataset.jsonl"))))
             if _skip_live_write(path):
                 return
             mint = cand.get("mint") or ""
@@ -3507,10 +3646,20 @@ class LaunchScanner(Daemon):
                 journaled = getattr(tr, "journal_series", None)
                 if callable(journaled):
                     series = journaled(mint, now)
+                    if getattr(tr,'_journal_last_read_state',None)=='invalid':
+                        # Invalid original evidence must not be laundered
+                        # through a plausible truncated window fallback.
+                        logger.warning('judge history unavailable: invalid snapshot journal for %s',mint)
+                        return
                 if not series:
                     series = getattr(tr, "_series", {}).get(mint)
                     window_only = bool(series)
             if series:
+                try:
+                    fingerprints.validate_recorded_series([list(o[:7])+[None] if isinstance(o,(tuple,list)) and len(o)==8 else o for o in series],until=now)
+                except (ValueError,TypeError,OverflowError):
+                    logger.warning('judge history unavailable: invalid selected series for %s',mint)
+                    return
                 for o in series:
                     snaps.append({
                         "t": o[0], "mcap_usd": o[1], "price_usd": o[2],
@@ -3553,6 +3702,9 @@ class LaunchScanner(Daemon):
                 series_integrity = "journal-whole-no-detected-gaps"
             else:
                 series_integrity = "window-no-detected-gaps"
+            input_evidence=(tr.historical_inputs(mint,now) if tr is not None
+                and callable(getattr(tr,'historical_inputs',None)) else
+                {'state':'legacy-unrecorded','rows':[]})
             saf = cand.get("safety") or {}
             if verdict == "confirm":
                 first = float(cand.get("first_mcap") or 0)
@@ -3569,6 +3721,8 @@ class LaunchScanner(Daemon):
                 # confirm/reject time. Real realized outcomes arrive via
                 # _backtest_record_paper_close with outcome_kind="paper".
                 "outcome_kind": "judge",
+                "snapshot_input_evidence":input_evidence,
+                "snapshot_recorded_t":now,
                 # Timestamp-correctness provenance (2026-11-23, audit
                 # F1): when the stored safety report was evaluated.
                 # None = unknown -> timestamp-correct replay marks the
@@ -3601,6 +3755,14 @@ class LaunchScanner(Daemon):
         except Exception:
             logger.warning("backtest record failed", exc_info=True)
 
+    def _project_narrative_closes(self, store) -> None:
+        from . import close_outbox
+        if close_outbox.project_narratives(store):
+            tracker=getattr(self,'_narr_heat',None)
+            # Never discard unresolved local effects from legacy callers.
+            if tracker is not None and not tracker._pending:
+                self._narr_heat=None
+
     def _record_narrative_close(self, degen, state: Dict[str, Any],
                                 mint: str, pnl: float) -> None:
         """Record a closed paper position into the narrative-heat
@@ -3621,7 +3783,8 @@ class LaunchScanner(Daemon):
                                      pos: Dict[str, Any],
                                      entry_px: float, close_px: float,
                                      reason: str, pnl: float,
-                                     now: float) -> None:
+                                     now: float, record_only: bool = False,
+                                     snapshots_override=None):
         """Append a REAL paper-position outcome to the backtest dataset.
 
         Unlike the judge-verdict snapshots (which synthesize outcomes),
@@ -3639,23 +3802,44 @@ class LaunchScanner(Daemon):
                 getattr(degen, "backtest_dataset_path",
                         "~/.forex-agent/launch_scanner/"
                         "backtest_dataset.jsonl")))
-            if _skip_live_write(path):
+            if _skip_live_write(path) and not record_only:
                 return
-            entry_px = float(entry_px or 0)
-            close_px = float(close_px or 0)
-            peak = float(pos.get("peak_price_sol") or entry_px or close_px)
-            realized_mult = (close_px / entry_px) if entry_px > 0 else 1.0
-            peak_mult = (peak / entry_px) if entry_px > 0 else 1.0
-            rug = realized_mult <= 0.10  # lost 90%+ — liquidity-pull shape
+            import math
+            def number(value, nonnegative=False):
+                if type(value) not in (int,float):return None
+                try:
+                    value=float(value)
+                    return value if math.isfinite(value) and (not nonnegative or value>=0) else None
+                except (OverflowError,ValueError):return None
+            entry_px = number(entry_px,True)
+            close_px = number(close_px,True)
+            peak = number(pos.get('peak_price_sol'),True)
+            realized_mult = (close_px/entry_px if entry_px is not None and entry_px>0
+                             and close_px is not None else None)
+            peak_mult = (peak/entry_px if entry_px is not None and entry_px>0
+                        and peak is not None else None)
+            if realized_mult is not None and not math.isfinite(realized_mult):realized_mult=None
+            if peak_mult is not None and not math.isfinite(peak_mult):peak_mult=None
+            realized_pnl=number(pnl)
+            rug = realized_mult <= 0.10 if realized_mult is not None else None
             snaps: List[Dict[str, Any]] = []
-            tr = getattr(self, "_fp_tracker", None)
-            series = getattr(tr, "_series", {}).get(mint) if tr else None
+            from .close_outbox import snapshot_series
+            try:
+                series = snapshot_series(self,degen,mint,now,since=((state.get("seen") or {}).get(mint) or {}).get("first_ts"))
+            except (ValueError,TypeError,OverflowError,OSError):
+                series = None  # unavailable snapshots do not erase realized economics
             if series:
                 for o in series:
                     snaps.append({
                         "t": o[0], "mcap_usd": o[1], "price_usd": o[2],
                         "vol5m_usd": o[3], "buys5m": int(o[4]),
                         "sells5m": int(o[5]), "liq_usd": o[6]})
+            if snapshots_override is not None:
+                snaps = snapshots_override
+            from .fingerprints import FingerprintTracker
+            evidence_tracker=getattr(self,'_fp_tracker',None) or FingerprintTracker(degen)
+            input_evidence=evidence_tracker.historical_inputs(mint,now,
+                since=((state.get('seen') or {}).get(mint) or {}).get('first_ts'))
             saf_score = pos.get("safety_score")
             rec = {
                 "schema_version": backtest.HISTORY_SCHEMA_VERSION,
@@ -3674,16 +3858,18 @@ class LaunchScanner(Daemon):
                 "entry_price_sol": entry_px,
                 "close_price_sol": close_px,
                 "peak_price_sol": peak,
-                "peak_mult": round(peak_mult, 4),
-                "realized_mult": round(realized_mult, 4),
-                "pnl_sol": round(float(pnl or 0), 6),
+                "peak_mult": round(peak_mult, 4) if peak_mult is not None else None,
+                "realized_mult_metric":"close-price-over-entry-price-not-net-return",
+                "native_allocation_state":"unrecorded-legacy-source",
+                "realized_mult": round(realized_mult, 4) if realized_mult is not None else None,
+                "pnl_sol": round(realized_pnl, 6) if realized_pnl is not None else None,
                 "exit_reason": reason,
                 # Exit-policy version (v1 = single-stage trail, v2 =
                 # Leg A profit-lock added 2026-10-02): keeps the exit
                 # measurement honest across the regime change.
                 "exit_version": EXIT_POLICY_VERSION,
                 "rug": rug,
-                "outcome": {"peak_mult": round(peak_mult, 4),
+                "outcome": {"peak_mult": round(peak_mult, 4) if peak_mult is not None else None,
                             "peak_t": now, "rug": rug, "end_t": now,
                             "recorded_t": now},
                 "safety": {"score": saf_score,
@@ -3709,9 +3895,14 @@ class LaunchScanner(Daemon):
                 # on pre-2026-10-19 closes.
                 "entry_features": pos.get("entry_features"),
                 "snapshots": snaps,
+                "snapshot_coverage": "recorded-observations-only" if snaps else "unrecorded",
+                "snapshot_input_evidence":input_evidence,
+                "snapshot_recorded_t":now,
                 "verdict": "confirm",
             }
-            backtest.record_history(path, rec)
+            if record_only:
+                return {"path":path,"record":rec}
+            return backtest.record_history(path, rec)
         except Exception:
             logger.warning("paper backtest record failed", exc_info=True)
 
@@ -4635,6 +4826,10 @@ class LaunchScanner(Daemon):
         derived from ``wave`` exactly as before, so all existing
         callers are unaffected.
         """
+        from daemon.launch_scanner.entry_outbox import conflicted
+        if conflicted(state,position_key=mint if (tag or 'launch')=='launch' else '%s:%s'%(tag,mint),mint=mint):
+            card['note']='entry identity conflict unavailable; no new submission'
+            return False
         from broker import OrderRequest  # noqa: PLC0415
         from core.execution.broker_guard import execution_scope  # noqa: PLC0415
 
@@ -4787,6 +4982,27 @@ class LaunchScanner(Daemon):
             idempotency_key="%s:%s" % (tag, mint),
             comment=comment,
         )
+        entry_context=None
+        entry_context_b=None
+        if callable(getattr(adapter,'scanner_entry_evidence',None)):
+            from daemon.launch_scanner import entry_outbox
+            entry_store=getattr(self,'_close_store',None) or get_store()
+            entry_position_key=mint if tag=='launch' else '%s:%s'%(tag,mint)
+            entry_context=entry_outbox.prepare(self,entry_store,adapter,req,degen,state,card,intel or {},
+                mint,symbol,w,tag,'A' if two_tier else None,entry_position_key,tp)
+            if entry_context is not None:
+                known=adapter.scanner_entry_evidence(entry_context['request'],entry_context['book'])
+                if known is not None and conflicted(state,ticket=known['fill']['ticket'],mint=known['fill']['shared_mint']):
+                    card['note']='native entry ticket conflict unavailable; no submission'
+                    return False
+                if known is not None and known['state']=='closed':
+                    card['note']='prior entry already closed; no replayed position'
+                    return False
+            if two_tier:
+                req_b=OrderRequest(symbol=symbol,direction='BUY',volume=leg_vol,stop_loss=sl,take_profit=tp,
+                    signal_id='%s:%s:B'%(tag,mint),idempotency_key='%s:%s:B'%(tag,mint),comment='%s-B'%comment)
+                entry_context_b=entry_outbox.prepare(self,entry_store,adapter,req_b,degen,state,card,intel or {},
+                    mint,symbol,w,tag,'B',entry_position_key+LEG_B_SUFFIX,None)
         try:
             with execution_scope():
                 result = adapter.submit_order(req)
@@ -4809,11 +5025,14 @@ class LaunchScanner(Daemon):
                        tier=card.get("tier") or "?", sl=sl, card=card,
                        intel=intel, saf=saf, deployer=_pos_deployer,
                        entry_features=self._entry_features(card))
-        state["degen_positions"][pos_key] = self._leg_pos_dict(
-            ticket=result.ticket, entry_price=float(result.price),
-            tp=tp, volume_sol=leg_vol,
-            max_hold_hours=float(degen.max_hold_hours),
-            leg="A" if two_tier else None, **_leg_kw)
+        if entry_context is None:
+            state["degen_positions"][pos_key] = self._leg_pos_dict(
+                ticket=result.ticket, entry_price=float(result.price),
+                tp=tp, volume_sol=leg_vol,
+                max_hold_hours=float(degen.max_hold_hours),
+                leg="A" if two_tier else None, **_leg_kw)
+        if entry_context is not None:
+            entry_outbox.project_one(entry_store,adapter,entry_context,state)
         # Leg B is written to state right after leg A, so a crash between
         # the two can only strand leg A — which then behaves exactly like
         # the old single-position code. If leg B's submit fails, leg A
@@ -4833,15 +5052,18 @@ class LaunchScanner(Daemon):
                         idempotency_key="%s:%s:B" % (tag, mint),
                         comment="%s-B" % comment,
                     ))
-                state["degen_positions"][pos_key + LEG_B_SUFFIX] = \
-                    self._leg_pos_dict(
-                        ticket=result_b.ticket,
-                        entry_price=float(result_b.price),
-                        tp=None, volume_sol=leg_vol,
-                        max_hold_hours=float(
-                            getattr(degen, "tier_b_max_hold_hours", 24.0)
-                            or 24.0),
-                        leg="B", **_leg_kw)
+                if entry_context_b is None:
+                    state["degen_positions"][pos_key + LEG_B_SUFFIX] = \
+                        self._leg_pos_dict(
+                            ticket=result_b.ticket,
+                            entry_price=float(result_b.price),
+                            tp=None, volume_sol=leg_vol,
+                            max_hold_hours=float(
+                                getattr(degen, "tier_b_max_hold_hours", 24.0)
+                                or 24.0),
+                            leg="B", **_leg_kw)
+                if entry_context_b is not None:
+                    entry_outbox.project_one(entry_store,adapter,entry_context_b,state)
                 ticket_b = result_b.ticket
             except Exception as exc:
                 logger.warning("degen leg-B entry failed for %s "
@@ -4940,8 +5162,9 @@ class LaunchScanner(Daemon):
                 outcome = "hit_2x"
             else:
                 outcome = "dead"
-            if deployers.record_outcome(mint, deployer, outcome):
-                recorded[mint] = {"ts": time.time(), "outcome": outcome}
+            winner=deployers.claim_outcome(mint,deployer,outcome,time.time(),'legacy-scanner-close')
+            if winner:
+                recorded[mint] = {"ts":winner['observed_at'],"outcome":winner['outcome']}
                 logger.warning("DEPLOYER graded %s -> %s (%s…)", mint,
                                outcome, str(deployer)[:8])
         except Exception:
@@ -4954,6 +5177,9 @@ class LaunchScanner(Daemon):
         from core.execution.broker_guard import execution_scope  # noqa: PLC0415
 
         degen = config.degen
+        if callable(getattr(adapter,'scanner_entry_evidence',None)):
+            from daemon.launch_scanner import entry_outbox
+            entry_outbox.recover(getattr(self,'_close_store',None) or get_store(),adapter,state)
         positions = state.get("degen_positions") or {}
         price_fn = getattr(adapter, "_price_sol_quiet", None)
         now = time.time()
@@ -4964,7 +5190,16 @@ class LaunchScanner(Daemon):
         close_identity = getattr(adapter, "scanner_close_identity", None)
         if callable(close_identity):
             from daemon.launch_scanner import close_outbox
+            close_outbox.recover_orphans(getattr(self, '_close_store', None) or get_store(),adapter)
+            close_outbox.project_backtests(getattr(self, "_close_store", None) or get_store())
+            close_outbox.project_wallet_learning(getattr(self, "_close_store", None) or get_store())
+            close_outbox.project_exit_clock(getattr(self, "_close_store", None) or get_store())
+            self._project_narrative_closes(getattr(self, "_close_store", None) or get_store())
+            close_outbox.project_exit_copy(getattr(self, "_close_store", None) or get_store())
+            close_outbox.project_deployers(getattr(self, "_close_store", None) or get_store())
             for key, position in list(positions.items()):
+                from daemon.launch_scanner.entry_outbox import conflicted
+                if conflicted(state,position_key=key,ticket=position.get('ticket')):continue
                 identity = close_identity(position.get("ticket"))
                 if identity is not None:
                     store = getattr(self, "_close_store", None) or get_store()
@@ -4974,6 +5209,12 @@ class LaunchScanner(Daemon):
                         receipt = adapter.scanner_close_receipt(identity)
                         if receipt is not None:
                             close_outbox.commit(store, prior, receipt)
+                            close_outbox.project_backtests(store)
+                            close_outbox.project_wallet_learning(store)
+                            close_outbox.project_exit_clock(store)
+                            self._project_narrative_closes(store)
+                            close_outbox.project_exit_copy(store)
+                            close_outbox.project_deployers(store)
                             positions.pop(key, None)
                             recovered[key] = True
         # Price pre-pass: quotes for the exit checks below. A position
@@ -5007,6 +5248,8 @@ class LaunchScanner(Daemon):
             feed_healthy = bool(sol_px and sol_px > 0)
         for mint in list(positions):
             pos = positions[mint]
+            from daemon.launch_scanner.entry_outbox import conflicted
+            if conflicted(state,position_key=mint,ticket=pos.get('ticket')):continue
             symbol = pos.get("symbol", "")
             # Position dict keys may carry a wave suffix
             # (``second_wave:<mint>``); downstream records key on the
@@ -5091,8 +5334,28 @@ class LaunchScanner(Daemon):
                 if identity is not None:
                     from daemon.launch_scanner import close_outbox
                     store = getattr(self, "_close_store", None) or get_store()
+                    history_source=close_outbox.backtest_source(self,degen,state,real_mint,now)
+                    history_spec = self._backtest_record_paper_close(
+                        config, state, real_mint, symbol, pos, entry_px, 0., reason,
+                        0., now, record_only=True,snapshots_override=history_source.get('snapshots',[])) if history_source.get('state')=='recorded' else None
+                    # Testing never writes the real dataset, including recovery.
+                    if isinstance(history_spec, dict) and _skip_live_write(history_spec['path']):
+                        history_spec = None
+                    if not getattr(degen, 'backtest_enabled', True):
+                        history_state = 'disabled'
+                    elif isinstance(history_spec, dict):
+                        history_state = 'enabled-pinned'
+                    elif _testing():
+                        history_state = 'test-skipped-or-builder-error'
+                    else:
+                        history_state = 'enabled-builder-error'
                     close_context = close_outbox.prepare(store, identity, pos, mint,
-                        reason, peak, now, state, float(degen.entry_sol))
+                        reason, peak, now, state, float(degen.entry_sol),
+                        backtest_spec=history_spec if isinstance(history_spec, dict) else None,
+                        backtest_state=history_state,backtest_source=history_source,
+                        clock_spec=close_outbox.clock_source(degen,real_mint),
+                        exit_copy_spec=close_outbox.exit_copy_source(degen),
+                        deployer_spec=close_outbox.deployer_source(degen,state,pos,real_mint))
             try:
                 with execution_scope():
                     if pool_gone_close:
@@ -5115,16 +5378,23 @@ class LaunchScanner(Daemon):
                 if receipt is None or receipt["price_sol"] != close_px:
                     raise ValueError("scanner close returned without exact durable receipt")
                 close_outbox.commit(store, close_context, receipt)
+                close_outbox.project_backtests(store)
+                close_outbox.project_wallet_learning(store)
+                close_outbox.project_exit_clock(store)
+                self._project_narrative_closes(store)
+                close_outbox.project_exit_copy(store)
+                close_outbox.project_deployers(store)
                 # Learning uses the same actual native economics, never stale scanner size.
                 pnl = float(receipt["realized_pnl_sol"])
                 entry_px = float(receipt["allocations"][0]["entry_price_sol"])
             positions.pop(mint, None)
             # Score the smart wallets that bought this runner.
             try:
-                smartmoney.record_outcome(
-                    real_mint, pnl > 0,
-                    list((state.get("smart_activity") or {}).get(
-                        real_mint, [])))
+                if close_context is None:
+                    smartmoney.record_outcome(
+                        real_mint, pnl > 0,
+                        list((state.get("smart_activity") or {}).get(
+                            real_mint, [])))
             except Exception:
                 logger.warning("smart-money scoring failed", exc_info=True)
             # Deployer grading (#2): "rug" when the realized multiple is
@@ -5133,36 +5403,41 @@ class LaunchScanner(Daemon):
             # "dead". Once per mint (deployer_outcome_recorded) so the
             # milestone-expiry grade never double-counts the same launch.
             try:
-                self._grade_deployer_close(state, degen, real_mint,
-                                           entry_px, close_px, peak, pos)
+                if close_context is None:
+                    self._grade_deployer_close(state, degen, real_mint,
+                                               entry_px, close_px, peak, pos)
             except Exception:
                 logger.warning("deployer close grading failed",
                                exc_info=True)
             # Narrative heat: learn which narratives actually run from
             # closed paper positions (soft signal; never a gate).
-            self._record_narrative_close(degen, state, real_mint, pnl)
+            if close_context is None:
+                self._record_narrative_close(degen, state, real_mint, pnl)
             # Real-outcome backtest record: true entry/exit/peak, not a
             # synthesized judge outcome. This is what proves which
             # narratives and signals actually made money.
-            self._backtest_record_paper_close(
-                config, state, real_mint, symbol, pos, entry_px, close_px,
-                reason, pnl, time.time())
+            if close_context is None:
+                self._backtest_record_paper_close(
+                    config, state, real_mint, symbol, pos, entry_px, close_px,
+                    reason, pnl, time.time())
             # Safe batch (2026-10-09): exit-liquidity clock + exit-copy
             # observations. Measurement only — these calls cannot
             # change the close that just happened.
             try:
-                exit_liquidity_clock.record_close(
-                    degen, real_mint, float(pos.get("entry_ts") or now),
-                    entry_px, time.time(), close_px, peak, reason, pnl,
-                    pos.get("label") or "")
+                if close_context is None:
+                    exit_liquidity_clock.record_close(
+                        degen, real_mint, float(pos.get("entry_ts") or now),
+                        entry_px, time.time(), close_px, peak, reason, pnl,
+                        pos.get("label") or "")
             except Exception:
                 logger.warning("exit-clock record failed", exc_info=True)
             try:
-                exit_copy.record_close(
-                    degen, real_mint, float(pos.get("entry_ts") or now),
-                    time.time(),
-                    close_px / entry_px if entry_px > 0 else 0.0,
-                    reason, pnl)
+                if close_context is None:
+                    exit_copy.record_close(
+                        degen, real_mint, float(pos.get("entry_ts") or now),
+                        time.time(),
+                        close_px / entry_px if entry_px > 0 else 0.0,
+                        reason, pnl)
             except Exception:
                 logger.warning("exit-copy record failed", exc_info=True)
             if close_context is None:
@@ -5250,7 +5525,8 @@ class LaunchScanner(Daemon):
                 ticket = int(getattr(bp, "ticket", 0) or 0)
             except (TypeError, ValueError):
                 continue
-            if not ticket or ticket in tracked:
+            from daemon.launch_scanner.entry_outbox import conflicted
+            if not ticket or ticket in tracked or conflicted(state,ticket=ticket):
                 continue
             symbol = str(getattr(bp, "symbol", "") or "")
             try:
@@ -5282,6 +5558,22 @@ class LaunchScanner(Daemon):
                 # quoteless orphan still inside its grace period: leave
                 # it alone.
                 continue
+            orphan_context=None
+            identity_fn=getattr(adapter,'scanner_close_identity',None)
+            if callable(identity_fn):
+                identity=identity_fn(ticket)
+                if identity is not None:
+                    from daemon.launch_scanner import close_outbox
+                    store=getattr(self,'_close_store',None) or get_store()
+                    native_position={'ticket':ticket,'symbol':symbol,
+                        'entry_price_sol':float(getattr(bp,'price_open',0) or 0),
+                        'volume_sol':float(getattr(bp,'volume',0) or 0),
+                        'entry_ts':t_open.timestamp() if t_open is not None else None}
+                    orphan_context=close_outbox.prepare_orphan(store,identity,native_position,reason,now)
+                    if orphan_context['reason']=='pool_gone' and (not feed_healthy or not no_quote):
+                        logger.error('orphan pool-gone intent needs reconciliation ticket %s',ticket)
+                        continue
+                    reason=orphan_context['reason']
             try:
                 with execution_scope():
                     if reason == "pool_gone":
@@ -5292,6 +5584,13 @@ class LaunchScanner(Daemon):
             except Exception as exc:
                 logger.warning("orphan close failed ticket %s: %s",
                                ticket, exc)
+                continue
+            if orphan_context is not None:
+                receipt=adapter.scanner_close_receipt(identity)
+                if receipt is None or receipt['price_sol']!=close_px:
+                    raise ValueError('orphan close lacks exact native receipt')
+                close_outbox.commit(store,orphan_context,receipt)
+                closed+=1
                 continue
             entry_px = float(getattr(bp, "price_open", 0) or 0) or close_px
             vol = float(getattr(bp, "volume", 0) or 0)

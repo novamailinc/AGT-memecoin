@@ -91,6 +91,7 @@ import glob
 import importlib.util
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -319,6 +320,92 @@ VERDICT_SAMPLE_CLOSES = 100
 
 # ---- the four filters: exact operational definitions -------------------
 SERIAL_MAX_LAUNCHES_24H = 3      # reject at >= 3 launches / trailing 24h
+
+# Authoritative launch-history hook (2026-11-24 reviewer + main
+# contract). A sub-threshold 24h launch count may pass ONLY on an
+# authoritative complete launch history for the creator - e.g.
+# on-chain enumeration of the creator's window signatures classified
+# for create transactions, verified for identity, create-tx
+# discrimination, completeness, finality, window depth and pagination
+# (creator-signature enumeration alone can miss births made through
+# other signers/PDAs/program paths, so it is NOT authoritative until
+# those checks are verified). Production default None = NO such
+# source wired: every sub-threshold count fails closed. A future
+# reviewed delta may wire a real provider here; tests stub it to keep
+# downstream lanes exercised - a stubbed pass fixture proves INTERFACE
+# behavior only, never a real history source.
+#
+# Signature: (creator, now) -> PROOF DICT (see authoritative_proof)
+# or None when the source cannot answer. A bare count is NEVER
+# accepted: the proof is validated field by field and anything
+# malformed, negative, bool-typed, stale, wrong-creator, short-window,
+# partial, non-finalized or exceptional fails closed.
+_AUTHORITATIVE_LAUNCHES_24H = None
+
+AUTHORITATIVE_WINDOW_S = 86400.0   # the trailing-24h serial window
+# Engineering freshness bound (not a completeness guarantee): the
+# enumeration's view of the chain may lag the evaluation instant by
+# at most this much before the proof is treated as stale.
+_AUTHORITATIVE_MAX_STALE_S = 300.0
+
+
+def authoritative_proof(creator, count, now, window_start=None):
+    """Typed proof constructor for the authoritative-history hook.
+
+    The future provider builds its answer with this exact shape;
+    _valid_authoritative_count re-validates every field on receipt
+    and never trusts the producer.
+    """
+    return {
+        "complete": True,
+        "creator": creator,
+        "count": int(count),
+        "window_start": float(
+            window_start if window_start is not None
+            else now - AUTHORITATIVE_WINDOW_S),
+        "window_end": float(now),
+        "finality": "finalized",
+    }
+
+
+def _valid_authoritative_count(proof, creator, now):
+    """Validated count from a hook proof, else None (fail closed).
+
+    Rejects: non-dict, complete not literally True, wrong creator,
+    missing/bool/non-int/negative count, non-numeric or non-finite
+    (NaN/inf) window bounds, window shorter than the trailing 24h,
+    stale or future-dated window_end, non-finalized finality, and
+    any exception.
+    """
+    try:
+        if not isinstance(proof, dict):
+            return None
+        if proof.get("complete") is not True:
+            return None
+        if proof.get("creator") != creator:
+            return None
+        count = proof.get("count")
+        if isinstance(count, bool) or not isinstance(count, int):
+            return None
+        if count < 0:
+            return None
+        ws = proof.get("window_start")
+        we = proof.get("window_end")
+        if isinstance(ws, bool) or isinstance(we, bool) or not (
+                isinstance(ws, (int, float))
+                and isinstance(we, (int, float))):
+            return None
+        if not (math.isfinite(ws) and math.isfinite(we)):
+            return None   # NaN/inf comparisons never reject; fail closed
+        if ws > now - AUTHORITATIVE_WINDOW_S:
+            return None   # window must cover the full trailing 24h
+        if we < now - _AUTHORITATIVE_MAX_STALE_S or we > now + 60.0:
+            return None   # stale or future-dated enumeration
+        if proof.get("finality") != "finalized":
+            return None
+        return count
+    except Exception:
+        return None
 TTG_MAX_S = 3600.0               # curve must complete within 1 hour
 CURVE_TRADES_MAX = 250           # <= 250 curve signatures (see docstring)
 GRAD_SOL = 85.0                  # canonical curve completion, SOL (real)
@@ -465,6 +552,10 @@ _INDEX = {
     "by_mig": {},         # mint -> {"pool","ts"}
     "files": {},          # path -> byte offset consumed
     "coverage_start": None,   # earliest birth ts ever indexed
+    "event_ts": [],       # ALL absorbed birth/migration timestamps
+                          # (48h-pruned): continuity evidence for the
+                          # coverage window - an old coverage_start
+                          # with a mid-window outage is NOT complete.
     "available": False,   # any recorder data seen at all
 }
 _INDEX_LOCK = threading.Lock()
@@ -540,11 +631,15 @@ def _index_absorb(item, kind):
                 if cs is None or ts < cs:
                     _INDEX["coverage_start"] = ts
             _INDEX["available"] = True
+            if ts > 0:
+                _INDEX["event_ts"].append(ts)
         elif kind == "migration":
             _INDEX["by_mig"][mint] = {
                 "pool": str(extra.get("market_id") or ""),
                 "ts": ts}
             _INDEX["available"] = True
+            if ts > 0:
+                _INDEX["event_ts"].append(ts)
     except Exception:
         pass
 
@@ -606,6 +701,9 @@ def _index_refresh(now):
                     if kind in ("birth", "migration"):
                         _index_absorb(rec, kind)
             cutoff = now - _INDEX_PRUNE_S
+            if _INDEX["event_ts"]:
+                _INDEX["event_ts"] = [t for t in _INDEX["event_ts"]
+                                      if t >= cutoff]
             for trader in list(_INDEX["by_trader"]):
                 keep = [t for t in _INDEX["by_trader"][trader]
                         if t >= cutoff]
@@ -620,6 +718,53 @@ def _index_refresh(now):
 def _birth_record(mint):
     rec = _INDEX["by_mint"].get(mint)
     return dict(rec) if rec else None
+
+
+# Engineering continuity bound (reviewer-visible, 2026-11-24): the
+# recorder index demonstrates feed ingestion across the whole trailing
+# 24h only when observed birth/migration events leave no gap larger
+# than this (window edges included). 15 minutes is conservative: the
+# live feeds see births every few minutes around the clock. SCOPE
+# (2026-11-24 reviewer + main contract): continuity of observed flow
+# is INGESTION-HEALTH TELEMETRY ONLY - it witnesses that some events
+# were ingested, never that all of one creator's births were. A
+# silent upstream drop of a single birth (feed-side, network, parse)
+# leaves a continuous-looking stream, so continuity evidence is NOT
+# completeness authority and never admits a low launch count.
+_COVERAGE_GAP_MAX_S = 900.0
+
+
+def _coverage_window_complete(now):
+    """(complete, detail): is the recorder index's 24h window whole?
+
+    Requires coverage_start at/before the window start AND no
+    inter-event gap larger than _COVERAGE_GAP_MAX_S, window edges
+    included. Elapsed time ALONE is never completeness (2026-11-24
+    review: old coverage_start + 6h mid-window outage must not pass).
+    """
+    cs = _INDEX.get("coverage_start")
+    if cs is None:
+        return False, "coverage-start-unknown"
+    start = now - 86400
+    if cs > start:
+        return False, "partial-window (coverage_start %.0fs late)" % (cs - start)
+    stamps = sorted(t for t in _INDEX.get("event_ts", [])
+                    if t >= start)
+    if not stamps:
+        return False, "no-events-in-window"
+    gap = stamps[0] - start
+    prev = stamps[0]
+    worst, worst_at = gap, start
+    for ts in stamps[1:]:
+        if ts - prev > worst:
+            worst, worst_at = ts - prev, prev
+        prev = ts
+    if now - prev > worst:
+        worst, worst_at = now - prev, prev
+    if worst > _COVERAGE_GAP_MAX_S:
+        return False, "ingestion-gap %.0fs at ~%.0fs ago" % (
+            worst, now - worst_at)
+    return True, "continuous (worst gap %.0fs)" % worst
 
 
 def _trader_launches_24h(trader, now):
@@ -801,7 +946,7 @@ def _creator_from_oldest_tx(oldest_sig):
         # meta.err gate (2026-11-17, Batch 3): a CreateEvent can
         # survive in a REVERTED tx's logs, and a reverted create
         # names no deployer — the mint doesn't exist. Refuse.
-        if not _txg.tx_succeeded(tx):
+        if not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,oldest_sig):
             return None
         return _deployers._first_signer(tx)
     except Exception:
@@ -925,7 +1070,7 @@ def _canonical_pool_from_chain(curve_addr, pool, created_ts):
                 "maxSupportedTransactionVersion": 1}])
             if not tx:
                 continue
-            if _txg is not None and not _txg.tx_succeeded(tx):
+            if _txg is None or not _txg.tx_succeeded(tx) or not _txg.response_signature_matches(tx,mig_sig):
                 continue
             logs = ((tx.get("meta") or {}).get("logMessages") or [])
             if not any("Instruction: Migrate" in str(l)
@@ -1082,15 +1227,63 @@ def _reject(reason, values):
 
 def _serial_check(creator, now, values):
     """Filter 1 for a resolved creator. Returns a reject verdict
-    or None (pass). Stamps the measured count into values."""
+    or None (pass). Stamps the measured count into values.
+
+    CONSERVATIVE CONTRACT (2026-11-24 reviewer + main): a sub-threshold
+    24h launch count from the recorder passes ONLY with an
+    authoritative complete launch history for the creator - e.g.
+    on-chain enumeration of the creator's window signatures classified
+    for create transactions, verified for identity, create-tx
+    discrimination, completeness, finality, window depth and
+    pagination. The recorder's own activity can never supply that:
+    continuity of observed flow witnesses ingestion health, not
+    per-creator completeness, and a silent upstream drop of one birth
+    leaves a continuous-looking stream. No authoritative source is
+    wired yet, so EVERY sub-threshold count fails closed here and the
+    count is never stamped as measured. Continuity detail is journaled
+    as telemetry (recorder_flow_telemetry when continuous,
+    recorder_coverage_gap when not) - telemetry, not admission
+    authority. Definite evidence (>= SERIAL_MAX_LAUNCHES_24H observed
+    launches) still rejects serial_deployer with the count stamped,
+    because the observed launches alone meet the threshold even when
+    history is partial.
+    """
     n24, coverage = _trader_launches_24h(creator, now)
     if n24 is None:
         return _reject("unknown_serial", values)
-    values["deployer_launches_24h"] = n24
-    values["recorder_coverage_start"] = coverage
     if n24 >= SERIAL_MAX_LAUNCHES_24H:
+        # Definite evidence: the observed launches alone meet the
+        # threshold even if the recorder history is partial.
+        values["deployer_launches_24h"] = n24
+        values["recorder_coverage_start"] = coverage
         return _reject("serial_deployer", values)
-    return None
+    # Sub-threshold recorder count: undercount risk, never admitted
+    # from recorder activity alone (dense unrelated flow + missing
+    # creator births is indistinguishable from a quiet creator).
+    complete, detail = _coverage_window_complete(now)
+    if complete:
+        values["recorder_flow_telemetry"] = detail
+    else:
+        values["recorder_coverage_gap"] = detail
+    if coverage is not None:
+        values["recorder_coverage_start"] = coverage
+    auth = _AUTHORITATIVE_LAUNCHES_24H
+    if auth is not None:
+        try:
+            proof = auth(creator, now)
+        except Exception:
+            proof = None
+        n_auth = _valid_authoritative_count(proof, creator, now)
+        if n_auth is not None:
+            # Verified-complete history: the count is measured, so
+            # admit or reject on it directly.
+            values["deployer_launches_24h"] = n_auth
+            values["launches_source"] = "authoritative"
+            if n_auth >= SERIAL_MAX_LAUNCHES_24H:
+                return _reject("serial_deployer", values)
+            return None
+        values["launches_source"] = "authoritative-unavailable"
+    return _reject("unknown_serial_coverage", values)
 
 
 # ---- two-phase pre-buy check pipeline (2026-11-17) -------------------

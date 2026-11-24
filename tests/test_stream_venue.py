@@ -87,10 +87,17 @@ SEL = GR._select
 SEL._index_refresh = lambda now: None
 SEL._INDEX["available"] = True
 SEL._INDEX["coverage_start"] = NOW - 90000
+SEL._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 SEL._INDEX["by_mint"][MINT] = {
     "trader": "Trader111", "ts": NOW - 60,
     "bonding_curve": "CurveVenue"}
 SEL._INDEX["by_trader"]["Trader111"] = [NOW - 60]
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+    SEL.authoritative_proof(c, {"Trader111": 1}.get(c, 0), n)
 SEL._INDEX["by_mig"][MINT] = {"pool": "PoolReal", "ts": NOW}
 SEL._curve_stats = lambda addr: {
     "trades": 80, "created_ts": NOW - 60, "oldest_sig": "sig-venue",

@@ -320,6 +320,18 @@ class QualifyTest(unittest.TestCase):
 
 class PaperEntryTest(unittest.TestCase):
     def setUp(self):
+        # Import-time environment changes cannot isolate an already imported
+        # killswitch module. Pin real state files per test, never stub the gate.
+        from daemon.launch_scanner import killswitch
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        scratch=tempfile.TemporaryDirectory(prefix='entry-gate-test-')
+        self.addCleanup(scratch.cleanup)
+        for field,name in [('STATE_FILE','state.json'),('SHADOW_FILE','state.json.bak'),('LOCK_FILE','state.lock')]:
+            scope=patch.object(killswitch,field,str(Path(scratch.name)/name))
+            scope.start();self.addCleanup(scope.stop)
+
         self.sc = LaunchScanner.__new__(LaunchScanner)
         # Isolate the entry logic from the veto gate that _paper_enter
         # runs first: veto_check's bundle scan performs live Solana
@@ -1294,11 +1306,11 @@ class BundleTest(unittest.TestCase):
             # H1 and H2 funded by same wallet -> cluster 75% of top.
             funder = "FUNDER_X" if holder in ("H1", "H2") else "FUNDER_Y"
             return {
-                "transaction": {"message": {"instructions": [
+                "transaction": {"signatures": [params[0]], "message": {"instructions": [
                     {"parsed": {"type": "transfer",
                                 "info": {"source": funder,
                                          "destination": holder}}}]}},
-                "meta": {"innerInstructions": []}}
+                "meta": {"err": None, "innerInstructions": []}}
         return None
 
     def test_clustered_supply_fails(self):
@@ -1322,12 +1334,12 @@ class BundleTest(unittest.TestCase):
             if method == "getTransaction":
                 holder = params[0].replace("sig-", "")
                 return {
-                    "transaction": {"message": {"instructions": [
+                    "transaction": {"signatures": [params[0]], "message": {"instructions": [
                         {"parsed": {
                             "type": "transfer",
                             "info": {"source": "UNIQUE-" + holder,
                                      "destination": holder}}}]}},
-                    "meta": {"innerInstructions": []}}
+                    "meta": {"err": None, "innerInstructions": []}}
             return None
 
         with patch.object(bundle, "_rpc", side_effect=rpc), \
@@ -1530,11 +1542,11 @@ class BundleAnalyzeTest(unittest.TestCase):
             if method == "getTransaction":
                 sig = params[0]
                 dest = sig.replace("sig-of-", "")
-                return {"transaction": {"message": {"instructions": [
+                return {"transaction": {"signatures": [sig], "message": {"instructions": [
                     {"parsed": {"type": "transfer",
                                 "info": {"source": "FUNDER",
                                          "destination": dest}}}]}},
-                        "meta": {"innerInstructions": []}}
+                        "meta": {"err": None, "innerInstructions": []}}
             return None
 
         return patch.object(bundle, "_rpc", side_effect=fake_rpc)
@@ -1665,7 +1677,7 @@ class LogstreamRpcFailoverTest(unittest.TestCase):
         url = "https://mainnet.helius-rpc.com/?api-key=SUPERSECRET"
         self.assertNotIn("SUPERSECRET", logstream._rpc_label(url))
         self.assertEqual(logstream._rpc_label(url),
-                         "https://mainnet.helius-rpc.com/")
+                         "mainnet.helius-rpc.com")
 
     def test_helius_url_picked_up_from_key_file(self):
         import os
@@ -1688,7 +1700,7 @@ class LogstreamRpcFailoverTest(unittest.TestCase):
             with patch.dict(os.environ, {"FOREX_AGENT_HOME": home}):
                 self.assertIsNone(_helius_rpc_url())
 
-    def test_ensure_logstream_prefers_helius(self):
+    def test_ensure_logstream_uses_central_policy_not_helius_injection(self):
         import os
         import tempfile
         from types import SimpleNamespace
@@ -1705,9 +1717,8 @@ class LogstreamRpcFailoverTest(unittest.TestCase):
                 with patch.object(logstream.LogStream, "start"):
                     sc._ensure_logstream(cfg)
         ls = sc._logstream
-        self.assertTrue(
-            ls._http_rpc_urls[0].startswith("https://mainnet.helius-rpc.com/"))
-        self.assertIn("https://a.example", ls._http_rpc_urls)
+        self.assertTrue(ls._central_rpc)
+        self.assertFalse(any("helius" in url for url in ls._http_rpc_urls))
 
 
 class SeenPruneTest(unittest.TestCase):

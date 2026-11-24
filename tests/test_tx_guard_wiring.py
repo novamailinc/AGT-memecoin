@@ -93,7 +93,7 @@ old = GS._reserves
 GS._reserves = _FakeReserves(TX)
 try:
     check("grad_select: good tx names creator",
-          GS._creator_from_oldest_tx("somesig") == CREATOR)
+          GS._creator_from_oldest_tx(TX['transaction']['signatures'][0]) == CREATOR)
 finally:
     GS._reserves = old
 GS._reserves = _FakeReserves(_reverted(TX))
@@ -134,7 +134,7 @@ finally:
 
 def _fake_rpc_good(method, params=None, **kw):
     if method == "getSignaturesForAddress":
-        return [{"signature": "oldsig", "blockTime": 1794787202,
+        return [{"signature": TX['transaction']['signatures'][0], "blockTime": 1794787202,
                  "slot": 300000100}]
     if method == "getTransaction":
         return TX

@@ -156,53 +156,10 @@ def rpc_urls():
 
 
 def rpc(method, params, timeout=12):
-    """One JSON-RPC call with endpoint failover. None on failure.
-    Only hostnames are ever logged, never URLs (the Helius URL
-    carries an api-key query parameter).
+    """Kept offline lanes use the same section 9 routine policy."""
+    from daemon.intelligence.acquisition.routine import read
+    return read(method, params, timeout=timeout)
 
-    Pacing (2026-11-17): the Helius leg takes a pacer token for
-    its key's bucket first; no token -> the public leg carries
-    the read. A 429 reports to the pacer (progressive backoff +
-    single probe); a success clears the cooldown. (The mimic lanes
-    are killed; this path is kept paced so any future caller
-    cannot reintroduce an unguarded Helius leg.)"""
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
-                       "params": params}).encode()
-    bucket = ""
-    if _rl is not None:
-        try:
-            bucket = _rl.bucket_id_for_key(_helius_key())
-        except Exception:
-            bucket = ""
-    for url in rpc_urls():
-        host = urllib.parse.urlparse(url).hostname or "unknown"
-        is_helius = "helius" in host
-        if is_helius and _rl is not None and bucket:
-            if not _rl.pacer_acquire(bucket):
-                continue  # pacer: no token — public leg carries it
-        try:
-            req = urllib.request.Request(
-                url, data=body,
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read())
-            if isinstance(d, dict) and d.get("result") is not None:
-                if is_helius and _rl is not None and bucket:
-                    _rl.pacer_report(bucket, True)
-                return d["result"]
-            if isinstance(d, dict) and d.get("error") is not None:
-                logger.warning("mimic_curve rpc %s: %s returned "
-                               "JSON-RPC error %s", method, host,
-                               str(d["error"])[:160])
-        except Exception as e:
-            code = getattr(e, "code", None)
-            logger.warning("mimic_curve rpc %s: %s failed (%s%s)",
-                           method, host, type(e).__name__,
-                           (" HTTP %s" % code) if code else "")
-            if code == 429 and is_helius and _rl is not None and bucket:
-                _rl.pacer_report(bucket, False)
-            continue
-    return None
 
 
 def get_account(pubkey):

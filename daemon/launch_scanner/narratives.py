@@ -1,28 +1,17 @@
-"""AI narrative picker + narrative heat tracker.
+"""Narrative classification and outcome heat.
 
-Two halves, both read-only with respect to trading decisions:
+Classification matches names against a fixed keyword taxonomy. Heat compares
+per-tag and global runner rates, with a supplied multiplier >=2 and rugFalse
+counting as a runner. The scanner currently supplies its legacy realized pnl
+normalized by configured entry size, not an observed peak multiplier. Shared
+close recovery preserves that metric and pins source close time.
 
-* **narrative classification** — ``classify_narrative`` tags a coin by
-  matching its symbol/name/description against the curated
-  ``NARRATIVE_KEYWORDS`` taxonomy (dog, cat, ai, gaming, ...). Pure
-  substring matching, stdlib only, never raises on weird input.
+These values can affect decisions: sniper adds a bounded positive heat bonus
+and winner_model buckets heat as an entry feature. This module itself does not
+submit trades or bypass safety checks. Cold heat adds no sniper bonus.
 
-* **narrative heat** — ``NarrativeHeat`` learns which narratives are
-  actually running hot from closed-runner outcomes. A tag whose coins
-  turn into runners (peak multiple >= 2.0, not a rug) more often than
-  the global average gets a heat multiplier above 1.0; a tag that
-  underperforms gets one below 1.0. Multipliers stay in [0.5, 2.0].
-
-DESIGN RULE (standing user rule): narrative is a SOFT SIGNAL ONLY.
-This module never allows, blocks, holds, or drops anything. It
-classifies and scores; the safety gates and judge pipeline in
-``daemon/launch_scanner/__init__.py`` make every allow/block decision.
-A hot narrative must never override a safety fail, and a cold
-narrative must never block an otherwise qualified coin. Callers
-should use ``heat()`` as a tie-breaker / sizing input, not a gate.
-
-All state is bounded (5000 outcomes) and JSON-serializable; no
-network, no secrets, stdlib only.
+State holds at most5000 outcomes; exact-effect receipts are retained separately
+and currently unbounded. File access is local, with no network calls.
 """
 
 from __future__ import annotations
@@ -121,6 +110,8 @@ class NarrativeHeat:
         # (ts, tags tuple, peak mult, rug bool) — oldest on the left.
         self._outcomes: Deque[Tuple[float, Tuple[str, ...], float, bool]] = \
             deque(maxlen=MAX_OUTCOMES)
+        self._pending = []
+        self._prune_now = None
 
     # -- recording ------------------------------------------------------
     @staticmethod
@@ -151,9 +142,13 @@ class NarrativeHeat:
 
     def record_outcome(self, tags: Any, mult: Any, rug: Any,
                        now: Any) -> None:
-        """Record one closed outcome. ``mult`` = peak multiple vs entry."""
-        self._outcomes.append((self._f(now), self._norm_tags(tags),
-                               self._f(mult), bool(rug)))
+        """Record a supplied outcome multiplier. Scanner metric is described above."""
+        import uuid
+        canonical=validate_heat_outcome([now,list(self._norm_tags(tags)),mult,rug])
+        outcome=(canonical[0],tuple(canonical[1]),canonical[2],canonical[3])
+        identity='narrative-'+uuid.uuid4().hex
+        self._outcomes.append(outcome)
+        self._pending.append((identity,canonical))
 
     # -- heat ------------------------------------------------------------
     def _recent(self, now: float, window_s: float = DAY_S) -> list:
@@ -232,8 +227,16 @@ class NarrativeHeat:
 
     # -- hygiene -----------------------------------------------------------
     def prune(self, now: Any) -> None:
-        """Drop outcomes older than 72h."""
-        cutoff = self._f(now) - OUTCOME_TTL_S
+        """Prune this tracker's view, not the shared store.
+
+        Save refreshes respect this monotonic local watermark. Reload starts a
+        new view; physical store retention follows latest recorded source time.
+        """
+        import math
+        if type(now) not in (int,float) or not math.isfinite(now):
+            raise ValueError('narrative prune time invalid')
+        self._prune_now=max(now,self._prune_now) if self._prune_now is not None else now
+        cutoff = self._prune_now - OUTCOME_TTL_S
         self._outcomes = deque(
             (o for o in self._outcomes if o[0] >= cutoff),
             maxlen=MAX_OUTCOMES)
@@ -263,31 +266,73 @@ class NarrativeHeat:
                 ts, tags, mult, rug = item
             except (TypeError, ValueError):
                 continue
-            inst.record_outcome(tags, mult, rug, ts)
+            try:inst.record_outcome(tags, mult, rug, ts)
+            except ValueError:continue
+        inst._pending=[]
         return inst
 
     def save(self, path: Any) -> None:
-        """Persist to JSON with 0600 permissions (atomic replace)."""
-        p = Path(_s(path))
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(self.to_state()), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, p)
-        os.chmod(p, 0o600)  # belt-and-braces: umask-proof the final file
+        """Merge pending exact outcomes, never overwrite another writer's snapshot."""
+        p=Path(_s(path)).absolute()
+        for identity,outcome in self._pending:
+            append_heat(p,outcome,identity)
+        # Clear only after every exact append has confirmed durability. A fault
+        # leaves all pending identities intact so an exact retry is safe.
+        loaded=read_heat(p)
+        self._outcomes=deque((tuple([o[0],tuple(o[1]),o[2],o[3]]) for o in loaded['outcomes']),maxlen=MAX_OUTCOMES)
+        self._pending=[]
+        if self._prune_now is not None:self.prune(self._prune_now)
 
     @classmethod
     def load(cls, path: Any) -> "NarrativeHeat":
-        """Load from JSON; missing/corrupt file yields an empty tracker."""
-        try:
-            raw = Path(_s(path)).read_text(encoding="utf-8")
-        except OSError:
-            return cls()
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return cls()
-        return cls.from_state(data)
+        """Missing file starts empty. Corruption is unavailable, never overwritten."""
+        return cls.from_state(read_heat(Path(_s(path)).absolute()))
+
+
+def validate_heat(state):
+    from . import learning_effects as effects
+    effects._validate(state)
+    if not isinstance(state,dict) or set(state)!={'version','outcomes'} or type(state['version']) is not int or state['version']!=1 or not isinstance(state['outcomes'],list):
+        raise ValueError('narrative state unavailable')
+    for outcome in state['outcomes']:validate_heat_outcome(outcome)
+    return state
+
+
+def validate_heat_outcome(outcome):
+    import math
+    if not isinstance(outcome,list) or len(outcome)!=4:raise ValueError('narrative outcome unavailable')
+    ts,tags,mult,rug=outcome
+    if (type(ts) not in (int,float) or not math.isfinite(ts) or type(mult) not in (int,float) or not math.isfinite(mult) or mult<0
+            or not isinstance(tags,list) or not tags or any(not isinstance(t,str) or not t for t in tags)
+            or tags!=sorted(set(tags)) or type(rug) is not bool):raise ValueError('narrative outcome invalid')
+    return outcome
+
+
+def read_heat(path):
+    from . import learning_effects as effects
+    try:doc=json.loads(Path(path).read_text(),object_pairs_hook=effects._pairs,parse_constant=effects._constant)
+    except FileNotFoundError:return {'version':1,'outcomes':[]}
+    if isinstance(doc,dict) and set(doc)=={'version','value','effects'}:
+        if type(doc['version']) is not int or doc['version']!=1 or not isinstance(doc['effects'],dict) or any(not isinstance(k,str) or not k or not isinstance(v,str) or len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for k,v in doc['effects'].items()):
+            raise ValueError('narrative receipts unavailable')
+        doc=doc['value']
+    return validate_heat(doc)
+
+
+def append_heat(path,outcome,effect_id):
+    from . import learning_effects as effects
+    p=Path(path)
+    if not p.is_absolute():raise ValueError('narrative path must be absolute')
+    validate_heat_outcome(outcome)
+    p.parent.mkdir(parents=True,exist_ok=True)
+    def reducer(state,payload):
+        validate_heat(state);validate_heat_outcome(payload)
+        rows=state['outcomes']+[payload]
+        cutoff=max(o[0] for o in rows)-OUTCOME_TTL_S
+        rows=[o for o in rows if o[0]>=cutoff]
+        rows.sort(key=lambda o:(o[0],json.dumps(o,sort_keys=True,separators=(',',':'))))
+        return validate_heat({'version':1,'outcomes':rows[-MAX_OUTCOMES:]})
+    return effects.apply(p,effect_id,outcome,reducer,{'version':1,'outcomes':[]},legacy_import=validate_heat)
 
 
 def default_heat_path() -> Path:

@@ -45,6 +45,8 @@ def check(name, cond):
 # Helius URL (handed to a paced caller), holds config, uses WSS only,
 # or is dormant.
 ALLOWLIST = {
+    "daemon/intelligence/acquisition/routine.py": (False, "central router and WSS admission"),
+    "daemon/intelligence/acquisition/providers/helius.py": (True, "explicit paced adapter transport"),
     "daemon/intelligence/acquisition/helius_parsed_events.py": (
         False, "NOT LIVE — Parsed Events REST client calls Helius "
         "HTTPS directly via its injected opener with NO pacer token "
@@ -72,15 +74,13 @@ ALLOWLIST = {
     "daemon/launch_scanner/logstream.py": (
         True, "paced _http_rpc"),
     "daemon/launch_scanner/deployers.py": (
-        True, "paced _rpc"),
-    "daemon/launch_scanner/funding_clusters.py": (
-        True, "paced _rpc"),
+        False, "central routine facade, no direct HTTP"),
     "daemon/launch_scanner/instant_safety.py": (
-        True, "paced _rpc"),
+        False, "central routine facade, no direct HTTP"),
     "daemon/launch_scanner/mimic_curve.py": (
-        True, "paced rpc"),
+        False, "central routine facade, no direct HTTP"),
     "daemon/launch_scanner/smartmoney.py": (
-        True, "paced _rpc / discovery_rpc"),
+        False, "central routine facade, no direct HTTP"),
     "daemon/telegram/commands.py": (
         True, "paced _verify_helius_key"),
     "daemon/launch_scanner/helius_vault.py": (
@@ -172,6 +172,18 @@ def test_allowlist_complete():
                    and any(p in ln for p in CALL_PATTERNS)]
             check("non-caller has no same-line Helius call: %s" % rel,
                   not bad)
+    import ast
+    central = {'deployers': '_rpc', 'funding_clusters': '_rpc',
+               'instant_safety': '_rpc', 'mimic_curve': 'rpc', 'smartmoney': '_rpc'}
+    for module, function in central.items():
+        text = _read(os.path.join(REPO_ROOT, 'daemon/launch_scanner', module+'.py'))
+        tree = ast.parse(text)
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == function)
+        body = ast.get_source_segment(text, node)
+        check('central caller imports routine read: '+module,
+              'daemon.intelligence.acquisition.routine import read' in body)
+        check('central caller has no direct HTTP: '+module,
+              not any(pattern in body for pattern in CALL_PATTERNS))
     # The grader regression, stated plainly.
     grader = _read(os.path.join(REPO_ROOT, "scripts", "nightly-grader"))
     check("nightly-grader rpc_call is paced (regression 2026-11-18)",
@@ -312,3 +324,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

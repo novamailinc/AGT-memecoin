@@ -21,20 +21,26 @@ Facts (capability audit 2026-11-22, from Chainstack docs):
   be measured live.
 - Nodes auto-delete after 30 days of inactivity.
 
-LIVE STATUS (corrected 2026-11-22 ~02:02 PST): live verification
-from this VM is NOT possible through the surrogate helpers, and the
-key may be wrong after all — do NOT declare it correct until a
-path-segment test proves it. What changed: the query-param swap
-was PROVEN working (Helius vault getHealth returned HTTP 200,
-result ok), superseding the Nov 18 BLOCKED status for that
-placement — which narrows the problem to the url_path_segment swap
-(Alchemy + Chainstack), still UNPROVEN. The stored Chainstack value
-DID change on re-entry and still 401s, so either the path-segment
-swap is broken or the Chainstack node/key is inactive or wrong.
-Next check is console-side (node active in the console) — not
-another re-entry loop. Live verification is DEFERRED to the AGT
-target. This adapter is verified here with mocked transport +
-recorded fixtures only.
+LIVE STATUS (reconciled 2026-11-23, supersedes the 2026-11-22
+paragraph that follows it): live verification through this adapter
+is now PROVEN. The url_path_segment placement works: the vault
+endpoint URL (host + key as the final path segment) serves real
+mainnet traffic from the acquisition router, and the assigned
+independent-verification job passed live — verify_transaction()
+re-read a transaction that the Helius primary had fetched and
+returned verified:true / match:true in ~156ms. The 2026-11-22
+"key may be wrong / node inactive" suspicion was a stale-endpoint
+artifact of the re-entry loop, not a credential defect.
+
+Kept for history (2026-11-22 ~02:02 PST): live verification from
+this VM was then NOT possible through the surrogate helpers. What
+changed that day: the query-param swap was PROVEN working (Helius
+vault getHealth returned HTTP 200, result ok), superseding the
+Nov 18 BLOCKED status for that placement — which narrowed the
+problem to the url_path_segment swap (Alchemy + Chainstack), then
+UNPROVEN. The stored Chainstack value DID change on re-entry and
+still 401s, so either the path-segment swap is broken or the
+Chainstack node/key is inactive or wrong.
 """
 
 from __future__ import annotations

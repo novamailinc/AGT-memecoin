@@ -66,52 +66,69 @@ def _resolve_path(path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _atomic_write_0600(path: str, records: List[Dict[str, Any]]) -> bool:
-    try:
-        blob = json.dumps(records, separators=(",", ":")).encode("utf-8")
-    except Exception:
-        logger.exception("exit_clock: serialize failed")
-        return False
-    tmp = "%s.tmp.%d" % (path, os.getpid())
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(blob)
-                fh.flush()
-                os.fsync(fh.fileno())
-        except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        return True
-    except Exception:
-        logger.exception("exit_clock: write failed")
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return False
+def _validate_records(records):
+    from . import learning_effects
+    learning_effects._validate(records)
+    if not isinstance(records,list) or any(not isinstance(r,dict) for r in records):
+        raise ValueError('exit clock records unavailable')
+    return records
+
+
+def _all_records(path):
+    from . import learning_effects as effects
+    try:doc=json.loads(open(path).read(),object_pairs_hook=effects._pairs,parse_constant=effects._constant)
+    except FileNotFoundError:return []
+    if isinstance(doc,dict):
+        # Primitive validates envelope including receipts on an exact read retry;
+        # reader must not treat an envelope as an empty legacy list.
+        if set(doc)!={'version','value','effects'} or type(doc['version']) is not int or doc['version']!=1:
+            raise ValueError('exit clock envelope unavailable')
+        receipts=doc['effects']
+        if not isinstance(receipts,dict) or any(not isinstance(k,str) or not k or not isinstance(v,str) or len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for k,v in receipts.items()):
+            raise ValueError('exit clock receipts unavailable')
+        doc=doc['value']
+    return _validate_records(doc)
+
+
+def _validate_record(record):
+    import math
+    if not isinstance(record,dict):raise ValueError('exit clock record must be a map')
+    required=('close_ts','hold_h','close_mult','peak_mult','pnl_sol')
+    for field in required:
+        if type(record.get(field)) not in (int,float) or not math.isfinite(record[field]):raise ValueError('exit clock finite field required')
+    if not isinstance(record.get('mint'),str) or not record['mint']:raise ValueError('exit clock mint required')
+    for field in ('time_to_peak_h','dump_mult_per_h'):
+        v=record.get(field)
+        if v is not None and (type(v) not in (int,float) or not math.isfinite(v)):raise ValueError('exit clock optional finite field required')
+    return record
+
+
+def append_record(path,record,effect_id):
+    from . import learning_effects
+    from pathlib import Path
+    _validate_record(record)
+    p=Path(path)
+    if not p.is_absolute():raise ValueError('exit clock path must be absolute')
+    p.parent.mkdir(parents=True,exist_ok=True)
+    def reducer(records,payload):
+        _validate_records(records)
+        _validate_record(payload)
+        candidates=records+[payload]
+        watermark=max(_f(r.get('close_ts')) for r in candidates)
+        cutoff=watermark-_TTL_S
+        result=[r for r in candidates if _f(r.get('close_ts'))>=cutoff]
+        result.sort(key=lambda r:(_f(r.get('close_ts')),json.dumps(r,sort_keys=True,separators=(',',':'))))
+        return _validate_records(result[-_MAX_RECORDS:])
+    return learning_effects.apply(p,effect_id,record,reducer,[],legacy_import=_validate_records)
 
 
 def _load(path: Optional[str]) -> List[Dict[str, Any]]:
     p = _resolve_path(path)
     if not p:
         return []
-    try:
-        with open(p, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (FileNotFoundError, OSError, ValueError):
-        return []
+    try:data=_all_records(p)
     except Exception:
-        logger.exception("exit_clock: load failed")
-        return []
-    if not isinstance(data, list):
+        logger.exception('exit clock read unavailable')
         return []
     cutoff = time.time() - _TTL_S
     return [r for r in data
@@ -146,7 +163,8 @@ def note_price(mint: str, price_sol: float, ts: float) -> None:
 def record_close(degen: Any, mint: str, entry_ts: float, entry_px: float,
                  close_ts: float, close_px: float, peak_px: float,
                  reason: str, pnl_sol: float, label: str = "",
-                 path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                 path: Optional[str] = None, effect_id=None,
+                 record_only=False, pinned_peak=None, use_pinned_peak=False) -> Optional[Dict[str, Any]]:
     """Record one closed paper position's full run shape.
 
     Measurement only. Returns the record, or None when disabled /
@@ -154,6 +172,9 @@ def record_close(degen: Any, mint: str, entry_ts: float, entry_px: float,
     """
     try:
         if not getattr(degen, "exit_clock_enabled", True):
+            return None
+        import math
+        if not all(type(v) in (int,float) and math.isfinite(v) for v in (entry_ts,entry_px,close_ts,close_px,peak_px,pnl_sol)):
             return None
         if not mint or entry_px <= 0 or close_px < 0:
             return None
@@ -165,7 +186,7 @@ def record_close(degen: Any, mint: str, entry_ts: float, entry_px: float,
         # Time-to-peak from the in-memory peak watch; unknown (None)
         # when the watch never saw this mint (e.g. daemon restarted
         # mid-position) — recorded distinctly, never guessed.
-        peak_info = _PEAKS.pop(mint, None)
+        peak_info = pinned_peak if use_pinned_peak else (_PEAKS.get(mint) if record_only else _PEAKS.pop(mint, None))
         time_to_peak_h: Optional[float] = None
         dump_per_h: Optional[float] = None
         if peak_info and peak_info[1] >= float(entry_ts):
@@ -189,12 +210,12 @@ def record_close(degen: Any, mint: str, entry_ts: float, entry_px: float,
                                  if dump_per_h is not None else None),
             "pnl_sol": round(float(pnl_sol or 0.0), 6),
         }
-        records = _load(path)
-        records.append(rec)
-        records = records[-_MAX_RECORDS:]
-        p = _resolve_path(path)
+        _validate_record(rec)
+        if record_only:return rec
+        p=_resolve_path(path)
         if p:
-            _atomic_write_0600(p, records)
+            import uuid
+            append_record(p,rec,effect_id or 'legacy-'+uuid.uuid4().hex)
         return rec
     except Exception:
         logger.exception("exit_clock record_close failed for %s", mint)

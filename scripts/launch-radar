@@ -145,8 +145,10 @@ def rpc(method, params):
 def load_qualifying_deployers():
     """Deployers with >=3 launches and >=10% 2x hit rate."""
     try:
-        with open(DEPLOYER_FILE) as f:
-            hist = json.load(f)
+        import sys
+        sys.path.insert(0,os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'daemon', 'launch_scanner'))
+        from deployer_registry import read
+        hist=read(DEPLOYER_FILE)
     except Exception:
         return {}
     out = {}

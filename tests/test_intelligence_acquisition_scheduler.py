@@ -107,7 +107,11 @@ qb.report_429("throughput")
 st = qb.status()
 check("backoff doubles on repeat 429 (30 -> 60)",
       abs(st.get("backoff_s", 0) - 60.0) < 1e-9)
-# success clears backoff fleet-wide at once
+# In-flight success must not cancel active cooldown.
+_before = qb.status()["backoff_remaining_s"]
+qb.report_success()
+check("in-flight success preserves active cooldown", qb.status()["backoff_remaining_s"] == _before)
+clock3.advance(_before + 1)
 qb.report_success()
 st = qb.status()
 check("success clears backoff", st.get("backoff_remaining_s", 1) == 0.0)

@@ -353,3 +353,7 @@ if __name__ == "__main__":
         print("FAILED: %d check(s): %s" % (len(FAILURES), ", ".join(FAILURES)))
         sys.exit(1)
     print("ALL PIDFILE ROLLOUT TESTS PASSED")
+
+
+if __name__ != "__main__":
+    from tests.recorded_checks import recorded_check_guard

@@ -102,8 +102,10 @@ logger = logging.getLogger(
 # ---------------------------------------------------------------------------
 # Protocol constants (Helius Parsed Streams docs, 2026-11-22)
 # ---------------------------------------------------------------------------
-PARSED_STREAMS_WSS_TMPL = "wss://fs-beta.helius-rpc.com/?api-key={key}"
-PARSED_STREAMS_HOST = "fs-beta.helius-rpc.com"
+PARSED_STREAMS_WSS_TMPL = "wss://beta.helius-rpc.com/?api-key={key}"
+PARSED_STREAMS_HOST = "beta.helius-rpc.com"
+# describeProgram remains on a separate discovery host per current docs.
+PROGRAM_DISCOVERY_WSS_TMPL = "wss://fs-beta.helius-rpc.com/?api-key={key}"
 
 METHOD_SUBSCRIBE = "parsedTransactionSubscribe"
 METHOD_UNSUBSCRIBE = "parsedTransactionUnsubscribe"
@@ -403,13 +405,24 @@ def normalize_parsed_transaction(value):
     """
     if not isinstance(value, dict):
         return None
+    # Current Parsed Events envelope, verified against an actual response.
+    # A parser failure is evidence, never a successfully decoded transaction.
+    if "parserStatus" in value:
+        if value.get("parserStatus") != "OK" or not isinstance(value.get("parsed"), dict):
+            return None
+        parsed = dict(value["parsed"])
+        parsed["signature"] = value.get("signature")
+        execution = parsed.get("transactionStatus")
+        parsed["status"] = {"SUCCESS": "ok", "SUCCEEDED": "ok", "ERROR": "error"}.get(execution, "unknown")
+        value = parsed
     tx = value.get("transaction") or value
     if not isinstance(tx, dict):
         return None
     signature = tx.get("signature")
     if not isinstance(signature, str) or not signature:
         return None
-    instructions = tx.get("instructions") or []
+    instructions = value.get("instructions") if "instructions" in value else tx.get("instructions")
+    instructions = instructions or []
     if not isinstance(instructions, list):
         instructions = []
     matched = value.get("matchedIndexes")
@@ -442,6 +455,7 @@ def normalize_parsed_transaction(value):
         "matched_states": states,
         "summary": summary,
         "summary_type": summary.get("type"),
+        "execution_status_known": status in ("ok", "error"),
         "native_transfers": list(tx.get("nativeTransfers") or []),
         "token_transfers": list(tx.get("tokenTransfers") or []),
         "verification_status": VERIFICATION_PARSED_UNVERIFIED,
@@ -575,6 +589,19 @@ def verify_with_own_decoder(event, raw_tx, decoder=None):
                      % "; ".join(own.get("notes") or []))
         out["verification_notes"] = notes
         return out
+    if event.get("status") not in ("ok", "error"):
+        out["verification_status"] = VERIFICATION_UNVERIFIABLE
+        notes.append("parsed execution status unavailable")
+        out["verification_notes"] = notes
+        return out
+    required = ("signature", "slot", "fee", "instructions", "status")
+    missing = [k for k in required if event.get(k) is None]
+    own_meta = own.get("meta") or {}
+    if missing or own.get("slot") is None or own_meta.get("fee") is None or not own.get("program_ids") or not event.get("instructions"):
+        out["verification_status"] = VERIFICATION_UNVERIFIABLE
+        notes.append("comparison evidence incomplete")
+        out["verification_notes"] = notes
+        return out
     disagreements = []
     if own.get("signature") != event.get("signature"):
         disagreements.append("signature mismatch (own %r vs parsed %r)"
@@ -595,6 +622,12 @@ def verify_with_own_decoder(event, raw_tx, decoder=None):
             and own_status != event.get("status"):
         disagreements.append("status mismatch (own %r vs parsed %r)"
                              % (own_status, event.get("status")))
+    instructions = event.get("instructions") or []
+    if any(not isinstance(ix, dict) or not isinstance(ix.get("programId"), str) or not ix.get("programId") for ix in instructions):
+        out["verification_status"] = VERIFICATION_UNVERIFIABLE
+        notes.append("parsed instruction program identity unavailable")
+        out["verification_notes"] = notes
+        return out
     own_programs = sorted(p for p in (own.get("program_ids") or [])
                           if p)
     parsed_programs = sorted(
@@ -648,10 +681,13 @@ class HeliusParsedStreamClient:
     """
 
     def __init__(self, wss_url=None, router=None, ws_factory=None,
-                 on_event=None, now=None, usage_store=None):
+                 on_event=None, now=None, usage_store=None, account_home=None):
         self._wss_url = wss_url  # never logged (carries the key)
         self._router = router
         self._factory = ws_factory or self._default_factory
+        # Real transport (no injected factory) must pass shared-account
+        # admission explicitly; injected factories are offline fakes.
+        self._real_transport = ws_factory is None
         self._on_event = on_event
         self._now = now
         # Persistent usage accounting (Phase 3, D-07): when a
@@ -664,6 +700,7 @@ class HeliusParsedStreamClient:
         # standalone). Recording never raises and never blocks the
         # stream: a store failure is logged once per call site.
         self._usage_store = usage_store
+        self._account_home = account_home or getattr(router, "home", None)
         self._wanted = {}      # label -> {filter, options, priority,
         #                        local_id, server_id}
         self._next_local_id = 1
@@ -683,6 +720,8 @@ class HeliusParsedStreamClient:
         self.last_connect_ts = None
         self.last_disconnect_ts = None
         self.last_message_ts = None
+        self.accounting_failures = 0
+        self._accounting_blocked = False
         self._backoff_s = RECONNECT_BASE_S
         self._pending = {}     # local_id -> label (subscribe acks)
 
@@ -785,20 +824,31 @@ class HeliusParsedStreamClient:
             logger.warning("parsed-stream subscribe send failed")
 
     def _record_usage(self, method, kind, cost=None, elapsed=0.0):
-        """One persistent usage line (D-07). Never raises."""
+        """Persistent credit/outcome record. Production errors stop the
+        stream and leave a durable unresolved marker across recreation."""
         store = self._usage_store
         if store is None:
+            if self._real_transport:
+                self._accounting_blocked = True
+                self.stop()
+                raise RuntimeError("real parsed stream requires usage_store")
             return None
+        from . import stream_accounting_guard
         try:
-            return store.record(
-                account="helius_main", provider="helius",
-                method=method, workload=PARSED_TX_STREAM,
-                priority=PRIORITY_CARD, helius_priority=None,
-                cost=cost, kind=kind, elapsed=elapsed)
+            with stream_accounting_guard.recording(self._account_home, {'method':method,'kind':kind,'cost':cost}):
+                result = store.record(
+                    account="helius_main", provider="helius",
+                    method=method, workload=PARSED_TX_STREAM,
+                    priority=PRIORITY_CARD, helius_priority=None,
+                    cost=cost, kind=kind, elapsed=elapsed, strict=True)
+                if not isinstance(result, dict):
+                    raise OSError("usage write returned no durable record")
+                return result
         except Exception:
-            logger.warning("parsed-stream usage record failed",
-                           exc_info=True)
-            return None
+            self.accounting_failures += 1
+            self._accounting_blocked = True
+            self.stop()
+            raise
 
     def record_verified_event(self, event=None):
         """A consumer verified one received event against the own
@@ -845,6 +895,19 @@ class HeliusParsedStreamClient:
             # 1 credit per delivered event (CREDITS_PER_EVENT).
             self._record_usage("parsed_streams/event", "ok",
                                cost=CREDITS_PER_EVENT)
+            if self._real_transport:
+                from .usage_tracker import UsageTracker
+                try:
+                    allowed, _ = UsageTracker(home=self._account_home).nonessential_allowed(
+                        'helius_main', 'background', workload=PARSED_TX_STREAM,
+                        provider='helius')
+                except Exception:
+                    self._accounting_blocked = True
+                    self.stop()
+                    raise
+                if not allowed:
+                    self.stop()
+                    return
             if event.get("slot") is not None:
                 self.last_slot = event["slot"]
             if event["verification_status"] == VERIFICATION_UNDECODED:
@@ -861,6 +924,12 @@ class HeliusParsedStreamClient:
                 self.handshake_429s += 1
                 self._record_usage("parsed_streams/handshake",
                                    "rate_limited")
+                # A subscription rejection is not a failed HTTP
+                # upgrade handshake — report it on that lane.
+                self._report_subscription_throttled()
+                self.connected = False
+                if self._ws is not None:
+                    self._ws.close()
             return
 
     def _on_open(self, _ws):
@@ -874,6 +943,9 @@ class HeliusParsedStreamClient:
         self.connected = True
         self.last_connect_ts = self._time()
         self._backoff_s = RECONNECT_BASE_S
+        # Shared-account handshake accounting (success).
+        if not self._report_ws_result(None):
+            return
         # Live records, not copies: _send_subscribe registers the
         # entry in _pending so the subscribe ack can record the
         # server id back onto the SAME dict.
@@ -882,12 +954,54 @@ class HeliusParsedStreamClient:
         for entry in entries:
             self._send_subscribe(entry)
 
+    def _report_ws_result(self, error):
+        """Shared-account handshake accounting for this stream's URL.
+        Accounting must never break the stream: failures are counted
+        (accounting_failures, surfaced in stats()) and logged."""
+        from . import routine as _routine
+        try:
+            from . import stream_accounting_guard
+            with stream_accounting_guard.recording(self._account_home):
+                _routine.websocket_result(self._wss_url, error)
+            return True
+        except Exception:
+            self.accounting_failures += 1
+            self._accounting_blocked = True
+            self.stop()
+            logger.warning("parsed-stream result accounting failed",
+                           exc_info=True)
+            return False
+
+    def _report_subscription_throttled(self):
+        from . import routine as _routine
+        try:
+            from . import stream_accounting_guard
+            with stream_accounting_guard.recording(self._account_home):
+                _routine.websocket_subscription_throttled(self._wss_url)
+        except Exception:
+            self.accounting_failures += 1
+            self._accounting_blocked = True
+            self.stop()
+            logger.warning("parsed-stream throttle accounting failed",
+                           exc_info=True)
+
     def _on_error(self, _ws, error):
         text = str(error)
+        # Shared-account handshake accounting (failure / 429).
+        self._report_ws_result(error)
         if "429" in text or "Too Many Requests" in text:
             self.handshake_429s += 1
             self._record_usage("parsed_streams/handshake",
                                "rate_limited")
+            # A shared-account rate limit is a HOLD: reflect it in
+            # connection state and close so the backoff reconnect
+            # applies the hold instead of marching on connected.
+            self.connected = False
+            try:
+                if self._ws is not None:
+                    self._ws.close()
+            except Exception:
+                pass
         else:
             logger.warning("parsed-stream WS error: %s", text[:200])
 
@@ -907,6 +1021,11 @@ class HeliusParsedStreamClient:
         Subscriptions are sent from ``_on_open`` only, never from
         here. Refuses when unconfigured (no URL) or when the router
         refuses the stream."""
+        from . import stream_accounting_guard
+        if self._accounting_blocked or (self._real_transport and not stream_accounting_guard.allowed(self._account_home)):
+            return False
+        if self._real_transport and self._usage_store is None:
+            return False
         if not self.configured():
             return False
         decision = self.route_check()
@@ -914,16 +1033,30 @@ class HeliusParsedStreamClient:
             logger.warning("parsed-stream refused by router: %s",
                            decision.get("refusal_reason"))
             return False
+        # Mandatory shared-account admission — the same guard every
+        # other WebSocket consumer (logstream, armed_watch) passes
+        # through. Budget holds, account disable and the account-wide
+        # pacer all apply to Parsed Streams: it is the same Helius
+        # account. A refusal raises (fail closed, like logstream);
+        # an unrecognized host returns False = "no shared guard
+        # applies" and proceeds unchanged (test fakes, diagnostics).
+        from . import routine as _routine
+        admitted = _routine.websocket_admit(self._wss_url)
+        if admitted is not True and self._real_transport:
+            # Fail closed: a real socket whose URL the shared-account
+            # guard does not recognize must NOT proceed.
+            logger.warning("parsed-stream connect refused: URL outside "
+                           "shared-account admission policy")
+            return False
+        if self._stop.is_set():
+            return False
         self.connect_attempts += 1
         try:
             self._ws = self._factory(
                 self._wss_url, self._on_message, self._on_error,
                 self._on_close, self._on_open)
         except Exception as exc:
-            if "429" in str(exc):
-                self.handshake_429s += 1
-                self._record_usage("parsed_streams/handshake",
-                                   "rate_limited")
+            self._on_error(None, exc)
             return False
         return True
 
@@ -951,9 +1084,25 @@ class HeliusParsedStreamClient:
 
     def run_forever(self, sleep=time.sleep):
         """Connect, then reconnect with backoff until stop() is
-        called. Intended for a daemon thread."""
+        called. Intended for a daemon thread. A shared-account
+        admission denial (budget hold, cooldown, account disabled)
+        backs off and keeps the worker alive; it never kills the
+        thread and never bypasses the hold."""
+        from .routine import WebsocketAdmissionError
         while not self._stop.is_set():
-            if self.connect():
+            try:
+                connected = self.connect()
+            except WebsocketAdmissionError as exc:
+                logger.warning("parsed-stream admission denied: %s "
+                               "— backing off", str(exc)[:160])
+                self.last_disconnect_ts = self._time()
+                wait = self._schedule_reconnect()
+                if sleep is time.sleep:
+                    self._stop.wait(wait)
+                else:
+                    sleep(wait)
+                continue
+            if connected:
                 try:
                     self._ws.run_forever()
                 except Exception:
@@ -963,7 +1112,10 @@ class HeliusParsedStreamClient:
             if self._stop.is_set():
                 break
             wait = self._schedule_reconnect()
-            sleep(wait)
+            if sleep is time.sleep:
+                self._stop.wait(wait)
+            else:
+                sleep(wait)
 
     def stop(self):
         self._stop.set()
@@ -977,6 +1129,8 @@ class HeliusParsedStreamClient:
     def stats(self):
         out = {"provider": "helius", "stream": "parsed_streams",
                 "connected": self.connected,
+                "accounting_failures": self.accounting_failures,
+                "accounting_blocked": self._accounting_blocked,
                 "connect_attempts": self.connect_attempts,
                 "reconnects": self.reconnects,
                 "handshake_429s": self.handshake_429s,

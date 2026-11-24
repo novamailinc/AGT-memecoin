@@ -211,6 +211,94 @@ class Store:
             self._conn.commit()
             return cur.lastrowid
 
+    def scanner_entry_context(self,event_id,context):
+        """First pinned entry plan wins before native submission."""
+        with self._lock,self._txn():
+            self._conn.execute('BEGIN IMMEDIATE')
+            rows=self._conn.execute("SELECT payload FROM journal WHERE kind='scanner_entry_intent' AND symbol=?",(event_id,)).fetchall()
+            if rows:
+                if len(rows)!=1:raise ValueError('duplicate scanner entry context')
+                prior=json.loads(rows[0]['payload'])['detail']
+                if prior!=context:raise ValueError('scanner entry context conflict')
+                self._conn.commit();return prior
+            entry={'kind':'scanner_entry_intent','symbol':event_id,'detail':context}
+            self._conn.execute('INSERT INTO journal(ts,kind,symbol,payload) VALUES (?,?,?,?)',(_utcnow(),entry['kind'],event_id,json.dumps(entry,allow_nan=False)))
+            self._conn.commit();return context
+
+    def scanner_entry_publish(self,event_id,position_key,position,sources,active_state=None,closed_tickets=()):
+        """Merge one exact ticket into latest daemon state and ACK atomically."""
+        with self._lock,self._txn():
+            self._conn.execute('BEGIN IMMEDIATE')
+            row=self._conn.execute("SELECT payload FROM journal WHERE kind='daemon_state' AND symbol='launch_scanner' ORDER BY id DESC LIMIT 1").fetchone()
+            state=json.loads(row['payload'])['detail'] if row else {}
+            from daemon.launch_scanner.entry_outbox import conflicted
+            if (conflicted(state,position_key=position_key,mint=position['mint'],ticket=position['ticket'])
+                    or active_state is not None and conflicted(active_state,position_key=position_key,mint=position['mint'],ticket=position['ticket'])):
+                if active_state is not None:
+                    import copy
+                    for pk,proposal in (state.get('entry_position_conflicts') or {}).items():
+                        active_state.setdefault('entry_position_conflicts',{}).setdefault(pk,copy.deepcopy(proposal))
+                raise ValueError('scanner entry durable or active quarantine refuses publication')
+            if active_state is not None:
+                import copy
+                active=copy.deepcopy(active_state)
+                durable_positions=state.get('degen_positions') or {}
+                for pk,pv in list(durable_positions.items()):
+                    if pv.get('ticket') in closed_tickets:durable_positions.pop(pk)
+                for pk,pv in list((active.get('degen_positions') or {}).items()):
+                    if pv.get('ticket') in closed_tickets:active['degen_positions'].pop(pk)
+                for pk,pv in (active.get('degen_positions') or {}).items():
+                    if pk in durable_positions and pv.get('ticket')!=durable_positions[pk].get('ticket'):
+                        # Preserve both proposals rather than selecting either as truth.
+                        # The original key remains active; durable proposal is quarantined.
+                        quarantine=active_state.setdefault('entry_position_conflicts',{})
+                        quarantine[pk]={'active':copy.deepcopy(pv),'durable':copy.deepcopy(durable_positions[pk]),
+                                        'state':'unavailable-conflict'}
+                        state['entry_position_conflicts']=copy.deepcopy(quarantine)
+                        state['degen_positions'][pk]=copy.deepcopy(pv)
+                        entry={'kind':'daemon_state','symbol':'launch_scanner','detail':state}
+                        # Preserve independent active work in the quarantined snapshot.
+                        for k,v in active_state.items():
+                            if k!='degen_positions':state[k]=copy.deepcopy(v)
+                        state['degen_positions'].update(copy.deepcopy(active_state.get('degen_positions') or {}))
+                        self._conn.execute('INSERT INTO journal(ts,kind,symbol,payload) VALUES (?,?,?,?)',(_utcnow(),entry['kind'],entry['symbol'],json.dumps(entry,allow_nan=False)))
+                        self._conn.commit()
+                        raise ValueError('scanner entry ticket conflict quarantined; both proposals retained')
+                # Current-cycle membership decisions are authoritative for maps
+                # already present in active state. Only source/position maps
+                # have union semantics; otherwise consumed candidates resurrect.
+                def carry(target,source):
+                    for k,v in source.items():
+                        if k not in target:target[k]=copy.deepcopy(v)
+                        elif isinstance(target[k],dict) and isinstance(v,dict):carry(target[k],v)
+                workflow_keys={
+                    'candidates','pending_entry','sniper_pending','early_digest',
+                    'early_window','sustained_watch','milestone_watch','lowcap',
+                    'fingerprints','sentiment','winner_held','smart_fasttracked',
+                }
+                for name,value in state.items():
+                    if name not in active and name not in workflow_keys:active[name]=copy.deepcopy(value)
+                    elif name in ('degen_positions','narrative_tags','smart_activity','entry_position_conflicts'):
+                        carry(active[name],value)
+                state=active
+            positions=state.setdefault('degen_positions',{})
+            prior=positions.get(position_key)
+            if prior is not None:
+                for field in ('ticket','symbol','mint','entry_ts','entry_price_sol','volume_sol','sl','tp','label','leg','max_hold_hours'):
+                    if prior.get(field)!=position.get(field):raise ValueError('scanner entry position conflict')
+            else:positions[position_key]=position
+            for name,spec in sources.items():
+                if spec['state']=='recorded':state.setdefault(name,{}).setdefault(position['mint'],spec['value'])
+            entry={'kind':'daemon_state','symbol':'launch_scanner','detail':state}
+            self._conn.execute('INSERT INTO journal(ts,kind,symbol,payload) VALUES (?,?,?,?)',(_utcnow(),entry['kind'],entry['symbol'],json.dumps(entry,allow_nan=False)))
+            rows=self._conn.execute("SELECT payload FROM journal WHERE kind='scanner_entry_projected' AND symbol=?",(event_id,)).fetchall()
+            ack={'kind':'scanner_entry_projected','symbol':event_id,'detail':{'position_key':position_key,'position':position}}
+            if rows:
+                if len(rows)!=1 or json.loads(rows[0]['payload'])!=ack:raise ValueError('scanner entry ACK conflict')
+            else:self._conn.execute('INSERT INTO journal(ts,kind,symbol,payload) VALUES (?,?,?,?)',(_utcnow(),ack['kind'],event_id,json.dumps(ack,allow_nan=False)))
+            self._conn.commit()
+            return state
+
     def scanner_close_context(self, event_id: str, context: dict) -> dict:
         """Serialize competing context creators before any economic close."""
         with self._lock, self._txn():

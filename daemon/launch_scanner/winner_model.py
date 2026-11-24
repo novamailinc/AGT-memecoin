@@ -168,10 +168,17 @@ def features_from_record(rec: Dict[str, Any],
     return feats
 
 
+def _known_label(value):
+    if type(value) not in (int,float):return False
+    try:return math.isfinite(value) and value>=0
+    except (OverflowError,ValueError):return False
+
+
 def is_xxx(rec: Dict[str, Any]) -> bool:
     """The label we actually care about: did xxx, not a rug."""
     try:
-        return (not rec.get("rug")) and _f(rec.get("peak_mult")) >= XXX_MULT
+        if not _known_label(rec.get('peak_mult')) or type(rec.get('rug')) is not bool:return None
+        return (not rec['rug']) and rec['peak_mult'] >= XXX_MULT
     except Exception:
         return False
 
@@ -191,6 +198,10 @@ def train(rows: List[Dict[str, Any]],
     model: Dict[str, Any] = {"features": {}, "n_xxx": 0, "n_total": 0,
                              "trained_ts": time.time()}
     try:
+        unknown=sum(not isinstance(r,dict) or (not _known_label(r.get('peak_mult')) or type(r.get('rug')) is not bool) for r in rows or [])
+        if unknown:
+            model.update(evidence_state='unavailable-labels',input_count=len(rows or []),unavailable_count=unknown)
+            return model
         for rec in rows or []:
             if not isinstance(rec, dict):
                 continue
@@ -288,6 +299,8 @@ def suggest_threshold(model: Dict[str, Any],
     no-filter baseline on enough evidence.
     """
     try:
+        if any(not isinstance(r,dict) or not _known_label(r.get('peak_mult'))
+               or type(r.get('rug')) is not bool for r in rows or []):return None
         scored = []
         for rec in rows or []:
             if not isinstance(rec, dict):

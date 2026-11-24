@@ -60,6 +60,12 @@ from daemon.launch_scanner import killswitch as KS
 # reference (flat killswitch), so state isolation is set per
 # engine below, not only on the package KS.
 SEL = SS._sel
+# 2026-11-24 conservative contract: recorder-only sub-threshold
+# counts never admit; stub the authoritative-history hook with this
+# fixture's INTENDED complete per-creator history (explicit table,
+# never derived from the recorder index).
+SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
+    SEL.authoritative_proof(c, {"Trader1": 1, "TraderD": 1}.get(c, 0), n)
 
 fails = []
 
@@ -126,6 +132,7 @@ def _pass_index(mint, trader="Trader1", birth_ago=1800):
             "by_mint": {mint: {"trader": trader, "ts": NOW - birth_ago,
                                "bonding_curve": "Curve1"}},
             "by_trader": {trader: [NOW - birth_ago]},
+            "event_ts": [NOW - 90000 + i * 300 for i in range(301)],
             "coverage_start": NOW - 86400 * 3,
             "available": True}
 
@@ -467,11 +474,13 @@ def _mig_index(mint, mig_ts, trader="TraderD", birth_ago=1800,
                                "bonding_curve": "CurveD"}},
             "by_trader": {trader: (launches if launches is not None
                                    else [mig_ts - birth_ago])},
+            "event_ts": [NOW - 90000 + i * 300 for i in range(301)],
             "coverage_start": NOW - 86400 * 3,
             "available": True}
 
 
 _EMPTY_INDEX = {"by_mig": {}, "by_mint": {}, "by_trader": {},
+                "event_ts": [NOW - 90000 + i * 300 for i in range(301)],
                 "coverage_start": NOW - 86400 * 3, "available": True}
 
 

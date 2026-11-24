@@ -16,7 +16,7 @@ from daemon.launch_scanner import wallet_discovery as wd
 # Fakes
 # ---------------------------------------------------------------------------
 
-def _tx(owner_buys, block_time=1_700_000_000, mint="MINT1"):
+def _tx(owner_buys, block_time=1_700_000_000, mint="MINT1", signature="PURE-PARSER"):
     """Build a fake jsonParsed getTransaction result.
 
     owner_buys: {owner: (pre, post)} for the mint under test.
@@ -27,7 +27,8 @@ def _tx(owner_buys, block_time=1_700_000_000, mint="MINT1"):
                     "uiTokenAmount": {"uiAmount": a}})
         post.append({"owner": owner, "mint": mint,
                      "uiTokenAmount": {"uiAmount": b}})
-    return {"meta": {"preTokenBalances": pre,
+    return {"transaction": {"signatures": [signature]}, "blockTime": block_time,
+            "meta": {"err": None, "preTokenBalances": pre,
                      "postTokenBalances": post}}
 
 
@@ -85,9 +86,9 @@ def test_early_buyers_respects_window():
             ("sig_mid", t0 + 600),    # inside window
             ("sig_old", t0 - 300)]    # slightly before: allowed
     txs = {
-        "sig_new": _tx({"late": (0, 50.0)}),
-        "sig_mid": _tx({"mid": (0, 50.0)}),
-        "sig_old": _tx({"early": (0, 50.0)}),
+        "sig_new": _tx({"late": (0, 50.0)}, t0+7200, signature="sig_new"),
+        "sig_mid": _tx({"mid": (0, 50.0)}, t0+600, signature="sig_mid"),
+        "sig_old": _tx({"early": (0, 50.0)}, t0-300, signature="sig_old"),
     }
     rpc = FakeRPC({"MINT1": sigs}, {"MINT1": txs})
     buyers = wd.early_buyers_for_mint(rpc, "MINT1", t0,
@@ -111,9 +112,9 @@ def test_early_buyers_never_raises_on_rpc_failure():
 def _runner_rpc():
     t0 = 1_700_000_000.0
     sigs = {"MINT1": [("s1", t0 + 100)], "MINT2": [("s2", t0 + 100)]}
-    txs = {"MINT1": {"s1": _tx({"w_alice": (0, 10.0), "w_bob": (0, 5.0)})},
+    txs = {"MINT1": {"s1": _tx({"w_alice": (0, 10.0), "w_bob": (0, 5.0)}, t0+100, signature="s1")},
            "MINT2": {"s2": _tx({"w_alice": (0, 10.0), "w_bob": (0, 5.0)},
-                               mint="MINT2")}}
+                               block_time=t0+100, mint="MINT2", signature="s2")}}
     return FakeRPC(sigs, txs), t0
 
 
@@ -285,7 +286,7 @@ def _deep_history(t0, n=250):
         bt = t0 + 10000 - i * 50
         sigs.append((sig, bt))
         if t0 - 600 <= bt <= t0 + 3600:
-            txs[sig] = _tx({"w%03d" % i: (0, 10.0)})
+            txs[sig] = _tx({"w%03d" % i: (0, 10.0)}, bt, signature=sig)
     return sigs, txs
 
 
@@ -331,8 +332,8 @@ def test_pagination_terminates_when_before_ignored():
     # time: the walk must still terminate via the no-progress guard.
     t0 = 1_700_000_000.0
     sigs = [("sig_new", t0 + 7200), ("sig_mid", t0 + 600)]
-    txs = {"MINT1": {"sig_mid": _tx({"mid": (0, 50.0)}),
-                     "sig_new": _tx({"late": (0, 50.0)})}}
+    txs = {"MINT1": {"sig_mid": _tx({"mid": (0, 50.0)}, t0+600, signature="sig_mid"),
+                     "sig_new": _tx({"late": (0, 50.0)}, t0+7200, signature="sig_new")}}
     rpc = FakeRPC({"MINT1": sigs}, txs)
     buyers = wd.early_buyers_for_mint(rpc, "MINT1", t0,
                                       early_window_s=3600.0, sleep_s=0)

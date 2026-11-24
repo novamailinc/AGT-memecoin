@@ -1,3 +1,15 @@
+# Current qualification boundary (2026-11-23)
+
+This is packaging under validation, not deployment or trading approval. Current
+local tests do not establish Stage A historical validation, complete VM lifecycle,
+or phone/reboot qualification. Revised owner allocation: Alchemy handles normal scanning; Helius is primary
+for routine RPC, WebSockets and transaction reads plus selective intelligence.
+Chainstack complements recent transaction/block/account reads and independent
+verification within plan limits. Speed and coverage still require measurement.
+Current Free-account Alchemy HTTP works but Solana WS access is denied. Startup
+credential presence does not prove streaming entitlement. Do not activate the
+full bot while this and the remaining acceptance gates are unresolved.
+
 # AGT deployment package — meme-project paper bot
 
 Phase 13 **finalize** (2026-11-22). This package is the deployable
@@ -61,13 +73,18 @@ plus this package's own status dashboard over the tunnel.
 ## Deploy (operator steps)
 
 1. Confirm AGT is installed on the target phone and the deployment
-   is created from `https://github.com/olamoreA/meme-project`,
+   is created from `https://github.com/novamailinc/AGT-memecoin`,
    branch `main`, start command `bash deploy/agt/start.sh`, port
    8765.
-2. Set the vault secrets in the AGT app: `HELIUS_API_KEY` and
-   `TELEGRAM_BOT_TOKEN` (required — the deployment refuses to start
-   without them). Optional: `HELIUS_API_KEY_DISCOVERY`,
-   `ALCHEMY_API_KEY`, `CHAINSTACK_ENDPOINT`, `HELIUS_ALERT_CHAT_ID`.
+2. For the declared three-provider profile, set `ALCHEMY_API_KEY`,
+   `HELIUS_API_KEY_1`, `HELIUS_API_KEY_2`, `HELIUS_API_KEY_3`,
+   `CHAINSTACK_ENDPOINT` and `TELEGRAM_BOT_TOKEN` in the AGT vault.
+   All six are required at preflight. Helius owns routine RPC/WSS and
+   selective intelligence, Alchemy normal scanning, and Chainstack
+   complementary recent reads and independent verification.
+   `HELIUS_ALERT_CHAT_ID` is optional. `HELIUS_API_KEY` is legacy
+   compatibility, not a substitute for an explicit numbered slot or
+   another allowance. Presence does not prove service access or qualification.
    See `secrets_mapping.md`.
 3. Start the deployment. `start.sh` fails closed with a clear
    message when a required credential is missing.

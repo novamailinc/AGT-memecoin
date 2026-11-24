@@ -39,6 +39,10 @@ FAILS = []
 PASSES = [0]
 
 FAKE_ENV = {
+    'CHAINSTACK_ENDPOINT': 'https://example.invalid/fixture-node',
+    'HELIUS_API_KEY_1': 'fixture-helius-source-1',
+    'HELIUS_API_KEY_2': 'fixture-helius-source-2',
+    'HELIUS_API_KEY_3': 'fixture-helius-source-3',
     # Well-known public placeholder shapes, never real values and
     # never the "TEST-" placeholder prefix: credentials.py refuses
     # TEST- values outright (2026-11-22), and the GitHub secret

@@ -7,7 +7,22 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "..", "daemon", "launch_scanner"))
 
+import tempfile
+
+# Redirect the signal state to a fresh temp dir BEFORE spark resolves
+# its state path (same suite style as test_scouts.py); otherwise the
+# default ~/.forex-agent path is unwritable under a clean test env and
+# _save_state swallows the error, silently dropping every record.
+_TEST_HOME = tempfile.mkdtemp(prefix="forex-test-spark-")
+os.environ["FOREX_AGENT_HOME"] = _TEST_HOME
+
 import spark
+
+# Import-order guard: another test module may have imported spark
+# first in this pytest process with the default home.
+if spark.HOME != _TEST_HOME:
+    spark.HOME = _TEST_HOME
+    spark.SPARK_STATE_FILE = os.path.join(_TEST_HOME, "spark_signals.json")
 
 
 def _tok(**kw):

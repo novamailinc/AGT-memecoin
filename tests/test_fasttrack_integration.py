@@ -431,7 +431,7 @@ class OutcomeWiringTest(_Harness):
         from daemon.launch_scanner import milestones
         state = {"deployer_cache": {"M4": {"deployer": DEP1, "ts": 1.0}}}
         degen = _degen()
-        rec = {"peak_mult": 5.0, "card_ts": time.time() - 90000}
+        rec = {"card_ts":time.time()-90000,"peak_mult": 5.0, "card_ts": time.time() - 90000}
         milestones._grade_deployer_outcome(state, degen, "M4", rec)
         reg = deployers.load_registry()
         self.assertEqual(reg[DEP1]["hits_2x"], 1)
@@ -440,7 +440,7 @@ class OutcomeWiringTest(_Harness):
         from daemon.launch_scanner import milestones
         state = {"deployer_cache": {"M5": {"deployer": DEP1, "ts": 1.0}}}
         degen = _degen()
-        rec = {"peak_mult": 1.1, "card_ts": time.time() - 90000}
+        rec = {"card_ts":time.time()-90000,"peak_mult": 1.1, "card_ts": time.time() - 90000}
         milestones._grade_deployer_outcome(state, degen, "M5", rec)
         reg = deployers.load_registry()
         self.assertEqual(reg[DEP1]["dead"], 1)

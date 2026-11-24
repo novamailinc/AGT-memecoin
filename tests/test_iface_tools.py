@@ -386,6 +386,54 @@ class TestTrading(BaseToolTest):
                 self.assertFalse((node.module or "").startswith("broker."))
 
 
+def _repo_module_names(base):
+    """Repo-local importable names: every .py basename, plus every
+    first-party PACKAGE - a directory qualifies ONLY through its
+    __init__.py, the same-named module file, so a third-party SDK
+    import (ccxt, requests, a broker SDK) still fails: no such file
+    or package exists in the repo."""
+    names = set()
+    for _p in glob.glob(os.path.join(base, "**", "*.py"),
+                        recursive=True):
+        if "/.git/" in _p or "/node_modules/" in _p \
+                or "__pycache__" in _p:
+            continue
+        names.add(os.path.splitext(os.path.basename(_p))[0])
+        if os.path.basename(_p) == "__init__.py":
+            names.add(os.path.basename(os.path.dirname(_p)))
+    return names
+
+
+def _unknown_import_hits(base, first_party, repo_modules,
+                         known_third_party):
+    hits = []
+    for path in glob.glob(os.path.join(base, "**", "*.py"),
+                          recursive=True):
+        if "/.git/" in path or "/node_modules/" in path:
+            continue
+        if "__pycache__" in path:
+            continue
+        try:
+            tree = ast.parse(open(path).read())
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and node.level == 0:
+                    names = [node.module]
+            for name in names:
+                top = name.split(".")[0]
+                if (top not in sys.stdlib_module_names
+                        and top not in first_party
+                        and top not in repo_modules
+                        and top not in known_third_party):
+                    hits.append("%s: %s" % (path, name))
+    return hits
+
+
 class TestNoBrokerSdk(unittest.TestCase):
     # The memecoin provider is self-contained and keyless: it uses stdlib
     # urllib only. No third-party broker/exchange SDK may ever be imported.
@@ -447,43 +495,37 @@ class TestNoBrokerSdk(unittest.TestCase):
         # in the repo, so a genuine third-party SDK import (ccxt,
         # requests, a broker SDK, ...) still fails exactly as before:
         # no such file exists.
-        repo_modules = set()
-        for _p in glob.glob(os.path.join(base, "**", "*.py"),
-                            recursive=True):
-            if "/.git/" in _p or "/node_modules/" in _p \
-                    or "__pycache__" in _p:
-                continue
-            repo_modules.add(
-                os.path.splitext(os.path.basename(_p))[0])
-
-        hits = []
-        for path in glob.glob(os.path.join(base, "**", "*.py"),
-                              recursive=True):
-            if "/.git/" in path or "/node_modules/" in path:
-                continue
-            if "__pycache__" in path:
-                continue
-            try:
-                tree = ast.parse(open(path).read())
-            except (SyntaxError, OSError):
-                continue
-            siblings = repo_modules
-            for node in ast.walk(tree):
-                names = []
-                if isinstance(node, ast.Import):
-                    names = [a.name for a in node.names]
-                elif isinstance(node, ast.ImportFrom):
-                    if node.module and node.level == 0:
-                        names = [node.module]
-                for name in names:
-                    top = name.split(".")[0]
-                    if (top not in sys.stdlib_module_names
-                            and top not in first_party
-                            and top not in siblings
-                            and top not in self.KNOWN_THIRD_PARTY):
-                        hits.append("%s: %s" % (path, name))
+        repo_modules = _repo_module_names(base)
+        hits = _unknown_import_hits(base, first_party, repo_modules,
+                                    self.KNOWN_THIRD_PARTY)
         self.assertEqual(hits, [], "unknown third-party import: %s"
                          % hits)
+
+    def test_package_rule_still_rejects_unknown_sdk(self):
+        """Negative control for the first-party package rule: a
+        same-named directory WITHOUT __init__.py never qualifies, an
+        unknown third-party import is still flagged, and a real
+        first-party package is accepted."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tree:
+            os.mkdir(os.path.join(tree, "firstparty_pkg"))
+            open(os.path.join(tree, "firstparty_pkg",
+                              "__init__.py"), "w").close()
+            os.mkdir(os.path.join(tree, "not_a_package"))  # no __init__
+            open(os.path.join(tree, "not_a_package",
+                              "helper.py"), "w").close()
+            with open(os.path.join(tree, "user.py"), "w") as fh:
+                fh.write("import firstparty_pkg.config\n"
+                         "import not_a_package.helper\n"
+                         "import definitely_fake_sdk_xyz\n")
+            repo_modules = _repo_module_names(tree)
+            assert "firstparty_pkg" in repo_modules
+            assert "not_a_package" not in repo_modules
+            hits = _unknown_import_hits(tree, set(), repo_modules, set())
+            flagged = sorted(h.split(": ", 1)[1] for h in hits)
+            self.assertEqual(flagged,
+                             ["definitely_fake_sdk_xyz",
+                              "not_a_package.helper"])
 
 
 if __name__ == "__main__":

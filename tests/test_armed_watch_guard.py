@@ -93,13 +93,24 @@ class FakeWS:
 
 
 def _run_watcher(seconds):
-    w = aw.ArmedWatcher(on_price=lambda *a: None)
+    w = aw.ArmedWatcher(on_price=lambda *a: None, ws_url="wss://mainnet.helius-rpc.com/?api-key=fixture")
     w.start()
     time.sleep(seconds)
     w.stop()
     w._thread.join(timeout=5)
     alive = w._thread.is_alive()
     return w, alive
+
+
+def reset_account_test_state():
+    # Isolated test home only. Production success must never erase this hold.
+    import sqlite3
+    from pathlib import Path
+    from daemon.intelligence.acquisition import routine
+    hold=Path(_TMP_HOME)/'helius_account_hold.sqlite3'
+    if hold.exists():
+        with sqlite3.connect(hold) as db:db.execute('DELETE FROM hold')
+    helius_ratelimit.reset_pacer_for_tests()
 
 
 _ORIG_GUARD_FN = aw._shared_guard
@@ -139,14 +150,14 @@ try:
     check("429: pacer refuses a token while in cooldown",
           helius_ratelimit.pacer_acquire(expect_bucket, wait_s=0)
           is False)
-    helius_ratelimit.reset_pacer_for_tests()
+    reset_account_test_state()
 
     # --- 2. guard hot at start -> zero attempts; resumes on expiry --
     guard2 = FakeGuard(cooldown_s=30.0)
     guard2.until = time.time() + 30.0
     aw._shared_guard = lambda: guard2
     FakeWS.attempts = 0
-    w2 = aw.ArmedWatcher(on_price=lambda *a: None)
+    w2 = aw.ArmedWatcher(on_price=lambda *a: None, ws_url="wss://mainnet.helius-rpc.com/?api-key=fixture")
     w2.start()
     time.sleep(3.0)
     check("hot-at-start: 0 attempts while guard hot",
@@ -164,7 +175,7 @@ try:
     aw._shared_guard = lambda: guard3
     FakeWS.attempts = 0
     FakeWS.error = "connection refused"
-    helius_ratelimit.reset_pacer_for_tests()
+    reset_account_test_state()
     _w, alive = _run_watcher(5.5)
     check("non-429: thread exits on stop", not alive)
     check("non-429: retries via local backoff (>=2 attempts)",
@@ -184,13 +195,13 @@ try:
     FakeWS.attempts = 0
     FakeWS.error = ("websocket handshake rejected: "
                     "HTTP/1.1 429 Too Many Requests")
-    helius_ratelimit.reset_pacer_for_tests()
+    reset_account_test_state()
     helius_ratelimit.pacer().report(expect_bucket, False)
     _w, alive = _run_watcher(3.0)
     check("pacer: 0 attempts while pacer in cooldown",
           FakeWS.attempts == 0, "attempts=%d" % FakeWS.attempts)
     check("pacer: thread exits on stop", not alive)
-    helius_ratelimit.reset_pacer_for_tests()
+    reset_account_test_state()
     FakeWS.attempts = 0
     _w, alive = _run_watcher(3.0)
     check("pacer: 1 attempt after pacer reset",

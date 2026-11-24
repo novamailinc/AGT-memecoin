@@ -126,6 +126,7 @@ eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
 GS._index_refresh = lambda now: None
 GS._INDEX["available"] = True
 GS._INDEX["coverage_start"] = NOW - 90000
+GS._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]  # continuity fixture (2026-11-24)
 GS._INDEX["by_mint"][MINT_A] = {"trader": TRADER_A, "ts": NOW - 10,
                                 "bonding_curve": "Curve111"}
 # by_trader has NO entry for TRADER_A -> 0 launches counted.
@@ -134,6 +135,11 @@ GS._curve_stats = lambda addr: {"trades": 80,
                                 "oldest_sig": "sig-a", "capped": False,
                                 "exhausted": True}
 GS._creator_from_oldest_tx = lambda sig: None
+# 2026-11-24 conservative contract: recorder-only sub-threshold counts
+# never admit. Stub the authoritative-history hook with this fixture's
+# intended complete history (TRADER_A truly launched 0 in 24h).
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
+    GS.authoritative_proof(creator, 0, now)
 
 
 class _FakeSat:

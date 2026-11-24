@@ -120,6 +120,17 @@ eng._safety = _ExplodingSafety()
 GS._index_refresh = lambda now: None
 GS._INDEX["available"] = True
 GS._INDEX["coverage_start"] = NOW - 90000
+# 2026-11-24 continuity fix: low-count serial passes require
+# continuity-evidenced 24h coverage; fixtures demonstrate it with a
+# 5-minute event cadence across the whole window.
+GS._INDEX["event_ts"] = [NOW - 86400 + i * 300 for i in range(289)]
+# 2026-11-24 conservative contract: recorder-only sub-threshold counts
+# never admit. The authoritative-history hook is stubbed with each
+# fixture's INTENDED complete launch history (explicit per-creator
+# counts, never derived from the recorder index).
+_AUTH_HIST = {}
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
+    GS.authoritative_proof(creator, _AUTH_HIST.get(creator, 0), now)
 
 
 def _birth(mint, trader, ts, curve="Curve111"):
@@ -133,6 +144,7 @@ def _birth(mint, trader, ts, curve="Curve111"):
 # (absent from by_trader = zero other launches counted).
 _birth(MINT_OK, TRADER_OK, NOW - 600)
 GS._INDEX["by_trader"][TRADER_OK] = [NOW - 600]
+_AUTH_HIST[TRADER_OK] = 1
 _birth(MINT_SER, TRADER_SER, NOW - 300)
 GS._INDEX["by_trader"][TRADER_SER] = [NOW - 3600, NOW - 3500, NOW - 300]
 _birth(MINT_COPY, "TraderCopy11111111111111111111111111111111",
@@ -486,8 +498,10 @@ TRADER_P2 = "TraderP211111111111111111111111111111111"
 TRADER_P3 = "TraderP311111111111111111111111111111111"
 _birth(MINT_P1, TRADER_P1, NOW - 600, curve="CurveP1")
 GS._INDEX["by_trader"][TRADER_P1] = [NOW - 600]
+_AUTH_HIST[TRADER_P1] = 1
 _birth(MINT_P2, TRADER_P2, NOW - 300, curve="CurveP2")
 GS._INDEX["by_trader"][TRADER_P2] = [NOW - 300]
+_AUTH_HIST[TRADER_P2] = 1
 _birth(MINT_P3, TRADER_P3, NOW - 400, curve="CurveP3")
 GS._INDEX["by_trader"][TRADER_P3] = [NOW - 3600, NOW - 3500,
                                       NOW - 400]

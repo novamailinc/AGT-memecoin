@@ -587,11 +587,17 @@ def _ff_tx_price(engine, sig, mint):
         import reserves as _res
         res = _res.rpc("getTransaction", [sig, {
             "encoding": "json", "commitment": "confirmed",
-            "maxSupportedTransactionVersion": 0}])
+            # v1: current-chain txs are version 1 (live census
+            # 2026-11-23: recent pump txs fail v0 with RPC -32015);
+            # v0 options would misreport them as fetch failures.
+            "maxSupportedTransactionVersion": 1}])
     except Exception as e:
         return None, "migration tx fetch failed: %s" % e
     if not isinstance(res, dict):
         return None, "migration tx not available yet"
+    from daemon.launch_scanner import tx_guards as source_guard
+    if not source_guard.response_signature_matches(res,sig):
+        return None, "migration tx response signature mismatch"
     t.join(timeout=6)
     info, why = _ff_parse_tx_price(res, mint,
                                    sol_usd=holder.get("sol", 0.0))

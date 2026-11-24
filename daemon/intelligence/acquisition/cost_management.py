@@ -33,8 +33,8 @@ What lives here:
 - Batch-request accounting (``record_batch``): saved cost = N x
   per-call cost minus the batch cost.
 - Priority-based processing: nonessential work is shed FIRST,
-  essential work is NEVER stopped — reusing the tracker policy
-  (warn 80% / stop nonessential 95%).
+  essential work also stops at recorded exhaustion. Below exhaustion,
+  warn 80% / stop nonessential 95% ordering is unchanged.
 - AUTOMATIC SUPPRESSION of low-value requests (see
   ``LOW_VALUE_DEFINITION``). ``pre_call_check`` is the pre-call
   gate workload modules call before issuing nonessential requests;
@@ -108,16 +108,15 @@ COST_UNIT = {"helius": "credits", "alchemy": "compute units",
 # - At >= 95% of a provider's budget, ALL nonessential work
 #   (deployer + background) on that account is stopped (the §7
 #   tracker policy, reused here, not re-implemented).
-# - ESSENTIAL work — critical entry/exit + card safety — is NEVER
-#   low-value and is NEVER suppressed by this layer. Exhausting an
-#   essential budget is an operator decision, not an automatic drop.
+# - Essential work is not low-value, but priority is not spending
+#   approval. Every priority stops at known recorded exhaustion.
 # ---------------------------------------------------------------------------
 LOW_VALUE_DEFINITION = (
     "Low-value requests are P3/background-priority work (research, "
     "batch scans, dossiers, backfill refresh) and, at the 95% stop "
     "threshold, ALL nonessential work (deployer + background). "
     "Essential work — critical entry/exit and card safety — is never "
-    "low-value and is never suppressed. Background is suppressed at "
+    "low-value, but is refused at known recorded exhaustion. Background is suppressed at "
     "80% of any enforced provider budget; all nonessential work is "
     "stopped at 95% of the serving account's budget."
 )
@@ -291,9 +290,9 @@ class CostManager:
                 ...
 
         Returns (allowed, reason_or_None). Ordering (nonessential
-        shed before essential; essential never suppressed):
+        shed before essential; essential stops at recorded exhaustion):
         1. Disabled account -> refuse everything (operator decision).
-        2. Essential priority (critical/card) -> always allowed.
+        2. Known exhausted monthly/daily/feature budget -> refuse every priority.
         3. Account at/above the 95% stop threshold -> refuse all
            nonessential (tracker policy, reused).
         4. Background priority at/above the account's 80% warn
@@ -307,15 +306,15 @@ class CostManager:
             self._log_suppression(account, priority, workload,
                                   REASON_ACCOUNT_DISABLED)
             return False, REASON_ACCOUNT_DISABLED
-        if priority in ESSENTIAL_PRIORITIES:
-            return True, None
         allowed, reason = self.tracker.nonessential_allowed(
-            account, priority)
+            account, priority, workload=workload)
         if not allowed:
             # Tracker refuses nonessential at 95% (or disabled,
             # already handled above).
             self._log_suppression(account, priority, workload, reason)
             return False, reason
+        if priority in ESSENTIAL_PRIORITIES:
+            return True, None
         if priority == PRIORITY_BACKGROUND:
             status = self.tracker.budget_status(account)
             pct = status.get("pct")
@@ -354,8 +353,7 @@ class CostManager:
     def suppression_status(self, account=None):
         """What is suppressed right now, per account (or one account):
         warn/stop state, whether background / all nonessential is
-        suppressed, and the standing fact that essential is never
-        suppressed by this layer."""
+        suppressed, and whether essential requests are refused at recorded exhaustion."""
         accounts = [account] if account else list(caps.ACCOUNTS)
         strained = self._strained_accounts()
         out = {}
@@ -375,7 +373,7 @@ class CostManager:
                     or bool(strained)),
                 "nonessential_suppressed": bool(
                     self.tracker.account_disabled(name) or stop),
-                "essential_suppressed": False,
+                "essential_suppressed": not self.tracker.nonessential_allowed(name, PRIORITY_CRITICAL)[0],
                 "disabled": bool(status.get("disabled")),
                 "global_pressure": bool(strained),
                 "strained_accounts": list(strained),

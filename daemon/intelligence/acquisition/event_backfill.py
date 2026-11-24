@@ -31,6 +31,8 @@ import logging
 import os
 import time
 
+from .transaction_identity import response_signature_matches
+
 logger = logging.getLogger("forex_agent.daemon.intelligence.acquisition.event_backfill")
 
 SLOTS_PER_SECOND = 2.5
@@ -434,6 +436,8 @@ def recover_signature_range(address, rpc_call, until_signature,
              "failed": None}
     before = None
     pages = 0
+    page_signatures = set()
+    previous_slot = None
     while pages < max_pages:
         params = [address, {"limit": limit}]
         if until_signature:
@@ -446,15 +450,29 @@ def recover_signature_range(address, rpc_call, until_signature,
         if result is None or result.get("kind") != "ok":
             stats["failed"] = (result or {}).get("kind") or "no_result"
             break
-        page = result.get("result") or []
+        page = result.get("result")
+        if not isinstance(page, list) or any(
+                not isinstance(row, dict)
+                or not isinstance(row.get("signature"), str)
+                or not row["signature"]
+                or type(row.get("slot")) is not int or row["slot"] < 0
+                or (row.get("blockTime") is not None
+                    and (type(row["blockTime"]) is not int or row["blockTime"] < 0))
+                for row in page):
+            stats["failed"] = "malformed_signature_page"
+            break
         if not page:
             break
         for row in page:
             if not isinstance(row, dict):
                 continue
             sig = row.get("signature")
-            if not sig:
-                continue
+            slot = row['slot']
+            if sig in page_signatures or (previous_slot is not None and slot > previous_slot):
+                stats["failed"] = "signature_page_duplicate_or_position_regression"
+                return list(reversed(rows)), pages, stats
+            page_signatures.add(sig)
+            previous_slot = slot
             stats["rows_seen"] += 1
             if sig == until_signature:
                 # Defensive: ``until`` is exclusive, so this should
@@ -469,6 +487,8 @@ def recover_signature_range(address, rpc_call, until_signature,
         before = page[-1].get("signature")
         if not before:
             break
+    else:
+        stats["failed"] = "page_budget_exhausted"
     # Newest-first pages -> chronological for the store.
     return list(reversed(rows)), pages, stats
 
@@ -498,7 +518,22 @@ def fetch_transactions_for_signatures(rows, rpc_call):
                 "signature": sig, "slot": row.get("slot"),
                 "kind": (result or {}).get("kind") or "no_result"})
             continue
-        tx = result.get("result") or {}
+        tx = result.get("result")
+        if not response_signature_matches(tx, sig):
+            stats["failed"].append({
+                "signature": sig, "slot": row.get("slot"),
+                "kind": "response_identity_unavailable_or_mismatch"})
+            continue
+        contradictory = any(
+            field in row and row[field] is not None
+            and (field not in tx or tx[field] is None
+                 or type(row[field]) is not type(tx[field]) or row[field] != tx[field])
+            for field in ("slot", "blockTime"))
+        if contradictory:
+            stats["failed"].append({
+                "signature": sig, "slot": row.get("slot"),
+                "kind": "response_row_position_contradiction"})
+            continue
         meta = tx.get("meta") or {}
         events.append({
             "signature": sig,

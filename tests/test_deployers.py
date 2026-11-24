@@ -197,7 +197,7 @@ class ResolutionCacheTest(unittest.TestCase):
         # Batch 3 meta.err gate fails closed without it, so the
         # fixture must carry a success meta (err None).
         tx = {"meta": {"err": None},
-              "transaction": {"message": {"accountKeys": [
+              "transaction": {"signatures":["sig_old"], "message": {"accountKeys": [
                   {"pubkey": DEP2}, {"pubkey": "other"}]}}}
         with patch.object(deployers, "_rpc",
                            side_effect=[sigs, tx]) as rpc, \

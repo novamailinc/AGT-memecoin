@@ -96,27 +96,111 @@ def numbered_keys():
             (os.environ.get('HELIUS_API_KEY') if i==1 else None) for i in (1,2,3)]
 
 
+def _record_key_stat(home, label, field, cost=0):
+    """Fail-soft per-key counters (labels + numbers only, NEVER key
+    material) in helius_key_stats.json: requests, method-weighted
+    credits, per-outcome counts. Local counters are a LOWER BOUND on
+    true project usage (the vendor-side credit cycle is authoritative;
+    sync via the Admin API once the project id is known)."""
+    try:
+        import fcntl, json, os
+        root = home or os.environ.get('FOREX_AGENT_HOME') or \
+            os.path.expanduser('~/.forex-agent')
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, 'helius_key_stats.json')
+        lock = open(path + '.lock', 'a+')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with open(path) as fh:
+                    data = json.load(fh)
+            except Exception:
+                data = {}
+            st = data.setdefault(label, {})
+            for k, default in (('requests', 0), ('credits', 0.0),
+                               ('ok', 0), ('error', 0),
+                               ('rate_limited', 0), ('transport_error', 0),
+                               ('unconfigured', 0)):
+                if k not in st:
+                    st[k] = default
+            st['requests'] += 1
+            st['credits'] += float(cost or 0)
+            st[field] = st.get(field, 0) + 1
+            tmp = '%s.tmp.%d' % (path, os.getpid())
+            with open(tmp, 'w') as fh:
+                json.dump(data, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock.close()
+    except Exception:
+        pass
+
+
 def revised_call(adapter,method,params,timeout):
-    """Stable shard, one conservative account bucket, no key failover on denial."""
+    """Cooperative multi-key dispatch over ONE conservative account bucket.
+
+    The three numbered keys COOPERATE rather than merely rotate: a stable
+    method/params shard gives every call a home key (distinct calls
+    spread across all three keys), and a KEY-LEVEL failure (unconfigured
+    source or transport error) fails over to the next key in order.
+    Every attempt acquires from the SAME aggregate account bucket first,
+    so failover can never bypass project throttling or an exhausted
+    shared budget, and an aggregate refusal (shared account hold or
+    cooldown) hops no keys. Vendor 429s are answered, not evaded: a
+    rate_limited result is returned immediately with no retry on another
+    key. The bucket's rate is the operator's allocation policy and is
+    unchanged by this dispatch layer.
+    """
     import hashlib,json
     from .base import http_json_rpc,_parse_rpc_body
     from daemon.launch_scanner import helius_ratelimit
     keys=numbered_keys()
     shard=int.from_bytes(hashlib.sha256(json.dumps([method,params],sort_keys=True).encode()).digest()[:8],'big')%3
-    key=keys[shard]
     def answer(value,kind,elapsed=0.,**kw):
-        out=_result(value,kind,elapsed,'helius',**kw);out['credential_source']='key%d'%(shard+1);out['account']='helius_main';return out
-    if not key:return answer(None,'unconfigured',note='fixed numbered source unavailable')
+        out=_result(value,kind,elapsed,'helius',**kw);out['account']='helius_main';return out
     from .. import helius_account
-    if not helius_account.allowed(adapter.home):return answer(None,'rate_limited',note='shared account hold')
+    if not helius_account.allowed(adapter.home):
+        return answer(None,'rate_limited',note='shared account hold')
     bucket=helius_ratelimit.bucket_id_for_key('account:helius_main')
     pacer=helius_ratelimit.pacer()
-    if not pacer.acquire(bucket):return answer(None,'rate_limited',note='shared account cooldown')
-    start=time.monotonic()
-    status,body,err,retry=http_json_rpc('https://mainnet.helius-rpc.com/?api-key={key}'.format(key=key),method,params,timeout=timeout,_opener=adapter._transport)
-    value,kind,wait,rl_kind=_parse_rpc_body('helius',status,body,err,retry_after=retry)
-    if kind=='rate_limited':helius_account.throttled(adapter.home,wait,rl_kind=='monthly_quota')
-    if kind in ('ok','rate_limited'):pacer.report(bucket,kind=='ok')
-    out=_result(value,kind,time.monotonic()-start,'helius',http_status=status,wait_hint_s=wait,rate_limit_kind=rl_kind)
-    out['credential_source']='key%d'%(shard+1)
-    return out
+    last=None
+    for hop in range(3):
+        idx=(shard+hop)%3
+        key=keys[idx]
+        label='key%d'%(idx+1)
+        if not key:
+            _record_key_stat(adapter.home,label,'unconfigured',0)
+            continue
+        if not pacer.acquire(bucket):
+            return answer(None,'rate_limited',note='shared account cooldown')
+        start=time.monotonic()
+        status,body,err,retry=http_json_rpc('https://mainnet.helius-rpc.com/?api-key={key}'.format(key=key),method,params,timeout=timeout,_opener=adapter._transport)
+        value,kind,wait,rl_kind=_parse_rpc_body('helius',status,body,err,retry_after=retry)
+        if err is not None and status is None:
+            # KEY-LEVEL transport failure: the aggregate token for this
+            # attempt is spent (a real request was attempted); fail over
+            # to the next key, which must acquire its own token.
+            _record_key_stat(adapter.home,label,'transport_error',
+                             adapter.cost(method) or 0)
+            last=(value,kind,wait,rl_kind,status,label)
+            continue
+        if kind=='rate_limited':helius_account.throttled(adapter.home,wait,rl_kind=='monthly_quota')
+        if kind in ('ok','rate_limited'):pacer.report(bucket,kind=='ok')
+        _record_key_stat(adapter.home,label,kind,
+                         adapter.cost(method) or 0)
+        out=_result(value,kind,time.monotonic()-start,'helius',http_status=status,wait_hint_s=wait,rate_limit_kind=rl_kind)
+        out['credential_source']=label
+        return out
+    if last is not None:
+        value,kind,wait,rl_kind,status,label=last
+        out=_result(value,kind,0.,'helius',http_status=status,wait_hint_s=wait,rate_limit_kind=rl_kind)
+        out['credential_source']=label
+        out['account']='helius_main'
+        return out
+    return answer(None,'unconfigured',note='no fixed numbered source available')

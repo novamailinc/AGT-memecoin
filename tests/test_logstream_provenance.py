@@ -47,7 +47,7 @@ def test_real_router_transport_fallback_reaches_scanner_consider(tmp_path,monkey
         def __exit__(self,*a):pass
     def transport(req,timeout=None):
         calls.append(req.full_url)
-        if 'alchemy' in req.full_url:raise urllib.error.URLError('fixture unavailable')
+        if 'alchemy' in req.full_url:raise urllib.error.HTTPError(req.full_url,429,'Too Many Requests',{},__import__('io').BytesIO(b'{"error":{"code":429,"message":"rate limit"}}'))
         return Response()
     monkeypatch.setattr(routine._local,'router',ProviderRouter(home=str(tmp_path),helius_enabled=False,transport=transport),raising=False)
     stream=LogStream(intake_home=tmp_path)

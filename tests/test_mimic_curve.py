@@ -137,7 +137,10 @@ _calls=[]
 def _transport(req,timeout=None):
     _calls.append(req.full_url.split('?')[0])
     if 'alchemy.com' in req.full_url:
-        raise _urlerr.URLError('fixture outage')
+        # ANSWERED 429 = proven not-served, eligible for failover (each candidate
+        # separately reserved). An UNKNOWN outcome (URLError/timeout) is
+        # terminal by v3+ contract and is pinned separately below.
+        raise _urlerr.HTTPError(req.full_url,429,'Too Many Requests',{},__import__('io').BytesIO(b'{"error":{"code":429,"message":"rate limit"}}'))
     return _Resp({"value":"FALLBACK"})
 os.environ['ALCHEMY_API_KEY']='fixture-not-real'
 os.environ['HELIUS_API_KEY']='fixture-not-real'

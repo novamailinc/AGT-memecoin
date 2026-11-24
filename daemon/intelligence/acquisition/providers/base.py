@@ -60,6 +60,8 @@ import logging
 import math
 from email.utils import parsedate_to_datetime
 import os
+import re
+import threading
 import time
 from urllib.parse import urlsplit
 import urllib.error
@@ -333,6 +335,52 @@ def chainstack_ru_table():
 # ---------------------------------------------------------------------------
 # HTTP transport (urllib; injectable for tests — never import requests)
 # ---------------------------------------------------------------------------
+_RL_NUMERIC_HEADERS = ("retry-after",)  # plus any *ratelimit*/x-cu* name
+_RL_CONTENT_TYPES = ("application/json", "text/plain", "text/html")
+_RL_BODY_VOCAB = ("monthly", "quota", "allowance", "capacity", "compute units",
+                  "throughput", "rate limit", "too many", "exceeded", "upgrade",
+                  "billing", "concurrent", "burst", "daily", "per second")
+_NUM_RE = re.compile(r"^\d{1,10}(\.\d{1,3})?$")
+_last_429 = threading.local()
+
+
+def _capture_429(exc, raw):
+    """Keep ONLY structured, allowlisted 429 facts: status, numeric
+    rate-limit header values, a content-type from a fixed enum, the JSON
+    error code (int), a body length, and which fixed-vocabulary words the
+    message contained. Free text, header strings and identifiers are
+    never stored, so privacy does not rest on pattern matching."""
+    nums, ctype = {}, None
+    try:
+        for k, v in (exc.headers or {}).items():
+            kl = k.lower()
+            v = str(v).strip()
+            if kl == "content-type":
+                base = v.split(";")[0].strip().lower()
+                ctype = base if base in _RL_CONTENT_TYPES else "other"
+            elif kl in _RL_NUMERIC_HEADERS or "ratelimit" in kl \
+                    or "rate-limit" in kl or kl.startswith("x-cu"):
+                nums[kl[:40]] = v if _NUM_RE.match(v) else "<non-numeric>"
+    except Exception:
+        pass
+    code, words, valid = None, [], False
+    try:
+        body = json.loads(raw.decode("utf-8", "replace")) if raw else None
+        valid = isinstance(body, dict)
+        err = (body or {}).get("error") if valid else None
+        if isinstance(err, dict):
+            c = err.get("code")
+            code = c if isinstance(c, int) and not isinstance(c, bool) else None
+            msg = str(err.get("message", "")).lower()
+            words = [w for w in _RL_BODY_VOCAB if w in msg]
+    except ValueError:
+        pass
+    _last_429.meta = {"status": 429, "numeric_headers": nums,
+                      "content_type": ctype, "body_len": len(raw or b""),
+                      "json_valid": valid, "error_code": code,
+                      "message_vocab": words}
+
+
 def http_json_rpc(url, method, params, timeout=12, _opener=None):
     """One JSON-RPC POST. Returns (http_status, parsed_body_or_None,
     error_kind, retry_after) where error_kind is None | "timeout" | "transport" |
@@ -355,6 +403,7 @@ def http_json_rpc(url, method, params, timeout=12, _opener=None):
         except ValueError:
             parsed = {}
         if status == 429:
+            _capture_429(exc, raw)
             return status, parsed, "rate_limited", (exc.headers or {}).get("Retry-After")
         return status, parsed, "http", None
     except (TimeoutError, urllib.error.URLError, OSError) as exc:
@@ -475,12 +524,16 @@ class _HttpAdapter(BaseProviderAdapter):
         if self.unverified(method):
             note = "%s support on %s is UNVERIFIED" % (method, self.name)
         if kind == "rate_limited":
+            out_meta = getattr(_last_429, "meta", None)
+            _last_429.meta = None
             logger.warning("%s 429 on %s (%s)", _host_of(url), method,
                            rl_kind or "throughput")
         out = _result(result, kind, elapsed, self.name,
                       http_status=status, wait_hint_s=wait,
                       rate_limit_kind=rl_kind, note=note)
         out["transport_attempts"] = 1  # exactly one request was sent
+        if kind == "rate_limited" and out_meta:
+            out["rate_limit_evidence"] = out_meta  # redacted, capped
         if error_kind in ("timeout", "transport"):
             # Unknown post-I/O outcome: the request may have reached the
             # vendor and been billed. An uncertain request is never

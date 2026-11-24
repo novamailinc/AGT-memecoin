@@ -238,6 +238,12 @@ GS._curve_stats = lambda curve_addr: {
     "oldest_sig": "FakeCreateSig333333333333333333333333333",
     "creation_slot": 300000100, "capped": False, "exhausted": True}
 GS._saturation = None  # force the DexScreener path, deterministically
+# 2026-11-24 conservative contract (serial coverage): recorder-only counts
+# never admit, so this control supplies a typed authoritative proof for its
+# fixture creator (0 launches in 24h), scoped to this call and restored.
+_orig_auth = GS._AUTHORITATIVE_LAUNCHES_24H
+GS._AUTHORITATIVE_LAUNCHES_24H = lambda creator, now: \
+    GS.authoritative_proof(creator, 0, now)
 if GS._ds_ticker is not None:
     GS._ds_ticker.count_24h = lambda symbol, now=None, self_mint=None: {
         "tally": 1, "others": 0, "top_mint": MINT3,
@@ -249,6 +255,7 @@ try:
 finally:
     GS._curve_stats = _orig_curve_stats
     GS._saturation = _orig_saturation
+    GS._AUTHORITATIVE_LAUNCHES_24H = _orig_auth
     if GS._ds_ticker is not None and _orig_count_24h is not None:
         GS._ds_ticker.count_24h = _orig_count_24h
 check("control setup: grad_raw position opened", res["opened"] == 1)

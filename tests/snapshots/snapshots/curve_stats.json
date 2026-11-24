@@ -42,7 +42,9 @@
       "pool": "PoolVaultOwner111111111111111111111111111",
       "price_usd": 0.000875,
       "quote_sol": 10.0,
-      "sol_usd": 70.0
+      "received_at": 1794787400.0,
+      "sol_usd": 70.0,
+      "source_asof": 1794787341
     },
     "why": ""
   }

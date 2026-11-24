@@ -1,0 +1,16 @@
+{
+  "capture_method": "read-only public mainnet-beta RPC, 1 call/2s, no credential",
+  "captured_ts": 1795545950.8292754,
+  "captured_utc": "2026-11-24T18:45:50Z",
+  "fixture": "live_getEpochInfo",
+  "method": "getEpochInfo",
+  "params": [],
+  "result": {
+    "absoluteSlot": 473449705,
+    "blockHeight": 451462827,
+    "epoch": 1095,
+    "slotIndex": 409705,
+    "slotsInEpoch": 432000,
+    "transactionCount": 568207077707
+  }
+}

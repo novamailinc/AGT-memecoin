@@ -631,9 +631,12 @@ def helius_rpc_typed(method, params, timeout=12, max_attempts=None,
                      attempts_out=None):
     """Explicit Helius-only diagnostic transport, never routine failover.
 
-    Returns (result, kind, attempts). kind is "ok", "null", "fail" or
-    "error"; attempts counts real HTTP sends (0 when every pair was
-    skipped pre-I/O). A 429 is an ANSWERED refusal: trying the next
+    Returns (result, kind, attempts). kind is "ok", "null", "fail",
+    "rate_limited" or "error"; attempts counts real HTTP sends (0 when
+    every pair was skipped pre-I/O). "rate_limited" means every real
+    send was an ANSWERED 429 (definitive refusal, never uncertain);
+    "error" means no send happened at all (all pairs skipped pre-I/O).
+     A 429 is an ANSWERED refusal: trying the next
     URL/bucket pair is not an uncertain retry, so the loop continues -
     but answered-429 eligibility is NOT an unlimited attempt budget:
     ``max_attempts`` caps TOTAL real sends across the loop (the
@@ -648,6 +651,7 @@ def helius_rpc_typed(method, params, timeout=12, max_attempts=None,
     immediately with kind "fail" instead of hopping to the next pair."""
     body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
     attempts = 0
+    answered_429 = False
     for url,bucket in rpc_url_pairs():
         if 'helius-rpc.com' not in url or not bucket:
             continue
@@ -664,9 +668,16 @@ def helius_rpc_typed(method, params, timeout=12, max_attempts=None,
             return out,kind,attempts
         if kind == '429':
             _pacer().report(bucket,False)
+            answered_429 = True
             continue
         # Unknown post-I/O outcome: no retry on another endpoint.
         return None,'fail',attempts
+    if answered_429:
+        # Every real send was an ANSWERED 429: a definitive vendor
+        # refusal, not an uncertain outcome. Distinct kind so the
+        # caller (router) can fail over to a separately-reserved
+        # candidate; THIS call never sent beyond its max_attempts.
+        return None,'rate_limited',attempts
     return None,'error',attempts
 
 

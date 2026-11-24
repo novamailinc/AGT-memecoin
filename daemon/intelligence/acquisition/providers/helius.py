@@ -71,9 +71,24 @@ class HeliusAdapter(BaseProviderAdapter):
             return out
         attempts_box = []
         try:
+            # One ACTUAL send per reserved adapter call (2026-11-24 v6):
+            # the router reserves budget once per adapter call, so an
+            # internal multi-send 429 loop could send more than the
+            # reservation covers - and owning billing docs scope
+            # "failed responses free" to getTransactionsForAddress
+            # only, so extra answered 429 sends cannot be assumed
+            # unbilled. An answered 429 comes back as kind
+            # "rate_limited"; the router may then try its next
+            # candidate under a SEPARATE reservation, within the
+            # caller's aggregate max_attempts bound. Pre-I/O skips
+            # (unconfigured pair, pacer cooldown) remain free inside
+            # the call. The multi-send loop is retained in
+            # helius_rpc_typed for direct consumers only.
+            one_send = (1 if max_transport_attempts is None
+                        else min(1, max_transport_attempts))
             out, rkind, attempts = reserves.helius_rpc_typed(
                 method, params, timeout=timeout,
-                max_attempts=max_transport_attempts,
+                max_attempts=one_send,
                 attempts_out=attempts_box)
         except Exception:
             # Exception after invoke: whether a request was sent is
@@ -97,6 +112,15 @@ class HeliusAdapter(BaseProviderAdapter):
             res = _result(None, "error", elapsed, self.name,
                           note="reserves.rpc outcome unknown")
             res["outcome_unknown"] = True
+            res["transport_attempts"] = attempts
+            return res
+        if rkind == "rate_limited":
+            # ANSWERED 429 (never unknown): surface as rate_limited so
+            # the router can fail over to a separately-reserved
+            # candidate. This call's single send is covered by its
+            # own reservation.
+            res = _result(None, "rate_limited", elapsed, self.name,
+                          note="reserves.rpc answered 429")
             res["transport_attempts"] = attempts
             return res
         if rkind == "ok":

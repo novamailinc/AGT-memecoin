@@ -297,7 +297,7 @@ def test_reserves_typed_429_still_hops(monkeypatch):
         return None,'429',0.001
     monkeypatch.setattr(R,'_rpc_attempt',attempt)
     out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']])
-    assert (out,kind,attempts)==(None,'error',2) and len(calls)==2
+    assert (out,kind,attempts)==(None,'rate_limited',2) and len(calls)==2
 
 
 def test_legacy_helius_adapter_unknown_marked(tmp_path,monkeypatch):
@@ -351,18 +351,25 @@ def test_reserves_typed_429_hop_respects_max_attempts(monkeypatch):
         return None,'429',0.001
     monkeypatch.setattr(R,'_rpc_attempt',attempt)
     out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']],max_attempts=1)
-    assert (out,kind,attempts)==(None,'error',1) and len(calls)==1
+    assert (out,kind,attempts)==(None,'rate_limited',1) and len(calls)==1
     out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']],max_attempts=2)
-    assert (out,kind,attempts)==(None,'error',2) and len(calls)==3
+    assert (out,kind,attempts)==(None,'rate_limited',2) and len(calls)==3
 
 
-def test_legacy_adapter_exception_charges_exact_sends(tmp_path,monkeypatch):
-    # Exception after recorded sends: the adapter charges the exact
-    # sends made (from attempts_out), not a flat guess.
+def test_legacy_adapter_one_send_per_reserved_call(tmp_path,monkeypatch):
+    # v6 contract: ONE actual send per reserved adapter call. The
+    # router reserves budget once per adapter call; owning billing
+    # docs scope "failed responses free" to getTransactionsForAddress
+    # only, so extra answered-429 sends inside one call could be
+    # billed against a single reservation. The adapter therefore caps
+    # helius_rpc_typed at one send; an answered 429 surfaces as
+    # rate_limited (answered, failover-eligible) and the pacer's
+    # second acquire is never reached.
     from daemon.intelligence.acquisition.providers.helius import HeliusAdapter
     from daemon.launch_scanner import reserves as R
     pairs=[('https://mainnet.helius-rpc.com/?api-key=k1','b1'),
-           ('https://mainnet.helius-rpc.com/?api-key=k2','b2')]
+           ('https://mainnet.helius-rpc.com/?api-key=k2','b2'),
+           ('https://mainnet.helius-rpc.com/?api-key=k3','b3')]
     monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
     class P:
         def __init__(self):self.n=0
@@ -373,9 +380,75 @@ def test_legacy_adapter_exception_charges_exact_sends(tmp_path,monkeypatch):
         def report(self,b,ok):pass
     pacer=P()
     monkeypatch.setattr(R,'_pacer',lambda:pacer)
-    monkeypatch.setattr(R,'_rpc_attempt',lambda *a,**k:(None,'429',0.001))
+    calls=[]
+    def attempt(url,body,method,host,timeout):
+        calls.append(url)
+        return None,'429',0.001
+    monkeypatch.setattr(R,'_rpc_attempt',attempt)
     a=HeliusAdapter(home=str(tmp_path))
+    out=a.call('getBalance',['x'],max_transport_attempts=3)
+    assert out['kind']=='rate_limited'  # answered 429, not error/unknown
+    assert out.get('outcome_unknown') is not True
+    assert out['transport_attempts']==1 and len(calls)==1 and pacer.n==1
+
+
+def test_reserves_typed_two_sends_then_exception_records_both(monkeypatch):
+    # Direct-consumers causal fixture (v6): the multi-send loop is
+    # retained for callers that use helius_rpc_typed directly. Two
+    # answered-429 sends followed by a raise mid-loop must leave BOTH
+    # sends recorded in attempts_out - a flat-1 implementation cannot
+    # be distinguished by the one-send fixture, this one can.
+    from daemon.launch_scanner import reserves as R
+    pairs=[('https://mainnet.helius-rpc.com/?api-key=k1','b1'),
+           ('https://mainnet.helius-rpc.com/?api-key=k2','b2'),
+           ('https://mainnet.helius-rpc.com/?api-key=k3','b3')]
     monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
-    out=a.call('getBalance',['x'])
-    assert out['kind']=='error' and out['outcome_unknown'] is True
-    assert out['transport_attempts']==1  # exactly the send made before the raise
+    class P:
+        def __init__(self):self.n=0
+        def acquire(self,b):
+            self.n+=1
+            if self.n==3:raise RuntimeError('pacer blew up mid-loop')
+            return True
+        def report(self,b,ok):pass
+    pacer=P()
+    monkeypatch.setattr(R,'_pacer',lambda:pacer)
+    monkeypatch.setattr(R,'_rpc_attempt',lambda *a,**k:(None,'429',0.001))
+    attempts_box=[]
+    import pytest as _pt
+    with _pt.raises(RuntimeError):
+        R.helius_rpc_typed('getBalance',[['x']],max_attempts=3,
+                           attempts_out=attempts_box)
+    assert attempts_box==[pairs[0][0],pairs[1][0]]  # exactly 2 sends recorded
+
+
+def test_legacy_429_returned_to_router_for_separately_reserved_failover(tmp_path,monkeypatch):
+    # v6 contract end to end (legacy path): the reserved adapter call
+    # makes ONE actual send; an answered 429 returns to the router as
+    # rate_limited; the router fails over to the next candidate under a
+    # SEPARATE reservation, inside the aggregate max_attempts bound.
+    from daemon.intelligence.acquisition.provider_router import ROUTING_MODE_SHADOW
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    monkeypatch.setenv('ALCHEMY_API_KEY','fixture-alchemy')
+    monkeypatch.setattr(usage.caps,'get_account',lambda account:{'enabled':True,'monthly_quota':{'amount':100,'unit':'credits'}})
+    from daemon.launch_scanner import reserves as R
+    monkeypatch.setattr(R,'rpc_url_pairs',lambda:[('https://mainnet.helius-rpc.com/?api-key=k1','b1')])
+    seen_caps=[]
+    def typed(method,params,timeout=12,max_attempts=None,attempts_out=None):
+        seen_caps.append(max_attempts)
+        if attempts_out is not None:attempts_out.append('sent')
+        return None,'rate_limited',1
+    monkeypatch.setattr(R,'helius_rpc_typed',typed)
+    ok_resp=type('R',(),{'read':staticmethod(lambda:b'{"jsonrpc":"2.0","id":1,"result":42}'),
+                         'status':200,'headers':{},
+                         '__enter__':lambda s:s,'__exit__':lambda s,*a:False})
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=True,mode=ROUTING_MODE_SHADOW,
+                     transport=lambda *a,**kw:ok_resp())
+    out=r.call('getBalance',['fixture'],max_attempts=3)
+    assert out['kind']=='ok' and out['provider']=='alchemy' and out['fallback'] is True
+    assert seen_caps==[1]  # the reserved adapter call was capped at ONE send
+    kinds=[(a['provider'],a['kind']) for a in out['attempts'] if a['kind']!='skipped']
+    assert kinds==[('helius','rate_limited'),('alchemy','ok')]
+    import sqlite3 as _s
+    with _s.connect(str(tmp_path)+'/acquisition_budget_reservations.sqlite3') as db:
+        rows=db.execute('SELECT count(*) FROM reservations').fetchone()[0]
+    assert rows==2  # one reservation per candidate: the failover is separately reserved

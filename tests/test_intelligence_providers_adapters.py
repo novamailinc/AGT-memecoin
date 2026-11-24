@@ -322,6 +322,15 @@ try:
     check("helius adapter: transport failure -> kind error",
           res_none["kind"] == "error")
 
+    fake_reserves.helius_rpc_typed = lambda method, params, timeout=12, **kw: (
+        None, "rate_limited", 1)
+    res_rl = had.call("getSlot", [])
+    check("helius adapter: answered 429 -> kind rate_limited "
+          "(answered, failover-eligible, never unknown; 2026-11-24 v6)",
+          res_rl["kind"] == "rate_limited"
+          and res_rl.get("outcome_unknown") is not True
+          and res_rl.get("transport_attempts") == 1)
+
     def _boom(method, params, timeout=12, **kw):
         raise RuntimeError("boom")
     fake_reserves.helius_rpc_typed = _boom

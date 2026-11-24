@@ -107,7 +107,7 @@ def test_smartmoney_rpc_429_engages_pacer_cooldown(monkeypatch):
     import daemon.launch_scanner.reserves as sm
     monkeypatch.setattr(sm, "rpc_url_pairs", lambda: [("https://mainnet.helius-rpc.com/?api-key=k", rl.bucket_id_for_key("k"))])
     monkeypatch.setattr(sm, "_rpc_attempt", lambda *a,**k: (None,"429",.001))
-    assert sm.helius_rpc_typed("getSignaturesForAddress", []) == (None, "error", 1)
+    assert sm.helius_rpc_typed("getSignaturesForAddress", []) == (None, "rate_limited", 1)
     bucket = rl.bucket_id_for_key("k")
     st = rl.pacer()._read_state()[bucket]
     assert st["cooldown_until"] > time.time()  # pacer backoff engaged

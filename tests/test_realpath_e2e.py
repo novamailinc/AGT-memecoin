@@ -143,6 +143,7 @@ class Pacer:
 
 calls = []
 fail_primary = [False]
+unknown_primary = [False]
 fail_detail = [False]
 sell_mode = [False]
 response_mode = ['normal']
@@ -178,9 +179,11 @@ from daemon.intelligence.acquisition.provider_router import ProviderRouter
 from daemon.intelligence.acquisition.request_scheduler import SharedQuota
 os.environ['ALCHEMY_API_KEY']='fixture-not-real'
 class RpcResponse:
-    status=200
-    def __init__(self,value):self.value=value
-    def read(self):return json.dumps({'jsonrpc':'2.0','id':1,'result':self.value}).encode()
+    def __init__(self,value,status=200):
+        self.value=value;self.status=status;self.headers={}
+    def read(self):
+        if self.status!=200:return b''
+        return json.dumps({'jsonrpc':'2.0','id':1,'result':self.value}).encode()
     def __enter__(self):return self
     def __exit__(self,*a):pass
 
@@ -191,7 +194,15 @@ def central_transport(req,timeout=12):
     if response_mode[0]=='null':return RpcResponse(None)
     if response_mode[0]=='outage':raise urllib.error.URLError('fixture total outage')
     value,kind,elapsed=transport(req.full_url,req.data,method,urlsplit(req.full_url).hostname,timeout)
-    if kind!='ok':raise urllib.error.URLError('fixture provider unavailable')
+    if kind!='ok':
+        if unknown_primary[0]:
+            # UNKNOWN post-I/O outcome (transport failure): under the
+            # 2026-11-24 v3 contract the router must NOT retry this
+            # uncertain request on any other provider.
+            raise urllib.error.URLError('fixture provider unavailable')
+        # ANSWERED refusal (HTTP 429): the provider definitively
+        # processed and rejected the request; failover is allowed.
+        return RpcResponse(None,status=429)
     if response_mode[0]=='failed':value['meta']['err']={'InstructionError':[0,'fixture_failure']}
     return RpcResponse(value)
 central_router=ProviderRouter(home=os.environ['FOREX_AGENT_HOME'],helius_enabled=False,transport=central_transport)
@@ -213,8 +224,21 @@ with patch.object(routine,'router',return_value=central_router), \
         sw.poll_wallet(wallet,'unused-fixture',REGISTRY,seen,intake)
         check('actual poll acknowledges parsed and persisted sighting for '+wallet,
               intake.wallet(wallet)['pending']==[])
-    check("primary failure traversed actual public fallback without Helius",
+    check("primary answered failure traversed actual public fallback without Helius",
           any("mainnet-beta.solana" in host for host,_ in calls) and not any("helius" in host for host,_ in calls))
+    # Unknown post-I/O primary failure: no fallback traversal (the
+    # uncertain request is never retried anywhere), no fabrication -
+    # the poll degrades and keeps the cursor instead of inventing data.
+    unknown_primary[0]=True
+    fail_primary[0]=True
+    intake.stage("WalU",None,'old:WalU',[])
+    calls_before=len(calls)
+    sw.poll_wallet("WalU",'unused-fixture',REGISTRY,seen,intake)
+    traversed=[host for host,_ in calls[calls_before:] if "mainnet-beta.solana" in host]
+    check("unknown primary failure: no fallback traversal, no fabrication",
+          traversed==[] and intake.wallet("WalU")['cursor']=='old:WalU'
+          and intake.wallet("WalU")['pending']==[])
+    unknown_primary[0]=False
     check("actual poll used signature discovery and transaction detail methods",
           {method for _,method in calls}=={'getSignaturesForAddress','getTransaction'})
     fail_primary[0] = False

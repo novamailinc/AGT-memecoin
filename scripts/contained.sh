@@ -5,9 +5,10 @@
 # this exits nonzero (coverage UNQUALIFIED); there is no unwrapped fallback and no bypass switch.
 [ "$#" -ge 1 ] || { echo "usage: contained.sh CMD [ARGS...]" >&2; exit 64; }
 command -v unshare >/dev/null 2>&1 || { echo "CONTAINMENT UNAVAILABLE: unshare missing; coverage UNQUALIFIED" >&2; exit 90; }
+SELF_DIR=$(cd "$(dirname "$0")" && pwd) || exit 91
 SCRATCH_HOME=$(mktemp -d) || exit 91
 trap 'rm -rf "$SCRATCH_HOME"' EXIT
-unshare -rnpf --kill-child sh -c '
+unshare -rnpf --mount-proc --kill-child sh -c '
   ip link set lo up || exit 94
   [ "$(ip -o link | wc -l)" = 1 ] || exit 95
   [ -z "$(ip -o addr | grep -v " lo ")" ] || exit 96
@@ -15,10 +16,13 @@ unshare -rnpf --kill-child sh -c '
   [ "$(tail -n +2 /proc/net/route | wc -l)" = 0 ] || exit 98
   [ -z "$(ip -6 route | grep -v " dev lo \|^unreachable\|^local\|^fe80\|^ff00")" ] || exit 99
   echo "contained: links=lo v4routes=0 v6routes=lo-only"
-  H="$1"; shift
+  H="$1"; D="$2"; shift 2
   export AGT_CONTAINED=1 HOME="$H"
-  exec "$@"
-' sh "$SCRATCH_HOME" "$@"
+  # PID 1 of this namespace must reap orphans: daemons detach (setsid) and are
+  # re-parented to PID 1, so a non-reaping PID 1 (pytest/python) leaves their
+  # killed processes as zombies that still answer kill -0.
+  exec "${PYTHON:-python3}" "$D/ns-init.py" "$@"
+' sh "$SCRATCH_HOME" "$SELF_DIR" "$@"
 RC=$?
 case "$RC" in 90|94|95|96|97|98|99)
   echo "CONTAINMENT UNAVAILABLE/UNVERIFIED (rc=$RC): coverage UNQUALIFIED" >&2;; esac

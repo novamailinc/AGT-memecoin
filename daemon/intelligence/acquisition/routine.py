@@ -53,6 +53,16 @@ def read(method, params, timeout=12, critical=False, background=False, hints=Non
     return None
 
 
+def _valid_ws_key(key):
+    """A malformed stored key (whitespace, a full URL, stray query
+    separators) must fail closed — no URL at all — never produce a
+    configured-looking URL that fails mysteriously at the handshake."""
+    k = (key or '').strip()
+    if not k or any(c in k for c in '/?&#= \t\r\n'):
+        return None
+    return k
+
+
 def websocket_url(purpose='routine'):
     """Normal-scanning logs stay Alchemy; routine position pushes use Helius."""
     if purpose == 'normal_scanning':
@@ -60,13 +70,14 @@ def websocket_url(purpose='routine'):
         return alchemy_wss_url()
     from .providers.helius import numbered_keys
     keys=numbered_keys()
+    key=_valid_ws_key(keys[0])
     if purpose == 'parsed_streams':
         # Helius Parsed Streams (assigned: relevant streams/events)
         # live on the Gatekeeper host only; see
         # providers/base.HELIUS_PARSED_STREAMS_WSS_TMPL.
         from .providers.base import HELIUS_PARSED_STREAMS_WSS_TMPL
-        return HELIUS_PARSED_STREAMS_WSS_TMPL.format(key=keys[0]) if keys[0] else None
-    return 'wss://mainnet.helius-rpc.com/?api-key='+keys[0] if keys[0] else None
+        return HELIUS_PARSED_STREAMS_WSS_TMPL.format(key=key) if key else None
+    return 'wss://mainnet.helius-rpc.com/?api-key='+key if key else None
 
 
 def evidence_since(start=0):
@@ -81,13 +92,28 @@ class WebsocketAdmissionError(RuntimeError):
     pass
 
 
+# Both Helius WebSocket hosts carry traffic on the SAME Helius
+# account (same API keys, same shared quota): the standard mainnet
+# host and the Gatekeeper host that serves Parsed Streams
+# (providers/base.HELIUS_PARSED_STREAMS_WSS_TMPL). The shared-account
+# guard (budget admission, pacer, handshake accounting) must treat
+# them identically, so host checks go through _is_helius_ws_host,
+# never an exact single-host comparison.
+HELIUS_WSS_HOSTS = frozenset(
+    ("mainnet.helius-rpc.com", "beta.helius-rpc.com"))
+
+
+def _is_helius_ws_host(host):
+    return host in HELIUS_WSS_HOSTS
+
+
 def websocket_admit(url, critical=False):
     """Shared Alchemy reconnect admission. Explicit diagnostic URLs stay separate."""
     if not url:
         raise WebsocketAdmissionError('WebSocket endpoint unavailable: no configured endpoint')
     from urllib.parse import urlsplit
     host=urlsplit(url).hostname or ''
-    if host=='mainnet.helius-rpc.com':
+    if _is_helius_ws_host(host):
         r=router();account='helius_main'
         from . import helius_account
         if not helius_account.allowed(r.home):raise WebsocketAdmissionError('Helius shared account hold')
@@ -115,7 +141,7 @@ def websocket_admit(url, critical=False):
 
 def websocket_result(url, error=None):
     from urllib.parse import urlsplit
-    if url and urlsplit(url).hostname=='mainnet.helius-rpc.com':
+    if url and _is_helius_ws_host(urlsplit(url).hostname or ''):
         from daemon.launch_scanner import helius_ratelimit
         bucket=helius_ratelimit.bucket_id_for_key('account:helius_main')
         r=router()
@@ -152,7 +178,7 @@ def websocket_result(url, error=None):
 def websocket_subscription_throttled(url):
     """Subscription rejection is not a failed HTTP upgrade handshake."""
     from urllib.parse import urlsplit
-    if url and urlsplit(url).hostname=='mainnet.helius-rpc.com':
+    if url and _is_helius_ws_host(urlsplit(url).hostname or ''):
         from daemon.launch_scanner import helius_ratelimit
         bucket=helius_ratelimit.bucket_id_for_key('account:helius_main')
         from . import helius_account

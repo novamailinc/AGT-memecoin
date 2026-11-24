@@ -35,6 +35,18 @@ from broker.memecoin.execution.mainnet_executor import (
 from daemon.launch_scanner import killswitch as _ks
 from daemon.launch_scanner import live_select
 
+# DISCLOSED TEST EDIT (CI run 146, stale vs the mandatory entry guard): entries are refused unless the shared paper account
+# is enabled with every mandatory limit set. TEST-FIXTURE limits (not owner values); no guard is waived or patched and no
+# live executor is constructed (the executor in this file is the file's own fake).
+import importlib as _il
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import tests._guard_fixture as _GF
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+
 _PASSED = 0
 
 

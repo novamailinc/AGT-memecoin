@@ -11,9 +11,24 @@ Semantics, stated so nothing is implied:
   graduation is a STALE entry opportunity, and the lane's own entry-age rules, not this module, decide staleness. No age or count threshold is
   invented here (max_items only bounds one drain call).
 * Only complete lines (ending in a newline) are consumed; a torn last line waits for the writer. A corrupt complete line is skipped and counted.
-* A spool shorter than the cursor (rotated/truncated) resets the cursor to 0 and sets `reset_count`.
+* A spool SHORTER than the cursor (rotated/truncated by someone) is NOT recovered automatically: a reset to 0 would REPLAY every old item
+  (at-least-once across a truncation, re-delivering stale graduations), so the feed goes inert with a durable error "spool_shorter_than_cursor"
+  until an operator calls reset_cursor(reason) (source only, no caller): the replay is then a deliberate act. Same for an unreadable cursor.
+* Items drained but not yet used by the lane when the process dies are LOST (at-most-once, cursor written before drain() returns). This is chosen over
+  replay because a replayed graduation is a stale entry; it is a stated data-loss window, not hidden.
+* ERRORS SURFACE: any I/O or cursor fault writes a durable `<cursor>.status.json` ({"error", "since", "count", "last_ts"}) and health() returns it; an
+  empty feed with health ok is genuinely empty. grad_cycle copies health() into the cycle journal's scan step. A successful drain clears the status.
 * Only items with source == "pumpportal-migration" are spooled (what grad_raw.migration_to_candidate accepts); the writer refuses anything else.
 * The cursor is per reader (per lane): two lanes see the same spool independently. Spool growth/rotation is not managed here (stated gap).
+* Loss / duplication matrix (each is a stated case, none is hidden):
+    - writer crashes between PumpPortalFeed.drain() and append_items: those items are LOST to this lane (the in-memory queue died with the process;
+      the launch scanner's own pipeline loses them the same way).
+    - append_items fails (disk error): returns the refused count, the hook ignores it: lost for this lane only, the launch scanner continues.
+    - the reader's cursor write fails: drain() returns [] and does NOT consume, so the next drain re-reads them: NOT lost, NOT duplicated.
+    - reader crashes after the cursor was written but before the lane used the items: LOST (at-most-once, by design, see above).
+    - reader crashes mid cursor write: the atomic replace leaves the old OR the new cursor, never a torn one.
+    - duplicates: this module never re-delivers an item to the same reader. A migration that the SOURCE emits twice is spooled twice (no dedupe here);
+      de-duplication by mint belongs to the lane (not verified by this module).
 * Visible state: `stats()` returns counts of read, skipped_corrupt, reset_count and the cursor offset. Spool files hold market data only."""
 import json
 import os
@@ -50,12 +65,60 @@ def append_items(path, items, now=None):
     return len(lines), refused
 
 
+ENV = "AGT_GRAD_FEED_SPOOL"
+
+
+def spool_from_env(items, environ=None):
+    """The hook entry point: appends to the spool named by AGT_GRAD_FEED_SPOOL, or does NOTHING when it is unset (default). Never raises. Returns
+    the appended count, or None when disabled."""
+    try:
+        path = (environ if environ is not None else os.environ).get(ENV)
+        if not path:
+            return None
+        return append_items(path, items)[0]
+    except Exception:
+        return None
+
+
 class SpoolFeed:
     def __init__(self, path, cursor_path, max_items=200):
         self.path, self.cursor_path, self.max_items = path, cursor_path, int(max_items)
         self._stats = {"read": 0, "skipped_corrupt": 0, "reset_count": 0, "cursor_unreadable": 0}
+        self.status_path = cursor_path + ".status.json"
 
-    def _cursor(self):
+    def _set_error(self, kind, detail=""):
+        try:
+            prev = self.health()
+            rec = {"error": kind, "detail": str(detail)[:200], "since": (prev or {}).get("since") if (prev or {}).get("error") == kind else time.time(),
+                   "count": ((prev or {}).get("count", 0) + 1) if (prev or {}).get("error") == kind else 1, "last_ts": time.time()}
+            _atomic(self.status_path, rec)
+        except Exception:
+            pass                         # the in-memory flag below still reports it for this process
+        self._mem_error = kind
+
+    def _clear_error(self):
+        self._mem_error = None
+        try:
+            if os.path.exists(self.status_path): os.remove(self.status_path)
+        except Exception:
+            pass
+
+    def health(self):
+        """None when healthy; else the durable error record (or {"error": ..., "unreadable_status": True})."""
+        try:
+            with open(self.status_path) as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return {"error": self._mem_error} if getattr(self, "_mem_error", None) else None
+        except Exception:
+            return {"error": getattr(self, "_mem_error", None) or "status_unreadable", "unreadable_status": True}
+
+    def reset_cursor(self, reason):
+        """OPERATOR action (no caller): deliberately set the cursor to 0 (replays the whole spool) or clear an unreadable cursor. Records why."""
+        _atomic(self.cursor_path, {"offset": 0, "reset_reason": str(reason)[:200], "reset_ts": time.time()})
+        self._stats["reset_count"] += 1; self._clear_error()
+
+    def _cursor(self, count=True):
         try:
             with open(self.cursor_path) as fh:
                 off = json.load(fh)["offset"]
@@ -65,7 +128,8 @@ class SpoolFeed:
         except FileNotFoundError:
             return 0
         except Exception:
-            self._stats["cursor_unreadable"] += 1
+            if count:
+                self._stats["cursor_unreadable"] += 1
             return None
 
     def drain(self):
@@ -74,10 +138,10 @@ class SpoolFeed:
         try:
             off = self._cursor()
             if off is None:
-                return []
+                self._set_error("cursor_unreadable"); return []
             size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
             if size < off:
-                off = 0; self._stats["reset_count"] += 1
+                self._set_error("spool_shorter_than_cursor", "size %d < cursor %d" % (size, off)); return []
             out, pos = [], off
             with open(self.path, "rb") as fh:
                 fh.seek(off)
@@ -97,9 +161,11 @@ class SpoolFeed:
             if pos != off or size < off:
                 _atomic(self.cursor_path, {"offset": pos})
             self._stats["read"] += len(out)
+            self._clear_error()
             return out
-        except Exception:
+        except Exception as e:
+            self._set_error("io_error", repr(e))
             return []
 
     def stats(self):
-        return dict(self._stats, offset=self._cursor())
+        return dict(self._stats, offset=self._cursor(count=False))

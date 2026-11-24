@@ -115,7 +115,10 @@ def _open_logged_faults(grad):
         with open(_fault_log_path(grad)) as fh:
             for line in fh:
                 try: ids.append(json.loads(line)["fault_id"])
-                except Exception: return None
+                except Exception:
+                    if line.endswith("\n"):
+                        return None            # a COMPLETE unparseable line is damage
+                    # a final line without its newline is a crash mid-append: tolerated (the fault is still in the fault FILE or the next append)
     except FileNotFoundError:
         return []
     except Exception:
@@ -177,32 +180,47 @@ def _record_fault(grad, out, reason, **detail):
 
 
 def _journal_internal_consistency(pa, snap):
-    """INTERNAL consistency only, NOT independent conservation: the account's OWN genesis replay (paper_account._derive_buckets_locked, run on a
-    deepcopy, read only) rebuilds cash, buckets, open positions and pending_sol from its write-ahead log with the account's own semantics and
-    compares to the stored state. A bug that writes both sides consistently is invisible to it. Independent conservation (lane fill nets, fees and
-    stakes against the account's amounts per op id) is NOT implemented. Returns (ok_or_None, detail): None = not evaluable = refuse."""
-    import copy  # noqa: PLC0415
+    """INTERNAL consistency only, NOT independent conservation: paper_account.verify_replay() (READ ONLY: no truncation, creation, .bak restore or
+    reconcile) replays the account's own WAL and compares cash total, buckets, assumed_sold keys and open-position key sets. It does NOT compare
+    holds, pending_sol or per-position qty/basis. Independent conservation is NOT implemented. Returns (ok_or_None, detail): None = refuse."""
+    fn = getattr(pa, "verify_replay", None)
+    if fn is None:
+        return None, "account_has_no_verify_replay"
     try:
-        with pa._lock():
-            led, healthy, degraded = pa._load_locked()
-            if not healthy or led is None or degraded:
-                return None, "account_unhealthy:%s" % (degraded,)
-            entries, status, _ = pa._journal_read()
-            if status:
-                return None, "journal_status:%s" % status
-            led2 = copy.deepcopy(led)
-        _gen, reason = pa._derive_buckets_locked(led2, entries)
+        ok, why = fn()
     except Exception as e:
-        return None, "replay_error:%r" % (e,)
-    if reason:
-        return False, str(reason)[:300]
-    return True, "account_replay_matches_its_own_journal"
+        return None, "verify_replay_error:%r" % (e,)
+    return ok, why
 
 
-def _fills_ownership(grad, fills, d):
-    """Every journaled fill key of THIS lane must be owned. Returns a list of problems. Keys of other lanes are not ours. Instance-bound: an
-    entry fill must match an open or closed position's execution.entry_op; an exit fill must match an owned mint AND, when its key carries a
-    pa_pos_id suffix, an owned pa_pos_id; a mint with more than one owned instance makes a bare exit key ambiguous = blocked. Unknown kinds block."""
+def _account_op_index(pa):
+    """Read-only index of the account's WAL: {op_id: pos_id} for debits and the set of pos_ids with a FINAL credit. None when unreadable."""
+    try:
+        entries, status, _ = pa._journal_read()
+    except Exception:
+        return None
+    if status:
+        return None
+    debits, settled = {}, set()
+    for e in entries:
+        if e.get("event") == "debit" and e.get("op_id"):
+            debits[e["op_id"]] = e.get("pos_id")
+        elif e.get("event") == "credit" and e.get("final") is True and e.get("pos_id"):
+            settled.add(e["pos_id"])
+    return {"debits": debits, "settled": settled}
+
+
+def _fills_ownership(grad, jj, d, acct):
+    """Ownership of this lane's fill-journal keys. Returns (problems, notes). Keys of other lanes are skipped; a key with an unknown lane-like kind
+    blocks. ENTRY fills are anchored on the ACCOUNT, not on the lane's retained records (the lane caps `closes` at 500 and recovered closes carry no
+    entry_op): a DEMO entry journals its fill BEFORE the post-quote refusals and a refusal leaves the fill with NO account debit, so
+      - no account debit for the op: an uncommitted/refused entry (benign, counted in notes);
+      - a debit whose pos_id a lane position/close owns, or whose key equals a lane execution.entry_op: owned;
+      - a debit whose pos_id has a FINAL account credit but no lane record: settled on the account, record trimmed or never kept (benign, counted);
+      - a debit, still open on the account, with no lane owner: ORPHAN (block).
+    An open entry intent for this lane blocks (in flight or crashed: unknown). EXIT fills: owned mint within the retained window; a pa_pos_id
+    suffix must be owned; a bare key on a mint with more than one owned instance is ambiguous; an exit fill whose mint left the retained `closes`
+    window (cap 500) blocks (fail closed, stated, not guessed benign)."""
     lane = grad.LANE; pos = (d.get("positions") or {}); closes = d.get("closes") or []
     recs = list(pos.values()) + [c for c in closes if isinstance(c, dict)]
     entry_ops = {str(((r.get("execution") or {}).get("entry_op"))) for r in recs}
@@ -210,7 +228,11 @@ def _fills_ownership(grad, fills, d):
     per_mint = {}
     for r in recs:
         per_mint.setdefault(r.get("mint"), set()).add(str(r.get("pa_pos_id") or r.get("entry_op") or id(r)))
-    bad = []
+    bad, notes = [], {"entry_refused_no_debit": 0, "entry_settled_on_account_unowned": 0}
+    fills = jj.get("fills") or {}
+    for k in (jj.get("intents") or {}):
+        if str(k).startswith(lane + "|"):
+            bad.append("open_entry_intent:%s" % k)
     for k in fills:
         if not isinstance(k, str):
             bad.append("fill_key_not_string"); continue
@@ -219,16 +241,27 @@ def _fills_ownership(grad, fills, d):
         parts = k.split(":")
         kind = parts[1] if len(parts) > 1 else ""
         if kind == "entry":
-            if k not in entry_ops: bad.append("entry_fill_unowned:%s" % k)
+            if k in entry_ops:
+                continue
+            if acct is None:
+                bad.append("entry_fill_unclassifiable_account_journal_unreadable:%s" % k); continue
+            if k not in acct["debits"]:
+                notes["entry_refused_no_debit"] += 1; continue
+            pid = acct["debits"][k]
+            if pid is not None and str(pid) in pids:
+                continue
+            if pid is not None and pid in acct["settled"]:
+                notes["entry_settled_on_account_unowned"] += 1; continue
+            bad.append("entry_fill_debited_unowned:%s" % k)
         elif kind == "exit":
             if len(parts) < 4: bad.append("exit_fill_malformed:%s" % k); continue
             mint = parts[2]
-            if mint not in per_mint: bad.append("exit_fill_unowned_mint:%s" % k)
+            if mint not in per_mint: bad.append("exit_fill_unowned_mint_or_beyond_retained_closes:%s" % k)
             elif len(parts) >= 5 and parts[4] not in pids: bad.append("exit_fill_unowned_instance:%s" % k)
             elif len(parts) == 4 and len(per_mint[mint]) > 1: bad.append("exit_fill_ambiguous_instance:%s" % k)
         else:
             bad.append("fill_key_unknown_kind:%s" % k)
-    return bad
+    return bad, notes
 
 
 def _fingerprint(grad, account=None):
@@ -267,7 +300,10 @@ def clear_fault(grad, account=None, operator_note=""):
     ev["fault_record"] = "none" if f is None else ("unreadable" if f.get("unreadable") else "present")
     if f is not None and f.get("unreadable"):
         return False, dict(ev, blocked=["fault_record_unreadable"])
-    if f is None and not _open_logged_faults(grad):
+    _lg = _open_logged_faults(grad)
+    if _lg is None and f is None:
+        return False, dict(ev, blocked=["fault_log_unreadable"])
+    if f is None and not _lg:
         return False, dict(ev, blocked=["no_fault"])
     bad = []
     j = _read_journal(grad)
@@ -324,9 +360,11 @@ def clear_fault(grad, account=None, operator_note=""):
         ev["account_journal_internal_consistency"] = det
         if ok_c is not True: bad.append("account_journal_consistency_%s" % ("failed" if ok_c is False else "unevaluable"))
     try:
-        fills = grad._demo_filler()._locked(lambda jj: dict(jj["fills"])); ev["fill_journal"] = "ok:%d" % len(fills)
+        jj = grad._demo_filler()._locked(lambda j_: json.loads(json.dumps({"fills": j_.get("fills") or {}, "intents": j_.get("intents") or {}}, default=str)))
+        ev["fill_journal"] = "ok:%d" % len(jj["fills"])
         if d is not None:
-            own = _fills_ownership(grad, fills, d)
+            own, notes = _fills_ownership(grad, jj, d, _account_op_index(pa) if pa is not None else None)
+            ev["fill_ownership_notes"] = notes
             if own: bad.append("fill_ownership:%s" % own[:5])
     except Exception as e:
         ev["fill_journal"] = "unreadable:%r" % (e,); bad.append("fill_journal")
@@ -406,7 +444,7 @@ def scan_gate(grad, account=None):
     return True, None
 
 
-def _run_cycle_inner(grad=None, price_fn=None, scan_fn=None, now=None, price_route=None, lock_ok=True):
+def _run_cycle_inner(grad=None, price_fn=None, scan_fn=None, now=None, price_route=None, lock_ok=True, defer_scan=False):
     """Never raises. Returns the cycle record (also journaled). See the module docstring for the price and gate contracts."""
     out = {"boot_id": _BOOT["id"], "steps": {}, "scan_skipped": None}
     if not enabled():
@@ -464,13 +502,15 @@ def _run_cycle_inner(grad=None, price_fn=None, scan_fn=None, now=None, price_rou
         out["scan_skipped"] = "cycle_lock_io_failure"
     elif not intent_ok:
         out["scan_skipped"] = "cycle_journal_unavailable"      # exits already ran; NEW entries need the durable cycle intent
+    elif defer_scan:
+        out["scan_deferred"] = True          # exits are done; scan_phase() runs the scan AFTER every lane's exits
     else:
         ok, why = scan_gate(grad)
         if not ok:
             out["scan_skipped"] = why
         else:
             try:
-                scan_fn(); out["steps"]["scan"] = {"ok": True}
+                _res = scan_fn(); out["steps"]["scan"] = {"ok": True, "feed_health": (_res or {}).get("feed_health") if isinstance(_res, dict) else None}
             except Exception as e:
                 out["steps"]["scan"] = {"ok": False, "error": repr(e)[:200]}
     out["status"] = "done"
@@ -482,7 +522,7 @@ def _run_cycle_inner(grad=None, price_fn=None, scan_fn=None, now=None, price_rou
 from daemon.common import Daemon as _Daemon       # a broken import FAILS CLOSED (module import error), never a stand-in base class
 
 
-def run_cycle(grad=None, price_fn=None, scan_fn=None, now=None, price_route=None):
+def run_cycle(grad=None, price_fn=None, scan_fn=None, now=None, price_route=None, defer_scan=False):
     """Takes the per-ledger cycle lock (non-blocking flock; the SAME lock clear_fault's commit takes) around the whole cycle. When it cannot be
     taken (a clear is committing, or another cycle runs on this ledger) nothing runs this tick and the record says so; the next tick retries."""
     if grad is None and enabled():
@@ -498,12 +538,57 @@ def run_cycle(grad=None, price_fn=None, scan_fn=None, now=None, price_route=None
     except BlockingIOError as e:
         return {"status": "busy:cycle_lock_held:%r" % (e,), "steps": {}, "scan_skipped": "busy"}
     except Exception as e:       # an I/O failure (not contention): exits STILL run, NEW entries are refused (no lock, no durable intent)
-        return _run_cycle_inner(grad, price_fn, scan_fn, now, price_route, lock_ok=False)
+        return _run_cycle_inner(grad, price_fn, scan_fn, now, price_route, lock_ok=False)      # never defers: entries are refused anyway
     try:
-        return _run_cycle_inner(grad, price_fn, scan_fn, now, price_route)
+        return _run_cycle_inner(grad, price_fn, scan_fn, now, price_route, defer_scan=defer_scan)
     finally:
         try: lk.close()
         except Exception: pass
+
+
+def scan_phase(grad, scan_fn, rec):
+    """Second phase of a deferred cycle: runs the entry scan for ONE lane, after every lane's exit phase. Takes the same per-ledger cycle lock, re-checks
+    the scan gate NOW (fault, markers, account) and whether an abort happened since the exit phase ended. Never raises; exits are not involved."""
+    import fcntl  # noqa: PLC0415
+    if not rec.get("scan_deferred") or scan_fn is None:
+        return rec
+    rec["scan_deferred"] = False
+    try:
+        lk = open(_cycle_lock_path(grad), "w"); fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception as e:
+        rec["scan_skipped"] = "busy_or_lock_failure:%r" % (e,); return rec
+    try:
+        now_ab = _abort_count(grad)
+        if now_ab is None or (rec.get("aborts_end") is not None and now_ab > int(rec["aborts_end"])):
+            _record_fault(grad, rec, "abort_between_exit_phase_and_scan", aborts_end=rec.get("aborts_end"), aborts_now=now_ab)
+            rec["scan_skipped"] = "abort_before_scan"
+        else:
+            ok, why = scan_gate(grad)
+            if not ok:
+                rec["scan_skipped"] = why
+            else:
+                try:
+                    _res = scan_fn(); rec.setdefault("steps", {})["scan"] = {"ok": True, "feed_health": (_res or {}).get("feed_health") if isinstance(_res, dict) else None}
+                except Exception as e:
+                    rec.setdefault("steps", {})["scan"] = {"ok": False, "error": repr(e)[:200]}
+        try: _atomic(_journal_path(grad), dict(rec))
+        except Exception: pass
+        return rec
+    finally:
+        try: lk.close()
+        except Exception: pass
+
+
+def run_all(engines, now=None):
+    """engines = [(lane, grad, scan_fn)]. ALL lanes' exit phases run first; only then each lane's scan (so a slow scan on one lane cannot delay another
+    lane's exits). Returns {lane: record}."""
+    recs = {}
+    for lane, eng, sf in engines:
+        recs[lane] = run_cycle(grad=eng, price_fn=None, scan_fn=sf, now=now, price_route="lane_default", defer_scan=True)
+    for lane, eng, sf in engines:
+        try: scan_phase(eng, sf, recs[lane])
+        except Exception as e: recs[lane]["scan_skipped"] = "scan_phase_error:%r" % (e,)
+    return recs
 
 
 class GradCycleDaemon(_Daemon):
@@ -551,7 +636,9 @@ def make_select_scan_fn(engine, feed=None, gt_rows_fn=None):
     INJECTED: this module opens no stream. With neither, scan_once sees no candidates and opens nothing (an inert scan, by design)."""
     def _scan():
         from daemon.launch_scanner import grad_select  # noqa: PLC0415
-        return grad_select.scan_once(engine, feed=feed, gt_rows=(gt_rows_fn() if gt_rows_fn else None))
+        res = grad_select.scan_once(engine, feed=feed, gt_rows=(gt_rows_fn() if gt_rows_fn else None))
+        h = feed.health() if feed is not None and hasattr(feed, "health") else None
+        return dict(res or {}, feed_health=h)       # an empty feed with feed_health None is genuinely empty; an error is visible in the cycle journal
     return _scan
 
 
@@ -608,7 +695,7 @@ def main_entry(argv=None):
     # Exits use each lane's own default read-only price route (price_fn None, price_route="lane_default"). Each engine has its OWN ledger, so
     # faults, journals and clear records are per lane. No graduation feed is opened here (needs a reviewed adapter): entries stay inert.
     d = GradCycleDaemon(price_route="lane_default")
-    d.run_once = lambda: [run_cycle(grad=e, price_fn=None, scan_fn=sf, price_route="lane_default") for (_l, e, sf) in engines]
+    d.run_once = lambda: run_all(engines)
     return d.run_forever()
 
 

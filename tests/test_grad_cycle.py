@@ -68,8 +68,7 @@ def rich(snap=None, positions=None, closes=None, fills=None, aborts=0, journal_e
     g.snap = snap if snap is not None else {"degraded": None, "start_balance": start, "cash": cash, "lanes": {lane: {"positions": []}}, "pending_sol": [], "holds": {}, "unresolved": [], "assumed_sold": []}
     g.entries = journal_entries if journal_entries is not None else []
     g.replay = {"reason": None}
-    g.pa = types.SimpleNamespace(snapshot=lambda: g.snap, _journal_read=lambda: (g.entries, None, None), _lock=_Lock,
-                                 _load_locked=lambda: ({"seq": 1}, True, None), _derive_buckets_locked=lambda led, entries: (led, g.replay["reason"]))
+    g.pa = types.SimpleNamespace(snapshot=lambda: g.snap, _journal_read=lambda: (g.entries, None, None), verify_replay=lambda: ((False, g.replay["reason"]) if g.replay["reason"] else ((None, g.replay["none"]) if g.replay.get("none") else (True, "match"))))
     g._paper_account = lambda: g.pa
     return g
 def cyc(g, **kw):
@@ -97,9 +96,10 @@ for label, mut, key in (
     ("account has assumed_sold for the lane", lambda g: g.snap.__setitem__("assumed_sold", [{"lane": "grad"}]), "account_assumed_sold_for_lane"),
     ("the fill journal holds an exit fill that no lane position or close owns", lambda g: g.fills.__setitem__("grad:exit:MINTX:k1", {}), "fill_ownership"),
     ("the account's OWN genesis replay reports a divergence", lambda g: g.replay.__setitem__("reason", "cash mismatch vs journal"), "account_journal_consistency_failed"),
-    ("account journal is torn", lambda g: setattr(g.pa, "_journal_read", lambda: ([], "torn", None)), "account_journal_consistency_unevaluable"),
-    ("the account replay cannot run (account unhealthy)", lambda g: setattr(g.pa, "_load_locked", lambda: (None, False, "x")), "account_journal_consistency_unevaluable"),
-    ("the fill journal holds an ENTRY fill that no open or closed position's entry_op owns", lambda g: g.fills.__setitem__("grad:entry:MINTY:123", {}), "fill_ownership"),
+    ("the account replay cannot run (unevaluable)", lambda g: g.replay.__setitem__("none", "ledger_file_unreadable_or_missing"), "account_journal_consistency_unevaluable"),
+    ("an ENTRY fill has an account debit (still open on the account) and no lane owner", lambda g: (g.fills.__setitem__("grad:entry:MINTY:123", {}), g.entries.append({"event": "debit", "op_id": "grad:entry:MINTY:123", "pos_id": "PX"})), "fill_ownership"),
+    ("an open entry intent exists for the lane", lambda g: setattr(g, "_demo_filler", lambda: types.SimpleNamespace(_locked=lambda fn: fn({"fills": g.fills, "intents": {"grad|MINTZ": {}}}))), "fill_ownership"),
+    ("the account journal is unreadable while an entry fill needs classifying", lambda g: (g.fills.__setitem__("grad:entry:MINTY:123", {}), setattr(g.pa, "_journal_read", lambda: ([], "torn", None))), "fill_ownership"),
     ("the fill journal has a key of an unknown kind for this lane", lambda g: g.fills.__setitem__("grad:weird:MINTY:1", {}), "fill_ownership"),
     ("an exit fill names an instance (pa_pos_id suffix) no position owns", lambda g: (g.state["closes"].append({"mint": "M2", "pa_pos_id": "P2"}), g.fills.__setitem__("grad:exit:M2:k:P9", {})), "fill_ownership"),
     ("a bare exit fill is ambiguous: the mint has two owned instances", lambda g: (g.state["closes"].extend([{"mint": "M2", "pa_pos_id": "P2"}, {"mint": "M2", "pa_pos_id": "P3"}]), g.fills.__setitem__("grad:exit:M2:k", {})), "fill_ownership"),
@@ -164,6 +164,31 @@ g = rich(); abort_once(g); _lk = open(g.LEDGER_PATH + ".cycle.lock", "w"); fcntl
 rb = cyc(g); okb, evb = GC.clear_fault(g); _lk.close()
 check("C10t the per-ledger cycle lock: while held, run_cycle runs nothing (busy) and clear_fault refuses (%s, %s)" % (rb["status"], evb.get("blocked")), rb["status"].startswith("busy") and g.calls == [] and (not okb) and any("cycle_lock_unavailable" in b for b in evb["blocked"]))
 GC.CLEAR_COMMIT_ENABLED = False
+GC.CLEAR_COMMIT_ENABLED = True
+g = rich(); abort_once(g); g.fills["grad:entry:MINTR:5"] = {}   # a REFUSED entry: fill journaled, NO account debit
+okr, evr = GC.clear_fault(g)
+check("C10u a refused entry (fill, no account debit) and a settled-on-account debit with no lane record are BENIGN, counted, and do not block the clear (%s %s)" % (evr.get("blocked"), evr.get("fill_ownership_notes")), okr and evr["fill_ownership_notes"]["entry_refused_no_debit"] == 1)
+g = rich(); abort_once(g); g.fills["grad:entry:MINTS:6"] = {}; g.entries.extend([{"event": "debit", "op_id": "grad:entry:MINTS:6", "pos_id": "PS"}, {"event": "credit", "pos_id": "PS", "final": True}])
+oks, evs = GC.clear_fault(g)
+check("C10v a debit that the account already settled (final credit) with no lane record is benign and counted (%s)" % (evs.get("fill_ownership_notes"),), oks and evs["fill_ownership_notes"]["entry_settled_on_account_unowned"] == 1)
+g = rich(); abort_once(g)
+with open(g.LEDGER_PATH + ".cycle-fault-log.jsonl", "a") as fh: fh.write('{"fault_id": "x"')   # torn last line, no newline
+os.remove(g.LEDGER_PATH + ".cycle-fault.json")
+check("C10w a torn LAST fault-log line is tolerated: the earlier logged fault is still active and the clear does not say no_fault (%s)" % (GC.fault_active(g),), GC.fault_active(g)[0] and "no_fault" not in (GC.clear_fault(g)[1].get("blocked") or []))
+g = rich(); open(g.LEDGER_PATH + ".cycle-fault-log.jsonl", "w").write("garbage line\n")
+check("C10x a COMPLETE unparseable fault-log line is damage: active and reported as fault_log_unreadable, not no_fault", GC.fault_active(g)[0] and GC.clear_fault(g)[1].get("blocked") == ["fault_log_unreadable"])
+GC.CLEAR_COMMIT_ENABLED = False
+# exits-before-scans across lanes
+order = []
+ga = rich(); gb = rich(); gb.LEDGER_PATH = os.path.join(TMP, "laneB2.json")
+ga.poll_exits = lambda price_fn=None: (order.append("A_exits") or []); gb.poll_exits = lambda price_fn=None: (order.append("B_exits") or [])
+recs = GC.run_all([("A", ga, lambda: (order.append("A_scan") or {"x": 1})), ("B", gb, lambda: (order.append("B_scan") or {}))])
+check("C15 run_all: EVERY lane's exits run before ANY scan (%s)" % order, order == ["A_exits", "B_exits", "A_scan", "B_scan"])
+ga = rich(); gb = rich(); gb.LEDGER_PATH = os.path.join(TMP, "laneB3.json"); order.clear()
+_pa = ga.poll_exits
+def _slow_scan_then_abort(): order.append("A_scan"); gb.ab["poll_aborts"]["count"] += 1; return {}
+recs = GC.run_all([("A", ga, _slow_scan_then_abort), ("B", gb, lambda: (order.append("B_scan") or {}))])
+check("C16 an abort that happens between lane B's exit phase and its scan is faulted and B's scan is refused (%s, %s)" % (recs["B"].get("scan_skipped"), order), recs["B"]["scan_skipped"] == "abort_before_scan" and "B_scan" not in order and GC.fault_active(gb)[0])
 GC._MEM.clear()
 g = fake(dict(CLEAN, n_pending=1), snap=OK_SNAP); r3 = GC.run_cycle(g, scan_fn=lambda: g.calls.append("scan"), price_route="lane_default")
 check("C11 an unresolved pending_exit keeps the scan refused across cycles (durable gate, not the in-memory counter): %s" % r3["scan_skipped"], "scan" not in g.calls and "n_pending" in str(r3["scan_skipped"]))

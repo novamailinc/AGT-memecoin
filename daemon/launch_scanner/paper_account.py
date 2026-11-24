@@ -1296,6 +1296,38 @@ def _derive_buckets_locked(led: Dict[str, Any],
     return led, None
 
 
+def verify_replay() -> Tuple[Optional[bool], str]:
+    """READ-ONLY check (writes nothing: no torn-tail truncation, no ledger creation, no .bak restore, no reconcile). Replays the WAL from genesis
+    on a deepcopy of the stored ledger file and compares: cash total, cash_spendable, cash_estimated, assumed_sold keys and the per-lane open
+    position key sets (the first two are checked inside _derive_buckets_locked, the rest here). NOT checked, because the replay keeps them local:
+    holds, pending_sol, per-position qty/basis. Returns (True, why) only on a full match of those; (False, reason) on a divergence; (None, reason)
+    when it cannot be evaluated (unreadable/torn/holed journal, missing ledger file). It is the account against its OWN journal, not independent
+    conservation."""
+    import copy
+    try:
+        with _lock():
+            entries, jstatus, _off = _journal_read()
+            if jstatus is not None:
+                return None, "journal_status:%s" % jstatus
+            if _seq_violation(entries) is not None:
+                return None, "journal_seq_violation"
+            led = _read_json(LEDGER_PATH)
+            if not isinstance(led, dict):
+                return None, "ledger_file_unreadable_or_missing"
+            led2 = copy.deepcopy(led)
+        _res, reason = _derive_buckets_locked(led2, entries)
+        if reason:
+            return False, str(reason)[:300]
+        for k in ("cash_spendable", "cash_estimated"):
+            if abs(float(led.get(k) or 0.0) - float(led2.get(k) or 0.0)) > 1e-6:
+                return False, "%s differs from the replay" % k
+        if set((led.get("assumed_sold") or {}).keys()) != set((led2.get("assumed_sold") or {}).keys()):
+            return False, "assumed_sold keys differ from the replay"
+        return True, "cash_buckets_assumed_sold_keys_and_open_position_sets_match_the_journal"
+    except Exception as e:
+        return None, "verify_replay_error:%r" % (e,)
+
+
 def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
                             Optional[str]]:
     """Read the ledger under the lock. Returns (ledger, healthy,

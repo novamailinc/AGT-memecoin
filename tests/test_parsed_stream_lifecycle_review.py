@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import types
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.getcwd())
@@ -11,7 +12,7 @@ from daemon.launch_scanner import LaunchScanner
 
 class Lifecycle(unittest.TestCase):
     def client(self):
-        c=hs.HeliusParsedStreamClient(wss_url='wss://beta.helius-rpc.com/?api-key=fixture')
+        c=hs.HeliusParsedStreamClient(wss_url='wss://beta.helius-rpc.com/?api-key=fixture',usage_store=MagicMock(),account_home=tempfile.mkdtemp())
         c._factory=MagicMock()
         return c
     def test_unknown_real_url_refused_before_factory(self):
@@ -56,7 +57,7 @@ class Lifecycle(unittest.TestCase):
             def __init__(self,target,**kwargs): self.target=target;jobs.append(self)
             def start(self): pass
         cfg=types.SimpleNamespace(degen=types.SimpleNamespace(parsed_stream_enabled=True))
-        with patch.object(hs,'HeliusParsedStreamClient',return_value=c),patch.object(routine,'websocket_url',return_value='wss://beta.helius-rpc.com/?api-key=fixture'),patch.object(routine,'router',return_value=object()),patch.object(threading,'Thread',Thread):
+        with patch.object(hs,'HeliusParsedStreamClient',return_value=c),patch.object(routine,'websocket_url',return_value='wss://beta.helius-rpc.com/?api-key=fixture'),patch.object(routine,'router',return_value=MagicMock()),patch.object(threading,'Thread',Thread):
             s._ensure_parsed_stream(cfg)
             self.assertEqual(len(jobs),1);c.connect.assert_not_called()
             jobs[0].target();c.run_forever.assert_called_once()
@@ -69,3 +70,36 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(routine._is_helius_ws_host('beta.helius-rpc.com.evil.invalid'))
 
 if __name__=='__main__': unittest.main(verbosity=2)
+
+class DurableReview(unittest.TestCase):
+    def test_failed_write_marker_survives_new_client(self):
+        from daemon.intelligence.acquisition import stream_accounting_guard as guard
+        with tempfile.TemporaryDirectory() as home:
+            with self.assertRaises(OSError):
+                with guard.recording(home):raise OSError('fixture write failure')
+            self.assertFalse(guard.allowed(home))
+            c=hs.HeliusParsedStreamClient(wss_url='wss://beta.helius-rpc.com/?api-key=fixture',usage_store=MagicMock(),account_home=home)
+            with patch.object(routine,'websocket_admit') as admit:
+                self.assertFalse(c.connect());admit.assert_not_called()
+    def test_event_credit_failure_stops_and_blocks_recreation(self):
+        from daemon.intelligence.acquisition import stream_accounting_guard as guard
+        with tempfile.TemporaryDirectory() as home:
+            store=MagicMock();store.record.side_effect=OSError('fixture event billing write')
+            c=hs.HeliusParsedStreamClient(usage_store=store,account_home=home)
+            with self.assertRaises(OSError):c._record_usage('parsed_streams/event','ok',cost=1)
+            self.assertTrue(c._stop.is_set());self.assertFalse(guard.allowed(home))
+    def test_config_disable_stops_existing_worker(self):
+        s=LaunchScanner.__new__(LaunchScanner);s._parsed_stream=MagicMock();old=s._parsed_stream
+        s._ensure_parsed_stream(types.SimpleNamespace(degen=types.SimpleNamespace(parsed_stream_enabled=False)))
+        old.stop.assert_called_once();self.assertIsNone(s._parsed_stream)
+    def test_stop_during_admission_cannot_construct(self):
+        with tempfile.TemporaryDirectory() as home:
+            c=hs.HeliusParsedStreamClient(wss_url='wss://beta.helius-rpc.com/?api-key=fixture',usage_store=MagicMock(),account_home=home)
+            c._factory=MagicMock()
+            def admit(url):c.stop();return True
+            with patch.object(routine,'websocket_admit',side_effect=admit):self.assertFalse(c.connect())
+            c._factory.assert_not_called()
+    def test_constructor429_reports_shared_hold(self):
+        c=hs.HeliusParsedStreamClient(wss_url='wss://fake.invalid',ws_factory=MagicMock(side_effect=RuntimeError('429 fixture')))
+        with patch.object(routine,'websocket_admit',return_value=False),patch.object(c,'_on_error') as report:
+            self.assertFalse(c.connect());report.assert_called_once()

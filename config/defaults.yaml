@@ -1332,6 +1332,7 @@ degen:
   fp_warm_score: 45.0            # composite >= this -> WARMING
   fp_holder_refresh_s: 600       # min seconds between holder refreshes
   fp_holder_per_cycle: 3         # max fresh holder lookups per cycle
+  parsed_stream_enabled: false # no stream activation by default
   logstream_enabled: true      # sub-second program-log detection thread
   usdc_pools_enabled: true     # USDC-quoted new pools (GeckoTerminal, ~1/min)
   # --- PumpPortal WebSocket discovery (free streams only: new tokens + migrations) ---

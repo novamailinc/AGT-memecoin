@@ -419,6 +419,10 @@ class LaunchScanner(Daemon):
             except Exception:
                 logger.exception("logstream drain failed")
             try:
+                self._drain_parsed_stream(config, adapter, state)
+            except Exception:
+                logger.exception("parsed stream drain failed")
+            try:
                 self._drain_pumpportal(config, adapter, state)
             except Exception:
                 logger.exception("pumpportal drain failed")
@@ -1049,6 +1053,9 @@ class LaunchScanner(Daemon):
         shared-account admission and handshake accounting are all in
         force inside the client."""
         if getattr(config.degen, "parsed_stream_enabled", False) is not True:
+            self._stop_parsed_stream()
+            return
+        if getattr(self, "_stop", False):
             return
         if getattr(self, "_parsed_stream", None) is not None:
             return
@@ -1059,8 +1066,10 @@ class LaunchScanner(Daemon):
             logger.warning("parsed stream: no usable Helius key — "
                            "stream disabled")
             return
+        stream_router = routine.router()
         st = helius_streams.HeliusParsedStreamClient(
-            wss_url=url, router=routine.router(),
+            wss_url=url, router=stream_router,
+            usage_store=stream_router.usage.store, account_home=stream_router.home,
             on_event=self._on_parsed_stream_event)
         ok, note = st.subscribe(helius_streams.pumpfun_filter(),
                                 "pumpfun")
@@ -1101,17 +1110,22 @@ class LaunchScanner(Daemon):
         finally:
             self._stop_parsed_stream()
 
+    def _parsed_intake(self):
+        intake = getattr(self, "_parsed_stream_intake", None)
+        if intake is None:
+            from .parsed_stream_intake import ParsedStreamIntake
+            intake = ParsedStreamIntake()
+            self._parsed_stream_intake = intake
+        return intake
+
     def _on_parsed_stream_event(self, event) -> None:
-        """Diagnostic delivery only. Candidate integration is NOT
-        implemented: the existing acceptance matrix explicitly calls
-        this delivery evidence, not full intelligence integration.
-        A decoded event is not a raw Solana transaction and cannot be
-        passed to SelectiveEnrichment.submit as if it were one.
-        No candidate state or trade authority changes here."""
-        logger.info("parsed stream event slot=%s sig=%s status=%s",
-                    event.get("slot"),
-                    str(event.get("signature") or "")[:12],
-                    event.get("verification_status"))
+        self._parsed_intake().receive_event(event)
+
+    def _drain_parsed_stream(self, config, adapter, state):
+        if getattr(config.degen, "parsed_stream_enabled", False) is not True:
+            return
+        self._drain_stream_candidates(config, adapter, state,
+            self._parsed_intake(), 'parsed_stream', 'pumpfun-parsed-verified')
 
     def _drain_logstream(self, config, adapter,
                          state: Dict[str, Any]) -> None:
@@ -1119,10 +1133,14 @@ class LaunchScanner(Daemon):
         ls = getattr(self, "_logstream", None)
         if ls is None:
             return
+        self._drain_stream_candidates(config, adapter, state, ls,
+                                      'logstream', 'pumpfun-log')
+
+    def _drain_stream_candidates(self, config, adapter, state, ls, lane, source):
         # A loaded committed batch may need only ACK after a crash.
-        if state.get('logstream_committed_refs'):
-            ls.acknowledge(state['logstream_committed_refs'])
-            state['logstream_committed_refs']=[]
+        if state.get(lane+'_committed_refs'):
+            ls.acknowledge(state[lane+'_committed_refs'])
+            state[lane+'_committed_refs']=[]
         for item in ls.drain():
             if getattr(self, "_stop", False):
                 logger.warning("logstream drain stopping on SIGTERM — "
@@ -1135,7 +1153,7 @@ class LaunchScanner(Daemon):
             c = {
                 "mint": mint,
                 "symbol": "", "name": "",
-                "chain": "solana", "source": "pumpfun-log",
+                "chain": "solana", "source": source,
                 "created_ts": item.get("ts") or time.time(),
                 "usd_market_cap": 0.0,
                 "extra": {"complete": False, "banned": False,
@@ -1150,16 +1168,16 @@ class LaunchScanner(Daemon):
             try:
                 self._consider(config, adapter, state, c)
                 token=uuid.uuid4().hex
-                state['logstream_commit']=token
-                state['logstream_committed_refs']=[item['signature']]
+                state[lane+'_commit']=token
+                state[lane+'_committed_refs']=[item['signature']]
                 store=get_store()
                 store.journal_add({'kind':'daemon_state','symbol':self.name,'detail':dict(state)})
                 rows=store.journal_query(kind='daemon_state',symbol=self.name,limit=1)
-                if not rows or (rows[0].get('detail') or {}).get('logstream_commit')!=token:
+                if not rows or (rows[0].get('detail') or {}).get(lane+'_commit')!=token:
                     raise OSError('logstream handoff persistence not verified')
                 durable=True
                 ls.acknowledge([item['signature']])
-                state['logstream_committed_refs']=[]
+                state[lane+'_committed_refs']=[]
                 try:store.prune_journal(kind='daemon_state',symbol=self.name,keep=10)
                 except Exception:logger.warning('logstream state prune failed',exc_info=True)
             except Exception:

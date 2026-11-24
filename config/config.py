@@ -488,6 +488,10 @@ class DegenConfig:
     # Early-fingerprint toolkit (fingerprints.py): per-mint buy/volume
     # acceleration + holder growth -> composite 0-100 HOT/WARMING/COLD.
     fp_enabled: bool = field(default_factory=lambda: _bool("DEGEN_FP_ENABLED", _y("degen", "fp_enabled", default=True)))
+    fp_series_journal_path: str = field(default_factory=lambda: os.environ.get(
+        "DEGEN_FP_SERIES_JOURNAL_PATH", str(_y("degen", "fp_series_journal_path", default=
+        os.path.join(os.environ.get("FOREX_AGENT_HOME", os.path.expanduser("~/.forex-agent")),
+                     "launch_scanner", "fp_series_journal.jsonl")))))
     fp_window_polls: int = field(default_factory=lambda: _int("DEGEN_FP_WINDOW_POLLS", _y("degen", "fp_window_polls", default=6)))
     fp_min_polls: int = field(default_factory=lambda: _int("DEGEN_FP_MIN_POLLS", _y("degen", "fp_min_polls", default=3)))
     fp_buy_floor: float = field(default_factory=lambda: _float("DEGEN_FP_BUY_FLOOR", _y("degen", "fp_buy_floor", default=3.0)))
@@ -500,6 +504,7 @@ class DegenConfig:
     # mints (pump.fun). Deploys a background thread; degrades gracefully
     # to polling when the websocket is unreachable.
     logstream_enabled: bool = field(default_factory=lambda: _bool("DEGEN_LOGSTREAM_ENABLED", _y("degen", "logstream_enabled", default=True)))
+    parsed_stream_enabled: bool = field(default_factory=lambda: _bool("DEGEN_PARSED_STREAM_ENABLED", _y("degen", "parsed_stream_enabled", default=False)))
     # USDC-pair launch discovery: newest USDC-quoted pools via free
     # GeckoTerminal new_pools (Raydium/Meteora/Orca on Solana,
     # Aerodrome/Uniswap on Base, Uniswap on Ethereum). Polled ~1/min.

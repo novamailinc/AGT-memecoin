@@ -681,7 +681,7 @@ class HeliusParsedStreamClient:
     """
 
     def __init__(self, wss_url=None, router=None, ws_factory=None,
-                 on_event=None, now=None, usage_store=None):
+                 on_event=None, now=None, usage_store=None, account_home=None):
         self._wss_url = wss_url  # never logged (carries the key)
         self._router = router
         self._factory = ws_factory or self._default_factory
@@ -700,6 +700,7 @@ class HeliusParsedStreamClient:
         # standalone). Recording never raises and never blocks the
         # stream: a store failure is logged once per call site.
         self._usage_store = usage_store
+        self._account_home = account_home or getattr(router, "home", None)
         self._wanted = {}      # label -> {filter, options, priority,
         #                        local_id, server_id}
         self._next_local_id = 1
@@ -823,20 +824,28 @@ class HeliusParsedStreamClient:
             logger.warning("parsed-stream subscribe send failed")
 
     def _record_usage(self, method, kind, cost=None, elapsed=0.0):
-        """One persistent usage line (D-07). Never raises."""
+        """Persistent credit/outcome record. Production errors stop the
+        stream and leave a durable unresolved marker across recreation."""
         store = self._usage_store
         if store is None:
+            if self._real_transport:
+                self._accounting_blocked = True
+                self.stop()
+                raise RuntimeError("real parsed stream requires usage_store")
             return None
+        from . import stream_accounting_guard
         try:
-            return store.record(
-                account="helius_main", provider="helius",
-                method=method, workload=PARSED_TX_STREAM,
-                priority=PRIORITY_CARD, helius_priority=None,
-                cost=cost, kind=kind, elapsed=elapsed)
+            with stream_accounting_guard.recording(self._account_home):
+                return store.record(
+                    account="helius_main", provider="helius",
+                    method=method, workload=PARSED_TX_STREAM,
+                    priority=PRIORITY_CARD, helius_priority=None,
+                    cost=cost, kind=kind, elapsed=elapsed)
         except Exception:
-            logger.warning("parsed-stream usage record failed",
-                           exc_info=True)
-            return None
+            self.accounting_failures += 1
+            self._accounting_blocked = True
+            self.stop()
+            raise
 
     def record_verified_event(self, event=None):
         """A consumer verified one received event against the own
@@ -883,6 +892,19 @@ class HeliusParsedStreamClient:
             # 1 credit per delivered event (CREDITS_PER_EVENT).
             self._record_usage("parsed_streams/event", "ok",
                                cost=CREDITS_PER_EVENT)
+            if self._real_transport:
+                from .usage_tracker import UsageTracker
+                try:
+                    allowed, _ = UsageTracker(home=self._account_home).nonessential_allowed(
+                        'helius_main', 'background', workload=PARSED_TX_STREAM,
+                        provider='helius')
+                except Exception:
+                    self._accounting_blocked = True
+                    self.stop()
+                    raise
+                if not allowed:
+                    self.stop()
+                    return
             if event.get("slot") is not None:
                 self.last_slot = event["slot"]
             if event["verification_status"] == VERIFICATION_UNDECODED:
@@ -902,6 +924,9 @@ class HeliusParsedStreamClient:
                 # A subscription rejection is not a failed HTTP
                 # upgrade handshake — report it on that lane.
                 self._report_subscription_throttled()
+                self.connected = False
+                if self._ws is not None:
+                    self._ws.close()
             return
 
     def _on_open(self, _ws):
@@ -932,7 +957,9 @@ class HeliusParsedStreamClient:
         (accounting_failures, surfaced in stats()) and logged."""
         from . import routine as _routine
         try:
-            _routine.websocket_result(self._wss_url, error)
+            from . import stream_accounting_guard
+            with stream_accounting_guard.recording(self._account_home):
+                _routine.websocket_result(self._wss_url, error)
             return True
         except Exception:
             self.accounting_failures += 1
@@ -945,7 +972,9 @@ class HeliusParsedStreamClient:
     def _report_subscription_throttled(self):
         from . import routine as _routine
         try:
-            _routine.websocket_subscription_throttled(self._wss_url)
+            from . import stream_accounting_guard
+            with stream_accounting_guard.recording(self._account_home):
+                _routine.websocket_subscription_throttled(self._wss_url)
         except Exception:
             self.accounting_failures += 1
             self._accounting_blocked = True
@@ -989,7 +1018,10 @@ class HeliusParsedStreamClient:
         Subscriptions are sent from ``_on_open`` only, never from
         here. Refuses when unconfigured (no URL) or when the router
         refuses the stream."""
-        if self._accounting_blocked:
+        from . import stream_accounting_guard
+        if self._accounting_blocked or (self._real_transport and not stream_accounting_guard.allowed(self._account_home)):
+            return False
+        if self._real_transport and self._usage_store is None:
             return False
         if not self.configured():
             return False
@@ -1013,16 +1045,15 @@ class HeliusParsedStreamClient:
             logger.warning("parsed-stream connect refused: URL outside "
                            "shared-account admission policy")
             return False
+        if self._stop.is_set():
+            return False
         self.connect_attempts += 1
         try:
             self._ws = self._factory(
                 self._wss_url, self._on_message, self._on_error,
                 self._on_close, self._on_open)
         except Exception as exc:
-            if "429" in str(exc):
-                self.handshake_429s += 1
-                self._record_usage("parsed_streams/handshake",
-                                   "rate_limited")
+            self._on_error(None, exc)
             return False
         return True
 

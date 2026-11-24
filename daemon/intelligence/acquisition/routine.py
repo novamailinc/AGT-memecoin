@@ -120,7 +120,8 @@ def websocket_admit(url, critical=False):
     host=urlsplit(url).hostname or ''
     if _is_helius_ws_host(host):
         r=router();account='helius_main'
-        from . import helius_account
+        from . import helius_account, stream_accounting_guard
+        if not stream_accounting_guard.allowed(r.home):raise WebsocketAdmissionError('Helius unresolved stream accounting')
         if not helius_account.allowed(r.home):raise WebsocketAdmissionError('Helius shared account hold')
         if r.usage.account_disabled(account):raise WebsocketAdmissionError('Helius account disabled')
         allowed,reason=r.usage.nonessential_allowed(account,PRIORITY_CRITICAL if critical else PRIORITY_BACKGROUND,workload='routine_websocket',provider='helius')

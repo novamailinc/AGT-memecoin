@@ -166,18 +166,18 @@ from daemon.intelligence.acquisition.providers import helius as hadapt
 adapter = hadapt.HeliusAdapter()
 
 _real_rpc_typed = res.helius_rpc_typed
-res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
+res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False, **kw: (
     None, "null", 1)
 r = adapter.call("getTransaction", [["sig"]])
 check("adapter: null answer -> kind ok, null payload, noted",
       r["kind"] == "ok" and r["result"] is None
       and "null" in (r.get("note") or ""))
-res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
+res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False, **kw: (
     {"x": 1}, "ok", 1)
 r = adapter.call("getSlot", [])
 check("adapter: ok passthrough",
       r["kind"] == "ok" and r["result"] == {"x": 1})
-res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
+res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False, **kw: (
     None, "error", 1)
 r = adapter.call("getSlot", [])
 check("adapter: error stays error",

@@ -627,13 +627,20 @@ def _rpc_impl(method, params, timeout=12, exempt=False):
     return result
 
 
-def helius_rpc_typed(method, params, timeout=12):
+def helius_rpc_typed(method, params, timeout=12, max_attempts=None,
+                     attempts_out=None):
     """Explicit Helius-only diagnostic transport, never routine failover.
 
     Returns (result, kind, attempts). kind is "ok", "null", "fail" or
     "error"; attempts counts real HTTP sends (0 when every pair was
     skipped pre-I/O). A 429 is an ANSWERED refusal: trying the next
-    URL/bucket pair is not an uncertain retry, so the loop continues.
+    URL/bucket pair is not an uncertain retry, so the loop continues -
+    but answered-429 eligibility is NOT an unlimited attempt budget:
+    ``max_attempts`` caps TOTAL real sends across the loop (the
+    caller's per-call budget applies to every send, not just the
+    first). ``attempts_out`` (optional mutable list) receives one entry
+    per real send as it happens, so a caller whose invoke raises can
+    still charge the exact sends made instead of guessing.
     "fail" is anything else from _rpc_attempt (curl failure, transport
     error) - an UNKNOWN post-I/O outcome where the request may have
     reached the vendor and been billed. An uncertain request is never
@@ -644,9 +651,13 @@ def helius_rpc_typed(method, params, timeout=12):
     for url,bucket in rpc_url_pairs():
         if 'helius-rpc.com' not in url or not bucket:
             continue
+        if max_attempts is not None and attempts >= max_attempts:
+            break
         if not _pacer().acquire(bucket):
             continue
         attempts += 1
+        if attempts_out is not None:
+            attempts_out.append(url)
         out,kind,_elapsed = _rpc_attempt(url,body,method,'helius',timeout)
         if kind in ('ok','null'):
             _pacer().report(bucket,True)

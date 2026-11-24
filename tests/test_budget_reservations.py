@@ -308,15 +308,15 @@ def test_legacy_helius_adapter_unknown_marked(tmp_path,monkeypatch):
     from daemon.launch_scanner import reserves
     a=HeliusAdapter(home=str(tmp_path))
     monkeypatch.setattr(reserves,'helius_rpc_typed',
-                        lambda m,p,timeout=12:(None,'fail',1))
+                        lambda m,p,timeout=12,**kw:(None,'fail',1))
     out=a.call('getBalance',['x'])
     assert out['kind']=='error' and out['outcome_unknown'] is True and out['transport_attempts']==1
-    def boom(m,p,timeout=12):raise RuntimeError('post-invoke')
+    def boom(m,p,timeout=12,**kw):raise RuntimeError('post-invoke')
     monkeypatch.setattr(reserves,'helius_rpc_typed',boom)
     out=a.call('getBalance',['x'])
     assert out['kind']=='error' and out['outcome_unknown'] is True and out['transport_attempts']==1
     monkeypatch.setattr(reserves,'helius_rpc_typed',
-                        lambda m,p,timeout=12:(None,'error',0))
+                        lambda m,p,timeout=12,**kw:(None,'error',0))
     out=a.call('getBalance',['x'])
     assert out['kind']=='error' and out.get('outcome_unknown') is not True and out['transport_attempts']==0
 
@@ -331,3 +331,51 @@ def test_revised_shared_hold_attempts_zero(tmp_path,monkeypatch):
     a=HeliusAdapter(home=str(tmp_path)); a.revised=True
     out=H.revised_call(a,'getBalance',['x'],12)
     assert out['kind']=='rate_limited' and out['transport_attempts']==0
+
+
+def test_reserves_typed_429_hop_respects_max_attempts(monkeypatch):
+    # Answered-429 eligibility is NOT an unlimited attempt budget: the
+    # caller's per-call cap bounds TOTAL sends across the legacy loop.
+    from daemon.launch_scanner import reserves as R
+    pairs=[('https://mainnet.helius-rpc.com/?api-key=k1','b1'),
+           ('https://mainnet.helius-rpc.com/?api-key=k2','b2'),
+           ('https://mainnet.helius-rpc.com/?api-key=k3','b3')]
+    monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
+    class P:
+        def acquire(self,b):return True
+        def report(self,b,ok):pass
+    monkeypatch.setattr(R,'_pacer',lambda:P())
+    calls=[]
+    def attempt(url,body,method,host,timeout):
+        calls.append(url)
+        return None,'429',0.001
+    monkeypatch.setattr(R,'_rpc_attempt',attempt)
+    out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']],max_attempts=1)
+    assert (out,kind,attempts)==(None,'error',1) and len(calls)==1
+    out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']],max_attempts=2)
+    assert (out,kind,attempts)==(None,'error',2) and len(calls)==3
+
+
+def test_legacy_adapter_exception_charges_exact_sends(tmp_path,monkeypatch):
+    # Exception after recorded sends: the adapter charges the exact
+    # sends made (from attempts_out), not a flat guess.
+    from daemon.intelligence.acquisition.providers.helius import HeliusAdapter
+    from daemon.launch_scanner import reserves as R
+    pairs=[('https://mainnet.helius-rpc.com/?api-key=k1','b1'),
+           ('https://mainnet.helius-rpc.com/?api-key=k2','b2')]
+    monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
+    class P:
+        def __init__(self):self.n=0
+        def acquire(self,b):
+            self.n+=1
+            if self.n==2:raise RuntimeError('pacer blew up mid-loop')
+            return True
+        def report(self,b,ok):pass
+    pacer=P()
+    monkeypatch.setattr(R,'_pacer',lambda:pacer)
+    monkeypatch.setattr(R,'_rpc_attempt',lambda *a,**k:(None,'429',0.001))
+    a=HeliusAdapter(home=str(tmp_path))
+    monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
+    out=a.call('getBalance',['x'])
+    assert out['kind']=='error' and out['outcome_unknown'] is True
+    assert out['transport_attempts']==1  # exactly the send made before the raise

@@ -69,20 +69,24 @@ class HeliusAdapter(BaseProviderAdapter):
                           self.name, note="reserves module unavailable")
             out["transport_attempts"] = 0  # pre-I/O: nothing sent
             return out
+        attempts_box = []
         try:
             out, rkind, attempts = reserves.helius_rpc_typed(
-                method, params, timeout=timeout)
+                method, params, timeout=timeout,
+                max_attempts=max_transport_attempts,
+                attempts_out=attempts_box)
         except Exception:
             # Exception after invoke: whether a request was sent is
             # unknowable, so this is an UNKNOWN post-I/O outcome
-            # (fail closed: never retried anywhere). One attempt is
-            # charged - conservative accounting.
+            # (fail closed: never retried anywhere). Charge the exact
+            # sends recorded before the raise, at least one -
+            # precise when known, conservative when not.
             logger.exception("helius adapter: reserves.rpc_typed "
                              "raised (%s)", method)
             res = _result(None, "error", time.monotonic() - start,
                           self.name)
             res["outcome_unknown"] = True
-            res["transport_attempts"] = 1
+            res["transport_attempts"] = max(1, len(attempts_box))
             return res
         elapsed = time.monotonic() - start
         if rkind == "fail":

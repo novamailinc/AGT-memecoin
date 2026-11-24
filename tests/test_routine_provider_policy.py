@@ -82,13 +82,23 @@ class TestRoutineProviderPolicy:
         monkeypatch.setenv('CHAINSTACK_ENDPOINT','https://chainstack.example.invalid/node')
         calls=[]
         class Response:
-            status=200
-            def read(self):return b'{"jsonrpc":"2.0","id":1,"result":{"value":[]}}'
+            def __init__(self,status=200):
+                self.status=status;self.headers={}
+            def read(self):
+                if self.status!=200:return b''
+                return b'{"jsonrpc":"2.0","id":1,"result":{"value":[]}}'
             def __enter__(self):return self
             def __exit__(self,*a):pass
         def transport(req,timeout=None):
             calls.append(req.full_url)
-            if 'alchemy' in req.full_url:raise urllib.error.URLError('fixture outage')
+            if 'alchemy' in req.full_url:
+                # ANSWERED refusal (HTTP 429): the vendor definitively
+                # processed and rejected the request, so failover to the
+                # next provider is allowed. An UNKNOWN post-I/O outcome
+                # (timeout/transport) is never retried or failed over
+                # since the 2026-11-24 v3 contract fix - that case is
+                # covered by test_no_failover_on_unknown_outcome below.
+                return Response(status=429)
             return Response()
         monkeypatch.setattr(routine._local,'router',ProviderRouter(home=str(tmp_path),helius_enabled=False,transport=transport),raising=False)
         routine.clear_evidence()
@@ -102,6 +112,29 @@ class TestRoutineProviderPolicy:
         assert cached['cached'] and cached['provider']=='chainstack' and cached['degraded']
         assert cached['fallback_difference']==evidence['fallback_difference']
         assert not any('helius' in url for url in calls)
+
+    def test_no_failover_on_unknown_outcome(self,tmp_path,monkeypatch):
+        import json,urllib.error
+        from daemon.intelligence.acquisition.provider_router import ProviderRouter
+        from daemon.launch_scanner import instant_safety
+        monkeypatch.setenv('ALCHEMY_API_KEY','fixture-not-real')
+        monkeypatch.setenv('CHAINSTACK_ENDPOINT','https://chainstack.example.invalid/node')
+        calls=[]
+        class Response:
+            status=200;headers={}
+            def read(self):return b'{"jsonrpc":"2.0","id":1,"result":{"value":[]}}'
+            def __enter__(self):return self
+            def __exit__(self,*a):pass
+        def transport(req,timeout=None):
+            calls.append(req.full_url)
+            if 'alchemy' in req.full_url:raise urllib.error.URLError('fixture outage')
+            return Response()
+        monkeypatch.setattr(routine._local,'router',ProviderRouter(home=str(tmp_path),helius_enabled=False,transport=transport),raising=False)
+        routine.clear_evidence()
+        # Unknown post-I/O outcome at alchemy: terminal. No chainstack
+        # attempt, no retry; the call surfaces as unusable (None).
+        assert instant_safety._rpc('getAccountInfo',['mint'],2) is None
+        assert calls and all('alchemy' in url for url in calls)
 
     def test_remaining_ordinary_readers_and_armed_ws_alchemy(self):
         from daemon.launch_scanner import exit_copy,lp_lock,armed_watch

@@ -70,15 +70,35 @@ class HeliusAdapter(BaseProviderAdapter):
             out["transport_attempts"] = 0  # pre-I/O: nothing sent
             return out
         try:
-            out, rkind = reserves.helius_rpc_typed(method, params, timeout=timeout)
+            out, rkind, attempts = reserves.helius_rpc_typed(
+                method, params, timeout=timeout)
         except Exception:
+            # Exception after invoke: whether a request was sent is
+            # unknowable, so this is an UNKNOWN post-I/O outcome
+            # (fail closed: never retried anywhere). One attempt is
+            # charged - conservative accounting.
             logger.exception("helius adapter: reserves.rpc_typed "
                              "raised (%s)", method)
-            return _result(None, "error", time.monotonic() - start,
-                           self.name)
+            res = _result(None, "error", time.monotonic() - start,
+                          self.name)
+            res["outcome_unknown"] = True
+            res["transport_attempts"] = 1
+            return res
         elapsed = time.monotonic() - start
+        if rkind == "fail":
+            # Unknown post-I/O outcome from the reserves transport:
+            # the request may have reached the vendor. Terminal, never
+            # retried (see helius_rpc_typed); marker consumed by the
+            # router's no-failover break.
+            res = _result(None, "error", elapsed, self.name,
+                          note="reserves.rpc outcome unknown")
+            res["outcome_unknown"] = True
+            res["transport_attempts"] = attempts
+            return res
         if rkind == "ok":
-            return _result(out, "ok", elapsed, self.name)
+            res = _result(out, "ok", elapsed, self.name)
+            res["transport_attempts"] = attempts
+            return res
         if rkind == "null":
             # The provider answered JSON null (e.g. getTransaction
             # for a not-yet-indexed signature): an ANSWER, not an
@@ -86,10 +106,14 @@ class HeliusAdapter(BaseProviderAdapter):
             # same contract the Alchemy leg has always had; the
             # router never caches null payloads and callers
             # re-poll (2026-11-22 null-vs-error fix).
-            return _result(None, "ok", elapsed, self.name,
-                           note="reserves.rpc answered null")
-        return _result(None, "error", elapsed, self.name,
-                       note="reserves.rpc failed")
+            res = _result(None, "ok", elapsed, self.name,
+                          note="reserves.rpc answered null")
+            res["transport_attempts"] = attempts
+            return res
+        res = _result(None, "error", elapsed, self.name,
+                      note="reserves.rpc failed")
+        res["transport_attempts"] = attempts
+        return res
 
 
 def numbered_keys():
@@ -176,7 +200,9 @@ def revised_call(adapter,method,params,timeout,max_transport_attempts=None):
         out=_result(value,kind,elapsed,'helius',**kw);out['account']='helius_main';return out
     from .. import helius_account
     if not helius_account.allowed(adapter.home):
-        return answer(None,'rate_limited',note='shared account hold')
+        out=answer(None,'rate_limited',note='shared account hold')
+        out['transport_attempts']=0  # pre-I/O refusal: nothing sent
+        return out
     bucket=helius_ratelimit.bucket_id_for_key('account:helius_main')
     pacer=helius_ratelimit.pacer()
     transport_attempts=0

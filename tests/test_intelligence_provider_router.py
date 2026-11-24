@@ -41,6 +41,8 @@ from daemon.intelligence.acquisition.usage_tracker import UsageTracker
 fails = []
 total = [0]
 HOME = tempfile.mkdtemp(prefix="acq_router_")
+_PREV_ENV = {k: os.environ.get(k)
+             for k in ("ALCHEMY_API_KEY", "CHAINSTACK_ENDPOINT")}
 os.environ["ALCHEMY_API_KEY"] = "testkey-not-real"
 os.environ["CHAINSTACK_ENDPOINT"] = "https://chainstack.example.invalid/abc"
 
@@ -520,8 +522,14 @@ check("manager has no hardcoded order of its own (ORDER_* are "
 # already cover the Helius-first order; the live Helius call is
 # covered by test_intelligence_router_live_helius.py.
 
-del os.environ["ALCHEMY_API_KEY"]
-del os.environ["CHAINSTACK_ENDPOINT"]
+# Restore, never clobber: this module is imported inside shared pytest
+# sessions, so deleting here would destroy env other modules set at their
+# own import (2026-11-24 failure_matrix 1-fail/5-errors root cause).
+for _k, _v in _PREV_ENV.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 print("\n%d checks, %d failed" % (total[0], len(fails)))
 if fails:

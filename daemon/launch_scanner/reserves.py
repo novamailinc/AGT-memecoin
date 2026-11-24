@@ -628,20 +628,35 @@ def _rpc_impl(method, params, timeout=12, exempt=False):
 
 
 def helius_rpc_typed(method, params, timeout=12):
-    """Explicit Helius-only diagnostic transport, never routine failover."""
+    """Explicit Helius-only diagnostic transport, never routine failover.
+
+    Returns (result, kind, attempts). kind is "ok", "null", "fail" or
+    "error"; attempts counts real HTTP sends (0 when every pair was
+    skipped pre-I/O). A 429 is an ANSWERED refusal: trying the next
+    URL/bucket pair is not an uncertain retry, so the loop continues.
+    "fail" is anything else from _rpc_attempt (curl failure, transport
+    error) - an UNKNOWN post-I/O outcome where the request may have
+    reached the vendor and been billed. An uncertain request is never
+    retried (budget_reservations contract), so the loop returns
+    immediately with kind "fail" instead of hopping to the next pair."""
     body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
+    attempts = 0
     for url,bucket in rpc_url_pairs():
         if 'helius-rpc.com' not in url or not bucket:
             continue
         if not _pacer().acquire(bucket):
             continue
+        attempts += 1
         out,kind,_elapsed = _rpc_attempt(url,body,method,'helius',timeout)
         if kind in ('ok','null'):
             _pacer().report(bucket,True)
-            return out,kind
+            return out,kind,attempts
         if kind == '429':
             _pacer().report(bucket,False)
-    return None,'error'
+            continue
+        # Unknown post-I/O outcome: no retry on another endpoint.
+        return None,'fail',attempts
+    return None,'error',attempts
 
 
 def rpc_typed(method, params, timeout=12, exempt=False):

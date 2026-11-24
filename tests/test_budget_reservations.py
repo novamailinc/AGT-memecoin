@@ -259,3 +259,75 @@ def test_pre_io_attempts_counted_zero(tmp_path,monkeypatch):
     a2._transport=lambda req,timeout=None:(_ for _ in ()).throw(TimeoutError('fixture'))
     out2=a2.call('getBalance',['x'])
     assert out2['kind']=='timeout' and out2['transport_attempts']==1 and out2['outcome_unknown'] is True
+
+
+def test_reserves_typed_no_hop_on_unknown(monkeypatch):
+    # v4 contract: reserves.helius_rpc_typed never retries an uncertain
+    # request on the next URL/bucket pair. fail = unknown post-I/O.
+    from daemon.launch_scanner import reserves as R
+    pairs=[('https://mainnet.helius-rpc.com/?api-key=k1','b1'),
+           ('https://mainnet.helius-rpc.com/?api-key=k2','b2')]
+    monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
+    class P:
+        def acquire(self,b):return True
+        def report(self,b,ok):pass
+    monkeypatch.setattr(R,'_pacer',lambda:P())
+    calls=[]
+    def attempt(url,body,method,host,timeout):
+        calls.append(url)
+        return None,'fail',0.001
+    monkeypatch.setattr(R,'_rpc_attempt',attempt)
+    out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']])
+    assert (out,kind,attempts)==(None,'fail',1) and len(calls)==1
+
+
+def test_reserves_typed_429_still_hops(monkeypatch):
+    # Answered 429s remain eligible for the next pair (not uncertain).
+    from daemon.launch_scanner import reserves as R
+    pairs=[('https://mainnet.helius-rpc.com/?api-key=k1','b1'),
+           ('https://mainnet.helius-rpc.com/?api-key=k2','b2')]
+    monkeypatch.setattr(R,'rpc_url_pairs',lambda:pairs)
+    class P:
+        def acquire(self,b):return True
+        def report(self,b,ok):pass
+    monkeypatch.setattr(R,'_pacer',lambda:P())
+    calls=[]
+    def attempt(url,body,method,host,timeout):
+        calls.append(url)
+        return None,'429',0.001
+    monkeypatch.setattr(R,'_rpc_attempt',attempt)
+    out,kind,attempts=R.helius_rpc_typed('getBalance',[['x']])
+    assert (out,kind,attempts)==(None,'error',2) and len(calls)==2
+
+
+def test_legacy_helius_adapter_unknown_marked(tmp_path,monkeypatch):
+    # Legacy (non-revised) path: reserves 'fail' and exceptions both
+    # surface as outcome_unknown with attempt accounting, so the v3
+    # router no-failover break covers every reachable mode.
+    from daemon.intelligence.acquisition.providers.helius import HeliusAdapter
+    from daemon.launch_scanner import reserves
+    a=HeliusAdapter(home=str(tmp_path))
+    monkeypatch.setattr(reserves,'helius_rpc_typed',
+                        lambda m,p,timeout=12:(None,'fail',1))
+    out=a.call('getBalance',['x'])
+    assert out['kind']=='error' and out['outcome_unknown'] is True and out['transport_attempts']==1
+    def boom(m,p,timeout=12):raise RuntimeError('post-invoke')
+    monkeypatch.setattr(reserves,'helius_rpc_typed',boom)
+    out=a.call('getBalance',['x'])
+    assert out['kind']=='error' and out['outcome_unknown'] is True and out['transport_attempts']==1
+    monkeypatch.setattr(reserves,'helius_rpc_typed',
+                        lambda m,p,timeout=12:(None,'error',0))
+    out=a.call('getBalance',['x'])
+    assert out['kind']=='error' and out.get('outcome_unknown') is not True and out['transport_attempts']==0
+
+
+def test_revised_shared_hold_attempts_zero(tmp_path,monkeypatch):
+    # Shared-account hold is a pre-I/O refusal: zero attempts consumed.
+    for i in (1,2,3):monkeypatch.setenv('HELIUS_API_KEY_%d'%i,'fixture-%d'%i)
+    from daemon.intelligence.acquisition.providers import helius as H
+    from daemon.intelligence.acquisition.providers.helius import HeliusAdapter
+    from daemon.intelligence.acquisition import helius_account
+    monkeypatch.setattr(helius_account,'allowed',lambda home=None:False)
+    a=HeliusAdapter(home=str(tmp_path)); a.revised=True
+    out=H.revised_call(a,'getBalance',['x'],12)
+    assert out['kind']=='rate_limited' and out['transport_attempts']==0

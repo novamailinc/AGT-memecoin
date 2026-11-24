@@ -167,18 +167,18 @@ adapter = hadapt.HeliusAdapter()
 
 _real_rpc_typed = res.helius_rpc_typed
 res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
-    None, "null")
+    None, "null", 1)
 r = adapter.call("getTransaction", [["sig"]])
 check("adapter: null answer -> kind ok, null payload, noted",
       r["kind"] == "ok" and r["result"] is None
       and "null" in (r.get("note") or ""))
 res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
-    {"x": 1}, "ok")
+    {"x": 1}, "ok", 1)
 r = adapter.call("getSlot", [])
 check("adapter: ok passthrough",
       r["kind"] == "ok" and r["result"] == {"x": 1})
 res.helius_rpc_typed = lambda method, params, timeout=12, exempt=False: (
-    None, "error")
+    None, "error", 1)
 r = adapter.call("getSlot", [])
 check("adapter: error stays error",
       r["kind"] == "error" and r["result"] is None)

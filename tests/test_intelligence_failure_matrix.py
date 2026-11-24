@@ -103,6 +103,8 @@ def matrix(scenario, expected, observed, cond):
 
 
 DATA = os.path.join(os.path.dirname(__file__), "data", "intelligence")
+_PREV_ENV = {k: os.environ.get(k)
+             for k in ("ALCHEMY_API_KEY", "CHAINSTACK_ENDPOINT")}
 os.environ["ALCHEMY_API_KEY"] = "testkey-not-real"
 os.environ["CHAINSTACK_ENDPOINT"] = "https://chainstack.example.invalid/abc"
 
@@ -408,12 +410,21 @@ def test_outage_matrix():
                        "mainnet-beta": [ok(999)]})
     r = router(transport=t)
     res = r.call("getBalance", ["addr1"], priority=PRIORITY_CARD)
+    # 2026-11-24 contract change (v3 quota fix, reviewed): a timeout is
+    # an UNKNOWN post-I/O outcome - the request may have reached the
+    # vendor and been billed. An uncertain request is never retried, so
+    # there is NO failover to chainstack: the router records the attempt
+    # (health/breaker/usage), retains the reservation and stops. The old
+    # expectation (failover on timeout) was the bug the v3 fix removed.
+    attempted = [a for a in res["attempts"] if a["kind"] != "skipped"]
     matrix("alchemy timeout",
-           "timeout fails over to chainstack, breaker counts it",
-           "kind=%s provider=%s alchemy_attempt=%s" % (
+           "unknown post-I/O outcome: no failover, reservation retained, "
+           "breaker/health recorded, exactly one attempted provider",
+           "kind=%s provider=%s attempted=%s" % (
                res["kind"], res.get("provider"),
-               res["attempts"][0]["kind"]),
-           res["kind"] == "ok" and res["provider"] == "chainstack"
+               [a["provider"] for a in attempted]),
+           res["kind"] == "timeout" and res["provider"] == "alchemy"
+           and [a["provider"] for a in attempted] == ["alchemy"]
            and res["attempts"][0]["kind"] == "timeout")
 
 
@@ -1360,9 +1371,33 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     finally:
-        os.environ.pop("ALCHEMY_API_KEY", None)
-        os.environ.pop("CHAINSTACK_ENDPOINT", None)
+        for _k, _v in _PREV_ENV.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+# Restore, never leak: under pytest this module is imported into a shared
+# process, and the leftover endpoint vars broke
+# test_intelligence_acquisition_health's no-endpoint check (2026-11-24).
+# All matrix checks above run at import time, so restoring here is safe;
+# the test functions below only consume the recorded results.
+for _k, _v in _PREV_ENV.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 
 if __name__ != "__main__":
     from tests.recorded_checks import recorded_check_guard
+    import pytest
+
+    @pytest.fixture(autouse=True)
+    def _matrix_env(monkeypatch):
+        # The import-time env above is restored before collection ends;
+        # the test bodies get the same values through scoped fixtures
+        # (monkeypatch reverts after each test - no cross-module leak).
+        monkeypatch.setenv("ALCHEMY_API_KEY", "testkey-not-real")
+        monkeypatch.setenv("CHAINSTACK_ENDPOINT",
+                           "https://chainstack.example.invalid/abc")

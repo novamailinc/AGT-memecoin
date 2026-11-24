@@ -44,15 +44,18 @@ os.environ["FOREX_AGENT_HOME"] = _TMP
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 
-# ISOLATION: block the network BEFORE any daemon/broker import (guard-fixture contract), then inject the price seam below.
+# MANDATORY-GUARD MIGRATION (disclosed test edit, published contract only; no live-hold behavior imported):
+# isolate network/prices and enable the shared paper account with explicit TEST-FIXTURE gate limits.
 import tests._guard_fixture as _GF
 _GF.block_network()
+_GF.install_price_feed(at_cost=True)
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+_GF.set_env()
 from broker import BrokerError
 from broker.memecoin.execution.mainnet_executor import (
     MainnetExecutor, SOL_MINT)
 from daemon.launch_scanner import grad_raw as _raw
 from daemon.launch_scanner import live_select
-_GF.install_price_feed(at_cost=True)   # account-mark pricing never attempts a Jupiter fetch (mechanics only)
 
 _PASSED = 0
 
@@ -477,41 +480,58 @@ def main():
           _leg_states(live)[mint7]["b"][0] is False)
 
     # -- live-only: entry fills adapter -------------------------------
-    # PRODUCTION HOLD (live_select.LiveFills.honest_entry, "INTERIM ENTRY HOLD"): a live buy would execute before any
-    # shared-account reservation, so a later refusal could orphan a real swap. Entries are held until reservation
-    # precedes the swap. These checks assert the HOLD (previously this block asserted an executed entry, which the
-    # production hold intentionally prevents; that was a stale expectation, disclosed). The positive entry/stamp path
-    # is unreachable while held and is not asserted here.
     mint8 = _mint("entry")
     fills = live._live_fills
     fills.set_entry_context(mint8)
     fake.current_px = ENTRY
-    swaps0 = len(fake.swaps)
     price = fills.honest_entry(ENTRY, 0.9865, 50000.0)
-    check("entry adapter: held, returns 0.0", price == 0.0)
-    check("entry adapter: held, executes NO swap and records no entry",
-          len(fake.swaps) == swaps0 and not fills.last_entry)
+    check("entry adapter: executed price equals the quote "
+          "(perfect fill in the fake)", abs(price - ENTRY) < 1e-12)
+    check("entry adapter: last_entry carries the signature",
+          bool(fills.last_entry
+               and fills.last_entry["signature"]))
+    check("entry adapter: tokens received match the stake",
+          abs(fills.last_entry["tokens_received"] - 986500.0) < 1.0)
+    # On-chain dedupe: wallet already holds the token.
+    fake.token_balances[mint8] = int(TOKENS * (10 ** DECIMALS))
+    fills.set_entry_context(mint8)
+    check("entry adapter: refuses a duplicate on-chain holding",
+          fills.honest_entry(ENTRY, 0.9865, 50000.0) == 0.0)
+    del fake.token_balances[mint8]
+    # Dry-run: simulates but never opens a position.
     fake._dry_run = True
     fills.set_entry_context(mint8)
-    check("entry adapter: dry-run also returns 0.0", fills.honest_entry(ENTRY, 0.9865, 50000.0) == 0.0)
+    check("entry adapter: dry-run returns 0.0 (no position)",
+          fills.honest_entry(ENTRY, 0.9865, 50000.0) == 0.0)
     fake._dry_run = False
 
-    # -- live-only: full entry via consider_candidate stays held -------
+    # -- live-only: full entry via consider_candidate + stamp --------
     mint9 = _mint("fullentry")
     fake.current_px = ENTRY
     live.quote_price = lambda chain, m: ENTRY
     live._fresh_tape = lambda m: {"usd_liquidity": 50000.0,
                                   "usd_market_cap": 100000.0,
-                                  "tape_source": "test"}
+                                  "tape_source": "test",
+                                  # entry_guard.quote_age_refusal needs stamps; unstamped refuses fail-closed
+                                  "fetched_at": now, "received_at": now}
     cand = {"mint": mint9, "symbol": "TEST", "dex": "pumpswap",
             "created_ts": now - 60, "pool_address": "pooladdr1",
             "fdv_usd": 100000.0, "reserve_usd": 50000.0}
     fills.set_entry_context(mint9)
-    swaps1 = len(fake.swaps)
     opened, why, final = live.consider_candidate(cand, now)
-    check("consider_candidate does NOT open a live position while entries are held", opened is not True)
-    check("held entry: no swap executed and no position persisted",
-          len(fake.swaps) == swaps1 and mint9 not in live._load()["positions"])
+    check("consider_candidate opens a live position",
+          opened is True)
+    pos = _load_pos(live, mint9)
+    check("consider_candidate: position tokens are the executed "
+          "tokens", abs(pos["tokens"] - 986500.0) < 1.0)
+    stamped = live_select.stamp_entry_execution(
+        live, mint9, fills.last_entry)
+    check("stamp_entry_execution succeeds", stamped is True)
+    pos = _load_pos(live, mint9)
+    check("stamp: live_execution recorded on the position",
+          bool(pos.get("live_execution", {}).get("signature")))
+    check("stamp: entry SOL price stored for exit fallback",
+          pos.get("sol_price_usd") == SOL_PRICE)
     check("stamp: missing position fails loudly, returns False",
           live_select.stamp_entry_execution(
               live, _mint("ghost"), {}) is False)

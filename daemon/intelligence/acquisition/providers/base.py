@@ -385,6 +385,7 @@ def http_json_rpc(url, method, params, timeout=12, _opener=None):
     """One JSON-RPC POST. Returns (http_status, parsed_body_or_None,
     error_kind, retry_after) where error_kind is None | "timeout" | "transport" |
     "rate_limited" | "http". Never raises. Never logs the URL."""
+    _last_429.meta = None  # evidence belongs to THIS request only
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                        "params": params}).encode()
     req = urllib.request.Request(url, data=body,

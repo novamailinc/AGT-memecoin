@@ -54,7 +54,13 @@ WINDOW_S = 600.0     # ... in 10 minutes = a spike
 def _home(home: Optional[str] = None) -> str:
     if home:
         return home
-    return os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+    # Same rule as daemon.common.get_home (minus creating the directory,
+    # these callers only read/write the alert file): the env var, else the
+    # CURRENT user's ~/.forex-agent. The old default was the original dev
+    # VM's home, so on any other host the alert state and the daemon-token
+    # fallback pointed at a path that does not exist.
+    return (os.environ.get("FOREX_AGENT_HOME")
+            or os.path.join(os.path.expanduser("~"), ".forex-agent"))
 
 
 def check_and_record(home: Optional[str] = None,

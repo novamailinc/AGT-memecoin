@@ -287,6 +287,41 @@ def test_notify_telegram_daemon_token_fallback():
             urllib.request.urlopen = real_open
 
 
+def test_home_default_is_the_current_users_not_the_dev_vm():
+    """FOREX_AGENT_HOME unset (or empty) must resolve under the current
+    user's home, never a hardcoded /home/hatch path. Pure path logic: nothing
+    is read, written or created."""
+    old_env, old_home = os.environ.get("FOREX_AGENT_HOME"), os.environ.get("HOME")
+    scratch = tempfile.mkdtemp(prefix="429-home-")
+    try:
+        os.environ.pop("FOREX_AGENT_HOME", None)
+        os.environ["HOME"] = scratch
+        want = os.path.join(scratch, ".forex-agent")
+        check("home: unset env resolves under the current HOME",
+              alerts._home() == want)
+        os.environ["FOREX_AGENT_HOME"] = ""
+        check("home: empty env counts as unset (same as daemon.common)",
+              alerts._home() == want)
+        os.environ["FOREX_AGENT_HOME"] = "/explicit/home"
+        check("home: explicit env still wins",
+              alerts._home() == "/explicit/home")
+        check("home: an explicit argument still wins",
+              alerts._home("/arg/home") == "/arg/home")
+        os.environ.pop("FOREX_AGENT_HOME", None)
+        check("home: the default never names the dev VM",
+              "hatch" not in alerts._home())
+        check("home: default is only computed, nothing created",
+              not os.path.exists(want))
+        check("home: no unset-env read_alert crash, absent file is None",
+              alerts.read_alert() is None)
+    finally:
+        for k, v in (("FOREX_AGENT_HOME", old_env), ("HOME", old_home)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_watch_script_transitions_and_audit_reads():
     with _Ctx() as ctx:
         os.environ["FOREX_AGENT_HOME"] = ctx.home
@@ -333,6 +368,7 @@ def main():
     test_smartmoney_shed_makes_zero_http_attempts()
     test_alert_file_active_and_quiet()
     test_notify_telegram_daemon_token_fallback()
+    test_home_default_is_the_current_users_not_the_dev_vm()
     test_watch_script_transitions_and_audit_reads()
     print()
     if FAILS:

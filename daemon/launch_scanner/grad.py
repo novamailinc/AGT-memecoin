@@ -1701,7 +1701,7 @@ def recon_health(now=None):
                           "migration_tries": mb.get("tries"), "why": pe.get("why"), "age_s": (now - float(pe["ts"])) if pe.get("ts") else None, "notes": ns,
                           "settlement_pending": sp.get("why"), "settlement_age_s": (now - float(sp["since"])) if sp.get("since") else None,
                           "settlement_tries": sp.get("tries")})
-    return {"poll_aborts": dict(_POLL_ABORTS), "n_recon": sum(1 for i in items if i["notes"]), "n_pending": sum(1 for i in items if i["why"]),
+    return {"poll_aborts": dict(_POLL_ABORTS), "price_obs_unsupported_polls": _OBS_UNSUPPORTED["n"], "n_recon": sum(1 for i in items if i["notes"]), "n_pending": sum(1 for i in items if i["why"]),
             "n_settlement_pending": sum(1 for i in items if i["settlement_pending"]),
             "n_migration_blocked": sum(1 for i in items if i.get("migration_blocked")), "items": items}
 
@@ -3826,6 +3826,32 @@ def _persist_poll_failure(d, mint, pos, exc):
         return False
 
 
+_OBS_UNSUPPORTED = {"n": 0}   # polls where the price module had no get_prices_observed (observation times then unknown, counted, visible)
+
+
+def _obs_fields(q, now):
+    """Validate a price observation timestamp at the source boundary. NEVER raises. For the Jupiter module the timestamp is the LOCAL time
+    this process filled its price cache (the v3 response carries no upstream time here), NOT an upstream/exchange time: obs_ts_kind says so.
+    Visibility only: no TTL, no refusal, no rule reads these fields. Other routes (caller price_fn, reserves, DexScreener, GeckoTerminal)
+    carry no observation time: status "none"."""
+    import math
+    raw = q.get("obs_ts")
+    base = {"obs_ts": None, "obs_age_s": None, "obs_ts_kind": "jup_local_cache_fill_time" if q.get("src") == getattr(_jup, "SOURCE", "\0") else None}
+    try:
+        if raw is None:
+            return dict(base, obs_status="none")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return dict(base, obs_status="invalid:type")
+        t = float(raw)
+        if not math.isfinite(t) or t <= 0:
+            return dict(base, obs_status="invalid:not_finite_or_nonpositive")
+        if t > float(now) + 1.0:
+            return dict(base, obs_status="invalid:future")
+        return dict(base, obs_ts=t, obs_age_s=max(0.0, float(now) - t), obs_status="ok")
+    except Exception:
+        return dict(base, obs_status="invalid:error")
+
+
 def _poll_exits(price_fn):
     _POLL_SEQ["n"] += 1
     # Phase 1: snapshot (locked read). Quotes happen outside the lock.
@@ -3860,6 +3886,7 @@ def _poll_exits(price_fn):
                 jup_obs = {m: v[1] for m, v in _o.items()}
             else:
                 jup_prices = _jup.get_prices(_jm) or {}
+                _OBS_UNSUPPORTED["n"] += 1
         except Exception:
             jup_prices, jup_obs = {}, {}
     quotes = {}
@@ -3963,8 +3990,7 @@ def _poll_exits(price_fn):
                     jq.append({"ts": now, "px": px,
                                "src": q.get("src") or "",
                                # price observation time (visibility only, no rule): None = the source did not say
-                               "obs_ts": q.get("obs_ts"),
-                               "obs_age_s": (now - float(q["obs_ts"])) if q.get("obs_ts") else None})
+                               **_obs_fields(q, now)})
                     del jq[:-40]
                     # SHADOW STOP (2026-11-20, faster-exits item 1c):
                     # journal-only — records the first eval at/below

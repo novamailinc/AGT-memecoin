@@ -1368,6 +1368,36 @@ check("P7zd1 quote journal carries the price's OBSERVATION time and age (obs_ts 
       _j1.get("obs_ts") == _tsold and 8.0 <= (_j1.get("obs_age_s") or 0) <= 60.0 and _j1.get("px") == _ep and _j1.get("src") == "jupiter-fake")
 check("P7zd2 a source without observation times records obs_ts None / obs_age None (unknown, never invented), same price (%s)" % ((_j2.get("obs_ts"), _j2.get("obs_age_s")),),
       _j2.get("obs_ts") is None and _j2.get("obs_age_s") is None and _j2.get("px") == _ep)
+# P7zd3-8: the observation timestamp is an UNTRUSTED source value: validated at the boundary, never raises (a raise would be a poll abort), invalid -> unknown + status.
+class _JupBad:
+    SOURCE = "jupiter-fake"
+    ts = None
+    def get_prices_observed(self, mints, now=None): return {m: (_ep, self.ts) for m in mints}
+_jb = _JupBad(); _bad = {}
+try:
+    GR._jup = _jb
+    for _lab, _v in (("string", "yesterday"), ("nan", float("nan")), ("inf", float("inf")), ("bool", True), ("future", time.time() + 3600.0), ("negative", -5.0), ("none", None), ("ok", time.time() - 3.0)):
+        _jb.ts = _v; _a0 = GR._POLL_ABORTS.get("count", 0); GR.poll_exits(price_fn=None)
+        _bad[_lab] = ((GR.open_positions()[_gmp].get("quote_journal") or [])[-1], GR._POLL_ABORTS.get("count", 0) - _a0)
+finally: GR._jup = _jsave
+check("P7zd3 invalid observation values (string, nan, inf, bool, future, negative) never raise or abort the poll, record obs_ts None and a status; price unchanged (%s)" % ({k: (v[0].get("obs_status"), v[1]) for k, v in _bad.items()},),
+      all(_bad[k][1] == 0 and _bad[k][0].get("obs_ts") is None and _bad[k][0].get("obs_age_s") is None and str(_bad[k][0].get("obs_status", "")).startswith("invalid:") and _bad[k][0].get("px") == _ep for k in ("string", "nan", "inf", "bool", "future", "negative")))
+check("P7zd4 none -> status none, a good timestamp -> ok with the kind label saying LOCAL cache-fill time, not upstream (%s, %s)" % (_bad["none"][0].get("obs_status"), _bad["ok"][0].get("obs_ts_kind")),
+      _bad["none"][0].get("obs_status") == "none" and _bad["ok"][0].get("obs_status") == "ok" and _bad["ok"][0].get("obs_ts_kind") == "jup_local_cache_fill_time" and 2.0 <= _bad["ok"][0]["obs_age_s"] <= 60.0)
+_u0 = (GR.recon_health() or {}).get("price_obs_unsupported_polls")
+try:
+    GR._jup = _JupNoObs(); GR.poll_exits(price_fn=None)
+finally: GR._jup = _jsave
+check("P7zd5 a price module WITHOUT get_prices_observed is counted in recon_health (visible, not silent): %s -> %s" % (_u0, (GR.recon_health() or {}).get("price_obs_unsupported_polls")),
+      (GR.recon_health() or {}).get("price_obs_unsupported_polls") == (_u0 or 0) + 1)
+# real jup_price cache layer, offline (its fetch replaced): which time does get_prices_observed report?
+# (a PRIVATE copy of the module source is executed: earlier fixtures in this process rebind attributes of the imported module, so the shared one is not a clean subject)
+_jspec = importlib.util.spec_from_file_location("_agt_jup_price_private_copy", os.path.join(ROOT, "daemon", "launch_scanner", "jup_price.py")); _JP = importlib.util.module_from_spec(_jspec); _jspec.loader.exec_module(_JP)
+_JP._cache.clear(); _JP._fetch_batch = lambda mints: {m: 2.5 for m in mints}
+_r1 = _JP.get_prices_observed(["MX"], now=1000.0); _JP._fetch_batch = lambda mints: {}
+_r2 = _JP.get_prices_observed(["MX"], now=1005.0); _dbg = ""
+check("P7zd6 real jup_price semantics (offline): the reported time is the LOCAL fetch time of the cache fill (fresh read at 1000 -> 1000; a cache hit at 1005 still reports 1000), no upstream timestamp exists in this layer (%s, %s)" % (_r1, _r2),
+      _r1.get("MX") == (2.5, 1000.0) and _r2.get("MX") == (2.5, 1000.0))
 check("P7zc unavailable_gates key is present on every verdict path: TWAP %s, entry_op %s, quarantine %s, unavailable %s" % ("unavailable_gates" in _dt, "unavailable_gates" in GR.diagnose_position(_gmi) , "unavailable_gates" in _dq, "unavailable_gates" in _dm),
       all("unavailable_gates" in x for x in (_dt, _dq, _dm, _di)) and _dt["unavailable_gates"] == [] and _dm["unavailable_gates"] == ["G3", "G6"] and _dq["unavailable_gates"] in (["G3", "G6"], ["G3"], ["G6"], []))
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.

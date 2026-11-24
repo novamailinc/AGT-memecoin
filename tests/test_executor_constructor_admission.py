@@ -78,7 +78,22 @@ def test_marker_truthiness_does_not_arm(inert, value):
     assert 'quote' not in calls
 
 
-def test_explicit_arm_and_disarm_remain_unchanged_at_inert_boundary(inert):
+def test_arm_live_refuses_without_registry_admission_even_with_armed_marker(inert):
+    # the registry admission gate is real (not stubbed) here: the marker alone never arms
+    marker, calls, make = inert
+    ex = make()
+    ex.connect()
+    marker['armed'] = True
+    with pytest.raises(BrokerError):
+        ex.arm_live()
+    assert ex.dry_run is True
+    assert 'quote' not in calls
+
+
+def test_explicit_arm_and_disarm_remain_unchanged_at_inert_boundary(inert, monkeypatch):
+    # DISCLOSED FIXTURE EDIT: this test checks the arm/disarm MECHANICS at the inert boundary. The registry admission
+    # step (which now gates arming, directive 11/25) is stubbed for this test only; its refusal is tested above.
+    monkeypatch.setattr(M.MainnetExecutor, '_require_admission', lambda self: None)
     marker, calls, make = inert
     ex = make()
     ex.connect()

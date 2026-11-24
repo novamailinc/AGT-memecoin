@@ -1344,7 +1344,12 @@ _gmi = list(GR.open_positions())[0]; sell_ab()
 _bi0 = _tree_bytes(PAi, GR.LEDGER_PATH); _fi0 = json.dumps(_fills_now(GR._demo_filler()), sort_keys=True)
 _di = GR.diagnose_position(_gmi)
 check("P7zb REAL try_debit_instance position (no stubs): G3 and G6 are EVALUATED (not unavailable) and pass; verdict %s, residue %s; byte-immutable (%s)" % (_di["verdict"], _di["residue"], _tree_bytes(PAi, GR.LEDGER_PATH) == _bi0 and json.dumps(_fills_now(GR._demo_filler()), sort_keys=True) == _fi0),
-      not _di["unavailable_gates"] and _di["gates"]["G3"]["ok"] and _di["gates"]["G6"]["ok"] and _tree_bytes(PAi, GR.LEDGER_PATH) == _bi0)
+      _di["verdict"] == "consistent" and (_di["residue"] or {}).get("label") == "none" and not _di["unavailable_gates"] and _di["gates"]["G3"]["ok"] and _di["gates"]["G6"]["ok"] and _tree_bytes(PAi, GR.LEDGER_PATH) == _bi0)
+_opi = "%s:leg:a:%s:%s" % (GR.LANE, _gmi, GR.open_positions()[_gmi]["pa_pos_id"])
+check("P7zb2 the real account op is an INSTANCE op (operation_receipt instance flag %s) so P7zb exercised the instance contract. CAVEAT: this entry route drops durable_refusal, so DEMO refusal journaling (design O-A4) is NOT covered" % (PAi.operation_receipt(_opi)[0] or {}).get("instance"),
+      (PAi.operation_receipt(_opi)[0] or {}).get("instance") is True)
+check("P7zc unavailable_gates key is present on every verdict path: TWAP %s, entry_op %s, quarantine %s, unavailable %s" % ("unavailable_gates" in _dt, "unavailable_gates" in GR.diagnose_position(_gmi) , "unavailable_gates" in _dq, "unavailable_gates" in _dm),
+      all("unavailable_gates" in x for x in (_dt, _dq, _dm, _di)) and _dt["unavailable_gates"] == [] and _dm["unavailable_gates"] == ["G3", "G6"] and _dq["unavailable_gates"] in (["G3", "G6"], ["G3"], ["G6"], []))
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.
 _po, _r, _PAg, _ = _p7o("current"); _gmg = _po["mint"]
 _orec = _PAg.operation_receipt

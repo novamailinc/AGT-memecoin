@@ -2640,7 +2640,7 @@ def diagnose_position(mint):
     "quarantine:<gate>:<why>"; "evidence_missing:<field>" (an input is absent: never defaulted); or
     "explained_residue:stored_dust" when the account residue equals the persisted dust record exactly (label only; unexplained residue is
     "quarantine:G5:unexplained_residue"). NOT a repair and NOT an authority to apply one."""
-    out = {"mint": mint, "gates": {}, "keys": [], "extra_fills": [], "residue": None, "scale": None, "verdict": None}
+    out = {"mint": mint, "gates": {}, "keys": [], "extra_fills": [], "residue": None, "scale": None, "verdict": None, "unavailable_gates": []}   # unavailable_gates is always present; it is only POPULATED once G3/G6 were evaluated (early verdicts: [])
     def gate(g, ok, why=None, unavailable=False):
         out["gates"][g] = {"ok": bool(ok), "why": why, "unavailable": bool(unavailable) and not ok}
         return ok
@@ -2741,7 +2741,7 @@ def diagnose_position(mint):
     for g in ("G1", "G2", "G3", "G4", "G5", "G6"):
         if not out["gates"][g]["ok"] and not out["gates"][g]["unavailable"]:
             out["verdict"] = "quarantine:%s:%s" % (g, out["gates"][g]["why"]); return out
-    out["unavailable_gates"] = [g for g in ("G3", "G6") if not out["gates"][g]["ok"]]     # reported on EVERY verdict: an evaluable failure above or below is never masked by them
+    out["unavailable_gates"] = [g for g in ("G3", "G6") if not out["gates"][g]["ok"] and out["gates"][g]["unavailable"]]     # populated once the gates were evaluated (verdicts reached after the quarantine loop); earlier returns carry []
     if out["extra_fills"]:
         out["verdict"] = "pending_crash_window:" + ",".join(x["key"] for x in out["extra_fills"]); return out
     if out["scale"] != 1.0: out["verdict"] = "evidence_missing:scale"; return out

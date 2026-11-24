@@ -127,7 +127,7 @@ except Exception:
     except Exception:
         _shadow_stop = None  # type: ignore
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 LEDGER_PATH = os.path.join(HOME, "momentum_ledger.json")
 MAX_CLOSES = 500
 MAX_VETOED = 500
@@ -567,6 +567,53 @@ def account_state():
         return {}
 
 
+try:
+    from daemon.launch_scanner import demo_fill as _demo
+except Exception:
+    _demo = None  # type: ignore
+
+
+def _demo_filler():
+    return _demo.default_filler() if _demo is not None else None
+
+
+def _demo_mode():
+    return bool(_demo is not None and _demo.mode_enabled())
+
+
+# EXIT POLICY (open owner decision, NOT chosen here): the owner max_price_impact_pct also gates
+# exits when set; only an unset/invalid cap falls back to this so a missing config cannot strand
+# a position. The effective cap + source are recorded in each exit's provenance.
+_EXIT_IMPACT_CAP_PCT = 100.0
+
+
+def _exit_cap():
+    try:
+        v = float(_paper_account().max_price_impact_pct())
+    except Exception:
+        v = 0.0
+    if v > 0:
+        return v, "owner_max_price_impact_pct"
+    return _EXIT_IMPACT_CAP_PCT, "fallback_unset_or_invalid"
+
+
+def _demo_sell(pos, leg_tokens, key):
+    """Sell through the quote sim. Returns (fill, cap, src) or None (leg stays PENDING with
+    diagnostics; nothing invented)."""
+    _df = _demo_filler()
+    if _df is None:
+        pos["pending_exit"] = {"leg": key, "why": "filler unavailable", "ts": time.time()}
+        return None
+    cap, src = _exit_cap()
+    try:
+        return _df.sell("%s:exit:%s:%s" % (LANE, pos["mint"], key), pos["mint"], leg_tokens,
+                        cap), cap, src
+    except _demo.DemoSkip as e:
+        pos["pending_exit"] = {"leg": key, "why": e.reason, "detail": e.detail, "ts": time.time()}
+        logger.warning("momentum demo exit pending %s %s: %s", pos["mint"][:12], key, e.reason)
+        return None
+
+
 def account_cash():
     try:
         return float(_load()["bankroll"])
@@ -628,6 +675,21 @@ def _fresh_tape(chain, mint):
 
 QUOTE_RETRY_GAP_S = 2.0
 _LAST_QUOTE_DETAIL = ""
+_LAST_QUOTE_STAMP = None  # OBSERVATION stamp of the last priced quote (request start / receipt); never source time
+
+
+def _tape_quote_stamp(st):
+    """Stamp for a quote priced from a tape row: only the row's own stamps. Missing -> None."""
+    if not isinstance(st, dict):
+        return None
+    out = {}
+    for k in ("source_asof", "fetched_at", "received_at"):
+        v = st.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = float(v)
+    if "received_at" not in out or not ("source_asof" in out or "fetched_at" in out):
+        return None
+    return out
 
 
 def _ds_pairs_price(pairs):
@@ -656,14 +718,18 @@ def _ds_pairs_price(pairs):
 def _quote_detail(chain, mint):
     """(price, trail): best-pair pairs fetch -> tape fallback -> one
     bounded retry. Trail is plain-language, for skip logs."""
-    global _LAST_QUOTE_DETAIL
+    global _LAST_QUOTE_DETAIL, _LAST_QUOTE_STAMP
+    _LAST_QUOTE_STAMP = None
     ds = DS_CHAIN.get((chain or "").lower())
     if not ds:
         _LAST_QUOTE_DETAIL = "no dexscreener chain for %s" % chain
         return 0.0, _LAST_QUOTE_DETAIL
     url = "https://api.dexscreener.com/tokens/v1/%s/%s" % (ds, mint)
     trail = []
+    _rs = time.time()
     px, note = _ds_pairs_price(_http_json(url))
+    if px > 0:
+        _LAST_QUOTE_STAMP = {"fetched_at": _rs, "received_at": time.time()}
     trail.append("pairs fetch: " + note)
     if px <= 0:
         st = _fresh_tape(chain, mint)
@@ -672,15 +738,18 @@ def _quote_detail(chain, mint):
             trail.append("tape fallback: priced via %s"
                          % ((st or {}).get("tape_source") or "unknown"))
             px = tpx
+            _LAST_QUOTE_STAMP = _tape_quote_stamp(st)
         else:
             trail.append("tape fallback: "
                          + ("no tape" if not st else "tape unpriced"))
     if px <= 0:
         time.sleep(QUOTE_RETRY_GAP_S)
+        _rs2 = time.time()
         px2, note2 = _ds_pairs_price(_http_json(url))
         trail.append("pairs retry: " + note2)
         if px2 > 0:
             px = px2
+            _LAST_QUOTE_STAMP = {"fetched_at": _rs2, "received_at": time.time()}
     _LAST_QUOTE_DETAIL = "; ".join(trail)
     return px, _LAST_QUOTE_DETAIL
 
@@ -884,6 +953,22 @@ def consider_candidate(cand, now=None):
         return False, "momentum error: %s" % e, False
 
 
+def _entry_notional():
+    """Stake for a new entry: the owner-configured EXACT trade size when
+    one is set and valid (shared paper account enabled); otherwise the
+    lane's own NOTIONAL_USD (the account debit gate still refuses an
+    invalid or conflicting configured size). Recorded on the position so
+    exits compute PnL from the real notional."""
+    _pa = _paper_account()
+    if _pa is None:
+        return NOTIONAL_USD
+    try:
+        v = _pa.configured_trade_size()
+    except Exception:
+        v = None
+    return NOTIONAL_USD if v is None else float(v)
+
+
 def _consider_candidate(cand, now):
     if not _HAS_DEPS:
         return _skip(str(cand.get("mint") or ""), "momentum deps missing",
@@ -901,9 +986,10 @@ def _consider_candidate(cand, now):
     if not _ks.gate(LANE):
         return _skip(mint, "momentum lane halted by killswitch", True)
 
+    _N = _entry_notional()
     with _ledger_lock():
         d = _read()
-        if float(d["bankroll"]) < NOTIONAL_USD:
+        if float(d["bankroll"]) < _N:
             return _skip(mint, "bankroll exhausted (notional counter $%.2f)"
                          % float(d["bankroll"]), True)
         if mint in d["positions"]:
@@ -922,7 +1008,7 @@ def _consider_candidate(cand, now):
                          False)
 
     # Pre-registered cost gate (chain_costs, same as every paper lane).
-    blocked, why = _costs.cost_gate(chain, NOTIONAL_USD)
+    blocked, why = _costs.cost_gate(chain, _N)
     if blocked:
         logger.warning("momentum %s: %s", mint, why)
         return False, why, True
@@ -931,6 +1017,7 @@ def _consider_candidate(cand, now):
     ok_gate, why_gate, st = _runner_gate(chain, mint)
     if not ok_gate:
         return _skip(mint, why_gate, False)
+    _entry_row = dict(st) if isinstance(st, dict) else None  # immutable: the row THIS entry's gate saw (a later read must not mask it)
 
     # Venue fee grounding (2026-11-22 fee integration): the fresh
     # tape's dex label selects the fee-model venue. An unmodeled venue
@@ -942,13 +1029,16 @@ def _consider_candidate(cand, now):
                                                  (st or {}).get("dex"))
     if fee_venue is None:
         return _skip(mint, venue_why, True)
-    blocked, why = _costs.cost_gate(chain, NOTIONAL_USD,
+    blocked, why = _costs.cost_gate(chain, _N,
                                     venue=fee_venue or None)
     if blocked:
         logger.warning("momentum %s: %s", mint, why)
         return False, why, True
 
+    global _LAST_QUOTE_STAMP
+    _LAST_QUOTE_STAMP = None  # never reuse a previous entry's stamp
     quoted = quote_price(chain, mint)
+    _quote_stamp_snap = dict(_LAST_QUOTE_STAMP) if _LAST_QUOTE_STAMP else None  # THIS entry's priced-quote stamp
     if quoted <= 0:
         why = "no live quote"
         if _LAST_QUOTE_DETAIL:
@@ -979,9 +1069,9 @@ def _consider_candidate(cand, now):
         _journal_vetoed(cand, chain, mint, why, quoted)
         return _skip(mint, "veto at entry: %s" % why, True)
 
-    gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD,
+    gas_in = _costs.tx_cost_usd(chain, _N,
                                 venue=fee_venue or None)
-    eff_notional = NOTIONAL_USD - gas_in
+    eff_notional = _N - gas_in
     if eff_notional <= 0:
         return _skip(mint, "costs exceed notional", True)
 
@@ -1007,7 +1097,7 @@ def _consider_candidate(cand, now):
         "chain": chain, "source": "momentum", "lane": LANE,
         "score": 0.0, "tier": str(cand.get("lane") or "established"),
         "entry_ts": time.time(), "quoted_price": quoted,
-        "entry_price": filled, "notional_usd": NOTIONAL_USD,
+        "entry_price": filled, "notional_usd": _N,
         "peak_price": filled,
         "peak_ts": time.time(),
         "tokens": tokens, "gas_in_usd": round(gas_in, 6),
@@ -1029,7 +1119,7 @@ def _consider_candidate(cand, now):
             "score": 0.0, "tier": str(cand.get("lane") or "established"),
             "mcap": mcap, "liquidity": liquidity,
             "quoted_price": quoted, "filled_price": filled,
-            "cost_summary": _costs.cost_summary(chain, NOTIONAL_USD),
+            "cost_summary": _costs.cost_summary(chain, _N),
             "safety": {
                 "score": (rep or {}).get("score", 0),
                 "flags": list((rep or {}).get("flags", []))[:6],
@@ -1045,7 +1135,7 @@ def _consider_candidate(cand, now):
             "mcap": mcap, "liquidity": liquidity,
             "tape_source": tape_source,
             "quoted_price": quoted, "filled_price": filled,
-            "cost_summary": _costs.cost_summary(chain, NOTIONAL_USD),
+            "cost_summary": _costs.cost_summary(chain, _N),
             "spec_filters": spec_journal,
         },
     }
@@ -1054,7 +1144,7 @@ def _consider_candidate(cand, now):
     # under the same lock that debits cash and inserts the position.
     with _ledger_lock():
         d = _read()
-        if float(d["bankroll"]) < NOTIONAL_USD:
+        if float(d["bankroll"]) < _N:
             if d["state"] != "bankroll_exhausted":
                 d["state"] = "bankroll_exhausted"
                 _write(d)
@@ -1080,6 +1170,19 @@ def _consider_candidate(cand, now):
         # and transient: cash freed by a close re-enables entries.
         # The op_id keys on mint + entry ts (this lane dedupes-ever,
         # so an entry instance is unique) under the LANE global.
+        # MANDATORY capital gate (function-local import: not rebindable by
+        # variant engines; no private-counter fallback; see entry_guard).
+        try:
+            try:
+                from daemon.launch_scanner import entry_guard as _eg
+            except ImportError:
+                import entry_guard as _eg
+            _why_blocked = _eg.mandatory_entry_refusal(LANE)
+        except Exception:
+            _why_blocked = ("mandatory entry guard unavailable; entries "
+                            "blocked fail-closed")
+        if _why_blocked:
+            return _skip(mint, _why_blocked, False)
         _pa = _paper_account()
         if _pa is not None:
             # Stage C: reconcile pending close intents BEFORE any
@@ -1091,19 +1194,71 @@ def _consider_candidate(cand, now):
                              "close-intent divergence frozen: "
                              "entries blocked until operator "
                              "resolution", False)
+            from daemon.launch_scanner import entry_guard as _eg
+            _age_why = _eg.quote_age_refusal(
+                _entry_row, _pa.max_data_age_s(), time.time())
+            if _age_why:
+                return _skip(mint, "risk: " + _age_why, False)
+            _qage_why = _eg.quote_age_refusal(
+                _quote_stamp_snap, _pa.max_data_age_s(), time.time())
+            if _qage_why:
+                return _skip(mint, "risk: priced quote: " + _qage_why, False)
             _op = "%s:entry:%s:%d" % (LANE, mint,
                                       int(pos["entry_ts"] * 1000))
-            _ok, _why, _pid = _pa.try_debit(LANE, mint, NOTIONAL_USD,
-                                            tokens, _op)
+            if _demo_mode():
+                # DEMO: fill = Jupiter-quote simulation, NEVER the model fill; no filler or a skip
+                # REFUSES the entry (no silent fallback to modelled P&L).
+                _df = _demo_filler()
+                if _df is None:
+                    return _skip(mint, "demo exec: quote-simulation filler unavailable; entry refused", False)
+                try:
+                    _op = _df.intent_id(LANE, mint)  # durable intent; stale/unknown classified from the account
+                    _prior_fill = _df.get_fill(_op)  # durable journal read BEFORE buy
+                    _committed = _prior_fill is not None and _df.op_committed(_op) is True  # replay needs account debit evidence
+                    _fill = _df.buy(_op, mint, _N, _pa.max_price_impact_pct())
+                except _demo.DemoSkip as _e:
+                    return _skip(mint, "demo exec: %s" % _e.reason, False)
+                from daemon.launch_scanner import entry_guard as _eg_pq
+                _pq = _eg_pq.post_quote_refusal(_fill, _prior_fill, _committed, _pa.max_data_age_s(), time.time())
+                if _pq:
+                    try:
+                        _df.release_intent(LANE, mint)
+                    except Exception as _re:
+                        logger.warning("%s: release_intent failed (%r); a retry may replay the original fill", LANE, _re)
+                    return _skip(mint, "risk: " + _pq, False)
+                tokens = _fill["qty_tokens"]
+                filled = _fill["price_usd"]
+                pos.update({"tokens": tokens, "entry_price": filled, "peak_price": filled,
+                            "gas_in_usd": round(_fill["fee_usd"], 6),
+                            "execution": {"source": _fill["execution_source"], "entry_op": _op,
+                                          "signature": _fill["signature"],
+                                          "synthetic_signature": _fill["synthetic_signature"],
+                                          "provenance": _fill["provenance"]}})
+                pos["legs"]["c"]["peak"] = filled
+                pos["entry_snapshot"]["filled_price"] = filled
+                pos["entry_snapshot"]["cost_summary_basis"] = "MODEL_NOT_EXECUTION"
+            _ok, _why, _pid = _pa.try_debit(LANE, mint, _N,
+                                            tokens, _op,
+                                            durable_refusal=_demo_mode())
             if not _ok:
+                if _demo_mode():
+                    try:
+                        _demo_filler().release_intent(LANE, mint)
+                    except Exception as _re:
+                        logger.warning("%s: release_intent failed (%r); a retry may replay the original (stale) fill", LANE, _re)
                 return _skip(mint, "paper account: " + _why, False)
             pos["pa_pos_id"] = _pid
-        d["bankroll"] = round(float(d["bankroll"]) - NOTIONAL_USD, 6)
+        d["bankroll"] = round(float(d["bankroll"]) - _N, 6)
         d["positions"][mint] = pos
         _write(d)
-    logger.warning("momentum OPEN %s %s @ %s ($1, %s, liq $%.0f, "
+        if _demo_mode():
+            try:
+                _demo_filler().consume_intent(LANE, mint)
+            except Exception as _ce:  # safe: a stale intent is classified from the account on re-entry
+                logger.warning("%s: consume_intent failed (%r); stale intent dropped on re-entry", LANE, _ce)
+    logger.warning("momentum OPEN %s %s @ %s ($%.2f, %s, liq $%.0f, "
                    "mcap $%.0f, cash now $%.2f)",
-                   symbol, mint[:12], filled,
+                   symbol, mint[:12], filled, _N,
                    pos["tier"], liquidity, mcap, account_cash())
     return True, "opened", True
 
@@ -1280,6 +1435,25 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     if leg["done"]:
         return 0.0
     leg_tokens = pos["tokens"] * leg["frac"]
+    _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
+    if _sim and _pkind(reason, pkind) != "write_down_zero":
+        _r = _demo_sell(pos, leg_tokens, leg_key)
+        if _r is None:
+            return 0.0
+        _fill, _cap, _src = _r
+        pos.pop("pending_exit", None)
+        _kind = _pkind(reason, pkind)
+        _fv = _exit_fee_venue(pos)
+        filled_exit, gross, gas_out = _fill["price_usd"], _fill["gross_usd"], _fill["fee_usd"]
+        net = gross - gas_out
+        leg.update(done=True, exit_price=filled_exit, realized_usd=round(net, 6),
+                   exit_reason=reason, exit_price_kind=_kind, fee_venue=_fv or "none",
+                   exit_execution={"source": _fill["execution_source"], "signature": _fill["signature"],
+                                   "synthetic_signature": True, "effective_impact_cap_pct": _cap,
+                                   "impact_cap_source": _src, "provenance": _fill["provenance"]})
+        pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+        _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key, price_kind=_kind)
+        return net
     try:
         leg_usd = leg_tokens * exit_price
         filled_exit = _fills.honest_exit(
@@ -1316,6 +1490,30 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
         return 0.0
     total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"]
                        for k in open_legs)
+    _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
+    if _sim and _pkind(reason, pkind) != "write_down_zero":
+        _rkey = "remaining:%s" % "".join(open_legs)
+        _r = _demo_sell(pos, total_tokens, _rkey)
+        if _r is None:
+            return 0.0
+        _fill, _cap, _src = _r
+        pos.pop("pending_exit", None)
+        _kind = _pkind(reason, pkind)
+        _fv = _exit_fee_venue(pos)
+        filled_exit, gross, gas_out = _fill["price_usd"], _fill["gross_usd"], _fill["fee_usd"]
+        net = gross - gas_out
+        for key in open_legs:
+            leg = pos["legs"][key]
+            share = (pos["tokens"] * leg["frac"]) / total_tokens if total_tokens else 0
+            leg.update(done=True, exit_price=filled_exit, realized_usd=round(net * share, 6),
+                       exit_reason=reason, exit_price_kind=_kind, fee_venue=_fv or "none",
+                       exit_execution={"source": _fill["execution_source"],
+                                       "signature": _fill["signature"], "synthetic_signature": True,
+                                       "effective_impact_cap_pct": _cap, "impact_cap_source": _src,
+                                       "provenance": _fill["provenance"]})
+        pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+        _pa_settle(pos, total_tokens, gross, gas_out, _rkey, price_kind=_kind)
+        return net
     try:
         leg_usd = total_tokens * exit_price
         filled_exit = _fills.honest_exit(
@@ -1390,6 +1588,32 @@ def _verdict_visibility(closes):
     except Exception:
         return {}
 
+def _close_basis(c):
+    """Frozen-verdict basis of one close: True (compatible), False
+    (incompatible) or None (UNKNOWN). The stamp wins; otherwise the
+    recorded notional_usd is compared with the frozen NOTIONAL_USD; with
+    neither, the basis is unknown and cannot support SURVIVED."""
+    st = c.get("frozen_verdict_notional_compatible")
+    try:
+        _n = c.get("notional_usd")
+        if _n is not None and st in (True, False):
+            _act = abs(float(_n) - float(NOTIONAL_USD)) < 1e-9
+            if _act != st:
+                return False  # stamp contradicts the recorded notional: invalid
+    except (TypeError, ValueError):
+        return None
+    if st is True or st is False:
+        return st
+    try:
+        n = c.get("notional_usd")
+        if n is None:
+            return True  # unstamped legacy = the frozen $1 (source-grounded)
+        return abs(float(n) - float(NOTIONAL_USD)) < 1e-9
+    except (TypeError, ValueError):
+        return None
+
+
+
 def _verdict_check(d):
     """The PRE-REGISTERED verdict, evaluated in-ledger at the moment
     the sample completes (grad.py semantics). Mutates d (lock held
@@ -1401,14 +1625,29 @@ def _verdict_check(d):
         return False
     exp = sum(float(c.get("pnl_usd") or 0) for c in closes) / len(closes)
     halt = exp <= 0
+    # The verdict is FROZEN at NOTIONAL_USD. Closes stamped as a
+    # non-frozen notional (owner-configured size) cannot yield a
+    # QUALIFIED verdict or a SURVIVED claim. Losses stay in the sample
+    # and the non-positive-expectancy safety halt is unchanged. Closes
+    # (see _close_basis: unstamped watcher/momentum legacy = frozen $1).
+    bases = [_close_basis(c) for c in closes]
+    qualified = all(b is True for b in bases)
     d["verdict"] = {
         "ts": time.time(),
         "n_closes": len(closes),
         "expectancy": round(exp, 6),
         "net_usd": round(sum(float(c.get("pnl_usd") or 0)
                              for c in closes), 4),
-        "action": ("HALT — sample expectancy <= 0" if halt else
-                   "SURVIVED — sample expectancy > 0"),
+        "action": (("HALT — sample expectancy <= 0" if halt else
+                    "SURVIVED — sample expectancy > 0") if qualified else
+                   ("HALT — sample expectancy <= 0 (UNQUALIFIED: closes at a "
+                    "non-frozen notional)" if halt else
+                    "UNQUALIFIED — closes at a non-frozen notional; "
+                    "no SURVIVED claim")),
+        "qualified": qualified,
+        "basis_valid": qualified,
+        "n_incompatible_basis": sum(1 for b in bases if b is False),
+        "n_unknown_basis": sum(1 for b in bases if b is None),
         "sample_closes": VERDICT_SAMPLE_CLOSES,
     }
     d["verdict"].update(_verdict_visibility(closes))
@@ -1421,10 +1660,11 @@ def _finalize(d, mint, pos, closed_reason):
     """Move an open position to closes, settle cash, record the lane
     trade, evaluate the pre-registered verdict. Lock held by caller."""
     _recover_close_intents()
+    _N = float(pos.get("notional_usd") or NOTIONAL_USD)  # the real entry notional
     realized = round(float(pos["realized_usd"]), 6)
-    pnl = round(realized - NOTIONAL_USD, 4)
+    pnl = round(realized - _N, 4)
     d["bankroll"] = round(float(d["bankroll"]) + realized, 6)
-    if d["bankroll"] < NOTIONAL_USD:
+    if d["bankroll"] < _N:
         d["state"] = "bankroll_exhausted"
     rec = {
         "mint": mint, "symbol": pos["symbol"], "chain": pos["chain"],
@@ -1432,7 +1672,7 @@ def _finalize(d, mint, pos, closed_reason):
         "entry_ts": pos["entry_ts"], "close_ts": time.time(),
         "entry_price": pos["entry_price"],
         "realized_usd": realized,
-        "realized_mult": round(realized / NOTIONAL_USD, 4),
+        "realized_mult": round(realized / _N, 4),
         "pnl_usd": pnl,
         "closed_reason": closed_reason,
         "legs": {k: {"done": v["done"],
@@ -1448,6 +1688,11 @@ def _finalize(d, mint, pos, closed_reason):
         # Stage C: match lane closes to account ops.
         "pa_pos_id": pos.get("pa_pos_id"),
     }
+    # The pre-registered verdict is frozen at NOTIONAL_USD. A close at any
+    # other notional is a different size candidate: label it, do not
+    # silently renormalize the frozen thresholds or evidence.
+    rec["notional_usd"] = _N
+    rec["frozen_verdict_notional_compatible"] = abs(_N - NOTIONAL_USD) < 1e-9
     rec.update(_peak_fields(pos))
     rec["exit_price_kind"] = (
         _pk.aggregate(v.get("exit_price_kind")

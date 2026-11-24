@@ -66,8 +66,7 @@ _FILE_RE = re.compile(r"^events-(\d{8})(?:\.(\d+))?\.jsonl$")
 # ---- paths (FOREX_AGENT_HOME read at call time) ---------------------------
 
 def _home():
-    return os.environ.get("FOREX_AGENT_HOME",
-                          "/home/hatch/.forex-agent")
+    return (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 
 
 def recorder_dir():

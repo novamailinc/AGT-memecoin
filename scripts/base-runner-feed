@@ -89,7 +89,7 @@ try:
 except ImportError:
     _HAS_BUS = False
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 SEEN_FILE = os.path.join(HOME, "base_runner_seen.json")
 OUTCOME_FILE = os.path.join(HOME, "base_runner_outcomes.json")
 DAILY_FILE = os.path.join(HOME, "base_runner_daily.json")

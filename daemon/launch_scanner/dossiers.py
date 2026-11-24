@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover - script-style import path
 
 logger = logging.getLogger("forex_agent.daemon.launch_scanner.dossiers")
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 DOSSIER_DIR = os.path.join(HOME, "dossiers")
 
 # Persistent launch memory (2026-11-23, request section 4.1):

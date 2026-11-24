@@ -241,7 +241,7 @@ def _send_degen_card(card_text: str) -> bool:
         import urllib.parse as _urlparse  # noqa: PLC0415
         import json as _json  # noqa: PLC0415
         token_path = os.path.join(
-            os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent"),
+            (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent")),
             "telegram", "bot_token")
         with open(token_path) as _f:
             token = _f.read().strip()

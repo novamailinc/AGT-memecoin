@@ -86,7 +86,9 @@ SPARK_STALE_S = 30 * 60
 LOCK_STALE_S = 3600
 ROTATE_BYTES = 50 * 1024 * 1024
 HTTP_TIMEOUT = 10
-TOOLKIT_RUNNER = "/home/hatch/workspace/memecoin-toolkit/run_all_tests.sh"
+TOOLKIT_RUNNER = os.environ.get("AGT_TOOLKIT_RUNNER") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tools", "memecoin-toolkit", "run_all_tests.sh")
 TOOLKIT_STAMP_NAME = "toolkit_last_check.json"
 TOOLKIT_INTERVAL_S = 24 * 3600
 # Measured 2026-10-20: run_all_tests.sh completes in ~23s, well within

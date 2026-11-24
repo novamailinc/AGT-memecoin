@@ -69,7 +69,7 @@ import time
 
 logger = logging.getLogger("forex_agent.daemon.launch_scanner.rugger_registry")
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 REGISTRY_PATH = os.path.join(HOME, "rugger_registry.json")
 
 FLAG_THRESHOLD = 3

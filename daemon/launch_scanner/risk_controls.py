@@ -9,11 +9,11 @@ if honestly priced. check_slippage wires that declared refusal at the
 fill, where the lane's liquidity read exists.
 
 Scope rule (owner-owned risk values): the declared fills cap is always
-enforced when liquidity is known. AGT_RISK_MAX_SLIPPAGE_PCT may only
+enforced when liquidity is known; unknown/invalid liquidity or size REFUSES
+the entry fail-closed (2026-11-24; unknown slippage is never zero). AGT_RISK_MAX_SLIPPAGE_PCT may only
 TIGHTEN it (min), never loosen it; when that env var is set but
 unparsable/non-positive, or set while liquidity is unknown, the gate
-fails CLOSED. When the env var is unset and liquidity is unknown the
-gate passes - the lane's existing unknown-liquidity handling stands.
+fails CLOSED. Unknown liquidity always fails closed.
 Entry/account gating (daily loss, drawdown, exposure) is owned by
 paper_account's owner-config gates; this module deliberately does not
 duplicate them.
@@ -45,10 +45,19 @@ def check_slippage(size_usd, liquidity_usd, env=None):
     """(allowed, reason, effective_cap_pct) for one entry's modeled
     one-leg slippage. Never raises."""
     try:
-        liq = float(liquidity_usd) if liquidity_usd else None
-        if liq is not None and liq <= 0:
+        import math
+        try:
+            liq = float(liquidity_usd) if liquidity_usd else None
+        except (TypeError, ValueError):
             liq = None
-        size = float(size_usd or 0)
+        if liq is not None and (not math.isfinite(liq) or liq <= 0):
+            liq = None
+        try:
+            size = float(size_usd or 0)
+        except (TypeError, ValueError):
+            size = float("nan")
+        if not math.isfinite(size) or size <= 0:
+            return False, "entry size unknown, non-finite or not positive - failing closed", _declared_cap()
 
         cap = _declared_cap()
         explicit = False
@@ -66,10 +75,11 @@ def check_slippage(size_usd, liquidity_usd, env=None):
                                "closed" % _ENV_SLIPPAGE), cap
 
         if liq is None:
-            if explicit:
-                return False, ("liquidity unknown with a slippage "
-                               "gate enabled - failing closed"), cap
-            return True, "", cap
+            # 2026-11-24: unknown liquidity means unknown slippage, which is
+            # never treated as zero. The ENTRY is refused (exits do not call
+            # this gate).
+            return False, ("liquidity unknown: slippage cannot be "
+                           "established - failing closed"), cap
         if _fills is not None:
             slip = _fills.slippage_pct(size, liq)
         else:

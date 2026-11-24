@@ -15,7 +15,7 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 STATE_DIR = os.path.join(HOME, "killswitch")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 # Shadow copy (2026-11-11 fix): _save() keeps state.json.bak holding the

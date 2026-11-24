@@ -125,7 +125,7 @@ def bucket_id_for_key(key: str) -> str:
 def _guard_home(home: Optional[str] = None) -> str:
     if home:
         return home
-    return os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+    return (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 
 
 # 2026-11-22 (herd fix): lock contention is the NORMAL case when the
@@ -676,6 +676,26 @@ def quiet_report_probe(ok, now=None,
 
 _PACER_REFILL_S = 20.0        # one token per 20s per key (3/min/key)
 _PACER_CAPACITY = 2.0         # burst allowance per key
+
+# Account-bucket parity with the qualification that passed (user request
+# 2026-11-24 03:27/03:33: the bot must use the setup that passed). Helius
+# calls through the provider router share ONE aggregate bucket
+# (bucket_id_for_key("account:helius_main")), not one per key. The
+# qualification run that passed 100 requests in 5 minutes used an
+# in-process 3.0s refill on exactly that bucket (capacity unchanged at 2).
+# Only that bucket gets the 3.0s refill; every other bucket keeps
+# _PACER_REFILL_S. Credit budgets, account cooldown/hold, backoff,
+# single-probe and max_attempts guards are untouched. 3.0s is an
+# engineering allocation (0.33 rps, below the documented Free-plan RPC
+# ceiling of 10 rps if the account is Free, which is unverified); it is
+# not a vendor guarantee.
+_ACCOUNT_BUCKET_REFILL_S = 3.0
+
+
+def _refill_s(bucket) -> float:
+    if bucket == bucket_id_for_key("account:helius_main"):
+        return _ACCOUNT_BUCKET_REFILL_S
+    return _PACER_REFILL_S
 _PACER_MAX_DEBT = 1.0         # priority may borrow one token
 _PACER_WAIT_S = 5.0           # normal acquire waits at most this long
 _PACER_PRIORITY_WAIT_S = 20.0  # priority (exit pricing) waits longer
@@ -820,7 +840,7 @@ class SharedPacer:
             self._local[bucket] = st
         st["tokens"] = min(_PACER_CAPACITY,
                            st["tokens"] + (now - st["updated_ts"])
-                           / _PACER_REFILL_S)
+                           / _refill_s(bucket))
         st["updated_ts"] = now
         if now < st["cooldown_until"]:
             return False
@@ -900,7 +920,7 @@ class SharedPacer:
             now = time.time()
             outcome = self._transact(bucket,
                                      lambda st, t: self._try_take(
-                                         st, t, priority))
+                                         st, t, priority, bucket))
             if outcome is None:
                 # Shared state unreachable. When the state file
                 # exists this is lock contention, not a missing
@@ -936,7 +956,7 @@ class SharedPacer:
             time.sleep(sleep_s + random.random() * 0.25)
 
     def _try_take(self, st: Dict[str, float], now: float,
-                  priority: bool):
+                  priority: bool, bucket: str = ""):
         """One atomic take attempt. Returns (outcome, new_state).
 
         outcome: "ok" (token taken), "cooldown" (do not call),
@@ -946,7 +966,7 @@ class SharedPacer:
         to exactly one caller."""
         st["tokens"] = min(
             _PACER_CAPACITY,
-            st["tokens"] + (now - st["updated_ts"]) / _PACER_REFILL_S)
+            st["tokens"] + (now - st["updated_ts"]) / _refill_s(bucket))
         st["updated_ts"] = now
         if now < st["cooldown_until"]:
             return "cooldown", st
@@ -970,7 +990,7 @@ class SharedPacer:
             return "ok", st
         # No token: sleep until the next refill lands.
         deficit = 1.0 - st["tokens"]
-        return deficit * _PACER_REFILL_S, st
+        return deficit * _refill_s(bucket), st
 
     def report(self, bucket: str, ok: bool) -> None:
         """Record a Helius outcome. A success clears the cooldown
@@ -986,7 +1006,7 @@ class SharedPacer:
             st["tokens"] = min(
                 _PACER_CAPACITY,
                 st["tokens"] + (t - st["updated_ts"])
-                / _PACER_REFILL_S)
+                / _refill_s(bucket))
             st["updated_ts"] = t
             if ok:
                 st["cooldown_until"] = 0.0

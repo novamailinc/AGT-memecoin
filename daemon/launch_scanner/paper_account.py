@@ -166,6 +166,16 @@ def mark_ttl_s() -> float:
 # entry fail-closed; it never falls back to an invented number.
 # Threshold selection and gate activation stay owner-owned.
 
+# Authoritative set of owner_config keys that the entry gates read. Keep in
+# lockstep with the _resolve_threshold(...) calls below; owner_config derives
+# its enforcement notes from this (drift guard: tests/test_owner_config_enforced_source.py).
+ENFORCED_OWNER_KEYS = ("max_daily_loss_usd", "max_drawdown_pct",
+                       "max_simultaneous_trades", "max_simultaneous_positions",
+                       "max_data_age_s", "max_price_impact_pct",
+                       "max_total_exposure_usd",
+                       "max_exposure_pct", "max_token_exposure_usd")
+
+
 def gates_enabled() -> bool:
     return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
 
@@ -228,8 +238,150 @@ def max_exposure_pct() -> Optional[float]:
                               "max_exposure_pct")
 
 
+def max_simultaneous_trades() -> Optional[float]:
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_SIMULTANEOUS",
+                              "max_simultaneous_trades")
+
+
+def max_simultaneous_positions() -> Optional[float]:
+    """Directive: Maximum simultaneous positions (distinct tokens). A
+    separate mandatory cap from max_simultaneous_trades (open lots)."""
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_POSITIONS",
+                              "max_simultaneous_positions")
+
+
+def max_price_impact_pct() -> Optional[float]:
+    """Maximum Jupiter quote price impact (percent). MANDATORY for demo
+    execution entries: unset refuses."""
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_PRICE_IMPACT_PCT",
+                              "max_price_impact_pct")
+
+
+def max_data_age_s() -> Optional[float]:
+    """Directive: Maximum data age. MANDATORY for entries (unset refuses);
+    when set it also TIGHTENS the accepted age of marks below the legacy
+    default TTL. Never loosens it."""
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_DATA_AGE_S",
+                              "max_data_age_s")
+
+
+def max_total_exposure_usd() -> Optional[float]:
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD",
+                              "max_total_exposure_usd")
+
+
+def max_token_exposure_usd() -> Optional[float]:
+    """Maximum exposure to ONE token (mint), across all lanes. Mandatory:
+    unset -> new entries fail closed."""
+    return _resolve_threshold("PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD",
+                              "max_token_exposure_usd")
+
+
+def configured_trade_size() -> Optional[float]:
+    """The configured EXACT trade size lanes should use, or None when no
+    valid size is configured (unset, invalid, or env/owner conflict; the
+    debit/hold gate refuses invalid and conflicting values itself)."""
+    try:
+        from daemon import owner_config  # noqa: PLC0415
+        state, owner_v = owner_config.stored_state("trade_amount_usd")
+    except Exception:
+        return None
+    env_raw = os.environ.get("PAPER_ACCOUNT_TRADE_SIZE_USD")
+    env_v = None
+    if env_raw not in (None, ""):
+        try:
+            env_v = float(env_raw)
+        except ValueError:
+            return None
+        if not (env_v > 0 and env_v == env_v and env_v != float("inf")):
+            return None
+    if state == "invalid":
+        return None
+    if state == "ok":
+        if env_v is not None and abs(env_v - owner_v) > 1e-9:
+            return None
+        return float(owner_v)
+    return env_v
+
+
+def _trade_size_refusal(new_stake: float) -> Optional[str]:
+    """Exact configured trade size (directive: a fixed size is used as
+    configured, not as a cap). Applies only when a size is configured;
+    unset leaves lane sizing unchanged (no invented default). A present
+    but invalid value, or an env value conflicting with the owner value,
+    refuses fail-closed."""
+    try:
+        from daemon import owner_config  # noqa: PLC0415
+        state, owner_v = owner_config.stored_state("trade_amount_usd")
+    except Exception:
+        return "gate: configured trade size unreadable; entry blocked fail-closed"
+    if state == "invalid":
+        return ("gate: configured trade_amount_usd is present but invalid; "
+                "entry blocked fail-closed")
+    env_raw = os.environ.get("PAPER_ACCOUNT_TRADE_SIZE_USD")
+    env_v = None
+    if env_raw not in (None, ""):
+        try:
+            env_v = float(env_raw)
+        except ValueError:
+            return "gate: PAPER_ACCOUNT_TRADE_SIZE_USD invalid; entry blocked fail-closed"
+        if not (env_v > 0 and env_v == env_v and env_v != float("inf")):
+            return "gate: PAPER_ACCOUNT_TRADE_SIZE_USD invalid; entry blocked fail-closed"
+    want = owner_v if state == "ok" else env_v
+    if state == "ok" and env_v is not None and abs(env_v - owner_v) > 1e-9:
+        return ("gate: trade size conflict (owner %.4f vs env %.4f); entry "
+                "blocked fail-closed" % (owner_v, env_v))
+    if want is None:
+        return None
+    if abs(float(new_stake) - want) > 1e-9 * max(1.0, want):
+        return ("gate: stake $%.4f is not the configured trade size $%.4f "
+                "(exact size, not a cap)" % (float(new_stake), want))
+    return None
+
+
+def _held_total(led: Dict[str, Any]) -> float:
+    """Sum of reserved (unconsumed, unreleased) hold amounts."""
+    return sum(float(h["amount"]) for h in (led.get("holds") or {}).values())
+
+
+def _position_identities(led: Dict[str, Any]) -> set:
+    """Distinct POSITION identities: one per token (mint) held across all
+    lanes and lots (an add-on lot or another lane entering the same token
+    is the same position), one per pending-SOL entry, and one per hold
+    (a hold with a recorded mint joins that token's identity)."""
+    ids = set()
+    for st in led.get("lanes", {}).values():
+        for key, p in (st.get("open") or {}).items():
+            ids.add(("mint", p.get("mint", key)))
+    for pid in (led.get("pending_sol") or {}):
+        ids.add(("pending", pid))
+    for op, h in (led.get("holds") or {}).items():
+        ids.add(("mint", h["mint"]) if h.get("mint") else ("hold", op))
+    return ids
+
+
+def _open_trade_count(led: Dict[str, Any]) -> int:
+    """Open TRADES: every open lot in every lane, every pending-SOL entry
+    and every reserved hold. An add-on lot or a second lane on a held token
+    is a separate trade (conservative; no identity merging)."""
+    n = sum(len(st.get("open", {})) for st in led.get("lanes", {}).values())
+    return n + len(led.get("pending_sol", {})) + len(led.get("holds") or {})
+
+
+def _open_position_count(led: Dict[str, Any], mint: Optional[str] = None) -> int:
+    """Open positions by IDENTITY (see _position_identities). With `mint`,
+    the count AFTER an entry on that mint: +1 only when that token is not
+    already a position."""
+    ids = _position_identities(led)
+    if mint:
+        ids.add(("mint", mint))
+    return len(ids)
+
+
 def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
-                       new_stake: float) -> Optional[str]:
+                       new_stake: float,
+                       pure_stake: Optional[float] = None,
+                       mint: Optional[str] = None) -> Optional[str]:
     """Account-level entry gate, evaluated UNDER the account lock as
     part of the debit's critical section: the evaluation and the
     reservation are atomic, so two lanes can never each pass on the
@@ -270,6 +422,57 @@ def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
         return ("gate: no owner-approved limit for %s; entry blocked "
                 "fail-closed (set via /config_set or env override)"
                 % ", ".join(unset))
+    # new_stake is the full reserve (exposure/cash); the configured size
+    # applies to the PURE stake when the caller reserves stake + fee.
+    _ts = _trade_size_refusal(new_stake if pure_stake is None else pure_stake)
+    if _ts:
+        return _ts
+    if max_data_age_s() is None:
+        return ("gate: no owner-approved limit for max_data_age_s; entry "
+                "blocked fail-closed (set via /config_set or env override)")
+    tok_lim = max_token_exposure_usd()
+    if tok_lim is None:
+        return ("gate: no owner-approved limit for max_token_exposure_usd; "
+                "entry blocked fail-closed (set via /config_set or env override)")
+    if not mint:
+        return "gate: entry has no mint; per-token exposure unknown; entry blocked fail-closed"
+    # Per-MINT exposure from TRUSTED MARKS (view marks_status is ok here),
+    # across all lanes, plus reserved holds for this mint (a hold with no
+    # recorded mint cannot be attributed, so it counts conservatively).
+    tok_now = float((view.get("marked_by_mint") or {}).get(mint, 0.0))
+    tok_hold = sum(float(h["amount"]) for h in (led.get("holds") or {}).values()
+                   if h.get("mint") in (None, mint))
+    if tok_now + tok_hold + new_stake > tok_lim:
+        return ("gate: token %s exposure $%.2f (marked $%.2f + held $%.2f) + "
+                "new $%.2f > limit $%.2f"
+                % (mint, tok_now + tok_hold + new_stake, tok_now, tok_hold,
+                   new_stake, tok_lim))
+    sim_lim, tot_lim = max_simultaneous_trades(), max_total_exposure_usd()
+    pos_lim = max_simultaneous_positions()
+    if sim_lim is None or tot_lim is None or pos_lim is None:
+        unset = [n for n, v in (("max_simultaneous_trades", sim_lim),
+                                ("max_simultaneous_positions", pos_lim),
+                                ("max_total_exposure_usd", tot_lim))
+                 if v is None]
+        return ("gate: no owner-approved limit for %s; entry blocked "
+                "fail-closed (set via /config_set or env override)"
+                % ", ".join(unset))
+    # Reserved holds are ADMITTED reservations (consume turns one into a
+    # position and removes it in the same locked mutation), so they count
+    # as exposure and as a position slot here. Held cash stays inside
+    # `cash`, so the view's cost_exposure/book_value must not include it.
+    held = _held_total(led)
+    if _open_trade_count(led) + 1 > sim_lim:
+        return ("gate: simultaneous trades %d (after this entry, every open "
+                "lot/pending/hold counts) > limit %d"
+                % (_open_trade_count(led) + 1, int(sim_lim)))
+    if _open_position_count(led, mint) > pos_lim:
+        return ("gate: simultaneous positions %d (after this entry, by "
+                "token identity) > limit %d"
+                % (_open_position_count(led, mint), int(pos_lim)))
+    if view["cost_exposure"] + held + new_stake > tot_lim:
+        return ("gate: total exposure $%.2f after entry > limit $%.2f"
+                % (view["cost_exposure"] + held + new_stake, tot_lim))
     if dl > dl_lim:
         return ("gate: daily loss $%.2f > limit $%.2f"
                 % (dl, dl_lim))
@@ -278,7 +481,7 @@ def _gate_check_locked(led: Dict[str, Any], view: Dict[str, Any],
                 % (view["drawdown_pct"], dd_lim))
     if me <= 0:
         return "gate: marked equity $%.2f; no capacity" % me
-    after = view["cost_exposure"] + new_stake
+    after = view["cost_exposure"] + held + new_stake
     if after > exp_lim / 100.0 * me:
         return ("gate: exposure $%.2f after entry > %.0f%% of marked "
                 "equity $%.2f" % (after, exp_lim, me))
@@ -856,7 +1059,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                                  if ev.get("instance") is True else {})}
             replayed += 1
         elif kind == "debit_refused":
-            if not op_id or ev.get("instance") is not True:
+            if not op_id or not (ev.get("instance") is True or ev.get("durable_refusal") is True):
                 return led, "invalid refused entry event"
             ops[op_id] = {k:v for k,v in ev.items() if k not in ("seq", "event_id", "ts")}
             replayed += 1
@@ -864,13 +1067,19 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             amount = float(ev.get("amount") or 0)
             if amount <= 0 or not lane:
                 return led, "replay cannot apply hold (bad amount/lane)"
+            _st = ev.get("stake")
+            _mt = ev.get("mint")
             led.setdefault("holds", {})[op_id] = {
-                "lane": lane, "amount": amount, "ts": ev.get("ts")}
+                "lane": lane, "amount": amount, "ts": ev.get("ts"),
+                **({"stake": float(_st)} if _st is not None else {}),
+                **({"mint": _mt} if _mt else {})}
             led["cash_spendable"] = round(
                 float(led.get("cash_spendable", 0.0)) - amount, 8)
             if op_id:
                 ops[op_id] = {"event": "hold", "lane": lane,
-                              "amount": amount}
+                              "amount": amount,
+                              **({"stake": float(_st)} if _st is not None else {}),
+                              **({"mint": _mt} if _mt else {})}
             replayed += 1
         elif kind == "hold_released":
             hold_op = ev.get("hold_op_id")
@@ -1185,9 +1394,16 @@ def _op_lookup(led: Dict[str, Any], op_id: str, kind: str,
 
 def try_debit(lane: str, mint: str, stake: float, qty: float,
               op_id: str, ts: Optional[float] = None,
-              marks: Optional[Dict[str, Dict[str, Any]]] = None):
-    """Legacy one-open-mint reservation; behavior and WAL shape unchanged."""
-    return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=False)
+              marks: Optional[Dict[str, Dict[str, Any]]] = None,
+              durable_refusal: bool = False):
+    """Legacy one-open-mint reservation; behavior and WAL shape unchanged by default.
+
+    durable_refusal=True (DEMO entry intents only: their op ids are unique per attempt) journals a
+    refusal as a replayable debit_refused op, so a lost intent release is classified STALE from the
+    account and the retry re-quotes. Left False, a refusal is transient and writes nothing (stable
+    op ids of other lanes must stay retryable)."""
+    return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=False,
+                      durable_refusal=bool(durable_refusal))
 
 
 def try_debit_instance(lane: str, mint: str, stake: float, qty: float,
@@ -1201,10 +1417,11 @@ def try_debit_instance(lane: str, mint: str, stake: float, qty: float,
     return _try_debit(lane, mint, stake, qty, op_id, ts, marks, instance=True)
 
 
-def _debit_refused(led, instance, lane, mint, stake, qty, op_id, why):
-    if instance:
+def _debit_refused(led, instance, lane, mint, stake, qty, op_id, why, durable=False):
+    if instance or durable:
         seq = int(led.get("seq") or 0) + 1
-        event = {"event": "debit_refused", "instance": True,
+        event = {"event": "debit_refused",
+                 ("instance" if instance else "durable_refusal"): True,
                  "lane": lane, "mint": mint, "stake": stake, "qty": qty,
                  "op_id": op_id, "reason": why, "seq": seq,
                  "event_id": "ev#%d" % seq}
@@ -1219,7 +1436,7 @@ def _debit_refused(led, instance, lane, mint, stake, qty, op_id, why):
 def _try_debit(lane: str, mint: str, stake: float, qty: float,
               op_id: str, ts: Optional[float] = None,
               marks: Optional[Dict[str, Dict[str, Any]]] = None,
-              instance: bool = False
+              instance: bool = False, durable_refusal: bool = False
               ) -> Tuple[bool, str, Optional[str]]:
     """Reserve `stake` paper dollars for `lane` buying `qty` units
     of `mint`. op_id is the caller's stable operation ID: an
@@ -1256,6 +1473,8 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         return False, "caller op_id is required", None
     if gates_enabled() and marks is None:
         marks = _central_marks()
+    def _refuse(*a):
+        return _debit_refused(*a, durable=durable_refusal)
     with _lock():
         led, healthy, degraded = _load_locked()
         if not healthy or led is None:
@@ -1264,9 +1483,10 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         if degraded:
             return False, "account degraded: %s" % degraded, None
         prior = led.get("ops", {}).get(op_id)
-        if instance and prior is not None and prior.get("event") == "debit_refused":
-            if any(prior.get(k) != v for k,v in
-                   {"lane":lane,"mint":mint,"stake":stake,"qty":qty,"instance":True}.items()):
+        if prior is not None and prior.get("event") == "debit_refused":
+            _exp = {"lane": lane, "mint": mint, "stake": stake, "qty": qty}
+            if (any(prior.get(k) != v for k, v in _exp.items())
+                    or bool(prior.get("instance")) != bool(instance)):
                 return False, "refused entry attempt parameter conflict", None
             return False, "original refusal: " + prior["reason"], None
         rec, conflict = _op_lookup(led, op_id, "debit", lane, mint,
@@ -1281,7 +1501,7 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         cash = float(led["cash"])
         spendable = float(led.get("cash_spendable", 0.0))
         if spendable < stake:
-            return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+            return _refuse(led, instance, lane, mint, stake, qty, op_id,
                                 ("account spendable cash $%.2f < stake "
                             "$%.2f (total $%.2f incl. quarantined "
                             "estimated proceeds)"
@@ -1289,7 +1509,7 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         st = _lane(led, lane)
         if (mint in st["open"] or (not instance and any(
                 p.get("mint") == mint for p in st["open"].values()))):
-            return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+            return _refuse(led, instance, lane, mint, stake, qty, op_id,
                                   "%s already has an open %s position" % (lane, mint))
         cap = lane_cap()
         if cap is not None:
@@ -1297,21 +1517,27 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
             open_basis += sum(float(p["basis"]) for p in
                               led.get("pending_sol", {}).values() if p["lane"] == lane)
             if open_basis + stake > cap:
-                return _debit_refused(led, instance, lane, mint, stake, qty, op_id,
+                return _refuse(led, instance, lane, mint, stake, qty, op_id,
                                     ("lane cap $%.2f would be exceeded "
                                 "($%.2f open + $%.2f new)"
                                 % (cap, open_basis, stake)))
-        if gates_enabled():
+        if not gates_enabled():
+            # MANDATORY (owner spec: no bypass of risk checks): an entry is
+            # never admitted with the account gates off. Evaluated inside
+            # the lock so direct callers cannot skip a lane-side precheck.
+            return _refuse(led, instance, lane, mint, stake, qty, op_id,
+                                  "mandatory gates off; entry blocked fail-closed")
+        if True:
             view = _view_locked(led, marks, degraded)
             _update_baselines_locked(led, view)
             view.update(_gate_fields(led, view))
-            refusal = _gate_check_locked(led, view, stake)
+            refusal = _gate_check_locked(led, view, stake, mint=mint)
             if refusal is not None:
-                return _debit_refused(led, instance, lane, mint, stake, qty, op_id, refusal)
+                return _refuse(led, instance, lane, mint, stake, qty, op_id, refusal)
         if provider_health_gate_enabled():
             refusal = _provider_health_refusal()
             if refusal is not None:
-                return _debit_refused(led, instance, lane, mint, stake, qty, op_id, refusal)
+                return _refuse(led, instance, lane, mint, stake, qty, op_id, refusal)
         led["seq"] = int(led.get("seq") or 0) + 1
         pid = _pos_id(lane, mint, led["seq"])
         _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
@@ -1331,7 +1557,9 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
 
 def hold_stake(lane: str, amount: float, op_id: str,
                ts: Optional[float] = None,
-               marks: Optional[Dict[str, Dict[str, Any]]] = None
+               marks: Optional[Dict[str, Dict[str, Any]]] = None,
+               stake: Optional[float] = None,
+               mint: Optional[str] = None
                ) -> Tuple[bool, str]:
     """Reserve `amount` of spendable cash at SEAL time for an
     execution whose outcome is not yet known (design: account-wide
@@ -1349,6 +1577,12 @@ def hold_stake(lane: str, amount: float, op_id: str,
     if not _valid_amount(amount) or amount <= 0:
         return False, "hold amount must be a positive finite number"
     amount = float(amount)
+    if stake is not None:
+        # `amount` is the FULL reserve (stake + max fee); `stake` is the
+        # pure stake the configured trade size applies to.
+        if not _valid_amount(stake) or stake <= 0 or float(stake) > amount + 1e-9:
+            return False, "hold stake must be a positive finite number <= the reserve"
+        stake = float(stake)
     if not lane:
         return False, "lane is required"
     if not op_id or not isinstance(op_id, str):
@@ -1363,8 +1597,12 @@ def hold_stake(lane: str, amount: float, op_id: str,
             return False, "account degraded: %s" % degraded
         prior = led.get("ops", {}).get(op_id)
         if prior is not None:
+            _ps = prior.get("stake")
             if (prior.get("event") == "hold"
                     and prior.get("lane") == lane
+                    and ((_ps is None and stake is None)
+                         or (_ps is not None and stake is not None
+                             and abs(float(_ps) - stake) < 1e-9))
                     and abs(float(prior.get("amount", -1)) - amount) < 1e-9):
                 return True, "ok (retry of applied op)"
             return False, "hold op_id parameter conflict"
@@ -1392,7 +1630,7 @@ def hold_stake(lane: str, amount: float, op_id: str,
             view = _view_locked(led, marks, degraded)
             _update_baselines_locked(led, view)
             view.update(_gate_fields(led, view))
-            refusal = _gate_check_locked(led, view, amount)
+            refusal = _gate_check_locked(led, view, amount, stake, mint=mint)
             if refusal is not None:
                 return False, refusal
         if provider_health_gate_enabled():
@@ -1400,12 +1638,18 @@ def hold_stake(lane: str, amount: float, op_id: str,
             if refusal is not None:
                 return False, refusal
         led["seq"] = int(led.get("seq") or 0) + 1
-        holds[op_id] = {"lane": lane, "amount": amount, "ts": ts}
+        holds[op_id] = {"lane": lane, "amount": amount, "ts": ts,
+                        **({"stake": stake} if stake is not None else {}),
+                        **({"mint": mint} if mint else {})}
         led["cash_spendable"] = round(spendable - amount, 8)
         led["ops"][op_id] = {"event": "hold", "lane": lane,
-                             "amount": amount}
+                             "amount": amount,
+                             **({"stake": stake} if stake is not None else {}),
+                             **({"mint": mint} if mint else {})}
         _journal({"event": "hold", "event_id": "ev#%d" % led["seq"],
                   "op_id": op_id, "lane": lane, "amount": amount,
+                  **({"stake": stake} if stake is not None else {}),
+                  **({"mint": mint} if mint else {}),
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
@@ -1612,6 +1856,37 @@ def settle_hold_fee(hold_op_id: str, fee_amount: float, fee_op_id: str,
                   "op_id": rel_op, "hold_op_id": hold_op_id,
                   "amount": float(held["amount"]), "reason": "fee settled",
                   "seq": led["seq"], "ts": ts})
+        _save_locked(led)
+        return True, "ok"
+
+
+def book_fee(fee_amount: float, fee_op_id: str,
+             ts: Optional[float] = None) -> Tuple[bool, str]:
+    """Book a REAL, already-incurred network fee (a landed-failed swap) that is not tied to a
+    hold: cash AND spendable fall by the fee. Idempotent by fee_op_id; journaled before the
+    state save and replayed after a crash (same "fee" event as settle_hold_fee, no hold)."""
+    if not _valid_amount(fee_amount) or fee_amount <= 0:
+        return False, "fee amount must be a positive finite number"
+    if not fee_op_id or not isinstance(fee_op_id, str):
+        return False, "caller fee_op_id is required"
+    fee_amount = float(fee_amount)
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return False, "account ledger unreadable (fail-closed)"
+        if degraded:
+            return False, "account degraded: %s" % degraded
+        if led.get("ops", {}).get(fee_op_id) is not None:
+            return True, "ok (retry of applied op)"
+        led["seq"] = int(led.get("seq") or 0) + 1
+        led["cash"] = round(float(led["cash"]) - fee_amount, 8)
+        led["cash_spendable"] = round(
+            float(led.get("cash_spendable", 0.0)) - fee_amount, 8)
+        led["ops"][fee_op_id] = {"event": "fee", "hold_op_id": None,
+                                 "amount": fee_amount}
+        _journal({"event": "fee", "event_id": "ev#%d" % led["seq"],
+                  "op_id": fee_op_id, "hold_op_id": None,
+                  "amount": fee_amount, "seq": led["seq"], "ts": ts})
         _save_locked(led)
         return True, "ok"
 
@@ -1974,6 +2249,36 @@ def operation_receipt(op_id: str) -> Tuple[Optional[dict], Optional[str]]:
         return copy.deepcopy(rec), None
 
 
+def op_receipts(op_ids):
+    """Batch form of op_receipt: ONE journal read for many op_ids. {op_id: credit event or None}. A truncated or
+    corrupt journal yields None for every id (unknown is never proof)."""
+    want = set(op_ids)
+    out = {o: None for o in want}
+    entries, status, _ = _journal_read()
+    if status is not None:
+        out["_unreadable"] = True
+        return out
+    for ev in entries:
+        if ev.get("op_id") in want and ev.get("event") == "credit":
+            out[ev["op_id"]] = dict(ev)
+    return out
+
+
+def op_receipt(op_id: str):
+    """Read-only receipt for an APPLIED credit op: the journaled credit event (qty, proceeds, fee, net,
+    price_kind), or None when there is no applied credit for the op or the journal is truncated/corrupt
+    (unknown is never proof). Lets a caller finish its own side of a crash window with the ORIGINAL
+    settlement facts instead of re-deriving or upgrading them."""
+    entries, status, _ = _journal_read()
+    if status is not None:
+        return None
+    rec = None
+    for ev in entries:
+        if ev.get("op_id") == op_id and ev.get("event") == "credit":
+            rec = dict(ev)
+    return rec
+
+
 def op_outcome(op_id: str) -> str:
     """Journal-backed outcome for one op_id (Stage C, 2026-11-22):
 
@@ -2107,6 +2412,8 @@ def _view_locked(led: Dict[str, Any],
     out_lanes = {}
     exposure = 0.0
     open_positions = []
+    mint_of: Dict[Any, str] = {}
+    by_mint: Dict[str, float] = {}
     for name, st in led.get("lanes", {}).items():
         basis = sum(float(p["basis"]) for p in led.get("pending_sol", {}).values()
                     if p["lane"] == name)
@@ -2118,6 +2425,7 @@ def _view_locked(led: Dict[str, Any],
             real_mint = p.get("mint", mint)
             open_positions.append((name, mark_key, _pos_qty(p),
                                    p.get("pos_id")))
+            mint_of[(name, mark_key)] = real_mint
             positions.append({"mint": real_mint, "qty": _pos_qty(p),
                               **({"mark_key": mark_key, "instance": True}
                                  if p.get("instance") is True else {}),
@@ -2188,6 +2496,12 @@ def _view_locked(led: Dict[str, Any],
         by_source: Dict[str, float] = {}
         now = time.time()
         ttl = mark_ttl_s()
+        try:
+            _mda = max_data_age_s()
+        except Exception:
+            _mda = None
+        if _mda is not None and _mda > 0:
+            ttl = min(ttl, float(_mda))  # owner age only tightens
         for lane, mint, want_qty, want_pos_id in open_positions:
             m = (marks.get(lane) or {}).get(mint)
             if m is None:
@@ -2199,6 +2513,9 @@ def _view_locked(led: Dict[str, Any],
                 problems.append("%s/%s: %s" % (lane, mint, problem))
             else:
                 total += v  # type: ignore[operator]
+                _mk = mint_of.get((lane, mint))
+                if _mk is not None:
+                    by_mint[_mk] = round(by_mint.get(_mk, 0.0) + v, 6)
                 src = str(m.get("source"))
                 by_source[src] = round(by_source.get(src, 0.0) + v,
                                        6)
@@ -2213,18 +2530,23 @@ def _view_locked(led: Dict[str, Any],
         # ignores the price impact of selling the position back
         # into the curve) versus a Jupiter-listed price.
         out["marked_by_source"] = by_source
+        out["marked_by_mint"] = by_mint
         out["marked_equity"] = round(cash + marked, 6)
         # CONSERVATIVE SERIES (quarantine acceptance, 2026-11-22):
         # the equity series every risk input consumes is
-        # cash_SPENDABLE + marked exposure. Quarantined estimated
+        # cash_SPENDABLE + HELD (reserved) cash + marked exposure. Quarantined estimated
         # proceeds are excluded by construction, so a stale-price
         # tranche can neither boost risk headroom (baseline/peak
         # captured without it) nor mask a drawdown (the series is
         # internally consistent: estimates never enter it at any
         # point in time). marked_equity above stays the gross
         # diagnostic (total cash incl. quarantined).
+        # Reserved holds are REAL cash (admitted reservations, still ours,
+        # not estimated proceeds): spendable + held + marks.
         out["marked_equity_conservative"] = round(
-            float(led.get("cash_spendable") or 0.0) + marked, 6)
+            float(led.get("cash_spendable") or 0.0)
+            + sum(float(h["amount"]) for h in (led.get("holds") or {}).values())
+            + marked, 6)
         out["unrealized_pnl"] = round(marked - exposure, 6)
     elif marks or open_positions:
         out["marks_status"] = ("; ".join(problems) if problems

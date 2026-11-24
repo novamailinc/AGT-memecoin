@@ -45,7 +45,7 @@ try:
 except Exception:  # pragma: no cover — zoneinfo is stdlib 3.9+
     _WAT = timezone.utc
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 STATE_PATH = os.path.join(HOME, "ab_forward.json")
 LEDGERS = {
     "grad_select": os.path.join(HOME, "grad_select_ledger.json"),

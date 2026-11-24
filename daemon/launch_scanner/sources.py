@@ -383,7 +383,7 @@ _GT_DS_DARK_UNTIL = 0.0       # per-process skip-DS latch deadline
 
 
 def _gt_throttle_path() -> str:
-    home = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+    home = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
     return os.path.join(home, "gt_throttle.json")
 
 
@@ -588,6 +588,15 @@ def tape_batch_stats(mints: List[str],
         except Exception:
             gt = {}
         out.update(gt)
+    # Freshness stamps (entry quote/tape age gate). fetched_at is the
+    # REQUEST START: data cannot be fresher than that; the source's own
+    # as-of is not provided by these venues, so it stays absent (unknown)
+    # and is never invented.
+    _recv = time.time()
+    for _r in out.values():
+        if isinstance(_r, dict):
+            _r.setdefault("fetched_at", float(now))
+            _r.setdefault("received_at", float(_recv))
     return out
 
 

@@ -22,7 +22,7 @@ import tempfile
 import os
 import time
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 BUS_PATH = os.path.join(HOME, "launch_scanner", "signal_bus.jsonl")
 SWITCHES_PATH = os.path.join(HOME, "launch_scanner", "feed_switches.json")
 

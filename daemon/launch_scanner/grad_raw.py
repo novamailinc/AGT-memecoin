@@ -155,7 +155,7 @@ def _note_feed_health(feed, now):
         except Exception:
             pass
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 LEDGER_PATH = os.path.join(HOME, "grad_raw_ledger.json")
 LANE = "grad_raw"
 CHAIN = "solana"
@@ -552,6 +552,13 @@ def _ff_parse_tx_price(res, mint, sol_usd=0.0):
             "quote_sol": q_raw / (10.0 ** q_dec),
             "sol_usd": sol,
         }
+        # Freshness stamps for the mandatory entry data-age gate: ONLY
+        # from the tx's own observed time (blockTime). Absent -> no stamp,
+        # so the gate refuses fail-closed; a time is never invented.
+        _bt = (res or {}).get("blockTime")
+        if isinstance(_bt, int) and not isinstance(_bt, bool) and _bt > 0:
+            info["source_asof"] = _bt
+            info["received_at"] = time.time()
         if not (FF_MCAP_MIN_USD <= info["mcap_usd"]
                 <= FF_MCAP_MAX_USD):
             return None, ("payload mcap $%.0f outside graduation "
@@ -642,7 +649,9 @@ def _ff_install(engine):
             return {"price_usd": float(info["price_usd"]),
                     "usd_liquidity": float(info["liquidity_usd"]),
                     "usd_market_cap": float(info["mcap_usd"]),
-                    "tape_source": "migration-tx"}
+                    "tape_source": "migration-tx",
+                    "source_asof": info.get("source_asof"),
+                    "received_at": info.get("received_at")}
         return engine._ff_orig_fresh_tape(mint)
 
     engine.quote_price = quote_price

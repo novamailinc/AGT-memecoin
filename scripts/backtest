@@ -10,5 +10,15 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-exec /home/hatch/workspace/Forex-agent/.venv/bin/python \
+# Interpreter resolution (relocatable; mirrors scripts/supervisor _venv_python):
+# FOREX_VENV_PYTHON, else {repo}/.venv, else {repo}/../.venv, else python3.
+PY="${FOREX_VENV_PYTHON:-}"
+if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+    PY=""
+    for _c in "$REPO/.venv/bin/python" "$REPO/../.venv/bin/python"; do
+        if [ -x "$_c" ]; then PY="$_c"; break; fi
+    done
+    PY="${PY:-python3}"
+fi
+exec "$PY" \
     daemon/launch_scanner/backtest.py "$@"

@@ -47,6 +47,8 @@ check("grad: verdict sample constant is 100",
 _ks_tmp = tempfile.mkdtemp(prefix="grad-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
 r = KS.halt_lane("grad", "unit test halt")
 check("killswitch: halt_lane halts + records reason",
       r["action"] == "HALTED" and KS.is_halted("grad")
@@ -59,6 +61,20 @@ KS.reenable("grad", "unit test reset")
 check("killswitch: grad not halted after human reenable",
       not KS.is_halted("grad"))
 
+
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched. Also isolates ALL killswitch paths.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 
 # ---------------- harness ----------------
 TMPD = tempfile.mkdtemp(prefix="grad-test-")
@@ -96,7 +112,8 @@ FAKE_KS = FakeKS()
 
 SAFETY_OK = {"passed": True, "unknown": False, "score": 7,
              "flags": [], "fails": [], "source": "rugcheck"}
-TAPE_OK = {"usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
+TAPE_OK = {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(),  # freshness stamps (TEST-FIXTURE)
+   "usd_liquidity": 8_000.0, "usd_market_cap": 69_000.0,
            "chg_m5": 3.0, "price_usd": 0.00007,
            "tape_source": "dexscreener"}
 
@@ -108,12 +125,16 @@ def _patch_all(price=0.00007):
     p4 = patch.object(G, "quote_price", return_value=price)
     p5 = patch.object(G, "_fresh_tape", return_value=dict(TAPE_OK))
     p6 = patch.object(G, "QUOTE_RETRY_GAP_S", 0.0)
+    # DISCLOSED: the shared-account guard fixture installs an at-cost price feed under jup_price, which G._jup.get_prices reads;
+    # with price_fn returning 0 ("unquotable") that feed answered at cost and the case closed as time_stop_24h instead of
+    # time_stop_24h_unquotable. These cases model "Jupiter has no price", so the lane's Jupiter read returns nothing here.
+    p7 = patch.object(G._jup, "get_prices", return_value={}) if getattr(G, "_jup", None) is not None else None
     m_veto, m_safety = p1.start(), p2.start()
-    for p in (p3, p4, p5, p6):
+    for p in [x for x in (p3, p4, p5, p6, p7) if x is not None]:
         p.start()
     m_veto.veto_check.return_value = {"passed": True, "vetoes": []}
     m_safety.check_token.return_value = dict(SAFETY_OK)
-    return (p1, p2, p3, p4, p5, p6), m_veto, m_safety
+    return tuple(x for x in (p1, p2, p3, p4, p5, p6, p7) if x is not None), m_veto, m_safety
 
 
 def _unpatch(ps):
@@ -122,6 +143,15 @@ def _unpatch(ps):
 
 
 def _fresh(price=0.00007):
+    # DISCLOSED: each case gets a clean shared account (the account persists across cases otherwise, so earlier open
+    # positions make later entries refuse). TEST-FIXTURE values.
+    global _pa
+    os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+    _pa = _il.reload(_pa)
+    _GF.install(_pa)
+    os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
+    G._RECOVERY_DONE = False
+    G._ENTRY_BLOCKED = False
     if os.path.exists(G.LEDGER_PATH):
         os.remove(G.LEDGER_PATH)
     FAKE_KS.halted = set()

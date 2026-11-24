@@ -1,0 +1,11 @@
+{
+  "fixture": "pre_guard_orphan_grad_ledger.json",
+  "fixture_sha256": "feb14ea0a75071662540fe1b85877d15dba8eb5deda00abcf938bf1287eacac1",
+  "what": "grad lane ledger holding ONE open position (ORPH11pump) opened with PAPER_ACCOUNT_ENABLED unset: a pre-account-epoch position with no shared-account debit, as the pre-guard lane really wrote it. Bytes are the lane ledger UNMODIFIED.",
+  "generated_by": "gen_pre_guard_orphan_grad.py",
+  "generator_sha256": "63e62ad87953c9620702ed1780dd616f55daa7f4db1c64e26e7b2d2a68e7815e",
+  "generated_against_commit": "6b0aed801f7c610ac3df84e034f4d4e4489a7da3",
+  "generated_on": "2026-11-24 05:10 PST",
+  "method": "generator run through agt-ns-run.sh (OS network+PID namespace, only lo, no routes, env -i) in a clean detached worktree at 6b0aed8; provider calls patched with local values; no network.",
+  "hand_edited": false
+}

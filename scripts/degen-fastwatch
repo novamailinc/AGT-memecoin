@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.WARNING,
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("degen-fastwatch")
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(HOME, "degen_fastwatch_seen.json")
 OUTCOMES_FILE = os.path.join(HOME, "degen_outcomes.json")

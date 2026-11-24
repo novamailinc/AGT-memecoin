@@ -96,7 +96,7 @@ except ImportError:  # top-level import context
 
 logger = logging.getLogger("forex_agent.daemon.launch_scanner.reserves")
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 
 PUMPSWAP_PROGRAM = _solana_ids.PUMPSWAP_PROGRAM_ID
 PUMP_PROGRAM = _solana_ids.PUMP_PROGRAM_ID

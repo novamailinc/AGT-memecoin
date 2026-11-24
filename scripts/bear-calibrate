@@ -52,7 +52,7 @@ import bear_score as B
 import lessons as L
 import point_in_time as PIT
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 
 BANDS = ((0, 19), (20, 39), (40, 59), (60, 79), (80, 100))
 

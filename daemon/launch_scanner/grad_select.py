@@ -300,7 +300,7 @@ def _slot_clock():
     return _SLOT_CLOCK
 
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 LEDGER_PATH = os.path.join(HOME, "grad_select_ledger.json")
 GRAD_RAW_LEDGER_PATH = os.path.join(HOME, "grad_raw_ledger.json")
 LANE = "grad_select"
@@ -349,7 +349,15 @@ AUTHORITATIVE_WINDOW_S = 86400.0   # the trailing-24h serial window
 _AUTHORITATIVE_MAX_STALE_S = 300.0
 
 
-def authoritative_proof(creator, count, now, window_start=None):
+# DRAFT (separate review): a proof must name a completeness guarantee that
+# is on this ACCEPTED list. Empty in production: no source guarantee has
+# been verified, so no proof can authorize admission. Adding an id here is a
+# reviewed code change, never a runtime string supplied by a producer.
+_ACCEPTED_COMPLETENESS_GUARANTEES = frozenset()
+
+
+def authoritative_proof(creator, count, now, window_start=None,
+                        completeness_guarantee=None):
     """Typed proof constructor for the authoritative-history hook.
 
     The future provider builds its answer with this exact shape;
@@ -365,6 +373,7 @@ def authoritative_proof(creator, count, now, window_start=None):
             else now - AUTHORITATIVE_WINDOW_S),
         "window_end": float(now),
         "finality": "finalized",
+        "completeness_guarantee": completeness_guarantee,
     }
 
 
@@ -403,6 +412,9 @@ def _valid_authoritative_count(proof, creator, now):
             return None   # stale or future-dated enumeration
         if proof.get("finality") != "finalized":
             return None
+        g = proof.get("completeness_guarantee")
+        if not isinstance(g, str) or g not in _ACCEPTED_COMPLETENESS_GUARANTEES:
+            return None   # label alone never authorizes admission
         return count
     except Exception:
         return None

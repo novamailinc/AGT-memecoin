@@ -16,9 +16,9 @@ import time
 import urllib.request
 import json
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 LOG = os.path.join(HOME, "log", "degen-feed.log")
-REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def scanner_running():

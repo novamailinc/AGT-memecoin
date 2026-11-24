@@ -69,10 +69,14 @@ def _trading_mode(v: Any) -> str:
 # key -> (coerce/validate, human description). Anything not listed here
 # is refused outright.
 KEY_SPEC: Dict[str, Tuple[Callable[[Any], Any], str]] = {
-    "trade_amount_usd": (_pos_float, "per-trade size in USD (inert)"),
+    "trade_amount_usd": (_pos_float, "exact per-trade size in USD (enforced at the account debit when set)"),
     "demo_starting_balance_usd": (_pos_float, "simulated starting capital (inert)"),
-    "max_simultaneous_trades": (_pos_int, "open-position ceiling (inert)"),
-    "max_total_exposure_usd": (_pos_float, "total open-exposure ceiling in USD (inert)"),
+    "max_simultaneous_trades": (_pos_int, "open-TRADE (lot) ceiling, every open lot/pending/hold counts, enforced by the account gate"),
+    "max_price_impact_pct": (_pos_float, "max Jupiter quote price impact in percent for demo execution; mandatory, entries refuse when unset"),
+    "max_data_age_s": (_pos_float, "max age in seconds of market data (marks) accepted for entries; tightens the mark TTL, enforced by the account gate"),
+    "max_simultaneous_positions": (_pos_int, "open-POSITION ceiling by distinct token, enforced by the account gate"),
+    "max_total_exposure_usd": (_pos_float, "total open-exposure ceiling in USD, enforced by the account gate"),
+    "max_token_exposure_usd": (_pos_float, "per-token (mint) exposure ceiling in USD, marked, enforced by the account gate"),
     "max_daily_loss_usd": (_pos_float, "daily loss limit in USD (inert)"),
     "max_drawdown_pct": (_drawdown_pct, "max drawdown as percent"),
     "max_exposure_pct": (_drawdown_pct,
@@ -141,6 +145,29 @@ def set_value(key: str, value: Any) -> Any:
     return coerced
 
 
+def stored_state(key: str) -> Tuple[str, Any]:
+    """('unset', None) | ('ok', value) | ('invalid', None) for one key,
+    reading the raw file so a present-but-invalid value is NOT mistaken
+    for unset (load() silently drops those). A corrupt file is 'invalid'
+    only when it exists but cannot be parsed; a missing file is 'unset'."""
+    p = _path()
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return ("unset", None)
+    except (OSError, ValueError):
+        return ("invalid", None)
+    if not isinstance(data, dict):
+        return ("invalid", None)
+    if key not in data:
+        return ("unset", None)
+    try:
+        return ("ok", KEY_SPEC[key][0](data[key]))
+    except (KeyError, TypeError, ValueError):
+        return ("invalid", None)
+
+
 class ConfigUnset(RuntimeError):
     """Raised when an operation needs an owner-config value that is unset.
 
@@ -160,18 +187,62 @@ def require(key: str) -> Any:
     return cur[key]
 
 
+def _enforced_keys():
+    """Authoritative set from paper_account (lazy import: paper_account
+    imports this module lazily too, so no import cycle). None when the
+    account module is unavailable: callers must then claim nothing."""
+    try:
+        try:
+            from daemon.launch_scanner import paper_account as _pa
+        except ImportError:
+            import paper_account as _pa
+        return tuple(_pa.ENFORCED_OWNER_KEYS)
+    except Exception:
+        return None
+
+
+def gates_on() -> bool:
+    return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
+
+
+def enforcement_note(key: str) -> str:
+    """Truthful, current enforcement status for one key (no 'applied' claim)."""
+    enforced = _enforced_keys()
+    if enforced is None:
+        return ("enforcement status unknown: the paper-account module is "
+                "not available to this process, so this is not verified "
+                "(running daemon's state not verified from here)")
+    if key in enforced:
+        if gates_on():
+            return ("read by the paper-account entry gate; gates are ON in "
+                    "THIS process's environment (running daemon's state not "
+                    "verified from here)")
+        return ("NOT enforced as far as this process can tell: gates are OFF "
+                "in THIS process's environment (PAPER_ACCOUNT_GATES_ENABLED "
+                "is not 1; running daemon's state not verified from here). "
+                "Read only by the gate when gates are on")
+    return "STORED ONLY: nothing reads this key, it changes no trade or limit"
+
+
 def render() -> str:
     """Human-readable /config output. Saved-but-inactive is explicit."""
     cur = load()
+    _ek = _enforced_keys()
+    _eks = ", ".join(_ek) if _ek else "(enforced set unavailable; not verified)"
     lines = ["⚙️ Owner config. Values are recorded intent; activation "
-             "stays owner-approved. max_daily_loss_usd, max_drawdown_pct "
-             "and max_exposure_pct ARE enforced by the paper-account "
+             "stays owner-approved. %s ARE enforced by the paper-account "
              "entry gates when the owner enables those gates "
              "(PAPER_ACCOUNT_GATES_ENABLED=1); an unset gate limit "
              "blocks entries fail-closed. Every other key is saved but "
-             "INACTIVE until its enforcement wiring is added."]
+             "INACTIVE until its enforcement wiring is added." % _eks]
     for key in sorted(KEY_SPEC):
         marker = ("%r" % (cur[key],)) if key in cur else "(unset)"
         lines.append("  %s: %s - %s" % (key, marker, KEY_SPEC[key][1]))
+    lines.append("Account gates in THIS process's environment: %s "
+                 "(PAPER_ACCOUNT_GATES_ENABLED; the running daemon's state is "
+                 "not verified from here). While OFF, none of these limits is "
+                 "enforced by the gate." % (
+                     "ON" if os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
+                     else "OFF"))
     lines.append("Set with /config_set <key> <value> (two-step confirm).")
     return "\n".join(lines)

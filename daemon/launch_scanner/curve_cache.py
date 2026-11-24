@@ -58,7 +58,7 @@ _LOCK_FILE = "curve_cache.lock"
 def _home(home: Optional[str] = None) -> str:
     if home:
         return home
-    return os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+    return (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 
 
 class CurveCache:

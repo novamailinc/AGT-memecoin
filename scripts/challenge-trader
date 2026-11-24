@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.WARNING,
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("challenge-trader")
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 TRACK_FILE = os.path.join(HOME, "degen_outcomes.json")
 USD_CHALLENGE = os.path.join(HOME, "degen_challenge.json")
 SOL_CHALLENGE = os.path.join(HOME, "degen_challenge_sol.json")
@@ -78,6 +78,134 @@ def save_challenge(path, data):
         json.dump(data, f, indent=2)
 
 
+LANE = "challenge"
+
+
+def _pa_module():
+    """The ONE shared paper account (same module instance entry_guard uses)."""
+    try:
+        try:
+            from daemon.launch_scanner import paper_account as pa
+        except ImportError:
+            import paper_account as pa
+        return pa
+    except Exception:
+        return None
+
+
+try:
+    from daemon.launch_scanner import demo_fill as _demo
+except Exception:
+    _demo = None  # type: ignore
+
+
+def _demo_filler():
+    return _demo.default_filler() if _demo is not None else None
+
+
+def _demo_mode():
+    return bool(_demo is not None and _demo.mode_enabled())
+
+
+# EXIT POLICY (open owner decision, NOT chosen here): same fallback as the momentum lane; the owner
+# max_price_impact_pct also gates exits when set.
+_EXIT_IMPACT_CAP_PCT = 100.0
+
+
+def _exit_cap(pa):
+    try:
+        v = float(pa.max_price_impact_pct())
+    except Exception:
+        v = 0.0
+    if v > 0:
+        return v, "owner_max_price_impact_pct"
+    return _EXIT_IMPACT_CAP_PCT, "fallback_unset_or_invalid"
+
+
+def _op_key(label):
+    return "".join(c for c in str(label) if c.isalnum()) or "x"
+
+
+def _account_enter(pa, label, mint, price, stake):
+    """Reserve the stake from the shared account. STABLE op id per (challenge,
+    mint): a crash between the debit and the file save is retried with the same
+    id and gets the original reservation back (no second debit). Returns
+    (ok, why, pos_id)."""
+    if pa is None or not price or price <= 0 or not stake or stake <= 0:
+        return False, "no account/price/stake", None
+    return pa.try_debit(LANE, mint, float(stake), float(stake) / float(price),
+                        "%s:entry:%s:%s" % (LANE, _op_key(label), mint))
+
+
+def _demo_enter(pa, label, mint, stake):
+    """DEMO entry: fill from the Jupiter-quote sim under a durable intent (stale/unknown classified
+    from the account). Returns (ok, why, pos_id, fill). No filler or a skip REFUSES (no model fallback);
+    a declined debit releases the intent so the next attempt re-quotes."""
+    df = _demo_filler()
+    if df is None:
+        return False, "demo exec: quote-simulation filler unavailable; entry refused", None, None
+    try:
+        op = df.intent_id(LANE, mint)
+        _prior_fill = df.get_fill(op)  # durable journal read BEFORE buy
+        _committed = _prior_fill is not None and df.op_committed(op) is True  # replay needs account debit evidence
+        fill = df.buy(op, mint, float(stake), pa.max_price_impact_pct())
+    except _demo.DemoSkip as e:
+        return False, "demo exec: %s" % e.reason, None, None
+    from daemon.launch_scanner import entry_guard as _eg_pq
+    _pq = _eg_pq.post_quote_refusal(fill, _prior_fill, _committed, pa.max_data_age_s(), time.time())
+    if _pq:
+        try:
+            df.release_intent(LANE, mint)
+        except Exception as e:
+            logger.warning("%s: release_intent failed (%r); a retry may replay the original fill", LANE, e)
+        return False, "risk: " + _pq, None, None
+    ok, why, pid = pa.try_debit(LANE, mint, float(stake), fill["qty_tokens"], op, durable_refusal=True)
+    if not ok:
+        try:
+            df.release_intent(LANE, mint)
+        except Exception as e:
+            logger.warning("%s: release_intent failed (%r); a retry may replay the original (stale) fill", LANE, e)
+        return False, why, None, None
+    return True, why, pid, fill
+
+
+def _demo_exit(pa, label, t):
+    """DEMO exit: sell the entry tokens through the quote sim (fixed op per trade: a retry replays the
+    original fill) and credit the account with the SIM economics. Returns (converged, net_usd)."""
+    df = _demo_filler()
+    if df is None:
+        return False, 0.0
+    cap, _src = _exit_cap(pa)
+    try:
+        fill = df.sell("%s:exit:%s:%s" % (LANE, _op_key(label), t["mint"]), t["mint"], float(t["tokens"]), cap)
+    except _demo.DemoSkip as e:
+        logger.warning("[%s] demo exit pending %s: %s", label, t["mint"], e.reason)
+        return False, 0.0
+    op = "%s:exit:%s:%s" % (LANE, _op_key(label), t["mint"])
+    ok, why = pa.credit(LANE, t["mint"], float(fill["gross_usd"]), op, pos_id=t.get("pa_pos_id"),
+                        qty=float(t["tokens"]), fee=float(fill["fee_usd"]))
+    if not ok:
+        logger.warning("[%s] account exit refused for %s: %s", label, t["mint"], why)
+        return False, 0.0
+    return True, float(fill["gross_usd"]) - float(fill["fee_usd"])
+
+
+def _account_exit(pa, label, t, proceeds, rugged):
+    """Settle an account-backed trade. Idempotent by op id. Returns True when
+    the account side is applied/converged; the trade stays open otherwise."""
+    pid = t.get("pa_pos_id")
+    op = "%s:exit:%s:%s" % (LANE, _op_key(label), t["mint"])
+    if pa is None:
+        return False
+    if rugged:
+        ok, why = pa.write_down(LANE, t["mint"], op, pos_id=pid, reason="rugged")
+    else:
+        ok, why = pa.credit(LANE, t["mint"], float(proceeds), op, pos_id=pid)
+    if not ok:
+        logger.warning("[%s] account exit refused for %s: %s", label, t["mint"], why)
+    return bool(ok)
+
+
 def process_challenge(challenge_path, label):
     ch = load_challenge(challenge_path)
     if not ch:
@@ -91,6 +219,26 @@ def process_challenge(challenge_path, label):
         import killswitch
         entries_allowed = killswitch.gate("challenge")
     except Exception:
+        entries_allowed = False
+    pa = _pa_module()
+    try:
+        import entry_guard as _eg
+        _why = _eg.mandatory_entry_refusal(LANE)
+    except Exception:
+        _why = "mandatory entry guard unavailable; entries blocked"
+    # Design (per main's instructions, not repo-authored authority): ONE shared account, configured trade size read
+    # FRESH each cycle (control-room adjustable). No configured size => no
+    # entry (the old 5%-of-own-portfolio sizing is not used, nothing invented).
+    stake = None
+    if not _why:
+        try:
+            stake = pa.configured_trade_size() if pa is not None else None
+        except Exception:
+            stake = None
+        if not stake:
+            _why = "challenge: no configured trade size; entries blocked fail-closed"
+    if _why:
+        logger.warning("[%s] %s", label, _why)
         entries_allowed = False
     if not entries_allowed:
         logger.warning("[%s] challenge lane halted by killswitch — no new entries", label)
@@ -110,6 +258,7 @@ def process_challenge(challenge_path, label):
     # watch for a pullback to <=85% of alert, enter there. Skip if it runs
     # to 2x without dipping (don't chase) or 4h pass with no dip.
     dip_watch = ch.get("dip_watch", {})
+    consumes = []  # demo intents to consume AFTER the challenge file is saved
     for mint, v in outcomes.items():
         if mint in traded_mints or mint in dip_watch:
             continue
@@ -145,14 +294,28 @@ def process_challenge(challenge_path, label):
         if mult <= 0.85:
             # DIP — enter here (killswitch-gated)
             if entries_allowed:
-                size = portfolio * POSITION_PCT
+                size = stake
+                _fill = None
+                if _demo_mode():
+                    _ok, _why2, _pid, _fill = _demo_enter(pa, label, mint, size)
+                else:
+                    _ok, _why2, _pid = _account_enter(pa, label, mint, current_price, size)
+                if not _ok:
+                    logger.warning("[%s] DIP entry refused by account: %s", label, _why2)
+                    size = 0
                 if size > 0:
-                    trades.append({
+                    _tr = {
                         "mint": mint, "symbol": w["symbol"],
                         "entry_price": current_price, "entry_ts": time.time(),
                         "size": size, "status": "open", "entry_type": "dip",
                         "dip_from_alert": round(mult, 3),
-                    })
+                        "pa_pos_id": _pid,
+                    }
+                    if _fill is not None:
+                        _tr.update(entry_price=_fill["price_usd"], tokens=_fill["qty_tokens"],
+                                   execution_source=_fill["execution_source"])
+                        consumes.append(mint)
+                    trades.append(_tr)
                     traded_mints.add(mint)
                     logger.warning("[%s] DIP-ENTER $%s @ $%.8f (%.0f%% of alert) size=%.2f %s",
                                    label, w["symbol"], current_price, mult * 100,
@@ -183,17 +346,31 @@ def process_challenge(challenge_path, label):
         if v.get("score", 0) < MIN_TRADE_SCORE:
             continue
         # Enter position
-        size = portfolio * POSITION_PCT
-        if size <= 0:
+        size = stake
+        if not size or size <= 0:
             continue
-        trades.append({
+        _fill = None
+        if _demo_mode():
+            _ok, _why2, _pid, _fill = _demo_enter(pa, label, mint, size)
+        else:
+            _ok, _why2, _pid = _account_enter(pa, label, mint, alert_price, size)
+        if not _ok:
+            logger.warning("[%s] entry refused by account: %s", label, _why2)
+            continue
+        _tr = {
             "mint": mint,
             "symbol": v.get("symbol", "?"),
             "entry_price": alert_price,
             "entry_ts": time.time(),
             "size": size,
             "status": "open",
-        })
+            "pa_pos_id": _pid,
+        }
+        if _fill is not None:
+            _tr.update(entry_price=_fill["price_usd"], tokens=_fill["qty_tokens"],
+                       execution_source=_fill["execution_source"])
+            consumes.append(mint)
+        trades.append(_tr)
         traded_mints.add(mint)
         logger.warning("[%s] ENTER $%s @ $%.8f size=%.2f %s",
                        label, v.get("symbol"), alert_price, size, currency)
@@ -205,6 +382,8 @@ def process_challenge(challenge_path, label):
         current_price = get_price(t["mint"])
         if not current_price:
             # Dead — total loss
+            if t.get("pa_pos_id") and not _account_exit(pa, label, t, 0.0, True):
+                continue  # account side not converged: stay open, retry
             t["status"] = "closed"
             t["exit_reason"] = "rugged"
             t["exit_mult"] = 0
@@ -223,10 +402,18 @@ def process_challenge(challenge_path, label):
         elif age >= MAX_HOLD_SECS:
             exit_reason = "max_hold"
         if exit_reason:
+            _net = None
+            if t.get("execution_source") == "jupiter_quote_sim" and t.get("pa_pos_id"):
+                _conv, _net = _demo_exit(pa, label, t)
+                if not _conv:
+                    continue  # sim sell / account side not converged: stay open, retry
+            elif t.get("pa_pos_id") and not _account_exit(
+                    pa, label, t, t["size"] * mult, False):
+                continue  # account side not converged: stay open, retry
             t["status"] = "closed"
             t["exit_reason"] = exit_reason
             t["exit_mult"] = round(mult, 2)
-            t["pnl"] = round(t["size"] * (mult - 1), 4)
+            t["pnl"] = round((_net - t["size"]) if _net is not None else t["size"] * (mult - 1), 4)
             portfolio += t["pnl"]
             logger.warning("[%s] EXIT $%s %s %.2fx pnl=%+.2f %s",
                            label, t["symbol"], exit_reason, mult,
@@ -239,6 +426,11 @@ def process_challenge(challenge_path, label):
         ch["current_sol"] = round(portfolio, 4)
     ch["trades"] = trades
     save_challenge(challenge_path, ch)
+    for _m in consumes:
+        try:
+            _demo_filler().consume_intent(LANE, _m)
+        except Exception as _ce:  # safe: a stale intent is classified from the account on re-entry
+            logger.warning("%s: consume_intent failed (%r); stale intent dropped on re-entry", LANE, _ce)
 
 
 def main():

@@ -103,7 +103,7 @@ def _verdict_event(lane, kind, payload):
         pass
 
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 LEDGER_PATH = os.path.join(HOME, "degen_mirror_ledger.json")
 _LOCK_PATH = os.path.join(HOME, "degen_mirror_ledger.lock")
 MAX_CLOSES = 500
@@ -141,6 +141,7 @@ RUNNER_MIN_LIQ_USD = 25_000.0
 RUNNER_MIN_MCAP_USD = 50_000.0
 
 
+_LAST_QUOTE_STAMP = None  # request-start/receipt of the last priced quote
 _LAST_TAPE_SOURCE = ""  # venue of the last _fresh_tape read, for logs
 _LAST_GATE_TAPE = None  # last runner-gate tape read (journaling only)
 
@@ -319,9 +320,222 @@ def _write(d):
                 os.close(dfd)
         except OSError:
             pass
+        if _PENDING_CLOSE_INTENTS:
+            _ciw = _close_intents()
+            if _ciw is not None:
+                _keep = []
+                for _lane, _iid, _pid, _mint, _suffix in \
+                        _PENDING_CLOSE_INTENTS:
+                    if _ciw.tranche_lane_done(d, _pid, _mint, _suffix):
+                        _ciw.mark_lane_applied(_lane, _iid)
+                    else:
+                        _keep.append((_lane, _iid, _pid, _mint, _suffix))
+                _PENDING_CLOSE_INTENTS[:] = _keep
+            else:
+                _PENDING_CLOSE_INTENTS.clear()
         return True
     except Exception:
         return False
+
+# ---- shared paper account routing (mirror lanes) ------------------------
+# Mirror lanes (degen/base/eth/hl_mirror) reserve cash from the ONE shared
+# paper account like the other lanes (same pattern as ceo.py): the entry
+# debits it under the mandatory guard and gates, every exit TRANCHE credits
+# net proceeds with a stable op_id, and a durable close intent covers the
+# account/ledger write gap. The account lane name is pos["lane"].
+def _paper_account():
+    if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1":
+        return None
+    try:
+        try:
+            from daemon.launch_scanner import paper_account
+        except ImportError:
+            import paper_account
+        return paper_account
+    except Exception:
+        logger.exception("mirror: paper account unavailable")
+        return None
+
+
+def _close_intents():
+    if _paper_account() is None:
+        return None
+    try:
+        try:
+            from daemon.launch_scanner import close_intents
+        except ImportError:
+            import close_intents
+        return close_intents
+    except Exception:
+        logger.exception("mirror: close-intent journal unavailable")
+        return None
+
+
+# (lane, intent_id, pos_id, mint, suffix) whose account side is durable but
+# whose lane-ledger write is not yet confirmed; flushed by _write only when
+# the persist actually carries the tranche/close.
+_PENDING_CLOSE_INTENTS = []
+_RECOVERY_DONE = False
+_ENTRY_BLOCKED = False
+
+
+def _recover_close_intents():
+    """Re-drive incomplete close intents once per process for every mirror
+    lane before the first entry/close. A frozen intent (account and ledger
+    diverge) blocks ALL entries until an operator resolves it."""
+    global _RECOVERY_DONE, _ENTRY_BLOCKED
+    if _RECOVERY_DONE:
+        return _ENTRY_BLOCKED
+    _RECOVERY_DONE = True
+    _ci = _close_intents()
+    if _ci is None:
+        return False
+    for lane in sorted(set(LANE_BY_CHAIN.values())):
+        def account_apply(op, lane=lane):
+            _pa = _paper_account()
+            if _pa is None:
+                return False, "paper account disabled"
+            if op.get("kind") == "write_down":
+                ok, why = _pa.write_down(
+                    lane, op.get("mint"), op.get("op_id"),
+                    pos_id=op.get("pos_id"), qty=op.get("qty"),
+                    reason=op.get("reason") or "recovered")
+            else:
+                ok, why = _pa.credit(
+                    lane, op.get("mint"), op.get("amount"),
+                    op.get("op_id"), pos_id=op.get("pos_id"),
+                    qty=op.get("qty"), fee=op.get("fee") or 0.0,
+                    price_kind=op.get("price_kind"))
+            if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
+                    and not _pa.pos_ever_existed(
+                        pos_id=op.get("pos_id"), lane=lane,
+                        mint=op.get("mint")):
+                return True, "orphan (converged, epoch-proven)"
+            return ok, why
+
+        def lane_has_close(intent):
+            info = intent.get("close_info") or {}
+            return _ci.tranche_lane_done(_read(), intent.get("pos_id"),
+                                         intent.get("mint"),
+                                         info.get("leg_suffix"))
+
+        def lane_apply(intent):
+            d = _read()
+            pos = (d.get("positions") or {}).get(intent.get("mint"))
+            if pos is not None and (
+                    not intent.get("pos_id")
+                    or pos.get("pa_pos_id") == intent.get("pos_id")):
+                return None
+            return False
+
+        frozen = _ci.recover_lane(lane, account_apply, lane_has_close,
+                                  lane_apply)
+        if frozen:
+            _ENTRY_BLOCKED = True
+            logger.error("mirror %s: %d close intent(s) FROZEN - ledgers "
+                         "diverge, ENTRIES BLOCKED until operator "
+                         "resolution: %s", lane, len(frozen),
+                         ",".join(frozen))
+    return _ENTRY_BLOCKED
+
+
+def _pa_apply(pos, suffix, kind_op, apply_fn):
+    """Shared body of settle/write-down: durable intent BEFORE the account
+    op, orphan convergence, pending flush registration. Failures are
+    journaled by the account and never block the lane's own settle."""
+    pid = pos.get("pa_pos_id")
+    if not pid:
+        return
+    _pa = _paper_account()
+    if _pa is None:
+        return
+    lane, mint = pos["lane"], pos["mint"]
+    _pend = None
+    _ci = _close_intents()
+    if _ci is not None:
+        iid = _ci.begin(lane, mint, pid, [kind_op],
+                        {"realized_usd": kind_op.get("amount") or 0.0,
+                         "closed_reason": suffix, "close_ts": time.time(),
+                         "leg_suffix": suffix})
+        _pend = (lane, iid, pid, mint, suffix)
+    _ok, _why = apply_fn(_pa)
+    if not _ok and _pa.op_outcome(kind_op["op_id"]) == "orphan" \
+            and not _pa.pos_ever_existed(pos_id=pid, lane=lane, mint=mint):
+        _ok, _why = True, ""
+    if _ok:
+        if _pend is not None:
+            _ci.mark_account_applied(lane, _pend[1])
+            _PENDING_CLOSE_INTENTS.append(_pend)
+    else:
+        logger.warning("mirror: shared paper account %s for %s (%s) failed: "
+                       "%s (journaled, intent open for recovery)",
+                       kind_op["kind"], mint, suffix, _why)
+
+
+def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
+    pid = pos.get("pa_pos_id")
+    if not pid:
+        return
+    lane, mint = pos["lane"], pos["mint"]
+    op = "%s:%s:%s:%s" % (lane, suffix, mint, pid)
+    _pa_apply(pos, suffix,
+              {"kind": "credit", "op_id": op, "mint": mint, "amount": gross,
+               "qty": qty, "fee": fee, "price_kind": price_kind,
+               "pos_id": pid},
+              lambda _pa: _pa.credit(lane, mint, gross, op, pos_id=pid,
+                                     qty=qty, fee=fee,
+                                     price_kind=price_kind))
+
+
+def _pa_write_down(pos, reason):
+    pid = pos.get("pa_pos_id")
+    if not pid:
+        return
+    lane, mint = pos["lane"], pos["mint"]
+    op = "%s:writedown:%s:%s" % (lane, mint, pid)
+    _pa_apply(pos, "writedown",
+              {"kind": "write_down", "op_id": op, "mint": mint,
+               "pos_id": pid, "reason": reason},
+              lambda _pa: _pa.write_down(lane, mint, op, pos_id=pid,
+                                         reason=reason))
+
+
+try:
+    from daemon.launch_scanner import demo_fill as _demo
+except Exception:
+    try:
+        import demo_fill as _demo  # type: ignore
+    except Exception:
+        _demo = None  # type: ignore
+
+
+def _demo_filler():
+    return _demo.default_filler() if _demo is not None else None
+
+
+def _demo_mode():
+    return bool(_demo is not None and _demo.mode_enabled())
+
+
+# EXIT POLICY (open owner decision, NOT chosen here): the configured owner impact cap
+# (max_price_impact_pct) ALSO gates exits when set; only an unset/invalid cap falls back to
+# this value so a missing config cannot strand a position. A separate exit cap or unbounded
+# exit is an owner decision; the effective cap is recorded in each exit's provenance.
+_EXIT_IMPACT_CAP_PCT = 100.0
+
+
+def _entry_notional():
+    """Exact stake: the owner-configured trade size when set (the account
+    refuses a conflicting/invalid one), else this lane's legacy $1."""
+    _pa = _paper_account()
+    if _pa is None:
+        return NOTIONAL_USD
+    try:
+        v = _pa.configured_trade_size()
+    except Exception:
+        v = None
+    return NOTIONAL_USD if v is None else float(v)
+
 
 
 def _load():
@@ -414,14 +628,36 @@ def _ds_pairs_price(pairs):
     return 0.0, "%d pair(s), none priced" % len(pairs)
 
 
+def _tape_quote_stamp(st):
+    """Stamp for a quote priced from a tape row: only the row's own
+    stamps (source_asof/fetched_at + received_at). Missing -> None, so
+    the entry age gate refuses; never invented."""
+    if not isinstance(st, dict):
+        return None
+    out = {}
+    for k in ("source_asof", "fetched_at", "received_at"):
+        v = st.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = float(v)
+    if "received_at" not in out or not (
+            "source_asof" in out or "fetched_at" in out):
+        return None
+    return out
+
+
 def _quote_detail(chain, mint, spot_index=None):
     """(price, trail): quote via, in order — best-pair selection on the
     tokens/v1 fetch, the gate's tape read as fallback, one bounded
     retry of the pairs fetch. Trail is plain-language, for skip logs."""
-    global _LAST_QUOTE_DETAIL
+    global _LAST_QUOTE_DETAIL, _LAST_QUOTE_STAMP
     chain = (chain or "").lower()
+    _qstart = time.time()
+    _LAST_QUOTE_STAMP = None
     if chain == "hyperliquid":
         px = _hl_mark_price(spot_index)
+        if px > 0:
+            _LAST_QUOTE_STAMP = {"fetched_at": _qstart,
+                                 "received_at": time.time()}
         _LAST_QUOTE_DETAIL = "hl mark price: %s" % (
             "ok" if px > 0 else "unavailable")
         return px, _LAST_QUOTE_DETAIL
@@ -431,7 +667,12 @@ def _quote_detail(chain, mint, spot_index=None):
         return 0.0, _LAST_QUOTE_DETAIL
     url = "https://api.dexscreener.com/tokens/v1/%s/%s" % (ds, mint)
     trail = []
+    _rs = time.time()
     px, note = _ds_pairs_price(_http_json(url))
+    if px > 0:
+        # Stamp only from the observed request start/receipt (DexScreener
+        # gives no source time); no price -> no stamp -> age gate refuses.
+        _LAST_QUOTE_STAMP = {"fetched_at": _rs, "received_at": time.time()}
     trail.append("pairs fetch: " + note)
     if px <= 0:
         # Tape fallback: the runner gate just priced this mint through
@@ -446,15 +687,19 @@ def _quote_detail(chain, mint, spot_index=None):
             logger.warning("mirror quote via tape fallback %s",
                            (mint or "?")[:16])
             px = tpx
+            _LAST_QUOTE_STAMP = _tape_quote_stamp(st)
         else:
             trail.append("tape fallback: "
                          + ("no tape" if not st else "tape unpriced"))
     if px <= 0:
         time.sleep(QUOTE_RETRY_GAP_S)
+        _rs2 = time.time()
         px2, note2 = _ds_pairs_price(_http_json(url))
         trail.append("pairs retry: " + note2)
         if px2 > 0:
             px = px2
+            _LAST_QUOTE_STAMP = {"fetched_at": _rs2,
+                                 "received_at": time.time()}
     _LAST_QUOTE_DETAIL = "; ".join(trail)
     return px, _LAST_QUOTE_DETAIL
 
@@ -535,6 +780,7 @@ def mirror_card(chain, source, mint, symbol="", score=0.0, tier="",
 
 def _mirror_card(chain, source, mint, symbol, score, tier,
                  mcap, liquidity, evidence, extra):
+    global _LAST_QUOTE_STAMP
     if not _HAS_DEPS:
         return False, "mirror deps missing"
     chain = (chain or "").lower()
@@ -557,6 +803,27 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
     if not ok_gate:
         return False, why_gate
 
+    # MANDATORY capital gate: the shared paper account's guard (account
+    # enabled, gates on, every owner limit set) must pass before any entry.
+    # The reservation itself happens below, under the ledger lock.
+    try:
+        try:
+            from daemon.launch_scanner import entry_guard as _eg
+        except ImportError:
+            import entry_guard as _eg
+        return_why = _eg.mandatory_entry_refusal(lane)
+    except Exception:
+        return_why = "mandatory entry guard unavailable; entries blocked fail-closed"
+    if return_why:
+        return False, return_why
+    _pa = _paper_account()
+    if _pa is not None:
+        _recover_close_intents()
+        if _ENTRY_BLOCKED:
+            return False, ("close-intent divergence frozen: entries "
+                           "blocked until operator resolution")
+    _N = _entry_notional()
+
     # Locked read-modify-write: two feeds firing the same mint at once
     # must not double-open (audit 2026-10-18).
     with _ledger_lock():
@@ -567,17 +834,26 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
             return False, "already mirrored (closed)"
 
     # Pre-registered cost gate: the productive ETH answer.
-    blocked, why = _costs.cost_gate(chain, NOTIONAL_USD)
+    blocked, why = _costs.cost_gate(chain, _N)
     if blocked:
         logger.warning("mirror %s: %s", mint, why)
         return False, why
 
     extra = extra or {}
     spot_index = extra.get("spot_index")
+    _LAST_QUOTE_STAMP = None  # never reuse a previous entry's stamp
     quoted = quote_price(chain, mint, spot_index)
     if quoted <= 0:
         # HL listings carry their mark price from the watcher.
         quoted = float(extra.get("mark_px") or 0)
+    # A quote without its own fetch stamp is only as fresh as the watcher's
+    # mark stamp; no mark_asof means unknown age (the age gate refuses).
+    _ma = extra.get("mark_asof")
+    if _LAST_QUOTE_STAMP is None and isinstance(_ma, (int, float)):
+        _LAST_QUOTE_STAMP = {"source_asof": float(_ma),
+                             "fetched_at": float(_ma),
+                             "received_at": float(_ma)}
+    _quote_stamp_snap = dict(_LAST_QUOTE_STAMP) if _LAST_QUOTE_STAMP else None  # THIS entry's priced-quote stamp
     if quoted <= 0:
         why = "no live quote"
         if _LAST_QUOTE_DETAIL:
@@ -607,9 +883,9 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
 
     # Honest entry: adverse fill vs quoted (fills.py) on the $1 notional
     # minus the chain's per-tx cost.
-    gas_in = _costs.tx_cost_usd(chain, NOTIONAL_USD,
+    gas_in = _costs.tx_cost_usd(chain, _N,
                                 venue=fee_venue or None)
-    eff_notional = NOTIONAL_USD - gas_in
+    eff_notional = _N - gas_in
     if eff_notional <= 0:
         return False, "costs exceed notional"
 
@@ -635,17 +911,62 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
     if filled <= 0:
         return False, "bad fill price"
     tokens = eff_notional / filled
+    _exec = None
+    _intent_op = None
+    if _demo_mode():
+        # DEMO execution: the fill is the Jupiter-quote simulation, NEVER the
+        # model fill. If it cannot be obtained the entry REFUSES (no silent
+        # fallback to modelled P&L).
+        _df = _demo_filler()
+        if _df is None or _pa is None:
+            return False, "demo exec: quote-simulation filler unavailable; entry refused"
+        _cap = _pa.max_price_impact_pct()
+        try:
+            _intent_op = _df.intent_id(lane, mint)   # durable intent; stale/unknown classified from the account
+            _prior_fill = _df.get_fill(_intent_op)  # durable journal read BEFORE buy
+            _committed = _prior_fill is not None and _df.op_committed(_intent_op) is True  # replay needs account debit evidence
+            _fill = _df.buy(_intent_op, mint, _N, _cap)
+        except _demo.DemoSkip as _e:
+            return False, "demo exec: %s" % _e.reason
+        from daemon.launch_scanner import entry_guard as _eg_pq
+        _pq = _eg_pq.post_quote_refusal(_fill, _prior_fill, _committed, _pa.max_data_age_s(), time.time())
+        if _pq:
+            try:
+                _df.release_intent(lane, mint)
+            except Exception as _re:
+                logger.warning("mirror: release_intent failed (%r); a retry may replay the original fill", _re)
+            return False, "risk: " + _pq
+        tokens = _fill["qty_tokens"]
+        filled = _fill["price_usd"]
+        gas_in = _fill["fee_usd"]
+        _exec = {"source": _fill["execution_source"],
+                 "entry_op": _fill["op_id"],
+                 "signature": _fill["signature"],
+                 "synthetic_signature": _fill["synthetic_signature"],
+                 "provenance": _fill["provenance"]}
 
     # Journaling only: the gate's confirming tape read (real
     # entry-time buys/sells/liquidity/mcap), stamped below into the
     # position's entry_features so every close carries it.
     gate_tape = _gate_tape_stamp()
+    if _pa is not None:
+        from daemon.launch_scanner import entry_guard as _eg
+        _row = (_LAST_GATE_TAPE if (chain or "").lower() == "solana"
+                else _LAST_QUOTE_STAMP)
+        _age_why = _eg.quote_age_refusal(
+            _row, _pa.max_data_age_s(), time.time())
+        if _age_why:
+            return False, "risk: " + _age_why
+        _qage_why = _eg.quote_age_refusal(
+            _quote_stamp_snap, _pa.max_data_age_s(), time.time())
+        if _qage_why:
+            return False, "risk: priced quote: " + _qage_why
     pos = {
         "mint": mint, "symbol": (symbol or "?")[:32], "chain": chain,
         "source": (source or "unknown")[:32], "lane": lane,
         "score": round(float(score or 0), 1), "tier": (tier or "")[:32],
         "entry_ts": time.time(), "quoted_price": quoted,
-        "entry_price": filled, "notional_usd": NOTIONAL_USD,
+        "entry_price": filled, "notional_usd": _N,
         # Position-level peak over poll-observed prices, seeded with
         # the entry fill (the first genuinely observed price). Updated
         # in _poll_exits; persisted on closes as peak_mult so
@@ -669,7 +990,7 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
             "score": round(float(score or 0), 1), "tier": (tier or "")[:32],
             "mcap": float(mcap or 0), "liquidity": float(liquidity or 0),
             "quoted_price": quoted, "filled_price": filled,
-            "cost_summary": _costs.cost_summary(chain, NOTIONAL_USD),
+            "cost_summary": _costs.cost_summary(chain, _N),
             "evidence": dict(evidence or {}),
         },
         # Uniform decision-time record (2026-10-23, journaling):
@@ -687,11 +1008,13 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
             "mcap": float(mcap or 0),
             "liquidity": float(liquidity or 0),
             "quoted_price": quoted, "filled_price": filled,
-            "cost_summary": _costs.cost_summary(chain, NOTIONAL_USD),
+            "cost_summary": _costs.cost_summary(chain, _N),
             "evidence": dict(evidence or {}),
             "gate_tape": gate_tape,
         },
     }
+    if _exec is not None:
+        pos["execution"] = _exec
     d["positions"][mint] = pos
     with _ledger_lock():
         # Re-check under lock: another feed may have opened it while we
@@ -700,10 +1023,32 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
         if mint in d["positions"] or any(
                 c.get("mint") == mint for c in d["closes"]):
             return False, "already mirrored (race)"
+        if _pa is not None:
+            # STABLE per (lane, mint): a mint is mirrored at most once, so a
+            # crash between the debit and the ledger persist is retried with
+            # the SAME op id and gets the original reservation back (no
+            # orphan, no second debit). A timestamp here made every retry a
+            # new operation.
+            _op = _intent_op or "%s:entry:%s" % (lane, mint)
+            _ok, _why, _pid = _pa.try_debit(lane, mint, _N, tokens, _op,
+                                            durable_refusal=_demo_mode())
+            if not _ok:
+                if _intent_op:   # refused before any debit: the next attempt takes a FRESH quote
+                    try:
+                        _demo_filler().release_intent(lane, mint)
+                    except Exception as _re:
+                        logger.warning("mirror: release_intent failed (%r); a retry may replay the original (stale) fill", _re)
+                return False, "paper account: " + str(_why)
+            pos["pa_pos_id"] = _pid
         d["positions"][mint] = pos
         _write(d)
-    logger.warning("mirror OPEN %s %s %s @ %s ($1, %s)",
-                   chain, pos["symbol"], mint[:12], filled, lane)
+        if _intent_op:
+            try:
+                _demo_filler().consume_intent(lane, mint)
+            except Exception as _ce:
+                logger.warning("mirror: consume_intent failed (%r); stale intent dropped on re-entry", _ce)
+    logger.warning("mirror OPEN %s %s %s @ %s ($%.2f, %s)",
+                   chain, pos["symbol"], mint[:12], filled, _N, lane)
     return True, "opened"
 
 
@@ -746,6 +1091,55 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     if leg["done"]:
         return 0.0
     leg_tokens = pos["tokens"] * leg["frac"]
+    _kind = _pkind(reason, pkind)
+    _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
+    if _sim and _kind != "write_down_zero":
+        # DEMO: the sale goes through the quote simulation. A failed quote leaves
+        # the leg PENDING (no invented proceeds); the next poll retries.
+        _df = _demo_filler()
+        _pa_m = _paper_account()
+        if _df is None or _pa_m is None:
+            pos["pending_exit"] = {"leg": leg_key, "why": "filler unavailable", "ts": time.time()}
+            return 0.0
+        try:
+            _cap = _pa_m.max_price_impact_pct()
+        except Exception:
+            _cap = None
+        _cap_src = "owner_max_price_impact_pct"
+        try:
+            _capv = float(_cap) if _cap is not None else 0.0
+        except (TypeError, ValueError):
+            _capv = 0.0
+        if not (_capv > 0):
+            _capv, _cap_src = _EXIT_IMPACT_CAP_PCT, "fallback_unset_or_invalid"
+        _cap = _capv
+        try:
+            _fill = _df.sell("%s:exit:%s:%s" % (pos["lane"], pos["mint"], leg_key),
+                             pos["mint"], leg_tokens, _cap)
+        except _demo.DemoSkip as _e:
+            pos["pending_exit"] = {"leg": leg_key, "why": _e.reason,
+                                   "detail": _e.detail, "ts": time.time()}
+            logger.warning("mirror demo exit pending %s %s: %s", pos["mint"][:12], leg_key, _e.reason)
+            return 0.0
+        pos.pop("pending_exit", None)
+        filled_exit = _fill["price_usd"]
+        gross = _fill["gross_usd"]
+        gas_out = _fill["fee_usd"]
+        net = gross - gas_out
+        _fv = _exit_fee_venue(pos)
+        leg.update(done=True, exit_price=filled_exit,
+                   realized_usd=round(net, 6), exit_reason=reason,
+                   exit_price_kind=_kind, fee_venue=_fv or "none",
+                   exit_execution={"source": _fill["execution_source"],
+                                   "signature": _fill["signature"],
+                                   "synthetic_signature": True,
+                                   "effective_impact_cap_pct": _cap,
+                                   "impact_cap_source": _cap_src,
+                                   "provenance": _fill["provenance"]})
+        pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+        _pa_settle(pos, leg_tokens, gross, gas_out,
+                   "leg:%s" % leg_key, price_kind=_kind)
+        return net
     try:
         leg_usd = leg_tokens * exit_price
         filled_exit = _fills.honest_exit(
@@ -755,13 +1149,20 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
         filled_exit = exit_price
     gross = leg_tokens * filled_exit
     _fv = _exit_fee_venue(pos)
-    gas_out = _costs.tx_cost_usd(chain, gross, venue=_fv)
+    # A write-down is NOT a sale: no fee on units nobody bought.
+    gas_out = (0.0 if _kind == "write_down_zero"
+               else _costs.tx_cost_usd(chain, gross, venue=_fv))
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
-               exit_price_kind=_pkind(reason, pkind),
+               exit_price_kind=_kind,
                fee_venue=_fv or "none")
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+    if _kind == "write_down_zero":
+        _pa_write_down(pos, reason)
+    else:
+        _pa_settle(pos, leg_tokens, gross, gas_out,
+                   "leg:%s" % leg_key, price_kind=_kind)
     return net
 
 
@@ -787,16 +1188,24 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     except Exception:
         filled_exit = exit_price
     gross = total_tokens * filled_exit
+    _kind = _pkind(reason, pkind)
     _fv = _exit_fee_venue(pos)
-    gas_out = _costs.tx_cost_usd(chain, gross, venue=_fv)  # ONE tx for the combined exit
+    # ONE tx for the combined exit; none for a write-down (nothing sold).
+    gas_out = (0.0 if _kind == "write_down_zero"
+               else _costs.tx_cost_usd(chain, gross, venue=_fv))
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]
         share = (pos["tokens"] * leg["frac"]) / total_tokens if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason,
-                   exit_price_kind=_pkind(reason, pkind))
+                   exit_price_kind=_kind)
     pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+    if _kind == "write_down_zero":
+        _pa_write_down(pos, reason)
+    else:
+        _pa_settle(pos, total_tokens, gross, gas_out,
+                   "remaining:%s" % "".join(open_legs), price_kind=_kind)
     return net
 
 
@@ -845,8 +1254,11 @@ def _finalize(d, mint, pos, closed_reason):
     Must be called with _ledger_lock held; writes via _write (no re-lock,
     which would deadlock).
     """
-    pnl = round(pos["realized_usd"] - NOTIONAL_USD, 4)
+    _recover_close_intents()
+    _N = float(pos.get("notional_usd") or NOTIONAL_USD)  # the real entry stake
+    pnl = round(pos["realized_usd"] - _N, 4)
     rec = {
+        "pa_pos_id": pos.get("pa_pos_id"), "notional_usd": _N,
         "mint": mint, "symbol": pos["symbol"], "chain": pos["chain"],
         "source": pos["source"], "lane": pos["lane"],
         "entry_ts": pos["entry_ts"], "close_ts": time.time(),
@@ -891,7 +1303,7 @@ def _finalize(d, mint, pos, closed_reason):
                    pos["chain"], pos["symbol"], pnl, closed_reason)
     _vp = {"mint": mint, "pnl_usd": pnl,
            "realized_mult": round(float(pos["realized_usd"])
-                                  / NOTIONAL_USD, 4),
+                                  / _N, 4),
            "closed_reason": closed_reason,
            "closes_count": len(d["closes"])}
     if rec.get("f2"):

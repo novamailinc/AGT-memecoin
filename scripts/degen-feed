@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.WARNING,
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("degen-feed")
 
-HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+HOME = (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
 SEEN_FILE = os.path.join(HOME, "degen_seen.json")
 TRACK_FILE = os.path.join(HOME, "degen_outcomes.json")
 LS_DIR = os.path.join(HOME, "launch_scanner")

@@ -827,8 +827,12 @@ class ProviderRouter:
         if timeout is None:
             timeout = WORKLOAD_TIMEOUTS.get(workload, 12)
         candidates = decision["candidates"]
-        if max_attempts is not None:
-            candidates = candidates[:max_attempts]
+        # NOTE (2026-11-24 v7): max_attempts bounds TOTAL actual
+        # transport attempts, enforced inside the loop - it must NOT
+        # pre-slice the candidate list: zero-attempt pre-I/O results
+        # (unconfigured, capability refusal, budget skips) consume no
+        # budget, and slicing here would starve later candidates the
+        # caller's attempt budget still covers.
         attempts = []
         last = None
         transport_attempts = 0
@@ -886,6 +890,20 @@ class ProviderRouter:
                         None, "rate_limited", 0.0, provider,
                         note="budget admission refused (%s); priority does not authorize overspend"
                              % budget_reason)
+                # Soft nonessential stop (95% threshold) on THIS
+                # provider's account is failover-eligible: the next
+                # candidate serves under its OWN account budget (pinned
+                # by the router script's budget-stopped-Alchemy ->
+                # Chainstack check). A HARD exhausted budget is
+                # terminal - no silent downgrade path (pinned by
+                # test_exhausted_credit_budget_makes_no_transport_
+                # attempt) - as is a reserve() refusal below
+                # (fail-closed accounting, reservation router tests).
+                if budget_reason in (
+                        "budget_exhausted", "daily_budget_exhausted") or \
+                        (budget_reason or "").startswith(
+                            "feature_budget_exhausted"):
+                    break
                 continue
             # Response cache (idempotent reads only; no quota spent).
             cached = self.cache.get(provider, method, params)
@@ -940,7 +958,9 @@ class ProviderRouter:
             if not admitted:
                 last=rpc_mod._result(None,'rate_limited',0.,provider,note=reservation_reason)
                 attempts.append({'provider':provider,'kind':'skipped','elapsed_s':0.,'note':reservation_reason})
-                continue
+                # Reservation refused: terminal for the same reason -
+                # never fail over around a budget decision.
+                break
             if provider == "helius":
                 result = adapter.call(
                     method, params, timeout=timeout,
@@ -949,7 +969,12 @@ class ProviderRouter:
                         else max_attempts - transport_attempts))
             else:
                 result = adapter.call(method, params, timeout=timeout)
-            transport_attempts += int(result.get("transport_attempts") or 1)
+            _ta = result.get("transport_attempts")
+            # Explicit 0 (proven pre-I/O: nothing sent) consumes NO
+            # attempt budget; only a MISSING marker falls back to 1.
+            # (2026-11-24 v7: `or 1` conflated the two and let a
+            # pre-I/O refusal starve the next candidate.)
+            transport_attempts += int(_ta if _ta is not None else 1)
             if result.get("outcome_unknown"):
                 # Unknown post-I/O outcome: an uncertain request is
                 # never retried - not on another key (adapter-internal)

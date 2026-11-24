@@ -452,3 +452,34 @@ def test_legacy_429_returned_to_router_for_separately_reserved_failover(tmp_path
     with _s.connect(str(tmp_path)+'/acquisition_budget_reservations.sqlite3') as db:
         rows=db.execute('SELECT count(*) FROM reservations').fetchone()[0]
     assert rows==2  # one reservation per candidate: the failover is separately reserved
+
+
+
+def test_router_zero_attempt_result_does_not_consume_budget(tmp_path,monkeypatch):
+    # v7 pin (reviewer Finding D): a pre-I/O unconfigured result with
+    # explicit transport_attempts=0 must NOT consume the max_attempts
+    # budget; the next candidate is tried. Missing marker still
+    # conservatively counts 1.
+    monkeypatch.setenv('ALCHEMY_API_KEY','fixture-a')
+    monkeypatch.setenv('CHAINSTACK_ENDPOINT','https://chainstack.example.invalid/n')
+    calls=[]
+    class FakeAdapter:
+        def __init__(self,name):self.name=name
+        def supports(self,m):return True
+        def unverified(self,m):return False
+        def configured(self):return True
+        def cost(self,m):return 1
+        def call(self,method,params,timeout=12,**kw):
+            calls.append(self.name)
+            if self.name=='alchemy':
+                return {'kind':'unconfigured','result':None,'elapsed':0.0,
+                        'provider':self.name,'note':'x','transport_attempts':0}
+            return {'kind':'ok','result':7,'elapsed':0.01,
+                    'provider':self.name,'transport_attempts':1}
+    fa=FakeAdapter('alchemy');fc=FakeAdapter('chainstack')
+    r=ProviderRouter(home=str(tmp_path),helius_enabled=False,
+                     transport=lambda *a,**k:None)
+    r._adapter=lambda p:fa if p=='alchemy' else fc
+    out=r.call('getBalance',['x'],max_attempts=1)
+    assert calls==['alchemy','chainstack']  # starved before the fix
+    assert out['kind']=='ok' and out['provider']=='chainstack'

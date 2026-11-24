@@ -146,13 +146,25 @@ err = exercise(ks, "main")
 check("only SHADOW_FILE repointed", err is None)
 
 # 2. Permission failure: every path inside an unwritable directory.
-ro = os.path.join(TMPD, "readonly")
-os.makedirs(ro)
+# DISCLOSED TEST EDIT (CI run 146): the contained CI runner maps the user to root inside its user
+# namespace, and root ignores chmod r-x, so the directory stayed writable and the fail-closed
+# assertions saw a working store. When chmod cannot make a directory unwritable (euid 0), the
+# unwritable location is a path BENEATH a regular file (ENOTDIR on every write). The assertions
+# are unchanged; the production code is unchanged.
+_ROOT = (os.geteuid() == 0)
+if _ROOT:
+    _blocker = os.path.join(TMPD, "readonly-blocker")
+    open(_blocker, "w").close()
+    ro = os.path.join(_blocker, "readonly")
+else:
+    ro = os.path.join(TMPD, "readonly")
+    os.makedirs(ro)
 ks = reload_with(state_dir=ro,
                  state_file=os.path.join(ro, "state.json"),
                  shadow_file=os.path.join(ro, "state.json.bak"),
                  lock_file=os.path.join(ro, "state.lock"))
-os.chmod(ro, stat.S_IRUSR | stat.S_IXUSR)  # r-x: no writes
+if not _ROOT:
+    os.chmod(ro, stat.S_IRUSR | stat.S_IXUSR)  # r-x: no writes
 try:
     raised = False
     try:
@@ -177,12 +189,16 @@ try:
     check("unwritable state: status state_error",
           st.get("state_error") is True)
 finally:
-    os.chmod(ro, stat.S_IRWXU)
+    if not _ROOT:
+        os.chmod(ro, stat.S_IRWXU)
 
 # 3. Bare import survives an unwritable FOREX_AGENT_HOME.
-rohome = os.path.join(TMPD, "rohome")
-os.makedirs(rohome)
-os.chmod(rohome, stat.S_IRUSR | stat.S_IXUSR)
+if _ROOT:
+    rohome = os.path.join(_blocker, "rohome")   # beneath a regular file: unwritable even for root
+else:
+    rohome = os.path.join(TMPD, "rohome")
+    os.makedirs(rohome)
+    os.chmod(rohome, stat.S_IRUSR | stat.S_IXUSR)
 try:
     p = subprocess.run(
         [sys.executable, "-c",
@@ -195,7 +211,8 @@ try:
     check("bare import with unwritable home survives",
           "IMPORT_OK" in p.stdout)
 finally:
-    os.chmod(rohome, stat.S_IRWXU)
+    if not _ROOT:
+        os.chmod(rohome, stat.S_IRWXU)
 
 # 4. Global human emergency stop (Telegram /halt -> storage
 #    kill_switch latch) halts every lane on top of per-lane state.

@@ -39,6 +39,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 
 FAILS = []
 
@@ -61,7 +62,9 @@ def fresh(home, start=None, cap=None):
     else:
         os.environ["PAPER_ACCOUNT_LANE_CAP"] = str(cap)
     import daemon.launch_scanner.paper_account as pa
-    return importlib.reload(pa)
+    pa = importlib.reload(pa)
+    import tests._guard_fixture as _gf  # mechanics fixture (mandatory-guard edit)
+    return _gf.install(pa)
 
 
 def mark(value, age_s=0.0, qty=5.0, pos_id=None):
@@ -237,7 +240,10 @@ with open(racer, "w") as f:
     f.write(
         "import os, sys\n"
         "sys.path.insert(0, %r)\n"
+        "import tests._guard_fixture as _gfb; _gfb.block_network()\n"
         "import daemon.launch_scanner.paper_account as pa\n"
+        "import tests._guard_fixture as _gf\n"
+        "_gf.install(pa)\n"
         "won = 0\n"
         "for i in range(20):\n"
         "    ok, _, _pid = pa.try_debit(sys.argv[1], 'M%%d' %% i,"
@@ -667,52 +673,92 @@ check("valid fresh mark accepted again after the rejects",
       snap["marks_status"] == "ok" and snap["marked_equity"] == 6.0)
 
 # ---- equity baselines: capture, carry, never-favorable-reset --------
-# This account's first TRUSTWORTHY view of the day came with the
-# position already down 80% (the debit preceded any snapshot), so
-# the day baseline captures AT THE LOSS: 6.00. (The account-start
-# capture case is covered by the first-run check above.)
+# REWRITTEN (mandatory-guard migration, reviewer-approved shapes). With
+# gates on, the first gated debit runs the real view in-lock, so the
+# day-start baseline and peak are captured AT THE DEBIT's equity (10.00),
+# before any later snapshot. The old premise (a gates-off debit, then a
+# first trustworthy view at the 6.00 loss) cannot occur. Each property is
+# re-established through the real pipeline; no expected value was fitted.
+# REVIEW LABELS (do not strengthen into claims):
+#  - Check (1a) proves the baseline is captured by the time the gated debit
+#    returns (debit-TRIGGERED). The capture is delivered by the pre-lock
+#    snapshot in account_marks.collect_marks, NOT proven atomic with the
+#    in-lock debit (mutant "in-lock capture removed" still passes).
+#  - Concurrent first debits racing to capture the baseline: UNVERIFIED.
+#  - The daily_loss "baseline day must equal today" guard is held by
+#    construction (a trustworthy new-day view captures in the same view); the
+#    mutant is unreachable through the public API, so it is NOT tested.
+#  - Mutants "capture no-op" and "snapshot persistence removed" are detected
+#    as harness TypeError crashes, not assertion FAILs.
+def _led(pa):
+    with open(pa.LEDGER_PATH) as f:
+        return json.load(f)
+
+# (1a) capture happens AT THE DEBIT: read the ledger before any snapshot.
+HOMEB = tempfile.mkdtemp(prefix="paper-account-baseline-")
+pab = fresh(HOMEB, start=10.0)
+pab.try_debit("grad", "DOWN1", 5.0, 5.0, "bl-d1")
+lb = _led(pab)
+check("baseline captured AT THE GATED DEBIT's view (10.00), pre-snapshot",
+      abs(lb["day_baseline"]["value"] - 10.0) < 1e-9
+      and abs(lb["peak_equity"]["value"] - 10.0) < 1e-9)
+pa9 = fresh(HOME11)   # module is shared: re-point at the marks account
+# (1b) then the mark-down: daily loss and drawdown against that capture.
 snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(1.0)}})
-check("day-start baseline captured from first trustworthy view",
-      abs(snap["day_start_equity"]["value"] - 6.0) < 1e-9
+check("day-start baseline = debit-time 10.00; mark-down to 6.00 -> "
+      "daily loss 4.00",
+      abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9
+      and abs(snap["daily_loss"] - (10.0 - 6.0)) < 1e-9)
+check("peak equity = debit-time 10.00; drawdown (10-6)/10",
+      abs(snap["peak_equity"]["value"] - 10.0) < 1e-9
+      and abs(snap["drawdown_pct"] - (10.0 - 6.0) / 10.0 * 100) < 1e-6)
+# (3) a later FAVORABLE mark (12.00) must not reset the baseline; the
+# peak moves up.
+snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(7.0)}})
+check("baseline never resets to a later favorable value (stays 10.00)",
+      abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9)
+check("peak rises with the recovery (12.00), no daily loss",
+      abs(snap["peak_equity"]["value"] - 12.0) < 1e-9
       and snap["daily_loss"] == 0.0)
-check("peak equity captured at 6.00",
-      abs(snap["peak_equity"]["value"] - 6.0) < 1e-9)
-# Later same day the mark RECOVERS: baseline must NOT reset to the
-# favorable value; the peak moves up.
-snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(4.0)}})
-check("baseline never resets to a later favorable value",
-      abs(snap["day_start_equity"]["value"] - 6.0) < 1e-9)
-check("peak rises with the recovery (9.00), no daily loss",
-      abs(snap["peak_equity"]["value"] - 9.0) < 1e-9
-      and snap["daily_loss"] == 0.0)
-# A dip below the baseline counts as daily loss; drawdown vs 9.00.
+# (5) a dip below the baseline: daily loss vs 10.00, drawdown vs 12.00.
 snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(0.5)}})
-check("daily loss (6.00 - 5.50 = 0.50), drawdown (9-5.5)/9",
-      abs(snap["daily_loss"] - 0.50) < 1e-9
-      and abs(snap["drawdown_pct"] - (9.0 - 5.5) / 9.0 * 100) < 1e-6)
-# Rollover with NO trustworthy mark: baseline carries, marked
-# fields and gate inputs go None (fail-closed), nothing resets.
-with open(pa9.LEDGER_PATH) as f:
-    led = json.load(f)
+check("daily loss (10.00 - 5.50 = 4.50), drawdown (12-5.5)/12",
+      abs(snap["daily_loss"] - (10.0 - 5.5)) < 1e-9
+      and abs(snap["drawdown_pct"] - (12.0 - 5.5) / 12.0 * 100) < 1e-6)
+# Rollover (NEW DAY, same day manipulation as before): an UNTRUSTWORTHY
+# first view carries the old baseline, inputs None, and an entry is
+# refused fail-closed.
+led = _led(pa9)
 led["day"] = "2000-01-01"
 led["day_baseline"]["day"] = "2000-01-01"  # captured "yesterday"
 with open(pa9.LEDGER_PATH, "w") as f:
     json.dump(led, f)
-snap = fresh(HOME11).snapshot()
-check("rollover without marks: baseline carries, gate inputs None",
+snap = fresh(HOME11).snapshot(
+    marks={"grad": {"DOWN1": mark(1.0, age_s=3600)}})
+check("rollover + STALE marks: baseline carries (old day, 10.00), "
+      "gate inputs None",
       snap["day_start_equity"] is not None
       and snap["day_start_equity"]["day"] != snap["day"]
+      and abs(snap["day_start_equity"]["value"] - 10.0) < 1e-9
       and snap["daily_loss"] is None
       and snap["drawdown_pct"] is None
       and snap["marked_equity"] is None)
-# First trustworthy mark of the new day captures the new baseline.
+pa9 = fresh(HOME11)
+ok_s, why_s, _ = pa9.try_debit(
+    "grad", "NEWD1", 1.0, 1.0, "bl-new-stale",
+    marks={"grad": {"DOWN1": mark(1.0, age_s=3600)}})
+check("rollover + stale marks: a new entry is refused fail-closed",
+      ok_s is False)
+check("stale view did NOT capture a new-day baseline",
+      _led(pa9)["day_baseline"]["day"] == "2000-01-01")
+# First TRUSTWORTHY mark of the new day captures at the (loss) equity.
 snap = pa9.snapshot(marks={"grad": {"DOWN1": mark(2.5)}})
-check("new day, first trustworthy mark captures a new baseline",
+check("new day, first trustworthy mark captures baseline at 7.50",
       snap["day_start_equity"]["day"] == snap["day"]
-      and abs(snap["day_start_equity"]["value"] - 7.5) < 1e-9
+      and abs(snap["day_start_equity"]["value"] - (5.0 + 2.5)) < 1e-9
       and snap["daily_loss"] == 0.0)
-check("peak still the all-time high (9.00)",
-      abs(snap["peak_equity"]["value"] - 9.0) < 1e-9)
+check("peak still the all-time high (12.00)",
+      abs(snap["peak_equity"]["value"] - 12.0) < 1e-9)
 
 print()
 if FAILS:

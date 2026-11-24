@@ -43,7 +43,13 @@ home = sys.argv[2]
 os.environ["FOREX_AGENT_HOME"] = home
 os.environ["PAPER_ACCOUNT_START"] = "10"
 sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
+import tests._guard_fixture as _g; _g.block_network()  # block before imports
 import daemon.launch_scanner.paper_account as pa
+_g.set_limits_env(); _g.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed)
+# Baselines are persisted by the gate's own view update. Bring them current
+# through the REAL view BEFORE arming the kill hooks, so the first save after
+# arming is the debit's own (the boundary these tests exist to kill at).
+pa.snapshot()
 
 if mode == "kill_after_journal":
     def die(led):
@@ -81,7 +87,9 @@ home, expect_cash = sys.argv[1], float(sys.argv[2])
 os.environ["FOREX_AGENT_HOME"] = home
 os.environ["PAPER_ACCOUNT_START"] = "10"
 sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
+import tests._guard_fixture as _g; _g.block_network()  # block before imports
 import daemon.launch_scanner.paper_account as pa
+_g.set_limits_env(); _g.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed)
 snap = pa.snapshot()
 pos = snap["lanes"].get("watcher", {}).get("positions", [])
 print("SNAP cash=%.6f spendable=%.6f open=%d degraded=%s"
@@ -107,7 +115,9 @@ import os, sys
 os.environ["FOREX_AGENT_HOME"] = sys.argv[1]
 os.environ["PAPER_ACCOUNT_START"] = "10"
 sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
+import tests._guard_fixture as _g; _g.block_network()  # block before imports
 import daemon.launch_scanner.paper_account as pa
+_g.set_limits_env(); _g.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed)
 pa.try_debit("watcher", "S", 1.0, qty=50.0, op_id="watcher:buy:S:1")
 pa.credit("watcher", "S", 1.5, "watcher:sell:S:1", qty=50.0,
           price_kind="current_price_simulated_fill")

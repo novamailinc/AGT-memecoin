@@ -39,6 +39,8 @@ from broker.memecoin.execution.mainnet_executor import (
     MainnetExecutor, SOL_MINT)
 from daemon.launch_scanner import grad_raw as _raw
 from daemon.launch_scanner import grad_select as _sel
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(_sel)
 from daemon.launch_scanner import live_select
 from daemon.launch_scanner import saturation as _sat
 
@@ -196,7 +198,7 @@ def main():
     # counts never admit; stub the authoritative-history hook with the
     # fixture's declared per-creator history (the `launches` table).
     _sel._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-        _sel.authoritative_proof(c, launches.get(c, (0, 0))[0], n)
+        fixture_proof(_sel, c, launches.get(c, (0, 0))[0], n)
     _sel._curve_stats = lambda addr: curves.get(
         addr, {"trades": None, "reason": "no curve"})
     _sel._creator_from_oldest_tx = lambda sig: ""

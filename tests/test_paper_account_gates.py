@@ -19,6 +19,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests (mandatory-guard migration, disclosed)
 
 FAILS = []
 
@@ -45,8 +46,20 @@ def fresh(home, start="10.0", gates=True, max_daily=5.00,
             os.environ.pop(k, None)
         else:
             os.environ[k] = str(v)
+    os.environ["PAPER_ACCOUNT_MAX_SIMULTANEOUS"] = "1000"  # TEST-FIXTURE value, not owner
+    os.environ["PAPER_ACCOUNT_MAX_POSITIONS"] = "1000"  # TEST-FIXTURE value, not owner
+    os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"  # TEST-FIXTURE value, not owner
+    os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
+    os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
     import daemon.launch_scanner.paper_account as pa
-    return importlib.reload(pa)
+    pa = importlib.reload(pa)
+    # Isolation (disclosed test edit): the central marks default reaches
+    # live Jupiter + a mainnet RPC curve probe. Replace it at the test
+    # boundary with the fail-closed result (no marks) it already returns
+    # when those sources are unreachable. Calls that pass marks= are
+    # unaffected.
+    pa._central_marks = lambda: {}
+    return pa
 
 
 def mark(value, qty, age_s=0.0, pos_id="p"):
@@ -70,7 +83,10 @@ def marks_at_cost(pa):
 H = tempfile.mkdtemp(prefix="gates-off-")
 pa = fresh(H, gates=False)
 ok, why, _ = pa.try_debit("grad", "A", 5.0, 5.0, "g-off-1")
-check("gates OFF by default: entry without marks succeeds", ok)
+# CONTRACT CHANGE (mandatory guard, owner directive): gates off no longer
+# admits entries; it refuses fail-closed.
+check("gates OFF: entry REFUSED fail-closed (mandatory gates)",
+      ok is False and "mandatory gates off" in str(why))
 
 # ---- empty account: equity is exactly cash, no marks needed ---------
 H_EMPTY = tempfile.mkdtemp(prefix="gates-empty-")
@@ -157,6 +173,11 @@ os.environ["FOREX_AGENT_HOME"] = _saved_home
 os.environ["PAPER_ACCOUNT_MAX_DAILY_LOSS_USD"] = "100"
 os.environ["PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"] = "100"
 os.environ["PAPER_ACCOUNT_MAX_EXPOSURE_PCT"] = "100"
+os.environ["PAPER_ACCOUNT_MAX_SIMULTANEOUS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_POSITIONS"] = "1000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
+os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
 
 # ---- open position: marks become mandatory ---------------------------
 # Re-bind the module to the gates-empty home: the owner-config blocks

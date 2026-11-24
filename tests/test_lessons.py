@@ -307,16 +307,34 @@ check("backfill: jsonl + ledger dedupe to one row per close",
 _ks_tmp = tempfile.mkdtemp(prefix="lessons-ks-")
 KS.STATE_DIR = _ks_tmp
 KS.STATE_FILE = os.path.join(_ks_tmp, "state.json")
+KS.SHADOW_FILE = os.path.join(_ks_tmp, "shadow.json")
+KS.LOCK_FILE = os.path.join(_ks_tmp, "state.lock")
+# DISCLOSED TEST EDIT (stale vs the mandatory entry guard, baseline red): entries are refused unless the shared account is
+# enabled. TEST-FIXTURE limits (not owner values); no guard waived or patched.
+import importlib as _il, tempfile as _tf
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+import tests._guard_fixture as _GF
+os.environ["FOREX_AGENT_HOME"] = _tf.mkdtemp(prefix="shared-acct-home-")
+os.environ["PAPER_ACCOUNT_START"] = "1000"
+os.environ.pop("PAPER_ACCOUNT_LANE_CAP", None)
+os.environ.pop("PAPER_ACCOUNT_TRADE_SIZE_USD", None)
+import daemon.launch_scanner.paper_account as _pa
+_pa = _il.reload(_pa)
+_GF.install(_pa)
+os.environ["PAPER_ACCOUNT_MAX_DATA_AGE_S"] = "100000"
 eng = GR.make_engine()
 _tmp = tempfile.mkdtemp(prefix="lessons-eng-")
 eng.LEDGER_PATH = os.path.join(_tmp, "grad_raw_ledger.json")
 eng.ensure_ledger()
 eng._jup = None  # no unconditional batch HTTP before fixture price_fn
 eng.quote_price = lambda chain, mint, spot_index=None: 0.001
-eng._fresh_tape = lambda mint: {"usd_liquidity": 5000.0,
+eng._fresh_tape = lambda mint: {"fetched_at": __import__("time").time(), "received_at": __import__("time").time(), "usd_liquidity": 5000.0,
                                 "usd_market_cap": 60000.0,
                                 "tape_source": "test"}
 SEL = GR._select
+from tests.fixture_guarantee import admit_in_script_process, fixture_proof  # noqa: E402
+admit_in_script_process(SEL)
+admit_in_script_process(GS)
 TRADER1 = "TraderLes11111111111111111111111111111111"
 MINT1 = "LesMint11111111111111111111111111111111pump"
 SEL._index_refresh = lambda now: None
@@ -331,7 +349,7 @@ SEL._INDEX["by_trader"][TRADER1] = [NOW - 600]
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
 SEL._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-    SEL.authoritative_proof(c, {TRADER1: 1}.get(c, 0), n)
+    fixture_proof(SEL, c, {TRADER1: 1}.get(c, 0), n)
 SEL._curve_stats = lambda addr: {"trades": 80,
                                  "created_ts": NOW - 600,
                                  "oldest_sig": "sig-l1",
@@ -452,7 +470,7 @@ GS._INDEX["by_trader"][TRADER_SER] = [NOW - 3600, NOW - 3500, NOW - 300]
 # fixture's INTENDED complete per-creator history (explicit table,
 # never derived from the recorder index).
 GS._AUTHORITATIVE_LAUNCHES_24H = lambda c, n: \
-    GS.authoritative_proof(c, {TRADER_OK: 1}.get(c, 0), n)
+    fixture_proof(GS, c, {TRADER_OK: 1}.get(c, 0), n)
 _CURVE = {
     MINT_OK: {"trades": 80, "created_ts": NOW - 600,
               "oldest_sig": "sig-ok", "capped": False,

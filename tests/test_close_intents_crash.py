@@ -54,6 +54,7 @@ mode, home = sys.argv[1], sys.argv[2]
 os.environ["FOREX_AGENT_HOME"] = home
 os.environ["PAPER_ACCOUNT_START"] = "10"
 sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
+import tests._guard_fixture as _g; _g.block_network(); _g.set_limits_env()  # mandatory-guard migration (disclosed): blocker before pa import; gates on + TEST-FIXTURE limits
 import daemon.launch_scanner.paper_account as pa
 import daemon.launch_scanner.close_intents as ci
 
@@ -105,6 +106,7 @@ home = sys.argv[1]
 os.environ["FOREX_AGENT_HOME"] = home
 os.environ["PAPER_ACCOUNT_START"] = "10"
 sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
+import tests._guard_fixture as _g; _g.block_network(); _g.set_limits_env()  # mandatory-guard migration (disclosed): blocker before pa import; gates on + TEST-FIXTURE limits
 import daemon.launch_scanner.paper_account as pa
 import daemon.launch_scanner.close_intents as ci
 

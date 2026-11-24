@@ -1,0 +1,2 @@
+{"mint": "62BYSfbsTiG1zd7vBcY1ubpiZGvPAbTuvSpwg4WYkdei", "symbol": "SPONGIEZ", "source": "", "leg": null, "realized_mult": 0.1493, "peak_mult": 2.1229, "rug": false, "exit_reason": "stop_loss", "outcome_kind": "paper", "snapshots": []}
+{"mint": "GpTtQsyKpukVSpAHL4NhKzF88rkLrRHKMnaiwjuLpump", "symbol": "DIHVIDENDS", "source": "", "leg": null, "realized_mult": 0.024, "peak_mult": 1.2355, "rug": true, "exit_reason": "stop_loss", "outcome_kind": "paper", "snapshots": []}

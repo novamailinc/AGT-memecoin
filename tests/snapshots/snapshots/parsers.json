@@ -1,0 +1,41 @@
+{
+  "pumpportal_migration.json": {
+    "chain": "solana",
+    "extra": {
+      "bonding_curve": "",
+      "market_cap_sol": 0.0,
+      "market_id": "",
+      "migration_pool": "pumpswap",
+      "signature": "Kt6s8UiPpinXnFzhnZks8xo71NWWHpt3E4FcU1R96zh3eWAiSH3yoZ31ckGrfXyWTo1eVU8SzRt3BkUjFzNV72m",
+      "trader": "",
+      "uri": "https://example.invalid/mig.json"
+    },
+    "mint": "H8DX2KJNV3c9Dg4L7sZ85qS5Mr9ZZ4y36tgsEFMopump",
+    "name": "MigCoin",
+    "source": "pumpportal-migration",
+    "state_from_event": true,
+    "symbol": "MIG",
+    "url": "https://pump.fun/coin/H8DX2KJNV3c9Dg4L7sZ85qS5Mr9ZZ4y36tgsEFMopump",
+    "usd_market_cap": 0.0
+  },
+  "pumpportal_new_token.json": {
+    "chain": "solana",
+    "extra": {
+      "bonding_curve": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsg",
+      "initial_buy_sol": 0.001503833,
+      "market_cap_sol": 28.03618884034107,
+      "signature": "AqNXeFF1wMNVXU1DkcqegTJCoeGT6cUxHr34K4vBz7vcRQq2bLau8qi9EkuQ7SS7yKSHGdKJFTtteRjZfRwKpbC",
+      "trader": "2BdnAxsgVehTFu14FmBJSXeCUnujkG8hVaZ4yxPufodz",
+      "uri": "https://example.invalid/test.json",
+      "virtual_sol_reserves": 30.0,
+      "virtual_token_reserves": 1073000000000000.0
+    },
+    "mint": "Dtqa7qp5Kta6GCh6MkUzs2CRiTgvxRQQ2iyGbZTfLoat",
+    "name": "TestCoin",
+    "source": "pumpportal-new",
+    "state_from_event": true,
+    "symbol": "TEST",
+    "url": "https://pump.fun/coin/Dtqa7qp5Kta6GCh6MkUzs2CRiTgvxRQQ2iyGbZTfLoat",
+    "usd_market_cap": 0.0
+  }
+}

@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Lane bandit shadow mode: sync closed trades from every lane ledger,
+update the bandit, and log what it WOULD allocate.
+
+Reads:
+  - main lane:    ~/.forex-agent/data/memecoin/fills.jsonl (CLOSE records)
+  - stacker:      ~/.forex-agent/stacker_ledger.json
+  - degen_v2:     ~/.forex-agent/degen_v2_ledger.json
+  - steady:       ~/.forex-agent/steady_ledger.json (closed list, $1 paper)
+  - nadir:        (no paper trades yet)
+
+Writes: ~/.forex-agent/launch_scanner/lane_bandit.json
+
+SHADOW MODE: prints the bandit's allocation recommendation but changes
+nothing. The kill switch keeps its veto. Promote to gating only after
+50+ closes AND the bandit demonstrably separates lanes.
+
+Usage: scripts/lane-bandit-shadow [--verbose]
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from lane_bandit import LaneBandit
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def sync_main(bandit, seen):
+    """Main lane: CLOSE records from fills.jsonl. Size 0.025 SOL/leg."""
+    path = os.path.join(HOME, "data", "memecoin", "fills.jsonl")
+    try:
+        lines = open(path).read().splitlines()
+    except Exception:
+        return 0
+    n = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("kind") != "CLOSE":
+            continue
+        key = ("main", d.get("ticket"))
+        if key in seen:
+            continue
+        seen.add(key)
+        pnl = float(d.get("realized_pnl_sol") or 0)
+        # main lane: 0.025 SOL per leg
+        bandit.update("main", pnl, 0.025)
+        n += 1
+    return n
+
+
+def sync_stacker(bandit, seen):
+    d = _load_json(os.path.join(HOME, "stacker_ledger.json"), {})
+    n = 0
+    for p in d.get("positions", []):
+        if not p.get("exit_ts"):
+            continue
+        key = ("stacker", p.get("mint"), p.get("entry_ts"))
+        if key in seen:
+            continue
+        seen.add(key)
+        pnl = float(p.get("realized_pnl") or 0)
+        size = float(p.get("size_usd") or 3.0)
+        bandit.update("stacker", pnl, size, ts=p.get("exit_ts"))
+        n += 1
+    return n
+
+
+def sync_degen_v2(bandit, seen):
+    d = _load_json(os.path.join(HOME, "degen_v2_ledger.json"), {})
+    n = 0
+    positions = d.get("positions", []) if isinstance(d, dict) else []
+    for p in positions:
+        if not p.get("exit_ts"):
+            continue
+        key = ("degen_v2", p.get("mint"), p.get("entry_ts"))
+        if key in seen:
+            continue
+        seen.add(key)
+        pnl = float(p.get("realized_pnl") or p.get("pnl") or 0)
+        size = float(p.get("size_usd") or p.get("size") or 1.0)
+        bandit.update("degen_v2", pnl, size, ts=p.get("exit_ts"))
+        n += 1
+    return n
+
+
+def sync_steady(bandit, seen):
+    d = _load_json(os.path.join(HOME, "steady_ledger.json"), {})
+    n = 0
+    closed = d.get("closed", []) if isinstance(d, dict) else []
+    for p in closed:
+        key = ("steady", p.get("mint"), p.get("entry_ts"))
+        if key in seen:
+            continue
+        seen.add(key)
+        pnl = float(p.get("pnl") or 0)
+        size = float(p.get("size_usd") or 1.0)
+        bandit.update("steady", pnl, size, ts=p.get("exit_ts"))
+        n += 1
+    return n
+
+
+def main():
+    verbose = "--verbose" in sys.argv
+    bandit = LaneBandit.load()
+    # idempotency: bandit state already counts synced closes; we track
+    # seen keys in the bandit file's shadow log to avoid double-counting
+    # across runs. Simpler: rebuild from scratch each run (ledgers are
+    # append-only; closes never change).
+    bandit = LaneBandit()  # fresh; ledgers are the source of truth
+    seen = set()
+    counts = {
+        "main": sync_main(bandit, seen),
+        "stacker": sync_stacker(bandit, seen),
+        "degen_v2": sync_degen_v2(bandit, seen),
+        "steady": sync_steady(bandit, seen),
+    }
+    total = bandit.total_closes()
+
+    # Shadow decision: what would the bandit allocate right now?
+    selected, samples = bandit.select()
+    bandit.log_shadow(selected, samples)
+    bandit.save()
+
+    print(f"synced closes: {counts} | total={total}")
+    print("posterior win-rate means:")
+    now = time.time()
+    for lane in ["main", "stacker", "degen_v2", "steady", "nadir"]:
+        arm = bandit.arms[lane]
+        mean = bandit.posterior_mean(lane, now)
+        s = samples.get(lane)
+        s_str = f"{s:.3f}" if s is not None else "  ---"
+        print(f"  {lane:10s} n={arm['n']:4d} "
+              f"E[win]={mean:.1%} sample={s_str}")
+    print(f"shadow allocation: {selected}")
+    if not bandit.trusted():
+        print(f"SHADOW MODE: {total}/{50} closes — not trusted yet, "
+              "kill switch only")
+    elif bandit.should_kill():
+        print("KILL CRITERION MET: lanes haven't separated after 150+ "
+              "closes — bandit adds nothing, keep kill-switch-only")
+    else:
+        print("TRUSTED: bandit separates lanes (still shadow — "
+              "promotion needs your go-ahead)")
+
+    if verbose:
+        print(json.dumps(bandit.to_dict()["arms"], indent=1))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Helius 429-spike watch (2026-11-18, resilience build).
+
+Run on a short cadence (recommend every 5 min via cron):
+counts the Helius 429s in the last 10 minutes via the pacer state.
+More than 5 is a spike: the alert state file is written
+(~/.forex-agent/helius_429_alert.json, read by the self-audit),
+the event is logged loudly, and the user gets ONE Telegram ping
+on the transition into active — an ongoing spike does not spam.
+
+Exit 1 while a spike is active (so cron logs it), 0 otherwise.
+Never raises; a broken pacer state reports inactive.
+Usage: scripts/helius-429-watch
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from helius_alerts import (  # noqa: E402
+    ALERT_FILE, THRESHOLD, WINDOW_S, check_and_record,
+    notify_telegram, read_alert)
+
+
+def main():
+    home = os.environ.get("FOREX_AGENT_HOME",
+                          "/home/hatch/.forex-agent")
+    prev = read_alert(home)
+    state = check_and_record(home)
+    count = state.get("count_10m", 0)
+    # AUTO-QUIET (advanced build, piece 10, 2026-11-21): the quiet
+    # switch decides for itself. At >=5 429s/10min it engages quiet
+    # for 1h (bounded, NOT the manual 12h — a wrong auto-engage
+    # self-corrects at the next probe); it releases when a probe
+    # succeeded and 429s are back below 5. The decision is
+    # journal-only (switches.auto_quiet_decision); this script
+    # performs the action and journals it to switch_log.jsonl.
+    # Quiet SHEDS Helius calls — the lanes keep trading on the
+    # public-RPC fallback — it never switches endpoints to evade
+    # a rate limit. A failure here must never break the alert watch.
+    try:
+        from switches import auto_quiet_decision, log_switch
+        from helius_ratelimit import (
+            quiet_clear, quiet_set, quiet_status)
+        _dec = auto_quiet_decision(count, quiet_status(home=home))
+        if _dec.get("action") == "engage":
+            quiet_set(_dec.get("duration_s", 3600) / 3600.0,
+                      reason="auto-quiet: %s" % _dec.get("reason", ""),
+                      home=home)
+            log_switch(home, {"switch": "helius_quiet",
+                              "action": "engage",
+                              "reason": _dec.get("reason", "")})
+            print("auto-quiet ENGAGED for %ss (%s)"
+                  % (_dec.get("duration_s", 3600),
+                     _dec.get("reason", "")), file=sys.stderr)
+        elif _dec.get("action") == "release":
+            quiet_clear(
+                reason="auto-quiet: %s" % _dec.get("reason", ""),
+                home=home)
+            log_switch(home, {"switch": "helius_quiet",
+                              "action": "release",
+                              "reason": _dec.get("reason", "")})
+            print("auto-quiet RELEASED (%s)" % _dec.get("reason", ""),
+                  file=sys.stderr)
+    except Exception as e:
+        print("auto-quiet skipped: %s" % type(e).__name__,
+              file=sys.stderr)
+    if state.get("active"):
+        msg = ("HELIUS 429 SPIKE: %d 429s in the last %.0f min "
+               "(threshold %d). Background Helius callers auto-shed; "
+               "entry-critical calls keep priority tokens. Entries "
+               "resume automatically when the flag lifts."
+               % (count, WINDOW_S / 60.0, THRESHOLD))
+        print(msg, file=sys.stderr)
+        if not (prev or {}).get("active"):
+            if notify_telegram(msg):
+                print("telegram ping sent", file=sys.stderr)
+            else:
+                print("telegram ping failed (alert file is the record)",
+                      file=sys.stderr)
+        return 1
+    print("helius 429 watch ok: %d 429s in the last %.0f min "
+          "(threshold %d)" % (count, WINDOW_S / 60.0, THRESHOLD))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

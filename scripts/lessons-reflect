@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Nightly decision-memory reflector (2026-11-17).
+
+Reads each grad lane's settled decisions — the per-lane
+decision log (``<HOME>/lessons/<lane>_lessons.jsonl``) merged
+with the lane ledger's closes (the ledgers keep only the last
+500 closes, so the merge is a bounded backfill) — and generates
+TEMPLATED lessons from the lane's own stats:
+
+  * fast/slow entry split (grad_age_s <= 30s vs > 30s)
+  * deployer-launch bands (0 / 1-2 / >= 3 in 24h)
+  * curve-speed bands (ttg_s <= 60s / 60-600s / > 600s)
+  * curve-trades bands (<= 100 / 101-250 / > 250 signatures)
+  * copycat-count bands (0 / 1-2 / >= 3 others in 24h)
+
+Lesson text is templated from the numbers only — no LLM, no
+model prose, no RPC. Each lesson carries ``resolved_at`` (the
+close_ts of the newest settled decision it is based on); the
+file carries ``generated_at``.
+
+Writes ``<HOME>/lessons/<lane>_lessons.json`` per lane.
+Advisory only: lessons never gate entries — the evaluation path
+reads them as context and the CEO reads them via
+``lessons.get_lessons(lane)``.
+
+Usage: scripts/lessons-reflect [--lane grad_select] [--home DIR]
+Paper only. Run nightly via cron; safe to run by hand any time
+(it only reads ledgers/logs and writes the lessons files).
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+import lessons as L
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+
+def reflect_lane(lane, home=None):
+    """Generate + write one lane's lessons. Returns the payload."""
+    home = home or HOME
+    decisions = L.merged_settled_decisions(lane, home=home)
+    payload = L.generate_lessons(lane, decisions)
+    L.write_lessons(lane, payload, home=home)
+    return payload
+
+
+def main(argv=None):
+    argv = list(argv or sys.argv[1:])
+    home = HOME
+    lanes = list(L.LANES)
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--home" and i + 1 < len(argv):
+            home = argv[i + 1]
+            i += 2
+        elif a == "--lane" and i + 1 < len(argv):
+            lanes = [argv[i + 1]]
+            i += 2
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print("unknown arg: %s" % a, file=sys.stderr)
+            return 2
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    for lane in lanes:
+        if lane not in L.LANES:
+            print("unknown lane: %s" % lane, file=sys.stderr)
+            return 2
+        payload = reflect_lane(lane, home=home)
+        n = payload.get("n_settled") or 0
+        print("[%s] %s: %d settled decisions -> %d lessons "
+              "(generated_at %.0f, resolved_at %s)"
+              % (now, lane, n, len(payload.get("lessons") or []),
+                 payload.get("generated_at") or 0,
+                 payload.get("resolved_at")))
+        print("  Advisory subset: %s included, %s excluded; simulated/unvalidated, not qualified performance. Missingness may bias results." % (
+            payload.get("n_qualified", "unknown"), payload.get("n_excluded_unqualified", "unknown")))
+        for lesson in L._rank(payload.get("lessons") or [])[:5]:
+            print("  - %s" % lesson.get("text", ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

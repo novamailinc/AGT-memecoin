@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Eagle Eye Engine 1 — Discovery: new launch intake.
+
+SILENT DATA LAYER — writes to SQLite, sends ZERO Telegram signals.
+
+Owns stage='new'. Watches for new Solana token launches:
+- GeckoTerminal new_pools (every 30s)
+- Applies hard filters at intake (liq, FDV)
+- INSERTs new tokens with stage='new', state='NEW', tier='cold'
+- Promotes stage 'new' → 'trending' when token matures (>20 min, liq OK)
+
+The momentum engine picks up stage='trending' on its next poll.
+No coordination needed — stage ownership eliminates races.
+
+Usage: scripts/eagle-eye-discovery [--once]
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from robust_http import get_json
+import eagle_eye_db as db
+
+try:
+    import killswitch
+    _HAS_KS = True
+except ImportError:
+    _HAS_KS = False
+
+ENGINE_ID = db.ENGINE_DISCOVERY
+POLL_S = 30
+
+GT_NEW_POOLS = ("https://api.geckoterminal.com/api/v2/networks/solana/"
+                "new_pools?page=1")
+
+# Hard filters at intake
+MIN_LIQ_USD = 5000
+MAX_FDV_USD = 50_000_000
+MATURITY_S = 20 * 60  # promote to trending after 20 min
+
+
+def discover(conn) -> int:
+    """Fetch new pools, insert new tokens. Returns count added."""
+    try:
+        d = get_json(GT_NEW_POOLS, tries=3, timeout=20)
+    except Exception as e:
+        print(f"  [{ENGINE_ID}] discovery failed: {e}", flush=True)
+        return -1
+    added = 0
+    for pool in d.get("data", []):
+        try:
+            attrs = pool.get("attributes", {})
+            pid = pool.get("id", "")
+            pool_addr = pid.split("_")[-1] if "_" in pid else pid
+            name = attrs.get("name", "?").split("/")[0].strip()
+            fdv = float(attrs.get("fdv_usd", 0) or 0)
+            liq = float(attrs.get("reserve_in_usd", 0) or 0)
+            if liq < MIN_LIQ_USD or fdv > MAX_FDV_USD or fdv <= 0:
+                continue
+            mint = pool.get("relationships", {}).get(
+                "base_token", {}).get("data", {}).get("id", "")
+            mint = mint.split("_")[-1] if "_" in mint else mint
+            if not mint:
+                continue
+            # Check if already known
+            cur = conn.execute(
+                "SELECT mint FROM tokens WHERE mint=?", (mint,))
+            if cur.fetchone():
+                continue
+            db.upsert_token(conn, mint, symbol=name,
+                            pool_address=pool_addr,
+                            liq_usd=liq, fdv_usd=fdv,
+                            source="gt_new_pools")
+            # Ensure stage='new' (upsert defaults to 'new' on insert)
+            added += 1
+        except Exception:
+            continue
+    return added
+
+
+def promote_mature(conn) -> int:
+    """Promote stage='new' → 'trending' for mature tokens I own."""
+    cutoff = time.time() - MATURITY_S
+    cur = conn.execute(
+        "SELECT mint FROM tokens WHERE stage='new'"
+        " AND first_seen < ? AND liq_usd >= ?",
+        (cutoff, MIN_LIQ_USD))
+    promoted = 0
+    for row in cur.fetchall():
+        db.promote_stage(conn, row["mint"], db.STAGE_TRENDING)
+        # New trending tokens start as WATCHLIST, warm tier (scored within 60s)
+        conn.execute(
+            "UPDATE tokens SET state=?, tier=? WHERE mint=?",
+            (db.WATCHLIST, db.TIER_WARM, row["mint"]))
+        conn.commit()
+        promoted += 1
+    return promoted
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args()
+
+    if _HAS_KS and not killswitch.gate("eagle_eye"):
+        print(f"[{ENGINE_ID}] halted by killswitch", flush=True)
+        return
+
+    conn = db.get_db()
+    print(f"🦅 [{ENGINE_ID}] starting (silent)", flush=True)
+
+    while True:
+        start = time.time()
+        try:
+            added = discover(conn)
+            promoted = promote_mature(conn)
+            err = ""
+            touched = max(added, 0) + promoted
+            if added > 0 or promoted > 0:
+                print(f"  [{ENGINE_ID}] +{added} new, {promoted} → trending",
+                      flush=True)
+        except Exception as e:
+            err = str(e)[:200]
+            touched = 0
+            print(f"  [{ENGINE_ID}] error: {err}", flush=True)
+
+        cycle_ms = int((time.time() - start) * 1000)
+        db.update_engine_heartbeat(conn, ENGINE_ID, touched, cycle_ms, err)
+
+        if args.once:
+            break
+        # Sleep until next poll
+        elapsed = time.time() - start
+        time.sleep(max(1, POLL_S - elapsed))
+
+
+if __name__ == "__main__":
+    main()

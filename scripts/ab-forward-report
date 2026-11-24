@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""A+B forward paper-test report (Phase 3, 2026-11-17).
+
+Reads the grad_select and grad_raw paper ledgers and splits FORWARD
+closes — closes with entry_ts >= the window start recorded in
+~/.forex-agent/ab_forward.json — by the ab_arm stamp
+(entry_features.ab_arm: "A" = deployer had 0 launches in the trailing
+24h at entry, "A+B" = >= 1).
+
+Per arm it reports: closes, wins (pnl_usd > 0), net pnl, expectancy
+per close. It also reports progress toward 100 forward closes.
+
+VERDICT RULE (hard): while fewer than 100 forward closes exist it
+prints "NO VERDICT — only N/100 forward closes" and NOTHING that
+adopts or rejects either arm. At >= 100 closes it reports the numbers
+only — the adopt/reject decision is a human decision, never this
+script's. There is no other verdict logic anywhere in this build.
+
+The state file is created on first use (started_ts = now, with a
+"forward window starts now" note) and NEVER backfilled to an earlier
+start. Read-only against the ledgers; writes only ab_forward.json.
+Stdlib-only, never raises.
+
+POINT-IN-TIME (TradingAgents #7, 2026-11-17): the report asserts —
+rather than assuming — that every close it counts as forward has
+entry_ts >= the window start, and that the counted total matches the
+summary. A violation exits non-zero before anything is reported, so
+a future edit can never silently let a pre-window close into the
+forward verdict set.
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+import point_in_time as PIT
+
+try:
+    from zoneinfo import ZoneInfo
+    _WAT = ZoneInfo("Africa/Lagos")
+except Exception:  # pragma: no cover — zoneinfo is stdlib 3.9+
+    _WAT = timezone.utc
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+STATE_PATH = os.path.join(HOME, "ab_forward.json")
+LEDGERS = {
+    "grad_select": os.path.join(HOME, "grad_select_ledger.json"),
+    "grad_raw": os.path.join(HOME, "grad_raw_ledger.json"),
+}
+VERDICT_CLOSES_REQUIRED = 100
+
+
+def load_state(create=True):
+    """Return the forward-window state dict.
+
+    Creates it on first use with started_ts = now (never backfilled).
+    Never raises — a missing/unreadable state defaults to starting now.
+    """
+    try:
+        with open(STATE_PATH) as f:
+            st = json.load(f)
+        if isinstance(st, dict) and st.get("started_ts"):
+            st.setdefault("verdict_closes_required",
+                          VERDICT_CLOSES_REQUIRED)
+            return st
+    except Exception:
+        pass
+    now = time.time()
+    st = {
+        "started_ts": now,
+        "started_wat": datetime.fromtimestamp(now, _WAT).strftime(
+            "%Y-%m-%d %H:%M:%S WAT"),
+        "verdict_closes_required": VERDICT_CLOSES_REQUIRED,
+        "note": ("Forward window starts now (first report run). "
+                 "Only closes with entry_ts >= started_ts count. "
+                 "No verdict before 100 forward closes."),
+    }
+    if create:
+        try:
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, STATE_PATH)
+        except Exception:
+            pass
+    return st
+
+
+def arm_of(close):
+    """'A' / 'A+B' from a close record, or None when unstamped."""
+    ef = (close or {}).get("entry_features") or {}
+    arm = ef.get("ab_arm")
+    return arm if arm in ("A", "A+B") else None
+
+
+def summarize(closes, started_ts):
+    """Per-arm stats over forward closes only.
+
+    closes: iterable of ledger close dicts. Returns
+    {"A": {...}, "A+B": {...}, "unstamped": n, "total": n} where each
+    arm dict is {"closes", "wins", "net_pnl", "expectancy"}.
+    A close counts only if entry_ts >= started_ts and it carries an
+    ab_arm stamp. Never raises."""
+    out = {"A": {"closes": 0, "wins": 0, "net_pnl": 0.0,
+                 "expectancy": 0.0},
+           "A+B": {"closes": 0, "wins": 0, "net_pnl": 0.0,
+                   "expectancy": 0.0},
+           "unstamped": 0, "total": 0}
+    try:
+        for c in closes or []:
+            try:
+                if not isinstance(c, dict):
+                    continue
+                if float(c.get("entry_ts") or 0) < float(started_ts):
+                    continue
+                arm = arm_of(c)
+                if arm is None:
+                    out["unstamped"] += 1
+                    continue
+                pnl = float(c.get("pnl_usd") or 0)
+                a = out[arm]
+                a["closes"] += 1
+                a["net_pnl"] += pnl
+                if pnl > 0:
+                    a["wins"] += 1
+                out["total"] += 1
+            except Exception:
+                continue
+        for arm in ("A", "A+B"):
+            a = out[arm]
+            a["net_pnl"] = round(a["net_pnl"], 2)
+            a["expectancy"] = (round(a["net_pnl"] / a["closes"], 2)
+                               if a["closes"] else 0.0)
+    except Exception:
+        pass
+    return out
+
+
+def _num_entry_ts(close):
+    """entry_ts as a float, or -inf when missing/unusable (never raises).
+
+    -inf keeps an undated close OUT of the counted forward set
+    (fail-closed: it cannot be proven inside the window)."""
+    try:
+        v = (close or {}).get("entry_ts")
+        if v is None or isinstance(v, bool):
+            return float("-inf")
+        return float(v)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _read_closes(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        closes = (d or {}).get("closes") or []
+        return [c for c in closes if isinstance(c, dict)]
+    except Exception:
+        return []
+
+
+def main():
+    st = load_state()
+    started_ts = float(st.get("started_ts") or 0)
+    started_wat = st.get("started_wat") or ""
+    required = int(st.get("verdict_closes_required")
+                   or VERDICT_CLOSES_REQUIRED)
+    per_lane = {}
+    all_closes = []
+    for lane, path in LEDGERS.items():
+        closes = _read_closes(path)
+        per_lane[lane] = summarize(closes, started_ts)
+        all_closes.extend(closes)
+    total = summarize(all_closes, started_ts)
+
+    # Point-in-time check, BEFORE any reporting: every close counted
+    # as forward must have entry_ts >= window start, and the counted
+    # total must match the summary. Violation exits non-zero with
+    # nothing reported.
+    counted = [c for c in all_closes
+               if isinstance(c, dict)
+               and _num_entry_ts(c) >= started_ts
+               and arm_of(c) is not None]
+    try:
+        PIT.assert_forward_window(counted, started_ts, "entry_ts")
+        if total["total"] != len(counted):
+            raise PIT.PointInTimeError(
+                "POINT-IN-TIME VIOLATION: forward summary counted %d "
+                "closes but %d closes carry entry_ts >= window start "
+                "%s — the report's counted set does not match its "
+                "summary." % (total["total"], len(counted),
+                             PIT.fmt_ts(started_ts)))
+    except PIT.PointInTimeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    print("A+B FORWARD PAPER TEST — report (paper only, instrument-only)")
+    print("window start: %s (epoch %.0f)" % (started_wat, started_ts))
+    print("forward closes counted: entry_ts >= started_ts, ab_arm stamped")
+    if counted:
+        earliest = min(_num_entry_ts(c) for c in counted)
+        print("point-in-time check: %d forward closes counted, earliest "
+              "entry %s >= window start — OK"
+              % (len(counted), PIT.fmt_ts(earliest)))
+    else:
+        print("point-in-time check: 0 forward closes counted — "
+              "nothing to verify against the window start")
+    print("")
+    for lane in ("grad_select", "grad_raw"):
+        s = per_lane[lane]
+        print("%s: A %d closes / %d wins / net $%.2f / exp $%.2f  |  "
+              "A+B %d closes / %d wins / net $%.2f / exp $%.2f  "
+              "(unstamped in window: %d)"
+              % (lane,
+                 s["A"]["closes"], s["A"]["wins"], s["A"]["net_pnl"],
+                 s["A"]["expectancy"],
+                 s["A+B"]["closes"], s["A+B"]["wins"],
+                 s["A+B"]["net_pnl"], s["A+B"]["expectancy"],
+                 s["unstamped"]))
+    print("COMBINED: A %d closes / %d wins / net $%.2f / exp $%.2f  |  "
+          "A+B %d closes / %d wins / net $%.2f / exp $%.2f"
+          % (total["A"]["closes"], total["A"]["wins"],
+             total["A"]["net_pnl"], total["A"]["expectancy"],
+             total["A+B"]["closes"], total["A+B"]["wins"],
+             total["A+B"]["net_pnl"], total["A+B"]["expectancy"]))
+    print("")
+    n = total["total"]
+    if n < required:
+        print("NO VERDICT — only %d/%d forward closes. "
+              "No adopt/reject verdict before %d forward closes."
+              % (n, required, required))
+    else:
+        print("FORWARD WINDOW COMPLETE — %d/%d forward closes reached. "
+              "Numbers above only; adopt/reject is a human decision, "
+              "never this script's." % (n, required))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""runner-autopsy — funnel autopsy for a single mint/CA.
+
+Faithful replay: loads each lane's REAL stage functions (the same code
+that fires your cards) and runs them against the coin's live
+GeckoTerminal pool data, plus safety checks, seen-history and the
+mirror ledger.
+
+Read-only: no cards, no state writes, no ledger touches, no Telegram.
+Stdlib only.
+
+Usage: runner-autopsy <mint-or-CA>
+"""
+import os
+import sys
+import json
+import gzip
+import urllib.request
+from datetime import datetime, timezone
+
+REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+RUNNER_LIQ = 25_000.0
+RUNNER_MCAP = 50_000.0
+
+
+def http_get(url, timeout=20):
+    """GET JSON, gzip-aware (egress proxy drops large uncompressed)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "forex-agent-runner-autopsy/1.0",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            return json.loads(raw.decode("utf-8", "replace"))
+    except Exception as e:
+        return {"_error": "%s: %s" % (type(e).__name__, e)}
+
+
+def fmt_usd(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "?"
+    if v >= 1_000_000:
+        return "$%.2fM" % (v / 1_000_000)
+    if v >= 1_000:
+        return "$%.1fk" % (v / 1_000)
+    return "$%.0f" % v
+
+
+def fmt_pct(v):
+    try:
+        return "%+.1f%%" % float(v)
+    except (TypeError, ValueError):
+        return "?"
+
+
+# ---------------------------------------------------------------- chain/id
+
+def detect_chain(raw):
+    s = raw.strip()
+    if s.startswith("0x") and len(s) == 42:
+        return "evm", s
+    return "solana", s
+
+
+def gecko_token_pools(net, token_id):
+    url = ("https://api.geckoterminal.com/api/v2/networks/%s/tokens/%s/pools"
+           % (net, token_id))
+    return http_get(url), url
+
+
+def resolve_pool(chain, mint):
+    """Return (net, token_id, raw_response, err)."""
+    if chain == "solana":
+        data, url = gecko_token_pools("solana", "solana_" + mint)
+        if data.get("_error"):
+            return None, None, None, "gecko: %s" % data["_error"]
+        if not (data.get("data") or []):
+            return None, None, None, "no pools indexed for this mint"
+        return "solana", "solana_" + mint, data, None
+    # evm: try base, then eth
+    last_err = None
+    for net, prefix in (("base", "base_"), ("eth", "eth_")):
+        data, url = gecko_token_pools(net, prefix + mint)
+        if data.get("_error"):
+            last_err = data["_error"]
+            continue
+        if data.get("data"):
+            return net, prefix + mint, data, None
+        last_err = "not indexed on %s" % net
+    return None, None, None, "evm lookup failed (%s)" % last_err
+
+
+def dexscreener_fallback(chain, mint):
+    """Gecko-shaped pool record built from DexScreener.
+
+    Gecko's /tokens/{id}/pools route 404s on tokens it has not indexed
+    yet — exactly the fresh runners this autopsy gets handed (DACITY,
+    2026-10-20: the autopsy FATAL'd instead of reporting). Fall back to
+    DexScreener's best-liquidity pair and synthesize the Gecko shape
+    the lane funnels consume. Returns (net, token_id, data, err).
+    """
+    # Endpoint choice matters on this VM: /latest/dex/tokens/ drops
+    # through the egress proxy (RemoteDisconnected), while the v1
+    # per-chain route answers. EVM keeps /latest/ with retries.
+    pairs = None
+    last_err = None
+    if chain == "solana":
+        data = http_get("https://api.dexscreener.com/tokens/v1/"
+                        "solana/%s" % mint)
+        if isinstance(data, list):
+            pairs = data
+        elif isinstance(data, dict) and not data.get("_error"):
+            pairs = data.get("pairs") or []
+        else:
+            last_err = (data or {}).get("_error", "bad response")
+    if pairs is None:
+        url = "https://api.dexscreener.com/latest/dex/tokens/%s" % mint
+        for _try in range(3):
+            data = http_get(url)
+            if isinstance(data, dict) and not data.get("_error"):
+                pairs = data.get("pairs") or []
+                break
+            last_err = (data or {}).get("_error", "bad response")
+    if pairs is None:
+        return None, None, None, "dexscreener: %s" % last_err
+    best = None
+    best_liq = -1.0
+    for p in pairs:
+        if not isinstance(p, dict):
+            continue
+        cid = p.get("chainId") or ""
+        if chain == "solana" and cid != "solana":
+            continue
+        if chain == "evm" and cid not in ("base", "ethereum"):
+            continue
+        try:
+            liq = float(((p.get("liquidity") or {}).get("usd")) or 0)
+        except (TypeError, ValueError):
+            liq = 0.0
+        if liq > best_liq:
+            best, best_liq = p, liq
+    if best is None:
+        return None, None, None, "dexscreener: no pairs for this mint"
+    cid = best.get("chainId") or "solana"
+    net = {"solana": "solana", "base": "base", "ethereum": "eth"}[cid]
+    pc = best.get("priceChange") or {}
+    created_ms = best.get("pairCreatedAt") or 0
+    created_iso = ""
+    if created_ms:
+        created_iso = datetime.fromtimestamp(
+            created_ms / 1000, timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z")
+    base = best.get("baseToken") or {}
+    quote = best.get("quoteToken") or {}
+    raw = {
+        "attributes": {
+            "name": "%s / %s" % (base.get("symbol") or "?",
+                                 quote.get("symbol") or "?"),
+            "address": best.get("pairAddress") or "",
+            "base_token_price_usd": best.get("priceUsd"),
+            "reserve_in_usd": ((best.get("liquidity") or {}).get("usd"))
+                              or 0,
+            "market_cap_usd": best.get("marketCap") or 0,
+            "fdv_usd": best.get("fdv") or 0,
+            "price_change_percentage": {
+                "m5": pc.get("m5"), "m15": None, "h1": pc.get("h1"),
+                "h6": pc.get("h6"), "h24": pc.get("h24")},
+            "transactions": best.get("txns") or {},
+            "volume_usd": best.get("volume") or {},
+            "pool_created_at": created_iso,
+        },
+        "relationships": {
+            "base_token": {"data": {"id": "%s_%s" % (cid, mint)}},
+            "dex": {"data": {"id": best.get("dexId") or "?"}},
+        },
+    }
+    return net, "%s_%s" % (cid, mint), {"data": [raw]}, None
+
+
+def raw_pool_for_mint(data, chain, mint):
+    """Find the raw JSON:API pool entry for this mint (best reserve)."""
+    best, best_r = None, -1
+    for p in data.get("data", []):
+        a = p.get("attributes", {}) or {}
+        rel = p.get("relationships", {}) or {}
+        base_id = (((rel.get("base_token") or {}).get("data") or {})
+                   .get("id", ""))
+        tok = base_id.split("_", 1)[-1] if "_" in base_id else base_id
+        if tok.lower() != mint.lower():
+            continue
+        r = float(a.get("reserve_in_usd") or 0)
+        if r > best_r:
+            best, best_r = p, r
+    return best
+
+
+def pool_age_min(raw):
+    a = (raw.get("attributes", {}) or {})
+    try:
+        created = datetime.fromisoformat(
+            (a.get("pool_created_at", "") or "").replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - created).total_seconds() / 60
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- lanes
+
+_LOADED = {}
+
+
+def load_lane(name):
+    if name in _LOADED:
+        return _LOADED[name]
+    path = os.path.join(REPO, "scripts", name)
+    src = open(path).read().split('if __name__ == "__main__":')[0]
+    g = {"__name__": "autopsy", "__file__": path}
+    exec(compile(src, path, "exec"), g)
+    _LOADED[name] = g
+    return g
+
+
+def stage(stages, name, ok, detail=""):
+    stages.append((name, bool(ok), detail))
+    return ok
+
+
+def lane_degen(raw, data, mint):
+    """Solana degen-feed funnel, real code. Returns (pool, stages)."""
+    g = load_lane("degen-feed")
+    now = datetime.now(timezone.utc)
+    stages = []
+    pools = g["_parse_pools"](data, now)
+    pool = next((p for p in pools if p["mint"].lower() == mint.lower()), None)
+    if pool is None:
+        a = (raw.get("attributes", {}) or {})
+        rel = (raw.get("relationships", {}) or {})
+        dex = (((rel.get("dex") or {}).get("data") or {}).get("id", "?"))
+        age = pool_age_min(raw)
+        why = []
+        if dex not in ("pump-fun", "raydium", "pumpswap"):
+            why.append("dex '%s' not in lane's universe (pump-fun/raydium/pumpswap)" % dex)
+        if age is not None and age > 30:
+            why.append("age %.0fmin — lane only evaluates pools <=30min old" % age)
+        if not mint.endswith("pump"):
+            why.append("mint is not a pump-fun mint")
+        stage(stages, "intake (_parse_pools)", False,
+              "; ".join(why) or "dropped by lane intake filter")
+        return None, stages
+    stage(stages, "intake (_parse_pools)", True,
+          "%s age=%.0fmin liq=%s fdv=%s" % (
+              pool["name"], pool["age_min"],
+              fmt_usd(pool["reserve"]), fmt_usd(pool["fdv"])))
+    ok, why = g["passes_runner_gate"](pool)
+    stage(stages, "runner gate (liq>=25k, mcap>=50k, rising)",
+          ok, why if not ok else "pass")
+    if not ok:
+        return pool, stages
+    knobs = g["get_weights"]()
+    ok, why = g["passes_hard_filters"](pool, knobs)
+    stage(stages, "hard filters (fdv %s-%s, buyers>=%d, b/s>=%.1f, age<=%dmin)" % (
+        fmt_usd(knobs["min_fdv"]), fmt_usd(knobs["max_fdv"]),
+        knobs["min_buyers_m5"], knobs["min_buy_sell_ratio"],
+        knobs["max_age_minutes"]),
+        ok, why if not ok else "pass")
+    if not ok:
+        return pool, stages
+    try:
+        safe, reason, intel = g["check_safety"](mint)
+    except Exception as e:
+        safe, reason, intel = False, "safety error: %s" % e, {"holder_conc": 0}
+    stage(stages, "safety (RugCheck, fail-closed)", safe,
+          reason if not safe else "pass (holder_conc=%.0f%%)" % intel.get("holder_conc", 0))
+    if not safe:
+        return pool, stages
+    if intel.get("holder_conc", 0) > 80:
+        stage(stages, "holder concentration <=80%", False,
+              "%.0f%% — whale dump risk" % intel["holder_conc"])
+        return pool, stages
+    stage(stages, "holder concentration <=80%", True,
+          "%.0f%%" % intel.get("holder_conc", 0))
+    try:
+        score, reasons, sm_hit, sm_wallet, components = g["score_pool"](pool, intel)
+    except Exception as e:
+        stage(stages, "score", False, "scorer error: %s" % e)
+        return pool, stages
+    bar = knobs["min_score"]
+    stage(stages, "score >= %.0f (bar)" % bar, score >= bar,
+          "score=%.1f%s" % (score, "" if score >= bar else " < bar"))
+    return pool, stages
+
+
+def _evm_lane(name, data, mint):
+    """base/eth runner-feed funnel, real code. Returns (pool, stages)."""
+    g = load_lane(name)
+    now = datetime.now(timezone.utc)
+    stages = []
+    pools = g["_parse_pools"](data, now)
+    pool = next((p for p in pools if p["mint"].lower() == mint.lower()), None)
+    if pool is None:
+        a = (raw_pool_attrs(data, mint) or {})
+        stage(stages, "intake (_parse_pools)", False,
+              "pool not in lane's parsed set (dex filter or bad created_at)")
+        return None, stages
+    stage(stages, "intake (_parse_pools)", True,
+          "%s age=%.0fmin liq=%s mcap=%s" % (
+              pool["name"], pool["age_min"],
+              fmt_usd(pool["liq"]), fmt_usd(pool["mcap"])))
+    ok, why = g["passes_prefilter"](pool)
+    stage(stages, "prefilter", ok, why if not ok else "pass")
+    if not ok:
+        return pool, stages
+    try:
+        safe, reason, intel = g["check_safety"](pool["mint"])
+    except Exception as e:
+        safe, reason, intel = False, "safety error: %s" % e, {}
+    stage(stages, "safety (GoPlus+Honeypot.is, fail-closed)", safe,
+          reason if not safe else "pass")
+    if not safe:
+        return pool, stages
+    ok, why = g["passes_manipulation"](pool)
+    stage(stages, "manipulation filters", ok, why if not ok else "pass")
+    if not ok:
+        return pool, stages
+    if "positive_evidence" in g:
+        ev = g["positive_evidence"](pool)
+        stage(stages, "positive evidence", bool(ev),
+              "hits=%s" % (ev if ev else "none"))
+        if not ev:
+            return pool, stages
+    if "continuation_ok" in g:
+        ok, why = g["continuation_ok"](pool)
+        stage(stages, "continuation", ok, why if not ok else "pass")
+        if not ok:
+            return pool, stages
+    try:
+        if "positive_evidence" in g:
+            score, reasons = g["score_pool"](pool, ev)
+        else:
+            score, reasons = g["score_pool"](pool), None
+    except TypeError:
+        try:
+            r = g["score_pool"](pool)
+            score = r[0] if isinstance(r, tuple) else r
+        except Exception as e:
+            stage(stages, "score", False, "scorer error: %s" % e)
+            return pool, stages
+    except Exception as e:
+        stage(stages, "score", False, "scorer error: %s" % e)
+        return pool, stages
+    bar = g.get("MIN_SCORE", 60)
+    stage(stages, "score >= %.0f (bar)" % bar, score >= bar,
+          "score=%.1f%s" % (score, "" if score >= bar else " < bar"))
+    return pool, stages
+
+
+def raw_pool_attrs(data, mint):
+    raw = None
+    for p in data.get("data", []):
+        rel = p.get("relationships", {}) or {}
+        base_id = (((rel.get("base_token") or {}).get("data") or {})
+                   .get("id", ""))
+        tok = base_id.split("_", 1)[-1] if "_" in base_id else base_id
+        if tok.lower() == mint.lower():
+            raw = p
+            break
+    return (raw.get("attributes", {}) or {}) if raw else {}
+
+
+def lane_locked_liq(chain, data, mint):
+    """locked-liq-scan funnel, real code. chain: solana|base|ethereum."""
+    g = load_lane("locked-liq-scan")
+    now = datetime.now(timezone.utc)
+    stages = []
+    cfg = g["CHAINS"][chain]
+    try:
+        pools = g["_parse_pools"](data, now, chain, cfg)
+    except Exception as e:
+        stage(stages, "intake (_parse_pools)", False, "parse error: %s" % e)
+        return None, stages
+    pool = next((p for p in pools if p["mint"].lower() == mint.lower()), None)
+    if pool is None:
+        stage(stages, "intake (_parse_pools)", False,
+              "pool not in lane's parsed set (dex/age filter)")
+        return None, stages
+    stage(stages, "intake (_parse_pools)", True,
+          "%s liq=%s mcap=%s" % (
+              pool.get("name", "?"), fmt_usd(pool.get("liq")),
+              fmt_usd(pool.get("mcap"))))
+    try:
+        ok, why = g["passes_prefilter"](pool, cfg)
+    except Exception as e:
+        ok, why = False, "prefilter error: %s" % e
+    stage(stages, "prefilter (liq>=%s, mcap %s-%s, age 10-120m)" % (
+        fmt_usd(cfg["min_liq"]), fmt_usd(cfg["min_mcap"]),
+        fmt_usd(cfg["max_mcap"])), ok, why if not ok else "pass")
+    if not ok:
+        return pool, stages
+    try:
+        ok, badge, detail = g["check_lp_locked"](pool)
+        stage(stages, "LP lock (>=90% burned/locked)", ok,
+              (badge + " " + detail).strip() if not ok else badge)
+    except Exception as e:
+        stage(stages, "LP lock (>=90% burned/locked)", None,
+              "UNKNOWN — on-chain check failed: %s" % e)
+        return pool, stages
+    if not ok:
+        return pool, stages
+    try:
+        safe, reason, _rep = g["check_safety"](pool)
+    except Exception as e:
+        safe, reason = False, "safety error: %s" % e
+    stage(stages, "safety (fail-closed)", safe,
+          reason if not safe else "pass")
+    if not safe:
+        return pool, stages
+    try:
+        ok, why = g["is_running"](pool)
+    except Exception as e:
+        ok, why = False, "is_running error: %s" % e
+    stage(stages, "is_running (m15 buys>=5, b/s>=1.2, not falling)",
+          ok, why if not ok else "running")
+    if not ok:
+        return pool, stages
+    try:
+        score = g["score_pool"](pool)
+        score = score[0] if isinstance(score, tuple) else score
+    except Exception as e:
+        stage(stages, "score", False, "scorer error: %s" % e)
+        return pool, stages
+    bar = g.get("MIN_SCORE", 50)
+    stage(stages, "score >= %.0f (bar)" % bar, score >= bar,
+          "score=%.1f%s" % (score, "" if score >= bar else " < bar"))
+    return pool, stages
+
+
+# ---------------------------------------------------------------- standing rule
+
+def standing_rule_verdict(pool_like, safety_ok, safety_detail):
+    """The user's standing rule: $25k liq, $50k mcap, rising, safe."""
+    liq = pool_like.get("liq_usd") or 0
+    mcap = pool_like.get("mcap_usd") or 0
+    chg_m15 = pool_like.get("chg_m15")
+    chg_h1 = pool_like.get("chg_h1")
+    out = []
+    out.append(("liquidity >= $25k", liq >= RUNNER_LIQ,
+                "%s%s" % (fmt_usd(liq),
+                          "" if liq >= RUNNER_LIQ else " — BELOW BAR")))
+    out.append(("mcap >= $50k", mcap >= RUNNER_MCAP,
+                "%s%s" % (fmt_usd(mcap),
+                          "" if mcap >= RUNNER_MCAP else " — BELOW BAR")))
+    mom_ok, mom_d = None, "no momentum data"
+    if chg_m15 is not None or chg_h1 is not None:
+        m15 = chg_m15 or 0
+        h1 = chg_h1 or 0
+        mom_ok = (m15 > 0 or h1 > 0)
+        mom_d = "m15=%s h1=%s%s" % (
+            fmt_pct(m15), fmt_pct(h1),
+            "" if mom_ok else " — NOT RISING")
+    out.append(("rising (m15>0 or h1>0)", bool(mom_ok), mom_d))
+    out.append(("safe contract (fail-closed)", bool(safety_ok), safety_detail))
+    return out
+
+
+# ---------------------------------------------------------------- history
+
+SEEN_FILES = {
+    "solana": ["degen_seen.json", "degen_runner_seen.json",
+               "degen_fastwatch_seen.json", "degen_watchlist_seen.json",
+               "stacker_seen.json", "locked_liq_seen.json", "spark_seen.json"],
+    "base": ["base_runner_seen.json", "locked_liq_seen.json"],
+    "eth": ["eth_runner_seen.json", "locked_liq_seen.json"],
+}
+
+
+def seen_history(chain_key, mint):
+    hits = []
+    low = mint.lower()
+    for fn in SEEN_FILES.get(chain_key, []):
+        path = os.path.join(HOME, fn)
+        try:
+            items = json.load(open(path))
+        except Exception:
+            continue
+        if isinstance(items, list):
+            if any((str(x).lower() == low) for x in items):
+                hits.append(fn)
+        elif isinstance(items, dict):
+            if any(str(k).lower() == low for k in items):
+                hits.append(fn)
+    # Dict-shaped sighting ledgers + the judge's replay dataset: this
+    # is where a "bot saw it but never carded it" coin actually shows
+    # up — the list-only check used to report NO for coins the bot had
+    # in fact evaluated (DACITY was in all three, 2026-10-20).
+    for fn in ("launch_scanner/smart_convergence.json",
+               "stacker_track.json", "spark_seen.json"):
+        path = os.path.join(HOME, fn)
+        try:
+            items = json.load(open(path))
+        except Exception:
+            continue
+        if isinstance(items, dict) and any(
+                str(k).lower() == low for k in items):
+            hits.append(fn)
+    try:
+        with open(os.path.join(
+                HOME, "launch_scanner/backtest_dataset.jsonl")) as f:
+            for line in f:
+                if low in line.lower():
+                    hits.append("launch_scanner/backtest_dataset.jsonl"
+                                " (judge)")
+                    break
+    except Exception:
+        pass
+    return hits
+
+
+def ledger_history(mint):
+    path = os.path.join(HOME, "degen_mirror_ledger.json")
+    try:
+        led = json.load(open(path))
+    except Exception:
+        return None
+    if not isinstance(led, dict):
+        return None
+    # current format: {"positions": {mint: entry}, "closes": [...]}
+    pos = led.get("positions")
+    if isinstance(pos, dict) and mint in pos:
+        e = dict(pos[mint])
+        e["_where"] = "open position"
+        return e
+    for c in (led.get("closes") or []):
+        if isinstance(c, dict) and c.get("mint") == mint:
+            e = dict(c)
+            e["_where"] = "closed position"
+            return e
+    # legacy flat format: {mint: entry}
+    if mint in led and isinstance(led[mint], dict):
+        return led[mint]
+    return None
+
+
+# ---------------------------------------------------------------- price action
+
+def price_action(net, pool_addr):
+    url = ("https://api.geckoterminal.com/api/v2/networks/%s/pools/%s/"
+           "ohlcv/minute?aggregate=15&limit=96" % (net, pool_addr))
+    data = http_get(url, timeout=20)
+    if data.get("_error"):
+        return None, "ohlcv: %s" % data["_error"]
+    try:
+        rows = data["data"]["attributes"]["ohlcv_list"]
+    except Exception:
+        return None, "ohlcv: unexpected response shape"
+    if not rows:
+        return None, "ohlcv: no candles"
+    closes = [(r[0], float(r[4])) for r in rows if len(r) >= 5 and r[4]]
+    if not closes:
+        return None, "ohlcv: no closes"
+    peak_ts, peak = max(closes, key=lambda x: x[1])
+    last_ts, last = closes[-1]
+    dd = (last / peak - 1) * 100 if peak else 0
+    # biggest single 15m rise
+    best_rise, best_ts = 0, None
+    for i in range(1, len(closes)):
+        prev = closes[i - 1][1]
+        if prev > 0:
+            r = (closes[i][1] / prev - 1) * 100
+            if r > best_rise:
+                best_rise, best_ts = r, closes[i][0]
+    return {
+        "candles": len(closes),
+        "peak": peak,
+        "peak_ts": peak_ts,
+        "last": last,
+        "drawdown_pct": dd,
+        "best_15m_rise_pct": best_rise,
+        "best_15m_rise_ts": best_ts,
+    }, None
+
+
+def ts_fmt(ts):
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime(
+            "%H:%M UTC %b %d")
+    except Exception:
+        return "?"
+
+
+# ---------------------------------------------------------------- report
+
+def print_stages(title, stages):
+    print("\n== %s ==" % title)
+    if not stages:
+        print("  (no stages ran)")
+        return
+    for name, ok, detail in stages:
+        mark = "PASS" if ok is True else ("FAIL" if ok is False else "????")
+        line = "  [%s] %s" % (mark, name)
+        if detail:
+            line += " — %s" % detail
+        print(line)
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("usage: runner-autopsy <mint-or-CA>")
+        print("Faithful funnel autopsy: runs the coin through each lane's")
+        print("REAL stage code + safety + seen-history + mirror ledger.")
+        print("Read-only. No cards, no state writes.")
+        return 2
+    raw_in = sys.argv[1].strip()
+    chain, mint = detect_chain(raw_in)
+    chain_key = {"solana": "solana", "evm": "evm"}[chain]
+
+    print("=" * 64)
+    print("RUNNER AUTOPSY  %s" % datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"))
+    print("input: %s" % raw_in)
+    print("detected: %s  mint: %s" % (chain, mint))
+
+    net, token_id, data, err = resolve_pool(chain, mint)
+    if err:
+        # Fail-soft (2026-10-20): a Gecko indexing gap must not kill
+        # the autopsy — fall back to DexScreener-shaped pool data.
+        net, token_id, data, derr = dexscreener_fallback(chain, mint)
+        if derr:
+            print("\nFATAL: %s | fallback: %s" % (err, derr))
+            return 1
+        print("gecko lookup failed (%s)" % err)
+        print("continuing with DexScreener fallback data")
+    print("gecko network: %s" % net)
+    raw = raw_pool_for_mint(data, chain, mint)
+    if raw is None:
+        print("\nFATAL: mint not found in any returned pool's base_token")
+        return 1
+    a = raw.get("attributes", {}) or {}
+    rel = raw.get("relationships", {}) or {}
+    dex = (((rel.get("dex") or {}).get("data") or {}).get("id", "?"))
+    name = (a.get("name", "?") or "?").split(" / ")[0]
+    pool_addr = a.get("address", "") or ""
+    liq = float(a.get("reserve_in_usd") or 0)
+    mcap = float(a.get("market_cap_usd") or 0) or float(a.get("fdv_usd") or 0)
+    pcp = a.get("price_change_percentage") or {}
+    tx = a.get("transactions") or {}
+    age = pool_age_min(raw)
+    print("coin: %s  dex: %s" % (name, dex))
+    print("pool: %s  age: %s" % (
+        pool_addr, ("%.0f min" % age) if age is not None else "?"))
+    print("liq: %s  mcap/fdv: %s  price: %s" % (
+        fmt_usd(liq), fmt_usd(mcap), a.get("base_token_price_usd", "?")))
+    print("chg: m5=%s m15=%s h1=%s h6=%s h24=%s" % (
+        fmt_pct(pcp.get("m5")), fmt_pct(pcp.get("m15")), fmt_pct(pcp.get("h1")),
+        fmt_pct(pcp.get("h6")), fmt_pct(pcp.get("h24"))))
+
+    # ---- lane funnels (real code) ----
+    lane_chain = {"solana": "solana", "base": "base", "eth": "ethereum"}[net]
+    safety_ok, safety_detail = None, "not evaluated"
+    if net == "solana":
+        pool, stages = lane_degen(raw, data, mint)
+        print_stages("degen-feed (Solana early-launch lane)", stages)
+        for _n, ok, d in stages:
+            if _n.startswith("safety"):
+                safety_ok = ok
+                safety_detail = d
+                break
+        # smart-watcher is trigger-based: report rule, not a replay
+        print("\n== smart-watcher (Solana wallet-triggered lane) ==")
+        print("  [info] trigger-based: fires ONLY when a tracked smart wallet")
+        print("         buys the mint; convergence = 2 independent wallets")
+        print("         within 5 min; a blocked first attempt retries for")
+        print("         30 min (2026-10-20). No historical replay possible —")
+        print("         seen-history below shows whether it ever evaluated it.")
+    elif net == "base":
+        pool, stages = _evm_lane("base-runner-feed", data, mint)
+        print_stages("base-runner-feed", stages)
+        for _n, ok, d in stages:
+            if _n.startswith("safety"):
+                safety_ok = ok
+                safety_detail = d
+                break
+    else:
+        pool, stages = _evm_lane("eth-runner-feed", data, mint)
+        print_stages("eth-runner-feed", stages)
+        for _n, ok, d in stages:
+            if _n.startswith("safety"):
+                safety_ok = ok
+                safety_detail = d
+                break
+
+    # locked-liq scan covers solana/base/eth
+    pool2, stages2 = lane_locked_liq(lane_chain, data, mint)
+    print_stages("locked-liq-scan (%s)" % lane_chain, stages2)
+
+    # ---- standing rule ----
+    pool_like = {
+        "liq_usd": liq, "mcap_usd": mcap,
+        "chg_m15": pcp.get("m15"), "chg_h1": pcp.get("h1"),
+    }
+    print("\n== YOUR STANDING RULE (right now) ==")
+    print("   $25k liq / $50k mcap / rising / safe contract")
+    rule_all = True
+    for crit, ok, detail in standing_rule_verdict(pool_like, safety_ok,
+                                                 safety_detail):
+        mark = "PASS" if ok else "FAIL"
+        if not ok:
+            rule_all = False
+        print("  [%s] %s — %s" % (mark, crit, detail))
+    print("  => rule verdict NOW: %s" % ("PASS" if rule_all else "FAIL"))
+
+    # ---- history ----
+    print("\n== HISTORY: did the bot ever see it? ==")
+    hits = seen_history({"solana": "solana", "base": "base",
+                         "eth": "eth"}[net], mint)
+    if hits:
+        print("  YES — evaluated before, in: %s" % ", ".join(hits))
+    else:
+        print("  NO — this mint is in none of the lane seen-files.")
+        print("      (seen-files rotate; absence = never evaluated or rotated out)")
+    print("\n== HISTORY: did any lane ever card it? ==")
+    entry = ledger_history(mint)
+    if entry:
+        st = entry.get("status", "?")
+        sym = entry.get("symbol", "?")
+        src = entry.get("source", "?")
+        where = entry.get("_where", "mirror ledger")
+        realized = entry.get("realized_usd", 0)
+        print("  YES — %s: %s (%s) via %s, status=%s, realized=$%.2f"
+              % (where, mint[:12] + "...", sym, src, st, realized or 0))
+    else:
+        print("  NO — no mirror paper position was ever opened for this mint.")
+
+    # ---- price action ----
+    print("\n== PRICE ACTION (last ~24h, 15m candles) ==")
+    pa, pa_err = price_action(net, pool_addr)
+    if pa_err:
+        print("  %s" % pa_err)
+    else:
+        print("  candles: %d  peak: %s at %s" % (
+            pa["candles"], pa["peak"], ts_fmt(pa["peak_ts"])))
+        print("  now vs peak: %+.1f%%   best single 15m rise: +%.1f%% at %s"
+              % (pa["drawdown_pct"], pa["best_15m_rise_pct"],
+                 ts_fmt(pa["best_15m_rise_ts"])))
+        if pa["drawdown_pct"] <= -30:
+            print("  => post-peak comedown: this is a coin that already ran.")
+        elif pa["best_15m_rise_pct"] >= 20:
+            print("  => it HAD a sharp rising leg in the last 24h.")
+
+    # ---- scope notes (not misses) ----
+    print("\n== LANE SCOPE (these are design, not misses) ==")
+    print("  - degen-feed only evaluates pools <=30min old, fdv <=$600k,")
+    print("    on pump-fun/raydium/pumpswap. Older/bigger runners are outside")
+    print("    its universe BY DESIGN — the momentum scanner is the lane")
+    print("    for those.")
+    print("  - base/eth runner feeds: 1 card/day each; smart-watcher needs a")
+    print("    tracked-wallet buy + 2-wallet convergence within 30 min.")
+    print("  - safety is fail-closed: unreachable safety API = no card, ever.")
+
+    # ---- miss test ----
+    print("\n" + "=" * 64)
+    print("MISS-TEST (your terms: rising + $25k liq + $50k mcap + safe)")
+    if entry:
+        print("NOT A MISS — the bot carded it (see mirror ledger above).")
+    elif rule_all and hits:
+        print("STRONG MISS CANDIDATE — passes the rule RIGHT NOW and the bot")
+        print("evaluated it before but never carded it. The blocking stage is")
+        print("in the funnel tables above; if it blocked mid-run too, say so")
+        print("and it gets fixed, not explained.")
+    elif rule_all and not hits:
+        print("LIVE CANDIDATE — passes the rule NOW, never evaluated. If it")
+        print("is still rising, the funnel should be on it; the stage tables")
+        print("above show exactly where it stands this minute.")
+    else:
+        print("NOT A MISS ON CURRENT STATE — the rule says NO right now.")
+        print("A miss claim needs the RISING-point state: the price-action")
+        print("block above is the best proxy. If it met all four criteria")
+        print("while rising and no lane carded it, bring the time it ran")
+        print("and the funnel gets replayed at that minute.")
+    print("=" * 64)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

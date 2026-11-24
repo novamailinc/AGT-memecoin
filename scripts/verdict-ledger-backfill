@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Seed the tamper-evident verdict ledger with checkpoint anchors.
+
+Appends ONE kind="checkpoint" record per lane summarizing that
+lane's CURRENT state from its live ledger (closes count, expectancy
+over closes, net pnl, bankroll/state/verdict where the ledger
+carries them), so the chain starts today with an auditable anchor.
+
+Historical closes are NOT individually backfilled — they predate the
+chain — and every checkpoint payload says exactly that.
+
+Idempotent: a lane that already has a checkpoint record on the chain
+is skipped, so re-running never duplicates anchors. Ledgers are only
+ever READ. Paper only; no daemon is touched.
+"""
+import json
+import os
+import sys as _sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+_sys.path.insert(0, _ROOT)
+_sys.path.insert(0, os.path.join(_ROOT, "daemon", "launch_scanner"))
+
+try:
+    from daemon.launch_scanner import verdict_ledger as _vl
+except Exception:  # script-style import path
+    import verdict_ledger as _vl  # type: ignore
+
+NOTE = ("Historical closes are NOT individually backfilled: they "
+        "predate the chain. This checkpoint anchors the lane's "
+        "current pre-registered state as of chain genesis.")
+
+# Single-ledger lanes: lane -> ledger filename under the agent home.
+SINGLE_LEDGERS = {
+    "grad": "grad_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "ceo": "ceo_ledger.json",
+}
+MIRROR_LEDGER = "degen_mirror_ledger.json"
+MIRROR_LANES = ("degen_mirror", "base_mirror", "eth_mirror",
+                "hl_mirror")
+
+
+def _home():
+    return os.environ.get("FOREX_AGENT_HOME",
+                          "/home/hatch/.forex-agent")
+
+
+def _load(fname):
+    try:
+        with open(os.path.join(_home(), fname)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _summary(closes):
+    pnls = [float(c["pnl_usd"]) for c in closes
+            if isinstance(c, dict)
+            and isinstance(c.get("pnl_usd"), (int, float))]
+    n = len(closes)
+    return {
+        "closes": n,
+        "expectancy": (round(sum(pnls) / len(pnls), 6)
+                       if pnls else None),
+        "net_pnl_usd": round(sum(pnls), 4) if pnls else 0.0,
+    }
+
+
+def main():
+    existing = {r.get("lane") for r in _vl.read_records()
+                if r.get("kind") == "checkpoint"}
+    done, skipped = [], []
+    plan = []  # (lane, payload)
+    for lane, fname in SINGLE_LEDGERS.items():
+        d = _load(fname)
+        if d is None:
+            print("skip %s: ledger %s not found" % (lane, fname))
+            continue
+        closes = d.get("closes") if isinstance(d.get("closes"), list) \
+            else []
+        payload = _summary(closes)
+        payload.update({
+            "source_ledger": fname,
+            "bankroll": d.get("bankroll"),
+            "state": d.get("state"),
+            "verdict": d.get("verdict"),
+            "preregistered": bool(d.get("preregistered_verdict")),
+            "note": NOTE,
+        })
+        plan.append((lane, payload))
+    md = _load(MIRROR_LEDGER)
+    if md is None:
+        print("skip mirrors: ledger %s not found" % MIRROR_LEDGER)
+    else:
+        closes = md.get("closes") if isinstance(md.get("closes"),
+                                                 list) else []
+        for lane in MIRROR_LANES:
+            lane_closes = [c for c in closes
+                           if isinstance(c, dict)
+                           and c.get("lane") == lane]
+            payload = _summary(lane_closes)
+            payload.update({
+                "source_ledger": MIRROR_LEDGER,
+                "preregistered": False,
+                "note": NOTE,
+            })
+            plan.append((lane, payload))
+    for lane, payload in plan:
+        if lane in existing:
+            skipped.append(lane)
+            continue
+        if _vl.append(lane, "checkpoint", payload):
+            done.append((lane, payload["closes"],
+                         payload["expectancy"]))
+        else:
+            print("FAILED to append checkpoint for %s" % lane)
+    for lane, n, exp in done:
+        print("checkpoint %s: closes=%d expectancy=%s" % (lane, n, exp))
+    for lane in skipped:
+        print("checkpoint %s: already on chain, skipped" % lane)
+    ok, n_records, bad = _vl.verify()
+    print("chain: records=%d ok=%s bad_seq=%s head=%s"
+          % (n_records, ok, bad, _vl.head_hash()))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

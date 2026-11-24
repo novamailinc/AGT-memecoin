@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Fetch full 720 hourly candles for the 3 Phase-1-passing tokens.
+Saves normalized OHLCV for Phase 2 replay."""
+import json, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+OUTDIR = os.path.join(HOME, "nadir_phase1")
+os.makedirs(OUTDIR, exist_ok=True)
+
+# The 3 tokens that passed Phase 1 (720/719 candles)
+TOKENS = {
+    "MEW": {"mint": "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
+            "pool": "879F697iuDJGMevRkRcnW21fcXiAeLJK1ffsw2ATebce"},
+    "ORCA": {"mint": "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",
+             "pool": "9tXiuRRw7kbejLhZXtxDxYs2REe43uH2e7k1kocgdM9B"},
+    "HNT": {"mint": "9F4UatNR9XnvQVffUu6MojWEywTqwAwD1CtNL7Lht3pT",
+            "pool": "6twoGe7EQh15eQgpE3gjuNyfJQBdoye7DkCdvyUiQ1Ko"},
+}
+
+def fetch_ohlcv(pool_addr, timeframe="hour", limit=1000):
+    """Fetch OHLCV from GeckoTerminal. Paginates if needed."""
+    url = (f"https://api.geckoterminal.com/api/v2/networks/solana/"
+           f"pools/{pool_addr}/ohlcv/{timeframe}?limit={limit}")
+    d = get_json(url, tries=6, timeout=25)
+    ohlcv = d.get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+    # Each entry: [timestamp, open, high, low, close, volume]
+    return ohlcv
+
+for sym, info in TOKENS.items():
+    mint = info["mint"]
+    pool = info["pool"]
+    # Resolve pool if not known
+    if not pool:
+        try:
+            pairs = get_json(f"https://api.dexscreener.com/tokens/v1/solana/{mint}",
+                             tries=4, timeout=20)
+            if pairs:
+                best = max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+                # DexScreener pair address != GeckoTerminal pool address; use DexScreener for OHLCV
+                print(f"{sym}: pool resolution via DexScreener not compatible with GeckoTerminal OHLCV")
+                continue
+        except Exception as e:
+            print(f"{sym}: pool resolve FAIL {str(e)[:50]}")
+            continue
+    try:
+        print(f"{sym}: fetching OHLCV for {pool[:16]}...")
+        candles = fetch_ohlcv(pool)
+        print(f"{sym}: got {len(candles)} candles")
+        # Normalize: [ts, o, h, l, c, v] -> dict
+        norm = [{"ts": c[0], "o": float(c[1]), "h": float(c[2]),
+                 "l": float(c[3]), "c": float(c[4]), "v": float(c[5])}
+                for c in candles]
+        norm.sort(key=lambda x: x["ts"])
+        out = {"mint": mint, "symbol": sym, "pool": pool,
+               "candles": norm, "count": len(norm)}
+        path = os.path.join(OUTDIR, f"phase2_{sym}.json")
+        json.dump(out, open(path, "w"))
+        print(f"{sym}: saved {len(norm)} candles to {path}")
+    except Exception as e:
+        print(f"{sym}: FAIL {str(e)[:80]}")
+    time.sleep(2)

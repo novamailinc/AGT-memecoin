@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""D-16 explicit-commitment slot probe + Chainstack current-plan
+re-probe (Phase 3).
+
+Read-only probe using existing keys. Runs:
+  1. probe_slot_commitments: getSlot with explicit commitments
+     (processed / confirmed / finalized) on Alchemy, Helius and
+     public, 5 rounds, ~21s apart (inside the Helius pacer).
+     Skips the Helius leg while auto-quiet is active.
+  2. probe_chainstack_current: re-probes getSlot, getAccountInfo,
+     getTransaction (recent), getSignaturesForAddress and
+     getProgramAccounts on Chainstack Developer Free, recording the
+     ACTUAL current behaviour (no Nov 22 assumption carried).
+
+Writes JSON to ~/workspace/reports/master-phase3-d16-probe.json
+and prints a human summary. No key material is ever printed or
+written. Paper-only: no trades, no writes to any ledger.
+"""
+import json
+import os
+import sys
+import time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from daemon.intelligence.acquisition import probes  # noqa: E402
+
+REPORT = os.path.expanduser(
+    "~/workspace/reports/master-phase3-d16-probe.json")
+
+
+def main():
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    slot = probes.probe_slot_commitments(rounds=5, pause_s=21.0)
+    chainstack = probes.probe_chainstack_current()
+    report = {"started_utc": started,
+              "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                            time.gmtime()),
+              "slot_commitments": slot,
+              "chainstack_current": chainstack}
+    with open(REPORT, "w") as fh:
+        json.dump(report, fh, indent=2)
+    print("=== D-16 slot-commitment probe ===")
+    print("helius quiet active: %s (helius leg skipped: %s)"
+          % (slot["helius_quiet_active"], slot["skipped_helius"]))
+    for commitment, rec in slot["lag"].items():
+        vh = rec["vs_helius"]
+        vp = rec["vs_public"]
+        print("commitment %-10s alchemy-vs-helius n=%s median=%s "
+              "mean=%s min=%s max=%s values=%s"
+              % (commitment, vh["n"], vh["median"], vh["mean"],
+                 vh["min"], vh["max"], vh["values"]))
+        print("commitment %-10s alchemy-vs-public n=%s median=%s "
+              "mean=%s min=%s max=%s values=%s"
+              % (commitment, vp["n"], vp["median"], vp["mean"],
+                 vp["min"], vp["max"], vp["values"]))
+    print("=== Chainstack current-plan re-probe ===")
+    for row in chainstack:
+        print("%-38s %-6s http=%s code=%s %s"
+              % (row["probe"], row["status"], row.get("http_status"),
+                 row.get("error_code"), row.get("detail", "")))
+    print("report: %s" % REPORT)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

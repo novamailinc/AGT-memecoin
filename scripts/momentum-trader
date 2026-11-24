@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Momentum lane trader daemon (2026-10-23, completion build).
+
+Runs the momentum paper lane (daemon/launch_scanner/
+momentum_lane.py): $1 paper shots on runners from the EXISTING
+momentum feed — GeckoTerminal trending pools qualified by
+momentum.MomentumScanner (lowcap + established), the same fetch +
+qualifier the main scanner's _momentum_scan uses in-process. Entry
+re-checks the runner rule from fresh tape, the fail-closed safety
+gate, and the veto engine as a HARD gate; vetoed coins are
+journaled for 24h counterfactual tracking. Exits are the user's
+ladder, evaluated in this loop (~5s cycle); vetoed-coin 24h checks
+are stamped in the same loop when due.
+
+Pre-registered verdict: at 100 closes, expectancy <= 0 halts the
+lane permanently (killswitch lane "momentum", human-only
+re-enable).
+
+Paper only. NO Telegram cards — journal/ledger only. Nothing here
+touches real money, keys, or the user's lanes.
+Free-only: GeckoTerminal + DexScreener public endpoints.
+"""
+import logging
+import os
+import sys as _sys
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("momentum-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import momentum_lane as _mom
+    import killswitch as _ks_check
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+POLL_SECS = 5
+SCAN_EVERY_S = 60
+NETWORKS = ("solana",)
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("momentum-trader", token="scripts/momentum-trader")
+    if not _HAS_DEPS:
+        logger.warning("momentum-trader deps missing: %s", _IMPORT_ERROR)
+        return 1
+    state = _mom.ensure_ledger()
+    # Register the lane's trial (idempotent) — lanes historically
+    # registered via backfill only; this lane registers explicitly.
+    _mom.register_trial()
+    # Materialize the killswitch lane entry (not halted) so the lane
+    # is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_mom.LANE)
+    except Exception:
+        pass
+    logger.warning("momentum-trader started (paper only, NO cards, "
+                   "bankroll $%.2f, state %s, verdict sample %d "
+                   "closes, feed: geckoterminal trending + "
+                   "MomentumScanner)",
+                   float(state.get("bankroll") or 0), state.get("state"),
+                   _mom.VERDICT_SAMPLE_CLOSES)
+
+    # FASTER EXITS (2026-11-20, item 1b): dedicated exit-poll thread.
+    # The main loop below still polls (backstop); this thread polls
+    # every ~10s while any position is <15 min old, so a slow scan
+    # can no longer delay exits. Latency-only: the same poll_exits —
+    # same decisions, same pricing, inside the pacer. Fail-soft: a
+    # missing helper leaves the previous cadence byte-identical.
+    try:
+        import exit_cadence as _ec
+    except Exception:
+        _ec = None
+    if _ec is not None:
+        _exit_poller = _ec.ExitPoller(
+            poll_fn=lambda: _mom.poll_exits(),
+            positions_fn=_mom.open_positions,
+            on_error=lambda e: logger.warning(
+                "momentum exit poller: %s", e))
+        _exit_poller.start()
+    last_scan = 0.0
+    while True:
+        try:
+            now = time.time()
+            res = {"opened": 0, "qualified": 0}
+            if now - last_scan >= SCAN_EVERY_S:
+                last_scan = now
+                res = _mom.scan_once(networks=NETWORKS)
+            closes = _mom.poll_exits()
+            stamped = _mom.update_counterfactuals()
+            if res.get("opened") or closes or stamped:
+                st = _mom.account_state()
+                logger.warning(
+                    "momentum-trader: %d qualified, %d opened; %d "
+                    "closes; %d counterfactuals stamped; cash $%.2f, "
+                    "%d open, %d vetoed, state %s",
+                    res.get("qualified", 0), res.get("opened", 0),
+                    len(closes), stamped, st.get("bankroll", 0.0),
+                    st.get("n_open", 0), st.get("n_vetoed", 0),
+                    st.get("state"))
+        except Exception:
+            logger.exception("momentum-trader loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

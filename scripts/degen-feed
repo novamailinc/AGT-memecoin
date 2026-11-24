@@ -1,0 +1,1050 @@
+#!/usr/bin/env python3
+"""Degen feed v3: EARLY launch detection via GeckoTerminal new pools.
+
+Fixes v2's core problem: DexScreener boosts are paid ads (late).
+This catches pump.fun / Raydium launches within minutes of creation.
+
+Source: GeckoTerminal new_pools (free, no key)
+Poll: every 30 seconds
+Freshness: pools created in last 15 minutes only
+"""
+import json
+import logging
+import os
+import time
+import urllib.request
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "launch_scanner"))
+try:
+    from robust_http import get_json as _robust_get
+    _HAS_ROBUST = True
+except ImportError:
+    _HAS_ROBUST = False
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+try:
+    import lp_lock
+    _HAS_LPLOCK = True
+except ImportError:
+    _HAS_LPLOCK = False
+try:
+    import saturation
+    _HAS_SATURATION = True
+except ImportError:
+    _HAS_SATURATION = False
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("degen-feed")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "degen_seen.json")
+TRACK_FILE = os.path.join(HOME, "degen_outcomes.json")
+LS_DIR = os.path.join(HOME, "launch_scanner")
+
+# Counterfactual candidate log (2026-10-23, signal audit §6.4): alert-time
+# features for ALL scored candidates — fired, sub-threshold, hard-filter
+# rejects, safety blocks — not just fired cards. Without the rejects the
+# learner can never judge whether the filters/min_score chose well.
+# Bounded JSONL: rotated down to CANDIDATES_KEEP lines past the byte cap.
+CANDIDATES_FILE = os.path.join(HOME, "degen_candidates.jsonl")
+CANDIDATES_MAX_BYTES = 2_000_000
+CANDIDATES_KEEP = 1000
+
+MAX_CARDS_PER_HOUR = 3  # user 2026-10-14: fewer cards, higher bar — quality over quantity
+POLL_SECS = 5  # 2026-10-12 speed pass: GeckoTerminal free tier = 30 req/min;
+# 5s polls = ~12 req/min, verified no 429s over a 60s live probe.
+# Cycle cost is now dominated by I/O, parallelized below.
+
+# Websocket fast-path: degen-ws-listener appends new pump.fun mints here;
+# the feed enriches + scores them through the same pipeline (one code path).
+WS_QUEUE_FILE = os.path.join(HOME, "degen_ws_queue.jsonl")
+WS_PENDING_MAX = 40
+WS_PENDING_TTL_SECS = 600  # match max age window
+
+# Tuning knobs — loaded from degen-weights.json, auto-tuned by degen-learner
+WEIGHTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "degen-weights.json")
+_weights_cache = {}
+_weights_mtime = 0
+
+
+def get_weights():
+    global _weights_cache, _weights_mtime
+    try:
+        mtime = os.path.getmtime(WEIGHTS_FILE)
+        if mtime != _weights_mtime:
+            with open(WEIGHTS_FILE) as f:
+                _weights_cache = json.load(f)
+            _weights_mtime = mtime
+    except Exception:
+        pass
+    w = _weights_cache.get("weights", {})
+    t = _weights_cache.get("thresholds", {})
+    return {
+        "w_freshness": w.get("freshness", 1.0),
+        "w_buy_pressure": w.get("buy_pressure", 1.0),
+        "w_buyer_count": w.get("buyer_count", 1.0),
+        "w_momentum": w.get("momentum", 1.0),
+        "w_fdv_zone": w.get("fdv_zone", 1.0),
+        # 2026-10-20: smart money is WATCHLIST-ONLY (user decision;
+        # copy-trading measured -41% avg, follower grades 0 active).
+        # The weights file stores smart_money_bonus as an ABSOLUTE
+        # value (currently 25.0) that the nightly learner's file
+        # round-trip preserves, so the applied bonus is clamped to 0
+        # HERE in code — a stored value can never resurrect it. The
+        # 🧠 hit is still detected, reasoned and journaled; it just
+        # scores 0. Re-enable only on follower-grade evidence.
+        "sm_bonus": 0.0,
+        "min_score": t.get("min_score", 45),
+        "min_fdv": t.get("min_fdv", 8000.0),
+        "max_fdv": t.get("max_fdv", 600000.0),
+        "min_reserve": t.get("min_reserve", 4000.0),
+        "min_buyers_m5": t.get("min_buyers_m5", 3),
+        "min_buy_sell_ratio": t.get("min_buy_sell_ratio", 0.8),
+        "max_age_minutes": t.get("max_age_minutes", 15),
+    }
+
+
+# Defaults for initial scoring (overridden by get_weights at runtime)
+MIN_SCORE = 45
+MIN_FDV = 8_000.0
+MAX_FDV = 600_000.0
+MIN_RESERVE = 25_000.0  # 2026-10-18 RUNNER-ONLY rule: was $4k
+MIN_BUYERS_M5 = 3
+MIN_BUY_SELL_RATIO = 0.8
+MAX_AGE_MINUTES = 15
+
+# RUNNER-ONLY standing rule (2026-10-18, user order): every lane hunts ONLY
+# real running signals — real runners with serious liquidity. Hard floor,
+# deliberately NOT learner-tunable (the nightly learner only tightens
+# weights; it cannot loosen this gate).
+RUNNER_MIN_LIQ = 25_000.0
+RUNNER_MIN_MCAP = 50_000.0
+
+
+def _http(url, timeout=10):
+    # Use robust client when available (retries, gzip, circuit breaker)
+    if _HAS_ROBUST:
+        try:
+            return _robust_get(url, timeout=timeout, tries=4)
+        except Exception:
+            return None
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+_wallet_grades = {}
+_deployer_hist = {}
+_last_refresh = 0
+
+
+def refresh_intel():
+    global _wallet_grades, _deployer_hist, _last_refresh
+    if time.time() - _last_refresh < 3600:
+        return
+    _wallet_grades = load_json(os.path.join(LS_DIR, "smart_wallet_grades.json"))
+    _deployer_hist = load_json(os.path.join(LS_DIR, "deployer_history.json"))
+    _last_refresh = time.time()
+    logger.warning("intel: %d wallets, %d deployers",
+                   len(_wallet_grades), len(_deployer_hist))
+
+
+def smart_money_hit(mint):
+    """Check if any tracked wallet bought this mint."""
+    for wallet, data in _wallet_grades.items():
+        for buy in (data.get("buys") or []):
+            if buy.get("mint") == mint:
+                return True, wallet[:6]
+    return False, ""
+
+
+def _instant_safety_fallback(mint, intel):
+    """Instant on-chain verdict when RugCheck has no report yet
+    (2026-10-20). Returns (safe, reason, intel) when the chain gives
+    a definitive verdict, or None when it cannot — the caller then
+    stays fail-closed exactly as before."""
+    try:
+        import instant_safety
+        rep = instant_safety.check(mint, timeout=8)
+    except Exception:
+        return None
+    if not rep or rep.get("unknown"):
+        return None
+    det = rep.get("instant") or {}
+    intel["holder_conc"] = det.get("top10_user_pct", 0) or 0
+    intel["rugcheck_score"] = rep.get("score", 0) or 0
+    intel["instant_safety"] = True
+    if rep.get("passed"):
+        return True, "ok (instant on-chain verified)", intel
+    return False, "SAFETY BLOCK: instant check: %s" % "; ".join(
+        (rep.get("fails") or [])[:2]), intel
+
+
+def check_safety(mint):
+    """RugCheck safety + intelligence.
+    Returns (safe: bool, reason: str, intel: dict).
+    Intel includes holder concentration, deployer, lockers, insiders."""
+    intel = {
+        "holder_conc": 0,      # top10 % held
+        "total_holders": 0,
+        "lp_locked": False,
+        "insiders": 0,
+        "creator": "",
+        "rugcheck_score": 0,
+    }
+    try:
+        data = _http(
+            "https://api.rugcheck.xyz/v1/tokens/%s/report" % mint,
+            timeout=8)
+        if not data:
+            fb = _instant_safety_fallback(mint, intel)
+            if fb is not None:
+                return fb
+            # 2026-10-12: fail-CLOSED (user: "I don't want rug coin").
+            # Unknown safety never sends a card.
+            return False, "SAFETY BLOCK: safety unknown (RugCheck unreachable)", intel
+        # Hard blocks
+        for r in (data.get("risks") or []):
+            name = (r.get("name") or "").lower()
+            level = (r.get("level") or "").lower()
+            if level == "danger" and any(
+                    k in name for k in ("honeypot", "cannot sell",
+                                        "transfer blocked")):
+                return False, "SAFETY BLOCK: " + r.get("name", "?"), intel
+        # Tax check
+        import re
+        for r in (data.get("risks") or []):
+            if "tax" in (r.get("name") or "").lower():
+                m = re.search(r"(\d+(?:\.\d+)?)\s*%",
+                              r.get("description", ""))
+                if m and float(m.group(1)) > 10:
+                    return False, "SAFETY BLOCK: tax %s%%" % m.group(1), intel
+        # Already rugged?
+        if data.get("rugged"):
+            return False, "SAFETY BLOCK: rugged", intel
+        # Extract intelligence
+        holders = data.get("topHolders") or []
+        if holders:
+            # Top 10 concentration (excluding known program addresses)
+            top10_pct = sum(h.get("pct", 0) for h in holders[:10])
+            intel["holder_conc"] = round(top10_pct, 1)
+        intel["total_holders"] = data.get("totalHolders", 0) or 0
+        intel["lp_locked"] = bool(data.get("lockers"))
+        intel["insiders"] = data.get("graphInsidersDetected", 0) or 0
+        intel["creator"] = data.get("creator", "") or ""
+        intel["rugcheck_score"] = data.get("score_normalised", 0) or 0
+        # Insider hard block (permanent invariant)
+        if intel["insiders"] > 5:
+            return False, "SAFETY BLOCK: %d insiders" % intel["insiders"], intel
+        return True, "ok", intel
+    except Exception:
+        fb = _instant_safety_fallback(mint, intel)
+        if fb is not None:
+            return fb
+        # 2026-10-12: fail-CLOSED (user: "I don't want rug coin").
+        return False, "SAFETY BLOCK: safety unknown (RugCheck error)", intel
+
+
+def _fetch_pool_page(page):
+    """Fetch one GeckoTerminal new_pools page. Returns parsed JSON or None."""
+    return _http(
+        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=%d"
+        % page)
+
+
+def _parse_pools(data, now):
+    """Filter raw page JSON down to fresh pump-fun/raydium candidate pools."""
+    fresh = []
+    if not data or "data" not in data:
+        return fresh
+    for p in data["data"]:
+        a = p.get("attributes", {})
+        rel = p.get("relationships", {})
+        # Check DEX — want pump.fun / raydium / pumpswap
+        # 2026-10-13: added pumpswap — graduated pump.fun coins trade there,
+        # and we were blind to them (only pump-fun + raydium listed).
+        dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
+        if dex_id not in ("pump-fun", "raydium", "pumpswap"):
+            continue
+        # Check age
+        created_str = a.get("pool_created_at", "")
+        try:
+            created = datetime.fromisoformat(
+                created_str.replace("Z", "+00:00"))
+            age_min = (now - created).total_seconds() / 60
+        except Exception:
+            continue
+        if age_min < 0:
+            continue
+        # 2026-10-13: late-catch window. GeckoTerminal indexes pools minutes
+        # late — a runner indexed at age 20min was invisible to us forever.
+        # Pools aged 15-30min still pass IF showing strong 15m momentum.
+        late_catch = False
+        if age_min > MAX_AGE_MINUTES:
+            if age_min > 30:
+                continue
+            chg15 = float((a.get("price_change_percentage") or {}).get("m15") or 0)
+            if chg15 < 50:
+                continue
+            late_catch = True
+        # Get mint
+        base_id = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
+        if not base_id.startswith("solana_"):
+            continue
+        mint = base_id.replace("solana_", "")
+        # Must be pump mint (not random SOL pairs)
+        if not mint.endswith("pump"):
+            continue
+        pcp = a.get("price_change_percentage") or {}
+        fresh.append({
+            "mint": mint,
+            "name": a.get("name", "?").split(" / ")[0],
+            "age_min": age_min,
+            "late_catch": late_catch,
+            "fdv": float(a.get("fdv_usd") or 0),
+            "reserve": float(a.get("reserve_in_usd") or 0),
+            "txns_m5": (a.get("transactions") or {}).get("m5") or {},
+            "txns_m15": (a.get("transactions") or {}).get("m15") or {},
+            "chg_m5": float(pcp.get("m5") or 0),
+            "chg_m15": float(pcp.get("m15") or 0),
+            "chg_h1": float(pcp.get("h1") or 0),
+            # RUNNER-ONLY: momentum presence tracked separately — absent
+            # fields coerce to 0 above, but "no data" must fail closed.
+            "has_mom": pcp.get("m15") is not None or pcp.get("h1") is not None,
+        })
+    return fresh
+
+
+def get_new_pools(pages=(1,)):
+    """Fetch fresh Solana pools from GeckoTerminal across given pages.
+
+    Coverage fix 2026-10-12: page 1 alone (~20 newest pools) let coins age
+    off the list unseen (a real 38x winner slipped through after a restart).
+    Deeper pages are fetched on a staggered cadence by the main loop so the
+    free-tier rate cap (30 req/min) is never breached:
+      page 1 every poll (5s)  -> 12 req/min
+      page 2 every 3rd poll   ->  4 req/min
+      page 3 every 6th poll   ->  2 req/min
+    Total worst-case ~18 req/min. Pages merge with mint dedupe; the existing
+    MAX_AGE_MINUTES filter below still bounds pool age — no filter loosened.
+    """
+    now = datetime.now(timezone.utc)
+    merged = []
+    seen_mints = set()
+    for page in pages:
+        data = _fetch_pool_page(page)
+        if not data:
+            # Fail-soft: one bad page never kills the whole poll.
+            continue
+        for pool in _parse_pools(data, now):
+            if pool["mint"] in seen_mints:
+                continue
+            seen_mints.add(pool["mint"])
+            merged.append(pool)
+    return merged
+
+
+def passes_runner_gate(pool):
+    """RUNNER-ONLY gate (2026-10-18 standing rule): real runners with
+    serious liquidity. Knob-independent hard floor — the nightly learner
+    cannot loosen it. Fail-closed on unknown liq/mcap/momentum.
+    fdv is the mcap proxy (pump.fun 1B supply => fdv ~= mcap), consistent
+    with the rest of this script. Returns (True, "") or (False, reason)."""
+    liq = pool.get("reserve") or 0
+    if liq < RUNNER_MIN_LIQ:
+        return False, "runner: liq < $25k"
+    mcap = pool.get("fdv") or 0
+    if mcap < RUNNER_MIN_MCAP:
+        return False, "runner: mcap < $50k"
+    if not pool.get("has_mom"):
+        return False, "runner: no momentum data"
+    if not (pool.get("chg_m15", 0) > 0 or pool.get("chg_h1", 0) > 0):
+        return False, "runner: not rising"
+    return True, ""
+
+
+def passes_hard_filters(pool, knobs):
+    """Cheap pre-filter using ONLY already-in-hand market data (no HTTP).
+
+    Run BEFORE check_safety so RugCheck is only called for pools that can
+    actually score. Returns (True, "") or (False, reason).
+    Quality filter only — safety hard-blocks are unchanged and still apply
+    to every survivor via check_safety()."""
+    # RUNNER-ONLY (2026-10-18): hard gate first — dust dies cheapest here.
+    ok, why = passes_runner_gate(pool)
+    if not ok:
+        return False, why
+    fdv = pool["fdv"]
+    reserve = pool["reserve"]
+    tx = pool["txns_m5"]
+    buys = tx.get("buys", 0) or 0
+    sells = tx.get("sells", 0) or 0
+    buyers = tx.get("buyers", 0) or 0
+
+    if fdv < knobs["min_fdv"] or fdv > knobs["max_fdv"]:
+        return False, "fdv out of range"
+    if reserve < knobs["min_reserve"]:
+        return False, "no liquidity"
+    if buyers < knobs["min_buyers_m5"]:
+        return False, "no buyers"
+    ratio = buys / sells if sells > 0 else (2.0 if buys > 0 else 0)
+    if ratio < knobs["min_buy_sell_ratio"]:
+        return False, "selling pressure"
+
+    # SUSTAINED buying check: m15 must also show net buying
+    # (kills fake 5m spikes from deployer/bots)
+    tx15 = pool.get("txns_m15", {})
+    b15 = tx15.get("buys", 0) or 0
+    s15 = tx15.get("sells", 0) or 0
+    ratio15 = b15 / s15 if s15 > 0 else (2.0 if b15 > 0 else 0)
+    if ratio15 < 1.0:
+        return False, "no sustained buying"
+    # Price must not be dumping on 15m
+    if pool.get("chg_m15", 0) < -30:
+        return False, "dumping"
+    # ANTI-CHASE hard cap (2026-10-21, CEO fix): peak tracker on the
+    # last 40 cards — only 12% ever traded above the card price after
+    # the card, median post-card peak 0.107x. A coin already +50% in
+    # 5m has paid its move to earlier buyers; carding it hands the
+    # follower the top. Rising is still required (runner rule) and
+    # the +10-30%/5m zone still scores best in score_pool — this only
+    # cuts the vertical-top tail the old -15pt penalty let through.
+    if pool.get("chg_m5", 0) >= 50:
+        return False, "chasing: +%.0f%%/5m vertical top" % pool["chg_m5"]
+    return True, ""
+
+
+def score_pool(pool, intel=None, skip_gates=False):
+    """0-100 score for early-launch 3x potential.
+
+    skip_gates=True bypasses the passes_hard_filters gate (used by the
+    watchlist tier, which applies its own lighter filters). Default False
+    keeps the feed's own behavior byte-identical.
+    """
+    knobs = get_weights()
+    intel = intel or {}
+    score = 0.0
+    reasons = []
+
+    fdv = pool["fdv"]
+    reserve = pool["reserve"]
+    tx = pool["txns_m5"]
+    buys = tx.get("buys", 0) or 0
+    sells = tx.get("sells", 0) or 0
+    buyers = tx.get("buyers", 0) or 0
+
+    # Hard filters (shared with the pre-safety fast path)
+    # (skipped by the watchlist tier via skip_gates=True)
+    if not skip_gates:
+        ok, why = passes_hard_filters(pool, knobs)
+        if not ok:
+            return 0, [why], False, "", {}
+    ratio = buys / sells if sells > 0 else (2.0 if buys > 0 else 0)
+
+    # Freshness (0-25) x weight
+    age = pool["age_min"]
+    fresh_pts = 0
+    if age <= 3:
+        fresh_pts = 25
+        reasons.append("⚡ %dm old" % age)
+    elif age <= 7:
+        fresh_pts = 18
+        reasons.append("%dm old" % age)
+    elif age <= 12:
+        fresh_pts = 10
+        reasons.append("%dm old" % age)
+    else:
+        fresh_pts = 5
+    score += fresh_pts * knobs["w_freshness"]
+
+    # Buy pressure (0-30) x weight — the KEY early signal
+    bp_pts = 0
+    if ratio >= 3.0:
+        bp_pts = 30
+        reasons.append("buys %d / sells %d 🚀" % (buys, sells))
+    elif ratio >= 2.0:
+        bp_pts = 22
+        reasons.append("buys %d / sells %d" % (buys, sells))
+    elif ratio >= 1.2:
+        bp_pts = 15
+        reasons.append("buys %d / sells %d" % (buys, sells))
+    else:
+        bp_pts = 8
+    score += bp_pts * knobs["w_buy_pressure"]
+
+    # Buyer count (0-15) x weight
+    bc_pts = 0
+    if buyers >= 15:
+        bc_pts = 15
+        reasons.append("%d buyers 🔥" % buyers)
+    elif buyers >= 8:
+        bc_pts = 10
+        reasons.append("%d buyers" % buyers)
+    else:
+        bc_pts = 5
+        reasons.append("%d buyers" % buyers)
+    score += bc_pts * knobs["w_buyer_count"]
+
+    # Early momentum (0-15) x weight
+    # 2026-10-13: ANTI-CHASE fix. Peak-tracker proved 10/10 recent trades
+    # never exceeded 0.36x after alert — we were buying the top. Coins up
+    # vertical in 5m are unchaseable; they get penalized, not rewarded.
+    chg = pool["chg_m5"]
+    mo_pts = 0
+    if chg >= 80:
+        mo_pts = -15
+        reasons.append("+%.0f%%/5m vertical — likely top, not chasing" % chg)
+    elif chg >= 30:
+        mo_pts = 5
+        reasons.append("+%.0f%%/5m (hot)" % chg)
+    elif chg >= 10:
+        mo_pts = 10
+        reasons.append("+%.0f%%/5m" % chg)
+    elif chg > 0:
+        mo_pts = 5
+    elif chg < -20:
+        mo_pts = -10
+        reasons.append("%.0f%%/5m ⚠️" % chg)
+    score += mo_pts * knobs["w_momentum"]
+
+    # FDV zone (0-15) x weight
+    fz_pts = 0
+    if 8000 <= fdv < 30000:
+        fz_pts = 15
+        reasons.append("fdv $%.0fk (early)" % (fdv / 1000))
+    elif 30000 <= fdv < 100000:
+        fz_pts = 12
+        reasons.append("fdv $%.0fk" % (fdv / 1000))
+    else:
+        fz_pts = 8
+    score += fz_pts * knobs["w_fdv_zone"]
+
+    # Smart money bonus
+    sm_hit, sm_wallet = smart_money_hit(pool["mint"])
+    sm_pts = 0
+    if sm_hit:
+        sm_pts = knobs["sm_bonus"]
+        score += sm_pts
+        reasons.append("🧠 smart wallet %s" % sm_wallet)
+
+    # Deployer track record (0-15)
+    dep_pts = 0
+    creator = intel.get("creator", "")
+    if creator and creator in _deployer_hist:
+        hist = _deployer_hist[creator]
+        seen_n = hist.get("launches_seen", 0)
+        hits = hist.get("hits_2x", 0)
+        if seen_n >= 3:
+            rate = hits / seen_n
+            if rate >= 0.10:
+                dep_pts = 15
+                reasons.append("🔥 deployer %.0f%% 2x rate" % (rate * 100))
+            elif rate >= 0.05:
+                dep_pts = 8
+                reasons.append("deployer %.0f%% 2x" % (rate * 100))
+    score += dep_pts
+
+    # Holder distribution (0-10): dispersed = safer
+    hold_pts = 0
+    conc = intel.get("holder_conc", 0)
+    holders_n = intel.get("total_holders", 0)
+    if conc > 0:
+        if conc < 30:
+            hold_pts = 10
+            reasons.append("holders dispersed %.0f%%" % conc)
+        elif conc < 50:
+            hold_pts = 6
+        elif conc < 70:
+            hold_pts = 3
+    if holders_n >= 100:
+        hold_pts += 5
+        reasons.append("%d holders" % holders_n)
+    elif holders_n >= 50:
+        hold_pts += 3
+    score += hold_pts
+
+    # LP locked bonus
+    lp_pts = 0
+    if intel.get("lp_locked"):
+        lp_pts = 8
+        reasons.append("🔒 LP locked")
+        score += lp_pts
+
+    components = {
+        "freshness": round(fresh_pts * knobs["w_freshness"], 1),
+        "buy_pressure": round(bp_pts * knobs["w_buy_pressure"], 1),
+        "buyer_count": round(bc_pts * knobs["w_buyer_count"], 1),
+        "momentum": round(mo_pts * knobs["w_momentum"], 1),
+        "fdv_zone": round(fz_pts * knobs["w_fdv_zone"], 1),
+        "smart_money": round(sm_pts, 1),
+        "deployer": round(dep_pts, 1),
+        "holders": round(hold_pts, 1),
+        "lp_locked": round(lp_pts, 1),
+        "total": round(max(0, score), 1),
+    }
+
+    return round(max(0, score), 1), reasons, sm_hit, sm_wallet, components
+
+
+def _tap_cb(chain, source, mint):
+    """64-byte-safe tap callback via signal_bus.track_callback.
+
+    The full "track:<chain>:<source>:<mint>" overflows Telegram's
+    64-byte callback_data cap (BUTTON_DATA_INVALID — the card never
+    delivers). Short source codes resolve back to full names in the
+    telegram tap parser, so the journal keeps full attribution."""
+    try:
+        from signal_bus import track_callback
+        return track_callback(chain, source, mint)
+    except Exception:
+        return "track:%s:%s:%s" % (chain, source, mint)
+
+
+def send_card(text, mint="", chain="solana", source="degen-feed"):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = None
+        if mint:
+            # Phase 0: chain+source ride in the callback so the tap journal
+            # can attribute the user's manual buy to this card's provenance.
+            keyboard = json.dumps({
+                "inline_keyboard": [[
+                    {
+                        "text": "📋 Copy CA",
+                        "copy_text": {"text": mint},
+                    },
+                    {
+                        "text": "📍 I bought this",
+                        "callback_data": _tap_cb(chain or "solana",
+                                                 source or "degen-feed",
+                                                 mint),
+                    },
+                ]],
+            })
+        payload = {"chat_id": "6883056760", "text": text}
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def fmt(v):
+    if not v:
+        return "?"
+    if v >= 1e6:
+        return "$%.1fM" % (v / 1e6)
+    if v >= 1e3:
+        return "$%.0fk" % (v / 1e3)
+    return "$%.0f" % v
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_seen(seen):
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(sorted(seen)[-500:], f)
+    except Exception:
+        pass
+
+
+def record_alert(mint, symbol, fdv, components=None, score=0):
+    # Real alert price: DexScreener first, else fdv/1e9 (pump.fun
+    # bonding-curve supply is exactly 1B, so fdv/1e9 == price).
+    # alert_price must never be 0 — the scoreboard measures
+    # peak multiples from it.
+    price = 0.0
+    try:
+        pairs = _http(
+            "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+        if pairs:
+            price = float(pairs[0].get("priceUsd") or 0)
+    except Exception:
+        price = 0.0
+    if not price and fdv:
+        price = fdv / 1_000_000_000
+    try:
+        outcomes = load_json(TRACK_FILE)
+        outcomes[mint] = {
+            "symbol": symbol,
+            "alert_ts": time.time(),
+            "alert_price": price,
+            "alert_mcap": fdv,
+            "score": round(score, 1),
+            "components": components or {},
+        }
+        with open(TRACK_FILE, "w") as f:
+            json.dump(outcomes, f)
+    except Exception:
+        pass
+
+
+def log_candidate(pool, decision, reason="", score=None, components=None):
+    """Append one counterfactual record for a scored candidate.
+
+    LOGGING ONLY — never influences any firing decision, threshold or
+    card. Fail-soft: any error is swallowed. Bounded: when the file
+    exceeds CANDIDATES_MAX_BYTES it is rotated to the newest
+    CANDIDATES_KEEP lines. alert_ts/alert_mcap mirror record_alert's
+    field names so degen-peak-tracker can peak-track candidates with
+    the exact same code path as fired cards."""
+    try:
+        now = time.time()
+        tx5 = pool.get("txns_m5") or {}
+        tx15 = pool.get("txns_m15") or {}
+        rec = {
+            "ts": now,
+            "alert_ts": now,
+            "mint": pool.get("mint", ""),
+            "symbol": pool.get("name", "?"),
+            "alert_mcap": pool.get("fdv", 0),
+            "fdv": pool.get("fdv", 0),
+            "reserve": pool.get("reserve", 0),
+            "age_min": pool.get("age_min", 0),
+            "buys_m5": tx5.get("buys", 0), "sells_m5": tx5.get("sells", 0),
+            "buyers_m5": tx5.get("buyers", 0),
+            "buys_m15": tx15.get("buys", 0),
+            "sells_m15": tx15.get("sells", 0),
+            "chg_m5": pool.get("chg_m5", 0),
+            "chg_m15": pool.get("chg_m15", 0),
+            "chg_h1": pool.get("chg_h1", 0),
+            "score": (round(score, 1) if score is not None else None),
+            "components": components or {},
+            "decision": decision,
+            "reason": reason,
+        }
+        with open(CANDIDATES_FILE, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        try:
+            if os.path.getsize(CANDIDATES_FILE) > CANDIDATES_MAX_BYTES:
+                with open(CANDIDATES_FILE) as f:
+                    lines = f.readlines()
+                tmp = CANDIDATES_FILE + ".tmp"
+                with open(tmp, "w") as f:
+                    f.writelines(lines[-CANDIDATES_KEEP:])
+                os.replace(tmp, CANDIDATES_FILE)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _candidate_score(pool, intel=None):
+    """Score a candidate for the counterfactual log WITHOUT the hard
+    gates (skip_gates=True) so rejects still carry their would-be score
+    + components. Fail-soft: returns (None, {}) on any error. Used only
+    for logging; the real firing path calls score_pool unchanged."""
+    try:
+        score, _r, _hit, _w, comps = score_pool(pool, intel or {},
+                                                skip_gates=True)
+        return score, comps
+    except Exception:
+        return None, {}
+
+
+def drain_ws_queue(seen):
+    """Read + clear the websocket fast-path queue.
+
+    Returns list of {"mint","sig","ts"} not already seen. Bounded: the
+    listener caps the file; we cap what we take per cycle too."""
+    items = []
+    try:
+        if not os.path.exists(WS_QUEUE_FILE):
+            return items
+        with open(WS_QUEUE_FILE) as f:
+            lines = f.read().strip().split("\n")
+        # atomic-ish clear: truncate after reading
+        open(WS_QUEUE_FILE, "w").close()
+        for line in lines[:WS_PENDING_MAX]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                it = json.loads(line)
+            except Exception:
+                continue
+            mint = it.get("mint", "")
+            if mint and mint not in seen:
+                seen.add(mint)
+                items.append(it)
+    except Exception:
+        pass
+    return items
+
+
+def enrich_ws_mint(mint, first_seen_ts):
+    """Build a pool-like dict for a WS-discovered mint via DexScreener.
+
+    Same shape as get_new_pools() entries so the ONE scoring pipeline
+    (passes_hard_filters -> check_safety -> score_pool) applies unchanged.
+    NOTE: DexScreener has no per-window unique-buyer count, so buyers is
+    approximated as buys (distinct buyers <= buys, so this is the lenient
+    direction on a quality filter only — safety checks are unaffected).
+    Returns None when no market data exists yet (caller retries later)."""
+    pairs = _http(
+        "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    if not pairs:
+        return None
+    p0 = pairs[0]
+    txns = p0.get("txns") or {}
+    m5 = txns.get("m5") or {}
+    m15 = txns.get("m15") or {}
+    h1 = txns.get("h1") or {}
+    chg = p0.get("priceChange") or {}
+    liq = p0.get("liquidity") or {}
+    m5_buys = m5.get("buys", 0) or 0
+    return {
+        "mint": mint,
+        "name": (p0.get("baseToken") or {}).get("symbol") or "?",
+        "age_min": max(0.0, (time.time() - first_seen_ts) / 60),
+        "fdv": float(p0.get("fdv") or p0.get("marketCap") or 0),
+        "reserve": float(liq.get("usd") or 0),
+        "txns_m5": {"buys": m5_buys, "sells": m5.get("sells", 0) or 0,
+                    "buyers": m5_buys},
+        "txns_m15": {"buys": m15.get("buys", 0) or 0,
+                     "sells": m15.get("sells", 0) or 0},
+        "chg_m5": float(chg.get("m5") or 0),
+        "chg_m15": float(chg.get("m15") or 0),
+        "chg_h1": float(chg.get("h1") or 0),
+        # RUNNER-ONLY: absent momentum fields must fail closed, not read as 0.
+        "has_mom": chg.get("m15") is not None or chg.get("h1") is not None,
+        "source": "ws",
+    }
+
+
+def main():
+    refresh_intel()
+    seen = load_seen()
+    ws_pending = {}  # mint -> first_seen_ts (WS fast path, awaiting data)
+    cards_this_hour = 0
+    hour_start = time.time()
+    poll_n = 0  # drives staggered deep-page coverage (see get_new_pools)
+    logger.warning("degen feed v3 started (early-launch mode)")
+    while True:
+        try:
+            refresh_intel()
+            if time.time() - hour_start > 3600:
+                cards_this_hour = 0
+                hour_start = time.time()
+            if cards_this_hour >= MAX_CARDS_PER_HOUR:
+                time.sleep(60)
+                continue
+            poll_n += 1
+            # Coverage fix 2026-10-12: page 1 every poll; page 2 every 3rd
+            # poll; page 3 every 6th poll. ~18 req/min worst case, under the
+            # 30/min free-tier cap. Deeper pages catch coins that aged off
+            # page 1 between polls/restarts.
+            if poll_n % 6 == 0:
+                pages = (1, 2, 3)
+            elif poll_n % 3 == 0:
+                pages = (1, 2)
+            else:
+                pages = (1,)
+            pools = get_new_pools(pages)
+            knobs = get_weights()
+            # --- WS fast path: drain queue, enrich pending mints ---
+            for it in drain_ws_queue(seen):
+                mint = it["mint"]
+                if mint not in ws_pending and len(ws_pending) < WS_PENDING_MAX:
+                    ws_pending[mint] = it.get("ts", time.time())
+            now = time.time()
+            ws_mints = set()
+            for mint in list(ws_pending):
+                if now - ws_pending[mint] > WS_PENDING_TTL_SECS:
+                    del ws_pending[mint]
+                    continue
+                pool = enrich_ws_mint(mint, ws_pending[mint])
+                if pool:
+                    del ws_pending[mint]
+                    pools.append(pool)
+                    ws_mints.add(mint)
+            # --- cheap pre-filter (no HTTP) before any safety call ---
+            candidates = []
+            for pool in pools:
+                mint = pool["mint"]
+                # WS fast-path mints were deduped at drain time; GT mints here
+                if mint in seen and mint not in ws_mints:
+                    continue
+                seen.add(mint)
+                ok, _why = passes_hard_filters(pool, knobs)
+                if ok:
+                    candidates.append(pool)
+                else:
+                    # Counterfactual log: hard-filter rejects carry
+                    # their would-be score/components too (logging only).
+                    _cs, _cc = _candidate_score(pool)
+                    log_candidate(pool, "hard_filter", _why,
+                                  score=_cs, components=_cc)
+            # --- safety checks in parallel (I/O bound); order preserved ---
+            # check_safety() itself is UNCHANGED: same hard-blocks, same
+            # fail-CLOSED-on-outage policy (2026-10-12). Speed never weakens safety.
+            results = []
+            if candidates:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    results = list(ex.map(
+                        check_safety, [p["mint"] for p in candidates]))
+            for pool, (safe, safety_reason, intel) in zip(candidates,
+                                                          results):
+                # Safety first — hard block rugs/honeypots + get intel
+                if not safe:
+                    logger.warning("SAFETY BLOCK %s: %s", pool["name"],
+                                   safety_reason)
+                    _cs, _cc = _candidate_score(pool, intel)
+                    log_candidate(pool, "safety_block", safety_reason,
+                                  score=_cs, components=_cc)
+                    continue
+                # Holder concentration filter (whale dump risk)
+                if intel["holder_conc"] > 80:
+                    logger.warning("SKIP %s: holder conc %.0f%%",
+                                   pool["name"], intel["holder_conc"])
+                    _cs, _cc = _candidate_score(pool, intel)
+                    log_candidate(pool, "holder_conc",
+                                  "holder conc %.0f%%" % intel["holder_conc"],
+                                  score=_cs, components=_cc)
+                    continue
+                score, reasons, sm_hit, sm_wallet, components = score_pool(
+                    pool, intel)
+                if score < knobs["min_score"]:
+                    log_candidate(pool, "sub_threshold",
+                                  "score %.1f < min_score %s" % (
+                                      score, knobs["min_score"]),
+                                  score=score, components=components)
+                    continue
+                tx = pool["txns_m5"]
+                # --- Nova's 3-second card design ---
+                if _HAS_CARDS:
+                    price = float(pool.get("price_usd", 0) or 0)
+                    card_text = build_card(
+                        symbol=pool["name"],
+                        score=score,
+                        mint=mint,
+                        entry_price=price,
+                        current_price=price,
+                        mcap=pool["fdv"],
+                        liquidity=pool["reserve"],
+                        buyers=tx.get("buyers", 0),
+                        age_min=pool["age_min"],
+                        buys_5m=tx.get("buys", 0),
+                        sells_5m=tx.get("sells", 0),
+                        smart_wallets=1 if sm_hit else 0,
+                        safety=safety_reason,
+                        is_fresh=True,
+                        risk_note="💸 If this rugs, you lose 0.010 SOL.",
+                        chain="solana",
+                        source="degen-feed",
+                        supply=(lp_lock.token_supply("solana", mint)
+                                if _HAS_LPLOCK else ""),
+                        saturation=(saturation.saturation_line(
+                            pool["name"]) if _HAS_SATURATION else ""),
+                    )
+                else:
+                    lines = [
+                        "🎲 DEGEN — $%s (score %.0f/100)" % (
+                            pool["name"], score),
+                        "⚡ FRESH LAUNCH — %d min old" % pool["age_min"],
+                        "⚠️ HIGH RISK — real-money gamble, not a pick.",
+                        "CA: %s" % mint,
+                        "fdv %s · liq %s" % (
+                            fmt(pool["fdv"]), fmt(pool["reserve"])),
+                        "5m: %d buys / %d sells (%d buyers)" % (
+                            tx.get("buys", 0), tx.get("sells", 0),
+                            tx.get("buyers", 0)),
+                    ]
+                    for r in reasons[:5]:
+                        lines.append("  • %s" % r)
+                    lines.append("🛡️ safety: %s" % safety_reason)
+                    lines.append("💸 If this rugs, you lose 0.010 SOL.")
+                    card_text = "\n".join(lines)
+                if send_card(card_text, mint=mint, chain="solana",
+                             source="degen-feed"):
+                    cards_this_hour += 1
+                    # Phase 0: publish the fired signal to the normalized bus.
+                    try:
+                        from signal_bus import make_signal, publish
+                        publish(make_signal(
+                            "solana", "degen-feed", mint,
+                            symbol=pool["name"], score=score,
+                            tier="pick", age_min=pool.get("age_min", 0),
+                            mcap=pool.get("fdv", 0),
+                            liquidity=pool.get("reserve", 0),
+                            buys=tx.get("buys", 0), sells=tx.get("sells", 0),
+                            evidence={"smart_hit": bool(sm_hit),
+                                      "safety": safety_reason}))
+                    except Exception:
+                        pass
+                    # Paper mirror (2026-10-17): every Solana card opens a
+                    # $1 paper position with honest fills + the user's exit
+                    # ladder. Never affects the card. Solana only.
+                    try:
+                        from mirror import mirror_card
+                        opened, why = mirror_card(
+                            "solana", "degen-feed", mint,
+                            symbol=pool["name"], score=score, tier="pick",
+                            mcap=pool.get("fdv", 0),
+                            liquidity=pool.get("reserve", 0),
+                            evidence={"smart_hit": bool(sm_hit),
+                                      "safety": safety_reason,
+                                      "age_min": pool.get("age_min", 0)})
+                        if not opened:
+                            logger.warning("mirror skip %s: %s",
+                                           mint[:12], why)
+                    except Exception:
+                        pass
+                    logger.warning("DEGEN CARD %s score=%.0f age=%.0fm",
+                                   pool["name"], score, pool["age_min"])
+                    log_candidate(pool, "fired", "", score=score,
+                                  components=components)
+                    record_alert(mint, pool["name"], pool["fdv"], components,
+                               score=score)
+                if cards_this_hour >= MAX_CARDS_PER_HOUR:
+                    break
+            save_seen(seen)
+            # Shared hourly budget for the watchlist tier (it only reads):
+            # pick-tier cards always get priority.
+            try:
+                with open(os.path.join(HOME, "degen_hourly.json"), "w") as f:
+                    json.dump({"hour_start": hour_start,
+                               "cards_this_hour": cards_this_hour,
+                               "ts": time.time()}, f)
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("feed loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

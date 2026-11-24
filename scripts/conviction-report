@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Conviction forward-test report — advanced build, piece 1.
+
+Judges the live conviction gate on REAL paper closes, not the
+replay: closes whose entry_features carry a conviction tier
+(post-deploy entries only) are tallied per tier, alongside the
+REVIEW queue (what the bar refused) and the select_journal
+conviction_* rejection counts.
+
+Verdict rule (same convention as the A+B / deployer-band /
+shadow-stop forward tests): NO verdict below 100 forward
+closes with a conviction stamp. The report refuses a verdict
+and prints the count so far.
+
+Read-only: never writes, never calls the network.
+Usage: scripts/conviction-report [--lane LANE] [--min N]
+Plain script — run directly with the venv python, not pytest.
+"""
+import argparse
+import json
+import os
+import sys
+
+HOME = os.environ.get(
+    "FOREX_AGENT_HOME",
+    os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+LANES = ("grad_select", "grad_raw", "tranche", "tranche_protect")
+
+LEDGER_FILES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+}
+
+TIERS = ("STRONG", "STANDARD", "WEAK", "SKIP", "BLOCK")
+
+
+def _load_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _load_jsonl(path):
+    recs = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if line.strip():
+                    recs.append(json.loads(line))
+    except Exception:
+        pass
+    return recs
+
+
+def report_lane(lane):
+    d = _load_json(os.path.join(HOME, LEDGER_FILES[lane]))
+    closes = [c for c in (d.get("closes") or [])
+              if isinstance(c, dict)]
+    cells = {t: {"n": 0, "wins": 0, "net": 0.0} for t in TIERS}
+    stamped = 0
+    unstamped = 0
+    for c in closes:
+        ef = c.get("entry_features") or {}
+        conv = ef.get("conviction") or {}
+        tier = conv.get("tier")
+        if tier not in cells:
+            unstamped += 1
+            continue
+        stamped += 1
+        pnl = float(c.get("pnl_usd") or 0)
+        cell = cells[tier]
+        cell["n"] += 1
+        cell["net"] += pnl
+        if pnl > 0:
+            cell["wins"] += 1
+    journal = (d.get("select_journal") or {}).get("counts") or {}
+    conv_rejects = {k: v for k, v in journal.items()
+                    if k.startswith("conviction_")}
+    queue = _load_jsonl(os.path.join(
+        HOME, "review_queue", "%s_review.jsonl" % lane))
+    return {"lane": lane, "stamped": stamped,
+            "unstamped": unstamped, "cells": cells,
+            "conv_rejects": conv_rejects, "queue_n": len(queue),
+            "queue_newest": queue[-1] if queue else None}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lane", default="")
+    ap.add_argument("--min", type=int, default=100)
+    args = ap.parse_args(argv)
+    lanes = [args.lane] if args.lane else list(LANES)
+    print("conviction forward test — live paper closes with a "
+          "conviction stamp")
+    print("home: %s" % HOME)
+    print("verdict needs %d stamped forward closes; below that "
+          "the report refuses a verdict" % args.min)
+    grand = {t: {"n": 0, "wins": 0, "net": 0.0} for t in TIERS}
+    grand_stamped = 0
+    for lane in lanes:
+        r = report_lane(lane)
+        print("")
+        print("== %s: %d stamped closes, %d unstamped (pre-gate) =="
+              % (lane, r["stamped"], r["unstamped"]))
+        for tier in TIERS:
+            cell = r["cells"][tier]
+            if not cell["n"]:
+                continue
+            print("  %-9s n=%-4d win %5.1f%% net $%9.2f mean "
+                  "$%6.2f" % (tier, cell["n"],
+                              cell["wins"] / cell["n"] * 100,
+                              cell["net"], cell["net"] / cell["n"]))
+            for k in ("n", "wins", "net"):
+                grand[tier][k] += cell[k]
+        print("  review queue: %d records" % r["queue_n"])
+        if r["conv_rejects"]:
+            print("  select_journal conviction rejects: %s"
+                  % r["conv_rejects"])
+        grand_stamped += r["stamped"]
+    if len(lanes) > 1:
+        print("")
+        print("== POOLED %d stamped closes ==" % grand_stamped)
+        for tier in TIERS:
+            cell = grand[tier]
+            if not cell["n"]:
+                continue
+            print("  %-9s n=%-4d win %5.1f%% net $%9.2f mean "
+                  "$%6.2f" % (tier, cell["n"],
+                              cell["wins"] / cell["n"] * 100,
+                              cell["net"], cell["net"] / cell["n"]))
+    print("")
+    if grand_stamped < args.min:
+        print("NO VERDICT: %d/%d stamped forward closes — the gate "
+              "is still in its forward paper test." % (
+                  grand_stamped, args.min))
+    else:
+        entered = grand["STRONG"]["n"] + grand["STANDARD"]["n"]
+        entered_net = grand["STRONG"]["net"] + grand["STANDARD"]["net"]
+        print("VERDICT-READY: %d stamped closes; entered set "
+              "(STRONG+STANDARD) n=%d net $%.2f"
+              % (grand_stamped, entered, entered_net))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

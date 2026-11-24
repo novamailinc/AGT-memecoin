@@ -1,0 +1,93 @@
+{
+  "symbol": "ETHUSDT",
+  "walkforward": {
+    "n_folds": 5,
+    "qualified": [],
+    "n_qualified": 0,
+    "folds": [
+      {
+        "fold": 0,
+        "train_candles": 9000,
+        "test_candles": 1800,
+        "train_from": "2024-09-10T18:00:00+00:00",
+        "test_from": "2025-09-20T18:00:00+00:00",
+        "test_to": "2025-12-04T17:00:00+00:00",
+        "btc_beta": 1.1934070432406656,
+        "discovered_on_train": 0
+      },
+      {
+        "fold": 1,
+        "train_candles": 9000,
+        "test_candles": 1800,
+        "train_from": "2024-11-24T18:00:00+00:00",
+        "test_from": "2025-12-04T18:00:00+00:00",
+        "test_to": "2026-02-17T17:00:00+00:00",
+        "btc_beta": 1.2684802960078252,
+        "discovered_on_train": 0
+      },
+      {
+        "fold": 2,
+        "train_candles": 9000,
+        "test_candles": 1800,
+        "train_from": "2025-02-07T18:00:00+00:00",
+        "test_from": "2026-02-17T18:00:00+00:00",
+        "test_to": "2026-05-03T17:00:00+00:00",
+        "btc_beta": 1.3144397290119854,
+        "discovered_on_train": 0
+      },
+      {
+        "fold": 3,
+        "train_candles": 9000,
+        "test_candles": 1800,
+        "train_from": "2025-04-23T18:00:00+00:00",
+        "test_from": "2026-05-03T18:00:00+00:00",
+        "test_to": "2026-07-17T17:00:00+00:00",
+        "btc_beta": 1.3139972691075275,
+        "discovered_on_train": 0
+      },
+      {
+        "fold": 4,
+        "train_candles": 9000,
+        "test_candles": 1800,
+        "train_from": "2025-07-07T18:00:00+00:00",
+        "test_from": "2026-07-17T18:00:00+00:00",
+        "test_to": "2026-09-30T17:00:00+00:00",
+        "btc_beta": 1.259832328198886,
+        "discovered_on_train": 0
+      }
+    ]
+  },
+  "deflated_sharpe": {
+    "dsr": 0.001414859268534796,
+    "best_idx": 58,
+    "best_sr": 0.07260223696318671,
+    "sr0_null": 0.4100114253764883,
+    "n_trials": 62,
+    "n_obs": 75,
+    "skew": 0.8420574209662055,
+    "kurtosis": 5.712795617030168,
+    "rejects_null_5pct": false
+  },
+  "block_bootstrap": {
+    "n_perm": 500,
+    "block": 24,
+    "observed_best_t": 1.6295516049910788,
+    "null_p95": 3.2461287486417367,
+    "null_percentile": 0.04,
+    "beats_null": false
+  },
+  "costs": {
+    "avg_round_trip": 0.002157421844600275,
+    "min_cost": 0.002,
+    "max_cost": 0.002929579829417099,
+    "min_hour": 0,
+    "max_hour": 21,
+    "flat_assumption": 0.002
+  },
+  "cost_sensitivity": {
+    "best_candidate": null,
+    "best_abs_t": 0.0,
+    "passes_bonferroni": false,
+    "n_hourly_candidates": 0
+  }
+}

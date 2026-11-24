@@ -1,0 +1,11 @@
+{
+  "capture_method": "daemon/launch_scanner/reserves.py rpc() (live Helius/public path, pacer-governed)",
+  "captured_ts": 1795341584.4886694,
+  "captured_utc": "2026-11-22T09:59:44Z",
+  "elapsed_s": 7.545,
+  "fixture": "live_getSlot",
+  "method": "getSlot",
+  "params": [],
+  "result": 472499391,
+  "source": "public-rpc"
+}

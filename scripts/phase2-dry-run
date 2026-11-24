@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Phase 2 dry-run (runs ON THIS VM — no key file, no network send,
+no deployment marker).
+
+Exercises the Phase 2 execution pieces end to end in-process:
+  * fee policy: all three tiers (calm / normal / hot), both caps
+    (absolute + 5%-of-stake), and the uneconomic-$1-tip verdict
+    with the math shown;
+  * signed-tx template: build from a canned Jupiter-style swap tx
+    (a minimal valid versioned tx constructed in-process with an
+    ephemeral keypair — no real Jupiter call), reuse, mismatch
+    refusal, expiry, invalidation;
+  * Jito bundle: tip tx + sendBundle payload built in dry-run mode
+    (the client NEVER posts) and printed for inspection.
+
+It deliberately does NOT call scripts/live-dry-run's mainnet path
+and does NOT touch MainnetExecutor: the executor refuses to run on
+this VM by design (no deployment marker), and that refusal is
+expected. Executor bundle coverage lives in
+tests/test_phase2_execution.py (fake RPC/Jupiter, temp marker).
+
+Exit 0 only if every check passes. Phase 1 is UNPROVEN (one
+post-fix close, Helius quota spent, zero new entries); nothing
+here claims otherwise.
+"""
+
+import base64
+import json
+import os
+import sys as _sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+
+try:
+    from broker import BrokerError
+    from broker.memecoin.execution import tx as tx_mod
+    from broker.memecoin.execution.fee_policy import (
+        PriorityFeePolicy, jito_tip_verdict)
+    from broker.memecoin.execution.jito import (
+        JitoClient, TIP_ACCOUNTS)
+    from broker.memecoin.execution.mainnet_executor import SOL_MINT
+    from broker.memecoin.execution.tx_templates import SignedTxTemplate
+    _HAS_DEPS = True
+    _IMPORT_ERROR = None
+except ImportError as e:  # pragma: no cover - missing solders etc.
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+_PASSED = 0
+_FAILED = []
+
+
+def check(name, cond, detail=""):
+    global _PASSED
+    if cond:
+        _PASSED += 1
+        print("PASS: %s%s" % (name, (" — " + detail) if detail else ""))
+    else:
+        _FAILED.append(name)
+        print("FAIL: %s%s" % (name, (" — " + detail) if detail else ""))
+
+
+def _b58encode(raw: bytes) -> str:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n > 0:
+        n, r = divmod(n, 58)
+        out = alphabet[r] + out
+    pad = len(raw) - len(raw.lstrip(b"\x00"))
+    return "1" * pad + (out or "")
+
+
+def _canned_swap_b64(kp, input_mint, output_mint):
+    """Minimal valid versioned tx shaped like a Jupiter swap."""
+    from solders.hash import Hash
+    from solders.instruction import AccountMeta, Instruction
+    from solders.message import MessageV0
+    from solders.pubkey import Pubkey
+    from solders.transaction import VersionedTransaction
+    accounts = [AccountMeta(kp.pubkey(), True, True),
+                AccountMeta(Pubkey.from_string(input_mint), False, True),
+                AccountMeta(Pubkey.from_string(output_mint), False, True)]
+    ix = Instruction(
+        Pubkey.from_string(tx_mod.JUPITER_AGGREGATOR_PROGRAM_ID),
+        b"\x00\x01", accounts)
+    msg = MessageV0.try_compile(
+        kp.pubkey(), [ix], [],
+        Hash.from_string(_b58encode(bytes(range(32)))))
+    vtx = VersionedTransaction(msg, [kp])
+    return base64.b64encode(bytes(vtx)).decode("ascii")
+
+
+def main():
+    if not _HAS_DEPS:
+        print("phase2 dry-run FAILED: missing dependency: %s"
+              % _IMPORT_ERROR)
+        return 1
+    from solders.keypair import Keypair
+    kp = Keypair()  # ephemeral, in-memory only, never written to disk
+    wallet = str(kp.pubkey())
+    tok_mint = _b58encode(bytes(range(1, 33)))
+
+    # -- 1. fee policy: tiers -----------------------------------------
+    for fees, want_tier, want_fee in (
+            ([5000, 8000, 9000], "calm", 10_000),
+            ([50000] * 5, "normal", 50_000),
+            ([200000] * 10, "hot", 200_000)):
+        p = PriorityFeePolicy(fee_source=lambda f=fees: list(f))
+        d = p.choose_fee(10_000_000)
+        check("fee tier %s" % want_tier,
+              d["verdict"] == "ok" and d["tier"] == want_tier
+              and d["fee_lamports"] == want_fee,
+              "fee=%d lamports" % d["fee_lamports"])
+    # -- 1b. fee policy: both caps skip ---------------------------------
+    p = PriorityFeePolicy(fee_source=lambda: [2_000_000] * 5)
+    d = p.choose_fee(100_000_000)
+    check("absolute fee cap skips",
+          d["verdict"] == "skip" and d["reason"] == "fee_over_cap",
+          "fee=%d over cap %d" % (d["fee_lamports"],
+                                  d["absolute_cap_lamports"]))
+    p = PriorityFeePolicy(fee_source=lambda: [100_000] * 5)
+    d = p.choose_fee(1_000_000)
+    check("5%-of-stake fee cap skips",
+          d["verdict"] == "skip" and d["reason"] == "fee_over_cap",
+          "fee=%d over 5%% of 1,000,000" % d["fee_lamports"])
+    # -- 1c. Jito tip economics: the $1 case ---------------------------
+    v = jito_tip_verdict(0.01, 0.001, sol_price_usd=100.0)
+    check("0.001 SOL tip on a $1 stake is uneconomic",
+          v["verdict"] == "uneconomic"
+          and abs(v["tip_frac"] - 0.10) < 1e-9,
+          "tip %.6f SOL / stake %.6f SOL = %.0f%% "
+          "(tip $%.2f of a $%.2f stake)"
+          % (v["tip_sol"], v["stake_sol"], v["tip_frac"] * 100,
+             v["tip_usd"], v["stake_usd"]))
+    v = jito_tip_verdict(0.01, 0.01)
+    check("0.01 SOL tip on a $1 stake is uneconomic",
+          v["verdict"] == "uneconomic"
+          and abs(v["tip_frac"] - 1.0) < 1e-9,
+          "tip is 100% of the stake")
+    v = jito_tip_verdict(1.0, 0.001)
+    check("0.001 SOL tip on a 1 SOL stake is economic",
+          v["verdict"] == "economic"
+          and abs(v["tip_frac"] - 0.001) < 1e-9,
+          "tip is 0.1% of the stake")
+    print("NOTE: a 0.001-0.01 SOL Jito tip eats a $1 trade. Sizing "
+          "is decided by the shakedown test, not by this build.")
+
+    # -- 2. signed-tx template -----------------------------------------
+    swap_b64 = _canned_swap_b64(kp, SOL_MINT, tok_mint)
+    now = time.monotonic()
+    template = SignedTxTemplate.build(
+        swap_b64, kp, wallet, SOL_MINT, tok_mint, 1_000_000, 100,
+        slot=100, created_at=now)
+    check("template builds and signs once",
+          bool(template.signed_base64) and bool(template.signature)
+          and bool(template.blockhash),
+          "sig=%s..." % template.signature[:12])
+    check("template reuses for identical params",
+          template.reuse_for(wallet, SOL_MINT, tok_mint, 1_000_000,
+                             100, now=now + 1, current_slot=101)
+          == template.signed_base64)
+    try:
+        template.reuse_for(wallet, SOL_MINT, tok_mint, 999_999, 100,
+                           now=now + 1)
+        check("template refuses param mismatch", False)
+    except BrokerError as e:
+        check("template refuses param mismatch",
+              (e.detail or {}).get("reason")
+              == "template_param_mismatch")
+    check("template expires past TTL",
+          template.is_expired(now=now + 61, current_slot=101)
+          and not template.is_expired(now=now + 59, current_slot=101))
+    template.invalidate()
+    check("template invalidate kills it", template.is_expired(now=now))
+
+    # -- 3. Jito bundle payload (dry-run: never posts) ------------------
+    def _never_post(url, payload):
+        raise AssertionError("dry-run client must never POST")
+
+    jito = JitoClient(http_post=_never_post, dry_run=True)
+    check("jito default endpoint is mainnet block engine",
+          jito.base_url == "https://mainnet.block-engine.jito.wtf")
+    tip_account = jito.pick_tip_account()
+    check("tip account is a published Jito tip account",
+          tip_account in TIP_ACCOUNTS, tip_account)
+    # Fresh template for the bundle (the invalidated one is dead).
+    template2 = SignedTxTemplate.build(
+        swap_b64, kp, wallet, SOL_MINT, tok_mint, 1_000_000, 100,
+        slot=100)
+    from broker.memecoin.execution import signer as signer_mod
+    tip_tx = jito.build_tip_tx(wallet, 1_000_000,
+                               template2.blockhash)
+    signer_mod.DevnetSigner.sign_transaction(
+        tip_tx, kp, template2.blockhash)
+    tip_b64 = tx_mod.tx_to_base64(tip_tx)
+    res = jito.send_bundle([template2.signed_base64, tip_b64],
+                           1_000_000)
+    check("dry-run send_bundle returns payload, posts nothing",
+          res["dry_run"] is True and res["bundle_id"] is None
+          and res["payload"]["method"] == "sendBundle"
+          and len(res["payload"]["params"][0]) == 2,
+          "2 txs (swap + tip), tip 1,000,000 lamports")
+    print("BUNDLE PAYLOAD (base64 txs truncated for display):")
+    shown = json.loads(json.dumps(res["payload"]))
+    shown["params"] = [[t[:40] + "...[%d chars]" % len(t)
+                        for t in res["payload"]["params"][0]]]
+    print(json.dumps(shown, indent=2))
+    print("NOTE: a bundle id is acceptance, not landing. A bundle "
+          "that never lands is UNKNOWN — reconcile from on-chain "
+          "balances before retrying.")
+
+    if _FAILED:
+        print("phase2 dry-run FAILED: %d/%d checks passed; failed: %s"
+              % (_PASSED, _PASSED + len(_FAILED), ", ".join(_FAILED)))
+        return 1
+    print("phase2 dry-run PASSED: %d checks green, zero network "
+          "calls, zero sends" % _PASSED)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Degen lane health check: verifies the lane is alive and delivering.
+
+Checks:
+  1. launch_scanner daemon is running
+  2. degen lane fired cards in the last 30 min (or is evaluating)
+  3. Telegram API is reachable
+
+Run every 10 min via cron. Logs issues; does NOT spam the user.
+Auto-heals: restarts dead scanner.
+"""
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+import json
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+LOG = os.path.join(HOME, "log", "degen-feed.log")
+REPO = "/home/hatch/workspace/Forex-agent/Forex-agent-main"
+
+
+def scanner_running():
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "scripts/degen-feed"], text=True)
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def restart_scanner():
+    subprocess.run(
+        "cd %s && FOREX_AGENT_HOME=%s nohup python3 scripts/degen-feed"
+        " > %s 2>&1 &" % (REPO, HOME, LOG),
+        shell=True, executable="/bin/bash")
+
+
+def recent_degen_alerts(minutes=30):
+    """Count DEGEN CARD lines in the last N minutes."""
+    try:
+        cutoff = time.time() - minutes * 60
+        count = 0
+        with open(LOG) as f:
+            for line in f:
+                if "DEGEN" not in line or "CARD" not in line:
+                    continue
+                # Parse timestamp: "2026-10-11 07:15:22,123 ..."
+                try:
+                    ts_str = line.split(",")[0]
+                    ts = time.mktime(time.strptime(
+                        ts_str, "%Y-%m-%d %H:%M:%S"))
+                    if ts >= cutoff:
+                        count += 1
+                except Exception:
+                    pass
+        return count
+    except Exception:
+        return -1
+
+
+def telegram_ok():
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/getMe" % token,
+            headers={"User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception:
+        return False
+
+
+def lane_evaluating(minutes=5):
+    """True if the feed's seen-file was saved recently (loop is alive)."""
+    try:
+        mtime = os.path.getmtime(os.path.join(HOME, "degen_seen.json"))
+        return (time.time() - mtime) < minutes * 60
+    except Exception:
+        return False
+
+
+def main():
+    issues = []
+    if not scanner_running():
+        restart_scanner()
+        issues.append("degen-feed was dead, restarted")
+    if not lane_evaluating():
+        issues.append("degen-feed may be stuck (no loop activity in 5 min)")
+    else:
+        alerts = recent_degen_alerts(30)
+        if alerts < 0:
+            issues.append("cannot read degen-feed log")
+    if not telegram_ok():
+        issues.append("telegram API unreachable")
+    if issues:
+        print("DEGEN HEALTH: " + "; ".join(issues))
+        return 1
+    print("DEGEN HEALTH: ok (evaluating, %d cards/30min)"
+          % recent_degen_alerts(30))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

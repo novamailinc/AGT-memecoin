@@ -1,0 +1,100 @@
+{
+ "capture": {
+  "captured_ts": 1795336874.812147,
+  "method": "getSignaturesForAddress via reserves.rpc",
+  "mint": "BiLAn35QaVqQC8f8BGrE92r2n5dcDEJmqJcx1v9Apump",
+  "pool": "3Y7Knabn84dpB6yy5LbCFt574E8ifTMeWkBMTPvGZCwE"
+ },
+ "signatures": [
+  {
+   "blockTime": 1795336232,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "5eLyyz6ZR1PBGXVAHKWTk2jjg4GK1GdyBaTCPFUJ43BNBBPwWmN4WZbMrxcYyHM7JabNCd49SKoRNoLa6xuRWxVo",
+   "slot": 472474446,
+   "transactionIndex": 86
+  },
+  {
+   "blockTime": 1795331792,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "2aqa3Zs4HRAabPScMoW6HHadMRnhZCRqodR3QbTqS8Ygpa7vqLJ5TJMoka9Kqz1aVngYuZYcipVbqjVPQW2T6PPe",
+   "slot": 472453792,
+   "transactionIndex": 188
+  },
+  {
+   "blockTime": 1795331327,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "hrQFU5LRaP6XMkPe92BdNbvTpqccGkgaLeuMvJwNrc48utqViHroByx5iCHYCGfqDiTGLbEEFrnuCfZHmpXvgmB",
+   "slot": 472451627,
+   "transactionIndex": 55
+  },
+  {
+   "blockTime": 1795330910,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "2BVW5dm6uVn4xkdttb53YzkYxbcvwErixHL17w6v5jQhQR97QfxUFQj6RXEMSvY31FBTpL1UbsnZcFbnZDq5FuKz",
+   "slot": 472449694,
+   "transactionIndex": 236
+  },
+  {
+   "blockTime": 1795329098,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "ZAY9TTchNka3JQo4tgPU3otJLZ38ETB3LF8VdBVWYfiMgsBSZzmtMMNkubWzLP9PMi3ZSNJP9Lvqm1sBeWos38R",
+   "slot": 472441271,
+   "transactionIndex": 58
+  },
+  {
+   "blockTime": 1795329060,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "5iuS4UVp4FoZZ89p7ZW2tj8X3n21aRh79AuCESASzJwLMoc7QddSZ3zYMFC8Gj3VomHEyo3WHKue4Lzfkhjceaat",
+   "slot": 472441091,
+   "transactionIndex": 210
+  },
+  {
+   "blockTime": 1795328416,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "23p8XxDf7Hw3RKWtQuQP5vkPL7PUA7W8YVVYaRnrQneZU4uwppHFFb4sZ33YCZSbjFPzsoZpvskhTzaUm9bcj66p",
+   "slot": 472438102,
+   "transactionIndex": 79
+  },
+  {
+   "blockTime": 1795325500,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "5akrRTtxa7gdUX7Le69wS8dExsMvog2M9jrVCmLkSdwn8qo6V6K8TvxumTeyZuvv3CvVs3L5x1AmrE5oovUnBT4k",
+   "slot": 472424536,
+   "transactionIndex": 278
+  },
+  {
+   "blockTime": 1795324881,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "4D8F6H72kspMne1uYp1w4NCSyLb8wDc8eLy5V71WeKjp58r9ESBijYMy6A7KywaTqatECobz7ciBbDcpdvnyJPe8",
+   "slot": 472421660,
+   "transactionIndex": 210
+  },
+  {
+   "blockTime": 1795324809,
+   "confirmationStatus": "finalized",
+   "err": null,
+   "memo": null,
+   "signature": "5wUNHFRJ6VnTkTJrd7QZyQnyDDS8T5GgebUukETqMuS63PANMKNQ6Ycpn62RjVU5nYA1HkqzQNzJrTjkLCwmh76E",
+   "slot": 472421331,
+   "transactionIndex": 224
+  }
+ ]
+}

@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-tests:
+    name: Python test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # pyyaml: config falls back to forex symbols without it;
+      # solders: devnet signing tests.
+      - run: pip install pytest pyyaml solders
+      - name: Agent subsystem suite (pytest modules)
+        run: python -m pytest tests -q
+      - name: Agent subsystem suite (script tests)
+        # About half of tests/ are plain scripts that pytest cannot
+        # collect; this runner executes each one and fails on any
+        # nonzero exit. Nothing is skipped.
+        run: python scripts/run_script_tests.py
+      - name: Manifest freshness check
+        run: python3 scripts/gen_manifest.py --check
+
+  worker-contract-tests:
+    name: Worker contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: node --test "worker/tests/*.test.mjs"
+
+  installer:
+    name: Installer idempotency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash installer/test_idempotent.sh

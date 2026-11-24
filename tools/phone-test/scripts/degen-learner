@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Degen learner: nightly auto-improvement for the degen feed.
+
+Reads degen_outcomes.json (alert FDV per mint) + degen_peaks.json
+(intraday peak multiples from degen-peak-tracker), labels runners by PEAK
+(>=3x intraday = spotted runner; the crash after is an exit problem, not a
+spotting problem), and adjusts score weights in degen-weights.json based on
+which signals predicted runners. Also reports close multiples for honesty.
+
+GUARDRAILS (never violated):
+- Weights stay within [0.5, 2.0] of default
+- min_score stays within [40, 60]
+- Thresholds only TIGHTEN, never loosen beyond defaults
+- Safety filters (min_reserve, min_buyers) never go below defaults
+- All changes logged with reason
+"""
+import json
+import logging
+import os
+import sys
+import time
+import urllib.request
+from datetime import datetime
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("degen-learner")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRACK_FILE = os.path.join(HOME, "degen_outcomes.json")
+PEAKS_FILE = os.path.join(HOME, "degen_peaks.json")
+WEIGHTS_FILE = os.path.join(SCRIPT_DIR, "degen-weights.json")
+LEARN_LOG = os.path.join(HOME, "log", "degen-learner.log")
+
+# What counts as a winner for learning
+WIN_MULT = 3.0
+MIN_SAMPLES = 5  # need at least this many resolved outcomes to learn
+
+# Minimum-evidence gate (2026-10-23, signal audit): no weight or
+# min_score change may take effect unless at least this many winners
+# WITH score components exist in the resolved set. Records written by
+# smart-watcher carry no components at all; until 2026-10-23 the learner
+# read their missing components as 0, so component-less "winners"
+# mechanically showed a negative edge on every signal and ratcheted
+# every weight to its floor tuning pure missing-data noise.
+MIN_WINNERS_WITH_FEATURES = 10
+
+# The nine score components the feed actually scores on. A components
+# dict counts as "features" ONLY if it carries at least one of these
+# keys (2026-10-25 fix): tracker-style records (smart-watcher etc.)
+# carry a non-empty components dict of raw tape fields (buys_m5,
+# chg_m5, ...) with none of these keys, and the old non-empty check
+# counted them as featured winners — so with 0 genuine winners the
+# stats read winners 0.0 on every signal and ratcheted every weight
+# to the floor on missing-data noise (Oct 23 + Oct 25 runs).
+SCORE_COMPONENTS = ["freshness", "buy_pressure", "buyer_count",
+                    "momentum", "fdv_zone", "smart_money",
+                    "deployer", "holders", "lp_locked"]
+
+# --dry-run: resolve + report only. Never writes the weights file and
+# never appends to the live learner log; the summary goes to stdout.
+DRY_RUN = "--dry-run" in sys.argv
+
+
+def record_has_components(rec):
+    """True only when the record carries a score-component value.
+
+    Missing components are NOT zeros (audit 2026-10-23): a record
+    without components must be skipped in signal-stat computation,
+    never averaged in as 0 on every signal. A non-empty dict of
+    non-score fields (tracker tape fields) is equally NOT features —
+    it must contain at least one SCORE_COMPONENTS key (fix 2026-10-25).
+    """
+    comps = rec.get("components") if isinstance(rec, dict) else None
+    if not isinstance(comps, dict):
+        return False
+    return any(k in comps for k in SCORE_COMPONENTS)
+
+
+def compute_signal_stats(winners, losers, comp_names):
+    """Mean component values per group, component-bearing records only.
+
+    A record contributes to a component's average only when that
+    component is actually present in its components dict."""
+    stats = {}
+    for comp in comp_names:
+        w_vals = [r["components"][comp] for r in winners
+                  if comp in (r.get("components") or {})]
+        l_vals = [r["components"][comp] for r in losers
+                  if comp in (r.get("components") or {})]
+        w_avg = sum(w_vals) / len(w_vals) if w_vals else 0
+        l_avg = sum(l_vals) / len(l_vals) if l_vals else 0
+        edge = (w_avg - l_avg) / (l_avg + 1) if l_avg else 0
+        stats[comp] = {"w_avg": w_avg, "l_avg": l_avg, "edge": edge,
+                       "w_n": len(w_vals), "l_n": len(l_vals)}
+    return stats
+
+
+def is_gated(n_winners_with_features):
+    """Tuning gate: too few component-bearing winners -> no changes."""
+    return n_winners_with_features < MIN_WINNERS_WITH_FEATURES
+
+
+def _http(url, timeout=10):
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def get_current_fdv(mint):
+    """Get current FDV via DexScreener token API."""
+    pairs = _http(
+        "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    if not pairs:
+        return 0
+    return float(pairs[0].get("fdv") or pairs[0].get("marketCap") or 0)
+
+
+def load_weights():
+    with open(WEIGHTS_FILE) as f:
+        return json.load(f)
+
+
+def save_weights(w):
+    w["_updated"] = datetime.utcnow().isoformat() + "Z"
+    with open(WEIGHTS_FILE, "w") as f:
+        json.dump(w, f, indent=2)
+
+
+def log_change(msg):
+    logger.warning(msg)
+    if DRY_RUN:
+        print(msg)
+        return
+    line = "%s %s\n" % (datetime.utcnow().isoformat(), msg)
+    with open(LEARN_LOG, "a") as f:
+        f.write(line)
+
+
+def main():
+    # Load outcomes
+    try:
+        with open(TRACK_FILE) as f:
+            outcomes = json.load(f)
+    except Exception:
+        log_change("no outcomes file, skipping")
+        return
+
+    # Intraday peaks (degen-peak-tracker): the highest multiple each coin
+    # reached since its alert. A coin that ran 20x at noon and crashed by
+    # 3 AM is still a spotted runner — the crash is an exit problem,
+    # not a spotting problem. Winners are labeled on PEAK.
+    try:
+        with open(PEAKS_FILE) as f:
+            peaks = json.load(f)
+    except Exception:
+        peaks = {}
+
+    # Resolve: peak multiple per alerted mint (>2h old)
+    resolved = []
+    for mint, v in outcomes.items():
+        alert_fdv = v.get("alert_mcap", 0)
+        if not alert_fdv:
+            continue
+        # Only learn from alerts >2h old (give them time to move)
+        if time.time() - v.get("alert_ts", 0) < 7200:
+            continue
+        peak = peaks.get(mint, {}).get("peak_mult", 0)
+        now_fdv = get_current_fdv(mint)
+        close_mult = (now_fdv / alert_fdv) if now_fdv > 0 else 0
+        if peak <= 0:
+            # No peak data yet (tracker not running long enough) —
+            # fall back to the snapshot so learning never stalls.
+            # Dead/rugged (no price): honest loser at 0x.
+            peak = close_mult
+        resolved.append({
+            "mint": mint,
+            "symbol": v.get("symbol", "?"),
+            "mult": peak,          # peak drives winner labels + tuning
+            "close_mult": close_mult,  # reported for honesty
+            "winner": peak >= WIN_MULT,
+            "components": v.get("components", {}),
+            "has_components": record_has_components(v),
+        })
+        time.sleep(0.5)  # rate limit
+
+    if len(resolved) < MIN_SAMPLES:
+        log_change("only %d resolved outcomes (need %d), skipping" % (
+            len(resolved), MIN_SAMPLES))
+        return
+
+    winners = [r for r in resolved if r["winner"]]
+    losers = [r for r in resolved if not r["winner"]]
+    win_rate = len(winners) / len(resolved)
+
+    # Component-less records (e.g. every smart-watcher record) are
+    # EXCLUDED from signal stats — missing is not 0 (audit 2026-10-23).
+    featured = [r for r in resolved if r["has_components"]]
+    n_excluded = len(resolved) - len(featured)
+    feat_winners = [r for r in winners if r["has_components"]]
+    feat_losers = [r for r in losers if r["has_components"]]
+    log_change("resolved %d outcomes: %d with components, %d excluded "
+               "as component-less from signal stats" % (
+                   len(resolved), len(featured), n_excluded))
+
+    log_change("analyzed %d outcomes: %d runners by PEAK (%.0f%%) | "
+               "%d held 3x+ at close" % (
+        len(resolved), len(winners), win_rate * 100,
+        sum(1 for r in resolved if r["close_mult"] >= WIN_MULT)))
+    for w in sorted(winners, key=lambda r: -r["mult"])[:10]:
+        log_change("  RUNNER: $%s peak %.1fx (close %.1fx)" % (
+            w["symbol"], w["mult"], w["close_mult"]))
+    # Runner tiers by peak — the true "how many coins ran" count
+    for label, th in [("10x+", 10), ("20x+", 20), ("50x+", 50)]:
+        n = sum(1 for r in resolved if r["mult"] >= th)
+        if n:
+            log_change("  peak %s runners: %d" % (label, n))
+
+    # --- DEEP SIGNAL ANALYSIS ---
+    # Which score components actually predicted winners?
+    # Compare average component scores: winners vs losers
+    comp_names = SCORE_COMPONENTS
+    # Signal stats run ONLY on component-bearing records: a record
+    # contributes to a component's average only when it actually has
+    # that component (missing != 0).
+    comp_stats = compute_signal_stats(feat_winners, feat_losers,
+                                      comp_names)
+    for comp in comp_names:
+        stats = comp_stats[comp]
+        if feat_winners and feat_losers:
+            log_change("  signal %s: winners %.1f vs losers %.1f (edge %+.0f%%)" % (
+                comp, stats["w_avg"], stats["l_avg"], stats["edge"] * 100))
+
+    # --- Minimum-evidence gate (2026-10-23) ---
+    # No weight / min_score change may take effect unless >=10 winners
+    # WITH components exist in the resolved set. Log the gate out loud
+    # so the nightly log shows WHY nothing changed.
+    if is_gated(len(feat_winners)):
+        log_change("gated: %d winners-with-features < %d — no changes" % (
+            len(feat_winners), MIN_WINNERS_WITH_FEATURES))
+        if DRY_RUN:
+            print("DRY-RUN SUMMARY resolved=%d excluded_component_less=%d "
+                  "winners_with_features=%d gated=True changes=0" % (
+                      len(resolved), n_excluded, len(feat_winners)))
+        return
+
+    # --- Auto-tune logic ---
+    weights = load_weights()
+    w = weights["weights"]
+    t = weights["thresholds"]
+    b = weights["_bounds"]
+    changed = []
+
+    # Rule 1: Boost weights for signals with proven predictive edge
+    # If winners scored 30%+ higher on a signal, increase its weight
+    for comp, stats in comp_stats.items():
+        # No winner evidence for this signal -> no tuning on it, ever.
+        # (Without this, w_n == 0 reads as winners 0.0 and the negative
+        # branch ratchets the weight on missing data alone.)
+        if stats["w_n"] == 0:
+            continue
+        if stats["edge"] >= 0.30 and winners:
+            wkey = comp  # weights dict uses same names
+            if wkey in w and w[wkey] < b["weight_max"]:
+                new_w = min(b["weight_max"],
+                            round(w[wkey] + 0.15, 2))
+                if new_w != w[wkey]:
+                    w[wkey] = new_w
+                    changed.append(
+                        "%s weight → %.2f (edge %+.0f%% on winners)" % (
+                            comp, new_w, stats["edge"] * 100))
+        # If signal shows NEGATIVE edge (losers scored higher), reduce it
+        elif stats["edge"] <= -0.20 and winners and losers:
+            wkey = comp
+            if wkey in w and w[wkey] > b["weight_min"]:
+                new_w = max(b["weight_min"],
+                            round(w[wkey] - 0.10, 2))
+                if new_w != w[wkey]:
+                    w[wkey] = new_w
+                    changed.append(
+                        "%s weight → %.2f (NEGATIVE edge %+.0f%%)" % (
+                            comp, new_w, stats["edge"] * 100))
+
+    # Rule 2: If win rate very low, raise the bar
+    if len(resolved) >= 10 and win_rate < 0.10:
+        new_min = min(b["min_score_ceiling"], t["min_score"] + 5)
+        if new_min != t["min_score"]:
+            t["min_score"] = new_min
+            changed.append("min_score → %d (win rate %.0f%% too low)" % (
+                new_min, win_rate * 100))
+
+    # Rule 3: If win rate healthy, loosen slightly
+    elif len(resolved) >= 10 and win_rate > 0.25:
+        new_min = max(b["min_score_floor"], t["min_score"] - 3)
+        if new_min != t["min_score"]:
+            t["min_score"] = new_min
+            changed.append("min_score → %d (win rate %.0f%% healthy)" % (
+                new_min, win_rate * 100))
+
+    if changed:
+        if DRY_RUN:
+            for c in changed:
+                log_change("DRY-RUN would apply: " + c)
+            print("DRY-RUN SUMMARY resolved=%d excluded_component_less=%d "
+                  "winners_with_features=%d gated=False changes=%d "
+                  "(weights file NOT written)" % (
+                      len(resolved), n_excluded, len(feat_winners),
+                      len(changed)))
+        else:
+            save_weights(weights)
+            for c in changed:
+                log_change("AUTO-TUNE: " + c)
+    else:
+        log_change("no tuning changes needed")
+        if DRY_RUN:
+            print("DRY-RUN SUMMARY resolved=%d excluded_component_less=%d "
+                  "winners_with_features=%d gated=False changes=0" % (
+                      len(resolved), n_excluded, len(feat_winners)))
+
+
+if __name__ == "__main__":
+    main()

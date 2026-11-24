@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Offline replay window (2026-10-23, P4).
+
+Usage:
+    scripts/replay-window --ledger grad|grad_raw --from <epoch> --to <epoch>
+
+Reads the P4 recorder files overlapping the window and, for every
+close in the chosen ledger whose close_ts falls in the window,
+checks two things:
+
+  1. Detection coverage — was there a migration/birth record for
+     the mint at or before its entry_ts? (Migration items'
+     `created_ts` is the stream receipt time; it is used as the
+     seen/graduation time. Detection records are read with a 24h
+     lookback before --from so a graduation just before the window
+     still counts.)
+  2. Ladder reproduction — a simple ladder simulation over the
+     recorded quote snapshots (entry at the close's recorded
+     entry_price; legs 50%@2x / 25%@3x / 25% trail-30% / -50% stop,
+     constants imported from grad.py) versus the close's actual
+     realized_mult. Quotes are ~5s tape snapshots, so exact equality
+     is NOT expected: |diff| <= 0.15 MATCH, <= 0.5 DRIFT, else MISS
+     (missing quote data is also MISS).
+
+Prints a per-close table plus summary counts and coverage %.
+No network. Never writes ledgers.
+"""
+import argparse
+import json
+import os
+import sys as _sys
+import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+_sys.path.insert(0, _ROOT)
+_sys.path.insert(0, os.path.join(_ROOT, "daemon", "launch_scanner"))
+
+try:
+    from daemon.launch_scanner import grad as _grad
+    from daemon.launch_scanner import recorder as _rec
+except Exception:  # script-style import path
+    import grad as _grad  # type: ignore
+    import recorder as _rec  # type: ignore
+
+LEDGERS = {"grad": "grad_ledger.json", "grad_raw": "grad_raw_ledger.json"}
+
+
+def _home():
+    return os.environ.get("FOREX_AGENT_HOME",
+                          "/home/hatch/.forex-agent")
+
+
+def _load_closes(lane):
+    path = os.path.join(_home(), LEDGERS[lane])
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        closes = d.get("closes") if isinstance(d, dict) else None
+        return closes if isinstance(closes, list) else []
+    except Exception:
+        return []
+
+
+def _seen_ts(event):
+    """Seen/graduation time of a detection event: the item's
+    created_ts (stream receipt time) when present, else the
+    record's own ts."""
+    for key in ("created_ts", "ts"):
+        try:
+            v = float((event or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            return v
+    return 0.0
+
+
+def replay(lane, from_ts, to_ts):
+    closes = [c for c in _load_closes(lane)
+              if isinstance(c, dict)
+              and from_ts <= float(c.get("close_ts")
+                                   or c.get("entry_ts") or 0) <= to_ts]
+    closes.sort(key=lambda c: float(c.get("close_ts") or 0))
+
+    # Detection candidate set: mint -> earliest seen_ts.
+    detection = {}
+    det_from = max(0.0, from_ts - 86400.0) if from_ts > 0 else 0.0
+    for ev in _rec.read_events(det_from, to_ts,
+                               kinds=("migration", "birth")):
+        mint = str(ev.get("mint") or "")
+        if not mint:
+            continue
+        seen = _seen_ts(ev)
+        if seen > 0 and (mint not in detection or seen < detection[mint]):
+            detection[mint] = seen
+
+    # Quote snapshots grouped by mint.
+    quotes = {}
+    for ev in _rec.read_events(from_ts - 86400.0 if from_ts > 0 else 0.0,
+                               to_ts, kinds=("quote",)):
+        mint = str(ev.get("mint") or "")
+        try:
+            px = float(ev.get("price") or 0)
+            ts = float(ev.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mint and px > 0:
+            quotes.setdefault(mint, []).append((ts, px))
+    for mint in quotes:
+        quotes[mint].sort()
+
+    rows = []
+    counts = {"MATCH": 0, "DRIFT": 0, "MISS": 0}
+    covered = 0
+    for c in closes:
+        mint = str(c.get("mint") or "")
+        entry_ts = float(c.get("entry_ts") or 0)
+        close_ts = float(c.get("close_ts") or to_ts)
+        entry_price = float(c.get("entry_price") or 0)
+        actual = c.get("realized_mult")
+        try:
+            actual = float(actual)
+        except (TypeError, ValueError):
+            actual = None
+        seen = detection.get(mint)
+        has_cov = seen is not None and entry_ts > 0 and seen <= entry_ts
+        if has_cov:
+            covered += 1
+        window_q = [(ts, px) for ts, px in quotes.get(mint, [])
+                    if entry_ts <= ts <= close_ts]
+        sim = _rec.simulate_ladder(
+            entry_price, window_q,
+            leg_a_frac=_grad.LEG_A_FRAC, leg_a_target=_grad.LEG_A_TARGET,
+            leg_b_frac=_grad.LEG_B_FRAC, leg_b_target=_grad.LEG_B_TARGET,
+            leg_c_frac=_grad.LEG_C_FRAC, leg_c_trail=_grad.LEG_C_TRAIL,
+            hard_stop_mult=_grad.HARD_STOP_MULT)
+        sim_mult = sim.get("realized_mult")
+        diff = None
+        if sim_mult is not None and actual is not None:
+            diff = abs(float(sim_mult) - actual)
+        cls = _rec.classify_diff(diff, has_data=sim_mult is not None
+                                 and sim.get("n_quotes", 0) > 0)
+        counts[cls] = counts.get(cls, 0) + 1
+        rows.append({
+            "mint": mint, "symbol": str(c.get("symbol") or "?"),
+            "entry_ts": entry_ts, "close_ts": close_ts,
+            "actual": actual, "sim": sim_mult, "diff": diff,
+            "class": cls, "covered": has_cov,
+            "n_quotes": sim.get("n_quotes", 0),
+            "sim_reason": sim.get("closed_reason"),
+            "closed_reason": c.get("closed_reason"),
+        })
+    return rows, counts, covered
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Offline replay of ledger closes against the "
+                    "P4 recorder (no network, never writes ledgers).")
+    ap.add_argument("--ledger", choices=sorted(LEDGERS), required=True)
+    ap.add_argument("--from", dest="from_ts", type=float, default=0.0,
+                    help="window start, epoch seconds")
+    ap.add_argument("--to", dest="to_ts", type=float,
+                    default=None, help="window end, epoch seconds")
+    args = ap.parse_args(argv)
+    to_ts = args.to_ts if args.to_ts is not None else time.time()
+    from_ts = args.from_ts
+
+    rows, counts, covered = replay(args.ledger, from_ts, to_ts)
+    print("replay ledger=%s window=[%.0f, %.0f] closes=%d"
+          % (args.ledger, from_ts, to_ts, len(rows)))
+    hdr = ("%-14s %-8s %8s %8s %7s %-6s %-5s %6s %s"
+           % ("mint", "symbol", "actual", "sim", "|diff|", "class",
+              "cover", "quotes", "reason (actual -> sim)"))
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        print("%-14s %-8s %8s %8s %7s %-6s %-5s %6d %s -> %s" % (
+            (r["mint"] or "?")[:14], r["symbol"][:8],
+            ("%.4f" % r["actual"]) if r["actual"] is not None else "-",
+            ("%.4f" % r["sim"]) if r["sim"] is not None else "-",
+            ("%.3f" % r["diff"]) if r["diff"] is not None else "-",
+            r["class"], "yes" if r["covered"] else "no",
+            r["n_quotes"],
+            r["closed_reason"] or "-", r["sim_reason"] or "-"))
+    n = len(rows)
+    cov_pct = (100.0 * covered / n) if n else 0.0
+    print()
+    print("summary: MATCH=%d DRIFT=%d MISS=%d total=%d"
+          % (counts.get("MATCH", 0), counts.get("DRIFT", 0),
+             counts.get("MISS", 0), n))
+    print("detection coverage: %d/%d closes (%.1f%%)"
+          % (covered, n, cov_pct))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,42 @@
+{
+  "capture_method": "daemon/launch_scanner/reserves.py rpc() (live Helius/public path, pacer-governed)",
+  "captured_ts": 1795341586.3654761,
+  "captured_utc": "2026-11-22T09:59:46Z",
+  "elapsed_s": 1.876,
+  "fixture": "live_getAccountInfo_wsol",
+  "method": "getAccountInfo",
+  "params": [
+    "So11111111111111111111111111111111111111112",
+    {
+      "encoding": "jsonParsed"
+    }
+  ],
+  "result": {
+    "context": {
+      "apiVersion": "4.4.0",
+      "slot": 472499400
+    },
+    "value": {
+      "data": {
+        "parsed": {
+          "info": {
+            "decimals": 9,
+            "freezeAuthority": null,
+            "isInitialized": true,
+            "mintAuthority": null,
+            "supply": "0"
+          },
+          "type": "mint"
+        },
+        "program": "spl-token",
+        "space": 82
+      },
+      "executable": false,
+      "lamports": 1933437407902,
+      "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "rentEpoch": 18446744073709551615,
+      "space": 82
+    }
+  },
+  "source": "public-rpc"
+}

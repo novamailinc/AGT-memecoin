@@ -1,0 +1,7 @@
+id: custom.legacy-helius
+title: custom.legacy-helius
+description: Use Helius when the user asks for Helius or this provider's API.
+include_in_prompt: true
+require_auth: false
+availability:
+  confidential_vm: false

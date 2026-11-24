@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Eagle Eye Engine 2 — Momentum: trending token scoring.
+
+SILENT DATA LAYER — writes to SQLite, sends ZERO Telegram signals.
+
+Owns stage='trending'. Polls trending tokens on tiers:
+- hot (50 tokens) @15s — score rising or candidates
+- warm (200 tokens) @60s — passed filters, quiet
+- cold (250 tokens) @5min — watchlist
+
+Uses DexScreener batch (/tokens/v1/solana/{30 mints}, 300/min limit).
+Budget: ~15 calls/min (20x headroom).
+
+Scores via eagle_eye_score (0-100 composite, traceable factors).
+- score >= 70 + state WATCHLIST/NEW → CANDIDATE + hot tier + runner event
+- score >= 50 + state NEW → WATCHLIST + warm tier
+- Old/cold tokens → promote stage 'trending' → 'established'
+
+The smartflow engine picks up stage='established' on its next poll.
+
+Usage: scripts/eagle-eye-momentum [--once]
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from robust_http import get_json
+import eagle_eye_db as db
+from eagle_eye_score import score_token
+
+try:
+    import killswitch
+    _HAS_KS = True
+except ImportError:
+    _HAS_KS = False
+
+ENGINE_ID = db.ENGINE_MOMENTUM
+
+# Tier config: (tier_name, poll_interval_s, max_tokens)
+TIERS = [
+    (db.TIER_HOT, 15, 50),
+    (db.TIER_WARM, 60, 200),
+    (db.TIER_COLD, 300, 250),
+]
+
+DS_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{}"
+RUNNER_SCORE = 70
+ESTABLISH_AGE_S = 6 * 3600  # trending → established after 6h
+
+
+def fetch_batch(mints: list) -> dict:
+    """DexScreener batch: 15 mints per call (smaller = proxy-safe)."""
+    if not mints:
+        return {}
+    result = {}
+    for i in range(0, len(mints), 15):
+        batch = mints[i:i + 15]
+        try:
+            url = DS_BATCH.format(",".join(batch))
+            data = get_json(url, tries=4, timeout=25)
+            for t in (data if isinstance(data, list) else []):
+                # /tokens/v1 returns baseToken.address (not tokenAddress)
+                addr = t.get("baseToken", {}).get("address", "")
+                if addr:
+                    result[addr] = t
+        except Exception as e:
+            print(f"  [{ENGINE_ID}] batch failed: {e}", flush=True)
+        time.sleep(0.5)
+    return result
+
+
+def extract_features(ds_token: dict) -> dict:
+    """Extract momentum features from DexScreener /tokens/v1 object.
+
+    Note: /tokens/v1 provides m5/h1/h6/h24 windows (no m15),
+    no buyer/seller wallet counts, no liquidity field.
+    We map h1→m15 slots and default missing fields to 0.
+    """
+    txns = ds_token.get("txns", {})
+    volume = ds_token.get("volume", {})
+    price_chg = ds_token.get("priceChange", {})
+    m5 = txns.get("m5", {})
+
+    return {
+        "price_usd": float(ds_token.get("priceUsd", 0) or 0),
+        "volume_m5": float(volume.get("m5", 0) or 0),
+        "volume_m15": float(volume.get("h1", 0) or 0) / 4,  # approx
+        "volume_h1": float(volume.get("h1", 0) or 0),
+        "volume_h24": float(volume.get("h24", 0) or 0),
+        "buys_m5": int(m5.get("buys", 0) or 0),
+        "sells_m5": int(m5.get("sells", 0) or 0),
+        "buyers_m5": 0,  # not provided by /tokens/v1
+        "sellers_m5": 0,
+        "price_chg_m5": float(price_chg.get("h1", 0) or 0) / 12,  # approx
+        "price_chg_m15": float(price_chg.get("h1", 0) or 0) / 4,  # approx
+        "price_chg_h1": float(price_chg.get("h1", 0) or 0),
+        "liq_usd": 0,  # not provided; use stored value from discovery
+        "fdv_usd": float(ds_token.get("fdv", 0) or 0),
+    }
+
+
+def get_baseline(conn, mint: str, window_s: float = 1800) -> float:
+    cur = conn.execute(
+        "SELECT AVG(vol_m5) as avg_v FROM snapshots"
+        " WHERE mint=? AND ts > ?",
+        (mint, time.time() - window_s))
+    r = cur.fetchone()
+    return r["avg_v"] if r and r["avg_v"] else 0
+
+
+def poll_tier(conn, tier: str, max_tokens: int) -> int:
+    """Poll one tier of stage='trending' tokens. Returns count updated."""
+    cur = conn.execute(
+        "SELECT mint, symbol, state, first_seen FROM tokens"
+        " WHERE stage='trending' AND tier=? LIMIT ?",
+        (tier, max_tokens))
+    tokens = [dict(r) for r in cur.fetchall()]
+    if not tokens:
+        return 0
+
+    ds_data = fetch_batch([t["mint"] for t in tokens])
+    updated = 0
+    now = time.time()
+
+    for t in tokens:
+        mint = t["mint"]
+        ds = ds_data.get(mint)
+        if not ds:
+            continue
+        feat = extract_features(ds)
+        age_s = now - (t["first_seen"] or now)
+        baseline = get_baseline(conn, mint)
+
+        result = score_token({
+            **feat,
+            "baseline_m5": baseline if baseline > 0 else feat["volume_m5"],
+            "vol_1m": feat["volume_m5"] / 5,
+            "age_s": age_s,
+        })
+
+        db.update_momentum(conn, mint, {
+            "price_usd": feat["price_usd"],
+            "volume_m5": feat["volume_m5"],
+            "volume_m15": feat["volume_m15"],
+            "volume_h1": feat["volume_h1"],
+            "volume_h24": feat["volume_h24"],
+            "buys_m5": feat["buys_m5"],
+            "sells_m5": feat["sells_m5"],
+            "buyers_m5": feat["buyers_m5"],
+            "sellers_m5": feat["sellers_m5"],
+            "price_chg_m5": feat["price_chg_m5"],
+            "price_chg_m15": feat["price_chg_m15"],
+            "price_chg_h1": feat["price_chg_h1"],
+            "heat_score": result["heat"],
+            "momentum_score": result["score"],
+            "buy_sell_ratio": result["buy_sell_ratio"],
+            "factors": result["factors"],
+        })
+        db.record_snapshot(conn, mint, feat["price_usd"],
+                           feat["volume_m5"], feat["buys_m5"],
+                           feat["sells_m5"])
+
+        # State transitions (I own stage='trending')
+        cur_state = t["state"]
+        score = result["score"]
+        if score >= RUNNER_SCORE and cur_state in (db.WATCHLIST, db.NEW):
+            db.set_state(conn, mint, db.CANDIDATE)
+            db.set_tier(conn, mint, db.TIER_HOT)
+            db.record_runner(conn, mint, t.get("symbol", "?"), score)
+            print(f"  [{ENGINE_ID}] RUNNER {t.get('symbol','?')}: {score}",
+                  flush=True)
+        elif score >= 50 and cur_state == db.NEW:
+            db.set_state(conn, mint, db.WATCHLIST)
+            db.set_tier(conn, mint, db.TIER_WARM)
+        elif score >= RUNNER_SCORE:
+            # Already candidate, keep hot
+            db.set_tier(conn, mint, db.TIER_HOT)
+        elif score < 20:
+            db.set_tier(conn, mint, db.TIER_COLD)
+
+        updated += 1
+
+    return updated
+
+
+def promote_established(conn) -> int:
+    """Promote old trending tokens → 'established' (smartflow's stage)."""
+    cutoff = time.time() - ESTABLISH_AGE_S
+    cur = conn.execute(
+        "SELECT mint FROM tokens WHERE stage='trending'"
+        " AND first_seen < ? AND state != 'CANDIDATE'",
+        (cutoff,))
+    n = 0
+    for row in cur.fetchall():
+        db.promote_stage(conn, row["mint"], db.STAGE_ESTABLISHED)
+        n += 1
+    return n
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args()
+
+    if _HAS_KS and not killswitch.gate("eagle_eye"):
+        print(f"[{ENGINE_ID}] halted by killswitch", flush=True)
+        return
+
+    conn = db.get_db()
+    print(f"🦅 [{ENGINE_ID}] starting (silent)", flush=True)
+
+    last_poll = {t[0]: 0 for t in TIERS}
+
+    while True:
+        start = time.time()
+        now = time.time()
+        total = 0
+        err = ""
+        try:
+            for tier, interval, max_tok in TIERS:
+                if now - last_poll[tier] >= interval:
+                    n = poll_tier(conn, tier, max_tok)
+                    total += n
+                    last_poll[tier] = time.time()
+            promoted = promote_established(conn)
+            if promoted:
+                print(f"  [{ENGINE_ID}] {promoted} → established", flush=True)
+            db.prune_snapshots(conn)
+        except Exception as e:
+            err = str(e)[:200]
+            print(f"  [{ENGINE_ID}] error: {err}", flush=True)
+
+        cycle_ms = int((time.time() - start) * 1000)
+        db.update_engine_heartbeat(conn, ENGINE_ID, total, cycle_ms, err)
+        if total:
+            print(f"  [{ENGINE_ID}] {total} updated ({cycle_ms}ms)",
+                  flush=True)
+
+        if args.once:
+            break
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

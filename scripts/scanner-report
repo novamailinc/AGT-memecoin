@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Scanner baseline report — advanced build, governing rule step 1.
+
+Test the scanner BEFORE anything new depends on it: measure
+detection-to-decision latency per lane, sensitivity (how early it
+catches real runners), and the false-positive rate against the
+runner-only bar, from the LIVE paper ledgers. Read-only: never
+writes, never calls the network, never touches a daemon.
+
+Sources (all local):
+  * <HOME>/<lane>_ledger.json closes — P5 latency stamps
+    (born_ts, seen_ts, decided_ts, entry_ts), entry_features
+    (detection source, grad_age_s, select measurements),
+    pnl_usd, realized_mult.
+  * select_journal in the ledger — filter-rejection counts by
+    reason (evaluated vs entered).
+
+Metrics:
+  * latency medians per lane: born->seen, seen->decided,
+    decided->entered, born->entered (grad age at entry).
+  * sensitivity: share of closes (and of WINNERS) detected at
+    grad_age <=5s / <=15s / <=30s, and win rate + net per age
+    bucket. A hypersensitive scanner must catch winners early;
+    the exit study (2026-11-21) found age <=30s wins 71.0%
+    vs >30s 21.5% — the scanner's job is to put entries in the
+    fast bucket.
+  * detection source split: stream (pumpportal-migration) vs
+    backfill (geckoterminal-backfill) — win rate + net each.
+  * false-positive rate: entered closes that lost / entered
+    closes (a false positive is an entry that loses money);
+    plus the filter-rejection breakdown (which gate rejects
+    what, and the evaluated-vs-entered ratio).
+
+Usage: scripts/scanner-report [--days N] [--lane LANE]
+Plain script — run directly with the venv python, not pytest.
+"""
+import argparse
+import json
+import os
+import statistics
+import sys
+import time
+
+HOME = os.environ.get(
+    "FOREX_AGENT_HOME",
+    os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+LANES = ("grad_select", "grad_raw", "tranche", "tranche_protect",
+         "momentum")
+
+LEDGER_FILES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+    "momentum": "momentum_ledger.json",
+}
+
+
+def _load_ledger(lane):
+    try:
+        with open(os.path.join(HOME, LEDGER_FILES[lane])) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _med(xs):
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return None
+    return statistics.median(xs)
+
+
+def _fmt(x, digits=1):
+    if x is None:
+        return "n/a"
+    return "%.*f" % (digits, x)
+
+
+def _bucket(age):
+    if age is None:
+        return "unknown"
+    if age <= 5:
+        return "<=5s"
+    if age <= 15:
+        return "5-15s"
+    if age <= 30:
+        return "15-30s"
+    return ">30s"
+
+
+def report_lane(lane, since_ts):
+    d = _load_ledger(lane)
+    closes = [c for c in (d.get("closes") or [])
+              if isinstance(c, dict)]
+    if since_ts:
+        closes = [c for c in closes
+                  if float(c.get("close_ts") or 0) >= since_ts]
+    positions = d.get("positions") or {}
+    out = {"lane": lane, "n": len(closes), "open": len(positions)}
+    if not closes:
+        return out
+    pnls = [float(c.get("pnl_usd") or 0) for c in closes]
+    wins = [p for p in pnls if p > 0]
+    out["wins"] = len(wins)
+    out["win_rate"] = len(wins) / len(pnls) if pnls else 0.0
+    out["net"] = sum(pnls)
+    out["mean"] = sum(pnls) / len(pnls) if pnls else 0.0
+    # False-positive rate: entered closes that lost money.
+    out["false_positive_rate"] = \
+        (len(pnls) - len(wins)) / len(pnls) if pnls else 0.0
+
+    # ---- latency (P5 stamps) ----
+    born_seen = []
+    seen_decided = []
+    decided_entered = []
+    born_entered = []
+    for c in closes:
+        born = c.get("born_ts")
+        seen = c.get("seen_ts")
+        decided = c.get("decided_ts")
+        entered = c.get("entry_ts")
+        try:
+            if born and seen:
+                born_seen.append(float(seen) - float(born))
+            if seen and decided:
+                seen_decided.append(float(decided) - float(seen))
+            if decided and entered:
+                decided_entered.append(float(entered) - float(decided))
+            if born and entered:
+                born_entered.append(float(entered) - float(born))
+        except (TypeError, ValueError):
+            continue
+    out["latency"] = {
+        "born_seen": _med(born_seen),
+        "seen_decided": _med(seen_decided),
+        "decided_entered": _med(decided_entered),
+        "born_entered": _med(born_entered),
+    }
+
+    # ---- sensitivity: age buckets ----
+    buckets = {}
+    for c in closes:
+        ef = c.get("entry_features") or {}
+        age = ef.get("grad_age_s")
+        if age is None:
+            age = c.get("entry_ts") and c.get("born_ts") and \
+                float(c["entry_ts"]) - float(c["born_ts"])
+        b = _bucket(age)
+        cell = buckets.setdefault(b, {"n": 0, "wins": 0, "net": 0.0})
+        cell["n"] += 1
+        pnl = float(c.get("pnl_usd") or 0)
+        cell["net"] += pnl
+        if pnl > 0:
+            cell["wins"] += 1
+    out["age_buckets"] = buckets
+    # Share of winners caught fast (<=30s, <=15s, <=5s).
+    win_ages = []
+    for c in closes:
+        if float(c.get("pnl_usd") or 0) > 0:
+            ef = c.get("entry_features") or {}
+            age = ef.get("grad_age_s")
+            if age is not None:
+                win_ages.append(float(age))
+    out["winners_fast"] = {
+        "n_winners_with_age": len(win_ages),
+        "le_5s": sum(1 for a in win_ages if a <= 5),
+        "le_15s": sum(1 for a in win_ages if a <= 15),
+        "le_30s": sum(1 for a in win_ages if a <= 30),
+    }
+
+    # ---- detection source split ----
+    sources = {}
+    for c in closes:
+        ef = c.get("entry_features") or {}
+        src = str(ef.get("detection") or
+                  c.get("source") or "unknown")
+        if "pumpportal" in src or "migration" in src:
+            src = "stream"
+        elif "geckoterminal" in src or "backfill" in src:
+            src = "backfill"
+        cell = sources.setdefault(src, {"n": 0, "wins": 0, "net": 0.0})
+        cell["n"] += 1
+        pnl = float(c.get("pnl_usd") or 0)
+        cell["net"] += pnl
+        if pnl > 0:
+            cell["wins"] += 1
+    out["sources"] = sources
+
+    # ---- filter-rejection breakdown (evaluated vs entered) ----
+    # Cumulative counts are only meaningful for the full ledger;
+    # a windowed report sums counts_by_day over the window's WAT
+    # dates instead (never mix cumulative counts with a windowed
+    # entered total).
+    journal = d.get("select_journal") or {}
+    counts = dict(journal.get("counts") or {})
+    if since_ts:
+        import datetime as _dt
+        by_day = journal.get("counts_by_day") or {}
+        days = set()
+        t = since_ts
+        end = time.time()
+        while t <= end:
+            days.add(_dt.datetime.fromtimestamp(
+                t + 3600, _dt.timezone.utc).strftime("%Y-%m-%d"))
+            t += 86400
+        counts = {}
+        for day in days:
+            for reason, n in (by_day.get(day) or {}).items():
+                counts[reason] = counts.get(reason, 0) + int(n or 0)
+    out["rejections"] = counts
+    out["rejected_total"] = sum(counts.values())
+    entered = len(closes) + len(positions)
+    out["entered_total"] = entered
+    if counts:
+        out["evaluated_total"] = out["rejected_total"] + entered
+        out["entry_rate"] = entered / out["evaluated_total"] \
+            if out["evaluated_total"] else 0.0
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=float, default=0.0)
+    ap.add_argument("--lane", default="")
+    args = ap.parse_args(argv)
+    since_ts = 0.0
+    if args.days:
+        since_ts = time.time() - args.days * 86400.0
+    lanes = [args.lane] if args.lane else list(LANES)
+    print("scanner baseline — live paper ledgers%s"
+          % (" (last %.1fd)" % args.days if args.days else ""))
+    print("home: %s" % HOME)
+    for lane in lanes:
+        r = report_lane(lane, since_ts)
+        print("")
+        print("== %s: n=%d open=%d ==" % (lane, r["n"], r["open"]))
+        if not r["n"]:
+            print("  no closes in window")
+            continue
+        print("  closes: %d, %d wins, win rate %.1f%%, net $%.2f, "
+              "mean $%.2f/close" % (
+                  r["n"], r["wins"], r["win_rate"] * 100,
+                  r["net"], r["mean"]))
+        print("  false-positive rate (entered closes that lost): "
+              "%.1f%%" % (r["false_positive_rate"] * 100))
+        lat = r["latency"]
+        print("  latency medians (s): born->seen %s, seen->decided "
+              "%s, decided->entered %s, born->entered %s" % (
+                  _fmt(lat["born_seen"]), _fmt(lat["seen_decided"]),
+                  _fmt(lat["decided_entered"]),
+                  _fmt(lat["born_entered"])))
+        print("  age buckets (grad_age at entry):")
+        for b in ("<=5s", "5-15s", "15-30s", ">30s", "unknown"):
+            cell = r["age_buckets"].get(b)
+            if not cell:
+                continue
+            wr = cell["wins"] / cell["n"] * 100 if cell["n"] else 0
+            print("    %-8s n=%-4d win %.1f%% net $%.2f" % (
+                b, cell["n"], wr, cell["net"]))
+        wf = r["winners_fast"]
+        if wf["n_winners_with_age"]:
+            print("  winners caught fast: %d/%d <=5s, %d/%d <=15s, "
+                  "%d/%d <=30s (of %d winners with age)" % (
+                      wf["le_5s"], wf["n_winners_with_age"],
+                      wf["le_15s"], wf["n_winners_with_age"],
+                      wf["le_30s"], wf["n_winners_with_age"],
+                      wf["n_winners_with_age"]))
+        print("  detection source:")
+        for src, cell in sorted(r["sources"].items()):
+            wr = cell["wins"] / cell["n"] * 100 if cell["n"] else 0
+            print("    %-10s n=%-4d win %.1f%% net $%.2f" % (
+                src, cell["n"], wr, cell["net"]))
+        if r.get("rejections"):
+            print("  filter rejections (%s): total %d, "
+                  "entered %d, entry rate %.2f%%" % (
+                      "window" if since_ts else "cumulative",
+                      r["rejected_total"], r["entered_total"],
+                      r.get("entry_rate", 0) * 100))
+            for reason, n in sorted(
+                    r["rejections"].items(), key=lambda kv: -kv[1]):
+                print("    %-22s %d" % (reason, n))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

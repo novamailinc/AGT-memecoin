@@ -1,0 +1,210 @@
+{
+  "overall": {
+    "n": 450,
+    "expectancy": -0.3225269493298889,
+    "mean_mult": 0.6774730506701111,
+    "n_negative_multiples": 12,
+    "wr_ge_1_5": 0.09333333333333334,
+    "wr_gt_1": 0.18888888888888888,
+    "share_ge_1_0": 0.19555555555555557,
+    "rug_rate": 0.32222222222222224,
+    "rug_basis": "mixed",
+    "wilson95_wr_ge_1_5": [
+      0.06979182957757035,
+      0.12375914976431246
+    ],
+    "required_n": null,
+    "required_n_note": "observed WR 0.093 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+  },
+  "per_lane": {
+    "ceo": {
+      "n": 1,
+      "expectancy": 0.40470000000000006,
+      "mean_mult": 1.4047,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.0,
+      "wr_gt_1": 1.0,
+      "share_ge_1_0": 1.0,
+      "rug_rate": 0.0,
+      "rug_basis": "proxy",
+      "wilson95_wr_ge_1_5": [
+        0.0,
+        0.7934506856227626
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.000 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "degen_mirror": {
+      "n": 37,
+      "expectancy": -0.4398903243243243,
+      "mean_mult": 0.5601096756756757,
+      "n_negative_multiples": 11,
+      "wr_ge_1_5": 0.0,
+      "wr_gt_1": 0.08108108108108109,
+      "share_ge_1_0": 0.08108108108108109,
+      "rug_rate": 0.32432432432432434,
+      "rug_basis": "proxy",
+      "wilson95_wr_ge_1_5": [
+        0.0,
+        0.09405782583720246
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.000 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "hl_mirror": {
+      "n": 4,
+      "expectancy": -0.002006249999999987,
+      "mean_mult": 0.99799375,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.0,
+      "wr_gt_1": 0.5,
+      "share_ge_1_0": 0.5,
+      "rug_rate": 0.0,
+      "rug_basis": "proxy",
+      "wilson95_wr_ge_1_5": [
+        0.0,
+        0.4898908364545972
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.000 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "paper": {
+      "n": 383,
+      "expectancy": -0.3269279373368146,
+      "mean_mult": 0.6730720626631854,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.10182767624020887,
+      "wr_gt_1": 0.185378590078329,
+      "share_ge_1_0": 0.19321148825065274,
+      "rug_rate": 0.34464751958224543,
+      "rug_basis": "recorded",
+      "wilson95_wr_ge_1_5": [
+        0.07538677065155705,
+        0.13617653766134194
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.102 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "stacker": {
+      "n": 7,
+      "expectancy": -0.5616560296100063,
+      "mean_mult": 0.43834397038999373,
+      "n_negative_multiples": 1,
+      "wr_ge_1_5": 0.0,
+      "wr_gt_1": 0.0,
+      "share_ge_1_0": 0.0,
+      "rug_rate": 0.14285714285714285,
+      "rug_basis": "proxy",
+      "wilson95_wr_ge_1_5": [
+        0.0,
+        0.3543304350666873
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.000 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "steady": {
+      "n": 18,
+      "expectancy": -0.006270443954442317,
+      "mean_mult": 0.9937295560455577,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.16666666666666666,
+      "wr_gt_1": 0.4444444444444444,
+      "share_ge_1_0": 0.4444444444444444,
+      "rug_rate": 0.0,
+      "rug_basis": "proxy",
+      "wilson95_wr_ge_1_5": [
+        0.05836576805861449,
+        0.39222038103915724
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.167 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    }
+  },
+  "per_source": {
+    "(blank)": {
+      "n": 289,
+      "expectancy": -0.29993460207612455,
+      "mean_mult": 0.7000653979238755,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.11764705882352941,
+      "wr_gt_1": 0.1972318339100346,
+      "share_ge_1_0": 0.20761245674740483,
+      "rug_rate": 0.3633217993079585,
+      "rug_basis": "recorded",
+      "wilson95_wr_ge_1_5": [
+        0.08542195604254742,
+        0.15990348083380151
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.118 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "gecko-trending": {
+      "n": 43,
+      "expectancy": -0.19851162790697674,
+      "mean_mult": 0.8014883720930233,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.046511627906976744,
+      "wr_gt_1": 0.2558139534883721,
+      "share_ge_1_0": 0.2558139534883721,
+      "rug_rate": 0.046511627906976744,
+      "rug_basis": "recorded",
+      "wilson95_wr_ge_1_5": [
+        0.012849260094380241,
+        0.1545549800406396
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.047 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "launch.early_digest": {
+      "n": 2,
+      "expectancy": -0.044300000000000006,
+      "mean_mult": 0.9557,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.0,
+      "wr_gt_1": 0.0,
+      "share_ge_1_0": 0.0,
+      "rug_rate": 0.0,
+      "rug_basis": "recorded",
+      "wilson95_wr_ge_1_5": [
+        0.0,
+        0.6576197724933468
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.000 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "launch.lowcap_runner": {
+      "n": 2,
+      "expectancy": -0.40185000000000004,
+      "mean_mult": 0.59815,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.0,
+      "wr_gt_1": 0.0,
+      "share_ge_1_0": 0.0,
+      "rug_rate": 0.0,
+      "rug_basis": "recorded",
+      "wilson95_wr_ge_1_5": [
+        0.0,
+        0.6576197724933468
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.000 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    },
+    "pumpfun": {
+      "n": 47,
+      "expectancy": -0.6192340425531915,
+      "mean_mult": 0.3807659574468085,
+      "n_negative_multiples": 0,
+      "wr_ge_1_5": 0.06382978723404255,
+      "wr_gt_1": 0.06382978723404255,
+      "share_ge_1_0": 0.06382978723404255,
+      "rug_rate": 0.5319148936170213,
+      "rug_basis": "recorded",
+      "wilson95_wr_ge_1_5": [
+        0.021945385205433265,
+        0.17162614183124433
+      ],
+      "required_n": null,
+      "required_n_note": "observed WR 0.064 does not exceed the 30% null; statslab.required_n requires p1 > p0 -- there is no edge here to power for"
+    }
+  }
+}

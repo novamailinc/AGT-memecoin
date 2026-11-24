@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Degen peak tracker: intraday peak-multiple measurement for the degen lane.
+
+The nightly learner only sees each coin's price at 3 AM — a coin that ran
+20x at noon and crashed by night counts as a loser. That hides the truth
+about whether the lane is actually spotting runners.
+
+This daemon polls every 10 minutes and records the HIGHEST multiple each
+alerted coin reached since its alert (peak_mult), so the learner can answer:
+"how many of our cards actually ran?"
+
+Writes /home/hatch/.forex-agent/degen_peaks.json (separate file — never
+touches degen_outcomes.json, avoiding multi-writer corruption).
+
+Polls mints alerted in the last 48h (fresh runners), plus mints in the
+degen-feed counterfactual candidate log (degen_candidates.jsonl), so
+rejected candidates get peak labels too.
+
+DEATH + REPAIR (2026-10-23): this tracker was removed from the watchdog
+on 2026-10-14 as "RETIRED with Degen v1" while the (v3) nightly learner
+still labels winners from its peaks; it was never added to the resident
+supervisor roster or any cron, so when the process died nothing revived
+it and the learner silently fell back to unstable close multiples.
+It is now in the supervisor roster (+ watchdog fallback). Retention is
+also fixed: entries used to be PRUNED at 48h, so no peak could ever
+label an older graded outcome; peaks now persist for 90 days (polling
+still only covers the first 48h — the peak is captured while fresh and
+then kept durably for the learner).
+"""
+import json
+import logging
+import os
+import time
+import urllib.request
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("degen-peak-tracker")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+OUTCOMES_FILE = os.path.join(HOME, "degen_outcomes.json")
+CANDIDATES_FILE = os.path.join(HOME, "degen_candidates.jsonl")
+PEAKS_FILE = os.path.join(HOME, "degen_peaks.json")
+LOG_FILE = os.path.join(HOME, "log", "degen-peak-tracker.log")
+
+POLL_SECS = 600          # 10 minutes
+TRACK_WINDOW_SECS = 48 * 3600  # poll mints alerted in last 48h
+# Peaks PERSIST far beyond the polling window so the learner can grade
+# older outcomes on their true intraday peak (was: pruned at 48h).
+PEAK_RETENTION_SECS = 90 * 24 * 3600
+REQ_GAP_SECS = 1.0       # gentle on DexScreener
+# Per-cycle poll cap: the counterfactual candidate log is prolific
+# (hundreds/day), and an uncapped cycle would run back-to-back and
+# starve every other DexScreener consumer. Fired-card outcomes are
+# always polled first; newest candidates fill the remaining slots
+# (their peaks are the ones still forming).
+MAX_POLLS_PER_CYCLE = 300
+
+
+def _http(url, timeout=12):
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def get_fdv(mint):
+    pairs = _http(
+        "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    if not pairs:
+        return 0
+    return float(pairs[0].get("fdv") or pairs[0].get("marketCap") or 0)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def prune_peaks(peaks, now):
+    """Drop only peaks past the long retention horizon (90d), NOT the
+    48h polling window — a peak recorded while a coin was fresh must
+    stay available for as long as the learner may grade that outcome.
+    Returns the list of dropped mints."""
+    stale = [m for m, p in peaks.items()
+             if now - p.get("alert_ts", 0) >= PEAK_RETENTION_SECS]
+    for m in stale:
+        del peaks[m]
+    return stale
+
+
+def build_poll_set(outcomes, candidates, now,
+                   cap=MAX_POLLS_PER_CYCLE):
+    """Mints to poll this cycle: fresh (<48h, mcap>0) outcome mints
+    first (all of them), then fresh candidate mints newest-first until
+    the per-cycle cap. Candidates already in outcomes are not duped."""
+    fresh_o = {m: v for m, v in outcomes.items()
+               if now - v.get("alert_ts", 0) < TRACK_WINDOW_SECS
+               and v.get("alert_mcap", 0) > 0}
+    poll = dict(fresh_o)
+    room = cap - len(poll)
+    if room > 0:
+        fresh_c = [(m, v) for m, v in candidates.items()
+                   if m not in poll
+                   and now - v.get("alert_ts", 0) < TRACK_WINDOW_SECS
+                   and v.get("alert_mcap", 0) > 0]
+        fresh_c.sort(key=lambda kv: -kv[1].get("alert_ts", 0))
+        for m, v in fresh_c[:room]:
+            poll[m] = v
+    return poll
+
+
+def load_candidate_mints(path):
+    """Read the degen-feed counterfactual log (JSONL) into an
+    outcomes-shaped dict {mint: {symbol, alert_ts, alert_mcap}} so
+    rejected candidates receive the same peak tracking as fired cards.
+    Bounded by the feed's own rotation; fail-soft per line."""
+    out = {}
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except Exception:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        mint = r.get("mint")
+        if mint and r.get("alert_mcap", 0) > 0 and r.get("alert_ts", 0) > 0:
+            out[mint] = {"symbol": r.get("symbol", "?"),
+                         "alert_ts": r["alert_ts"],
+                         "alert_mcap": r["alert_mcap"]}
+    return out
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("degen-peak-tracker", token="scripts/degen-peak-tracker")
+    logging.getLogger().handlers[0].setLevel(logging.WARNING)
+    fh = logging.FileHandler(LOG_FILE)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(fh)
+    logger.warning("degen peak tracker started (intraday peak multiples)")
+
+    while True:
+        try:
+            cycle()
+        except Exception as e:
+            logger.warning("cycle error: %s", e)
+        time.sleep(POLL_SECS)
+
+
+def cycle():
+    now = time.time()
+    outcomes = load_json(OUTCOMES_FILE, {})
+    # Counterfactual candidates get peak labels too (audit 2026-10-23
+    # §6.4: rejected candidates were never recorded, let alone tracked).
+    candidates = load_candidate_mints(CANDIDATES_FILE)
+    peaks = load_json(PEAKS_FILE, {})
+
+    # Poll fresh mints only (last 48h), outcomes first, capped
+    fresh = build_poll_set(outcomes, candidates, now)
+
+    updated = 0
+    for mint, v in fresh.items():
+        alert_mcap = v.get("alert_mcap", 0)
+        fdv = get_fdv(mint)
+        if fdv > 0:
+            mult = fdv / alert_mcap
+            prev = peaks.get(mint, {}).get("peak_mult", 0)
+            if mult > prev:
+                peaks[mint] = {
+                    "symbol": v.get("symbol", "?"),
+                    "alert_mcap": alert_mcap,
+                    "alert_ts": v.get("alert_ts", 0),
+                    "peak_mult": round(mult, 3),
+                    "peak_ts": now,
+                }
+                updated += 1
+        time.sleep(REQ_GAP_SECS)
+
+    # Retention prune only (90d) — peaks persist for learner grading
+    # long after the 48h polling window closes.
+    stale = prune_peaks(peaks, now)
+
+    if updated or stale:
+        tmp = PEAKS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(peaks, f)
+        os.replace(tmp, PEAKS_FILE)
+    # Per-cycle liveness line: a frozen log is how the 2026-10-14 death
+    # was (belatedly) diagnosed; keep the heartbeat visible.
+    logger.warning("cycle: %d fresh polled, %d new highs, %d pruned, "
+                   "%d peaks stored", len(fresh), updated, len(stale),
+                   len(peaks))
+
+
+if __name__ == "__main__":
+    main()

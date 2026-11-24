@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Stacker feed: 2x-confirmation entries for stacking multiples.
+
+Polls every 45s for tokens at the 2x confirmation stage ($6-12k mcap).
+Entry on confirmation, NOT launch snipe. Tiered exits via StackerLedger.
+
+Sources: GeckoTerminal new_pools + DexScreener batch.
+Eagle Eye momentum confirmation when available (silent data layer).
+Killswitch gated (lane: stacker). Paper-only Telegram cards.
+Silent unless cards fire.
+"""
+import json, os, sys, time, logging
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+from stacker import score_stacker, StackerLedger, SCORE_BAR
+from card_design import build_card
+import killswitch
+
+# Eagle Eye: silent momentum data layer. Lanes read, never signal.
+try:
+    from eagle_eye_api import momentum_confirms, get_momentum
+    _HAS_EAGLE = True
+except ImportError:
+    _HAS_EAGLE = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "stacker_seen.json")
+LEDGER_FILE = os.path.join(HOME, "stacker_ledger.json")
+TRACK_FILE = os.path.join(HOME, "stacker_track.json")  # mint -> first_price
+
+POLL_SEC = 45
+MAX_CARDS_PER_HOUR = 3
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("stacker")
+
+
+def load_json(path, default):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        json.dump(data, open(path, "w"))
+    except Exception as e:
+        log.warning(f"save {path} FAIL: {e}")
+
+
+def get_new_pools():
+    """GeckoTerminal new pools on Solana."""
+    try:
+        d = get_json(
+            "https://api.geckoterminal.com/api/v2/networks/solana/new_pools",
+            tries=3, timeout=20)
+        return d.get("data", [])
+    except Exception as e:
+        log.warning(f"new_pools FAIL: {e}")
+        return []
+
+
+def get_ds_batch(mints):
+    """DexScreener batch: 30 mints per call."""
+    out = {}
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        try:
+            d = get_json(
+                "https://api.dexscreener.com/tokens/v1/solana/"
+                + ",".join(chunk),
+                tries=3, timeout=20)
+            for t in (d or []):
+                out[t.get("tokenAddress", "")] = t
+        except Exception as e:
+            log.warning(f"ds batch FAIL: {e}")
+        time.sleep(1)
+    return out
+
+
+def send_card(token, result, ledger):
+    """Telegram card via Nova's 3-second design."""
+    try:
+        t = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+        import urllib.request, urllib.parse
+        price = token.get("price_usd", 0)
+        card = build_card(
+            symbol=token["symbol"],
+            score=result["score"],
+            mint=token["mint"],
+            entry_price=price,
+            current_price=price,
+            mcap=token.get("mcap", 0),
+            liquidity=token.get("liquidity", 0),
+            buyers=token.get("buyers", 0),
+            age_min=token.get("age_min", 0),
+            buys_5m=token.get("buys_5m", 0),
+            sells_5m=token.get("sells_5m", 0),
+            smart_wallets=token.get("smart_wallets", 0),
+            safety="clean",
+            is_fresh=True,
+            risk_note="📊 STACKER 2x-confirm entry | TP 2.2x/3.5x/trail",
+        )
+        # Inline buttons: Copy CA + I bought this
+        keyboard = json.dumps({
+            "inline_keyboard": [[
+                {"text": "📋 Copy CA",
+                 "copy_text": {"text": token["mint"]}},
+                {"text": "📍 I bought this",
+                 "callback_data": "track:" + token["mint"]},
+            ]],
+        })
+        payload = {"chat_id": "6883056760", "text": card,
+                   "parse_mode": "Markdown", "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{t}/sendMessage", data=data)
+        ok = json.loads(
+            urllib.request.urlopen(req, timeout=15).read().decode()
+        ).get("ok", False)
+        if ok:
+            log.info(f"card sent {token['symbol']} score={result['score']:.0f}")
+        return ok
+    except Exception as e:
+        log.warning(f"card FAIL: {e}")
+        return False
+
+
+def get_token_price(mint):
+    """Current USD price for a mint via DexScreener. 0 on any failure."""
+    try:
+        d = get_json(
+            "https://api.dexscreener.com/tokens/v1/solana/%s" % mint,
+            tries=2, timeout=15)
+        if not d:
+            return 0
+        p = d[0] if isinstance(d, list) else d
+        return float(p.get("priceUsd") or 0)
+    except Exception:
+        return 0
+
+
+def get_atr_pct(mint, price):
+    """ATR(14) on 5m candles as % of current price, via GeckoTerminal.
+
+    0 on any failure (caller falls back to fixed trail).
+    Used for the 2x ATR trailing stop (2026-10-15 exit research).
+    """
+    try:
+        # Need pool address: find via DexScreener token pairs
+        d = get_json(
+            "https://api.dexscreener.com/tokens/v1/solana/%s" % mint,
+            tries=2, timeout=15)
+        if not d:
+            return 0
+        p = d[0] if isinstance(d, list) else d
+        pair = p.get("pairAddress") or ""
+        if not pair:
+            return 0
+        c = get_json(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/"
+            f"pools/{pair}/ohlcv/minute?aggregate=5&limit=20",
+            tries=2, timeout=15)
+        ohlcv = (c.get("data") or {}).get("attributes", {}).get(
+            "ohlcv_list", [])
+        if len(ohlcv) < 15:
+            return 0
+        # True Range per candle, ATR = mean of last 14
+        trs = []
+        prev_close = float(ohlcv[0][4])
+        for row in ohlcv[1:]:
+            h, l, cl = float(row[2]), float(row[3]), float(row[4])
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+            trs.append(tr)
+            prev_close = cl
+        atr = sum(trs[-14:]) / min(14, len(trs))
+        if price > 0 and atr > 0:
+            return 100.0 * atr / price
+        return 0
+    except Exception:
+        return 0
+
+
+def check_exits(ledger, now):
+    """Feed current prices to open positions so TP/stop/trail/time exits
+    actually fire. Without this the ledger's exit logic never runs and
+    positions fly blind. Returns list of event strings."""
+    from stacker import TIME_STOP_SEC
+    events = []
+    for pos in ledger.positions:
+        if pos.exit_ts:
+            continue
+        price = get_token_price(pos.mint)
+        if price <= 0:
+            # Price feed dead (delisted/rugged token): if past the time
+            # stop, close it as a total loss rather than letting it sit
+            # OPEN forever. A token with no price is worth $0.
+            if now - pos.entry_ts >= TIME_STOP_SEC:
+                ledger._realize(pos, now, 0.0, "time_stop_noprice", 1.0)
+                msg = f"{pos.symbol} TIME STOP (no price feed, -100%)"
+                log.warning("STACKER EXIT: %s", msg)
+                events.append(msg)
+            continue
+        for ev in ledger.on_price(pos.mint, now, price):
+            log.warning("STACKER EXIT: %s", ev)
+            events.append(ev)
+        time.sleep(0.5)  # DexScreener rate limit
+    return events
+
+
+def main():
+    if not killswitch.gate("stacker"):
+        log.info("stacker halted by killswitch, skipping")
+        return
+
+    seen = set(load_json(SEEN_FILE, []))
+    track = load_json(TRACK_FILE, {})  # mint -> {first_price, first_ts, symbol}
+    ledger = StackerLedger.from_dict(load_json(LEDGER_FILE, {}))
+    now = time.time()
+    cards_this_hour = 0
+    hour_start = now - (now % 3600)
+
+    # Exit monitoring FIRST: open positions need price ticks for
+    # TP1/TP2/trail/hard-stop/time-stop to fire.
+    exited = check_exits(ledger, now)
+    if exited:
+        log.info(f"{len(exited)} exit events")
+
+    pools = get_new_pools()
+    log.info(f"scanning {len(pools)} new pools")
+
+    # Build token snapshots
+    candidates = []
+    for pool in pools:
+        try:
+            attrs = pool.get("attributes", {})
+            mint = pool.get("relationships", {}).get("base_token", {}).get(
+                "data", {}).get("id", "").split("_")[-1]
+            if not mint or mint in seen:
+                continue
+            price = float(attrs.get("base_token_price_usd") or 0)
+            if price <= 0:
+                continue
+            fdv = float(attrs.get("fdv_usd") or 0)
+            liq = float(attrs.get("reserve_in_usd") or 0)
+            created = attrs.get("pool_created_at", "")
+            # Track first-seen price for 2x detection
+            if mint not in track:
+                track[mint] = {"first_price": price, "first_ts": now,
+                               "symbol": attrs.get("name", "?").split("/")[0]}
+            first = track[mint]["first_price"]
+            mult = price / first if first > 0 else 0
+            # Only consider 1.8x-4x zone (2x confirmation window)
+            if not (1.8 <= mult <= 4.0):
+                continue
+            if not (6_000 <= fdv <= 50_000):
+                continue
+            if liq < 5_000:
+                continue
+            txns = attrs.get("transactions", {})
+            m5 = txns.get("m5", {}) if isinstance(txns, dict) else {}
+            buys = int(m5.get("buys", 0) or 0)
+            sells = int(m5.get("sells", 0) or 0)
+            buyers = int(m5.get("buyers", 0) or 0)
+            bs = buys / max(sells, 1)
+
+            # Eagle Eye momentum (silent layer)
+            eagle_score = 0
+            if _HAS_EAGLE:
+                try:
+                    m = get_momentum(mint)
+                    if m and now - (m.get("ts") or 0) < 300:
+                        eagle_score = m.get("momentum_score", 0) or 0
+                except Exception:
+                    pass
+
+            token = {
+                "mint": mint,
+                "symbol": track[mint]["symbol"],
+                "multiple_from_launch": mult,
+                "mcap": fdv,
+                "liquidity": liq,
+                "holders_per_min": 0,  # enriched below if promising
+                "buy_sell_ratio": bs,
+                "curve_pct": 0,  # unknown from GT; score handles 0
+                "safety": "clean",  # GT new pools pre-filtered; RC check below
+                "eagle_momentum": eagle_score,
+                "price_usd": price,
+                "buyers": buyers,
+                "buys_5m": buys,
+                "sells_5m": sells,
+                "age_min": (now - track[mint]["first_ts"]) / 60,
+            }
+            candidates.append(token)
+        except Exception:
+            continue
+
+    log.info(f"{len(candidates)} in 2x zone")
+    for token in candidates:
+        if cards_this_hour >= MAX_CARDS_PER_HOUR:
+            break
+        mint = token["mint"]
+        # RugCheck safety (fail-closed on hard fails)
+        try:
+            rc = get_json(
+                f"https://api.rugcheck.xyz/v1/tokens/{mint}/report",
+                tries=2, timeout=15)
+            risks = [r.get("name", "") for r in rc.get("risks", [])]
+            hard = {"Mint authority", "Freeze authority", "Honeypot",
+                    "Single holder", "High holder concentration"}
+            if any(r in hard for r in risks):
+                seen.add(mint)
+                continue
+        except Exception:
+            pass  # fail-open on RC outage (logged), safety marked unknown
+        result = score_stacker(token)
+        seen.add(mint)
+        if not result["pass"]:
+            continue
+        # Ledger gate: max 3 concurrent, daily loss halt, killswitch
+        # ATR for the 2x ATR trail (0 = fixed 25% fallback)
+        atr = get_atr_pct(mint, token["price_usd"])
+        pos = ledger.enter(mint, token["symbol"], now,
+                           token["price_usd"], atr_pct=atr)
+        if not pos:
+            log.info(f"{token['symbol']} blocked by ledger gate")
+            continue
+        log.info(f"{token['symbol']} entered, ATR {atr:.1f}% "
+                 f"-> trail {pos.trail_pct():.1f}%")
+        if send_card(token, result, ledger):
+            cards_this_hour += 1
+
+    save_json(SEEN_FILE, sorted(seen)[-5000:])
+    save_json(TRACK_FILE, track)
+    save_json(LEDGER_FILE, ledger.to_dict())
+    stats = ledger.stats()
+    log.info(f"done: {cards_this_hour} cards | ledger {stats}")
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true",
+                    help="single scan then exit (for cron/testing)")
+    args = ap.parse_args()
+    if args.once:
+        main()
+    else:
+        # Persistent poller: scan every POLL_SEC, supervised by watchdog
+        log.info(f"stacker-feed persistent mode, polling every {POLL_SEC}s")
+        while True:
+            try:
+                main()
+            except Exception as e:
+                log.warning(f"poll cycle FAIL: {e}")
+            time.sleep(POLL_SEC)

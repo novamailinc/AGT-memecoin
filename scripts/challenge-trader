@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Degen challenge paper trader.
+
+Simulates paper trades on degen lane signals for the user challenge:
+- 1 SOL → $2M by end of 2026 (started 2026-10-12; earlier $5→$1k and
+  1→100 SOL challenges were cancelled by the user)
+
+Entry: on degen alert (from degen_outcomes.json)
+Exit: 3x take profit, 50% stop loss, or 4h max hold
+Tracks portfolio value live.
+"""
+import json
+import logging
+import os
+import time
+import urllib.request
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "launch_scanner"))
+try:
+    from robust_http import get_json as _robust_get
+    _HAS_ROBUST = True
+except ImportError:
+    _HAS_ROBUST = False
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("challenge-trader")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+TRACK_FILE = os.path.join(HOME, "degen_outcomes.json")
+USD_CHALLENGE = os.path.join(HOME, "degen_challenge.json")
+SOL_CHALLENGE = os.path.join(HOME, "degen_challenge_sol.json")
+M2_CHALLENGE = os.path.join(HOME, "degen_challenge_2m.json")  # 2026-10-12: 1 SOL -> $2M by year end
+
+# Paper trade rules
+TP_MULT = 3.0       # take profit at 3x
+SL_MULT = 0.5       # stop loss at 50% down
+MAX_HOLD_SECS = 4 * 3600  # 4 hour max hold
+POSITION_PCT = 0.05  # 5% of portfolio per trade (2026-10-12: was 0.20;
+# 20% sizing + total-loss rugs = guaranteed bleed. 5% caps a rug at 5%.)
+MIN_TRADE_SCORE = 75  # only trade top-scored alerts (2026-10-12: was "everything")
+
+
+def _http(url, timeout=10):
+    # Use robust client when available (retries, gzip, circuit breaker)
+    if _HAS_ROBUST:
+        try:
+            return _robust_get(url, timeout=timeout, tries=4)
+        except Exception:
+            return None
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def get_price(mint):
+    pairs = _http(
+        "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    if not pairs:
+        return 0
+    return float(pairs[0].get("priceUsd") or 0)
+
+
+def load_challenge(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_challenge(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def process_challenge(challenge_path, label):
+    ch = load_challenge(challenge_path)
+    if not ch:
+        return
+    # Kill-switch gate (2026-10-15): the challenge lane was halted on
+    # 2026-10-14 (0% win rate over 30 trades) but the trader entered 5 more
+    # trades post-halt because nothing checked the gate. Fail-closed:
+    # halted => no NEW entries. Position resolution below still runs so
+    # open trades close out honestly.
+    try:
+        import killswitch
+        entries_allowed = killswitch.gate("challenge")
+    except Exception:
+        entries_allowed = False
+    if not entries_allowed:
+        logger.warning("[%s] challenge lane halted by killswitch — no new entries", label)
+    try:
+        with open(TRACK_FILE) as f:
+            outcomes = json.load(f)
+    except Exception:
+        return
+
+    portfolio = ch["current_usd"] if "current_usd" in ch else ch["current_sol"]
+    currency = "USD" if "current_usd" in ch else "SOL"
+    trades = ch.get("trades", [])
+    traded_mints = {t["mint"] for t in trades}
+
+    # 2026-10-13: DIP ENTRIES for runner alerts (path 2). Runner coins are
+    # already moving — buying the alert price = buying the top. Instead:
+    # watch for a pullback to <=85% of alert, enter there. Skip if it runs
+    # to 2x without dipping (don't chase) or 4h pass with no dip.
+    dip_watch = ch.get("dip_watch", {})
+    for mint, v in outcomes.items():
+        if mint in traded_mints or mint in dip_watch:
+            continue
+        if v.get("alert_ts", 0) < ch["start_ts"]:
+            continue
+        if v.get("type") != "runner":
+            continue
+        if v.get("score", 0) < MIN_TRADE_SCORE:
+            continue
+        dip_watch[mint] = {
+            "symbol": v.get("symbol", "?"),
+            "alert_price": v.get("alert_price", 0),
+            "alert_ts": v.get("alert_ts", 0),
+            "watch_ts": time.time(),
+        }
+        logger.warning("[%s] DIP-WATCH $%s armed @ $%.8f",
+                       label, v.get("symbol"), v.get("alert_price", 0))
+    # Resolve dip watches
+    for mint in list(dip_watch.keys()):
+        w = dip_watch[mint]
+        if mint in traded_mints:
+            del dip_watch[mint]; continue
+        alert_price = w.get("alert_price", 0)
+        if not alert_price:
+            del dip_watch[mint]; continue
+        current_price = get_price(mint)
+        age_h = (time.time() - w["watch_ts"]) / 3600
+        if not current_price:
+            # dead while watching — drop, no loss booked (never entered)
+            logger.warning("[%s] DIP-WATCH $%s died unwatched", label, w["symbol"])
+            del dip_watch[mint]; continue
+        mult = current_price / alert_price
+        if mult <= 0.85:
+            # DIP — enter here (killswitch-gated)
+            if entries_allowed:
+                size = portfolio * POSITION_PCT
+                if size > 0:
+                    trades.append({
+                        "mint": mint, "symbol": w["symbol"],
+                        "entry_price": current_price, "entry_ts": time.time(),
+                        "size": size, "status": "open", "entry_type": "dip",
+                        "dip_from_alert": round(mult, 3),
+                    })
+                    traded_mints.add(mint)
+                    logger.warning("[%s] DIP-ENTER $%s @ $%.8f (%.0f%% of alert) size=%.2f %s",
+                                   label, w["symbol"], current_price, mult * 100,
+                                   size, currency)
+            del dip_watch[mint]
+        elif mult >= 2.0 or age_h >= 4:
+            # ran away or went stale — don't chase
+            logger.warning("[%s] DIP-WATCH $%s skipped (mult=%.2f age=%.1fh)",
+                           label, w["symbol"], mult, age_h)
+            del dip_watch[mint]
+    ch["dip_watch"] = dip_watch
+
+    # Check for new signals to enter (launch alerts: immediate entry)
+    # Killswitch-gated: halted challenge lane => no new entries.
+    for mint, v in outcomes.items():
+        if not entries_allowed:
+            break
+        if mint in traded_mints:
+            continue
+        # Only trade signals from challenge start
+        if v.get("alert_ts", 0) < ch["start_ts"]:
+            continue
+        alert_price = v.get("alert_price", 0)
+        if not alert_price:
+            continue
+        # 2026-10-12: only trade high-conviction alerts. Unscored
+        # (pre-fix) alerts are skipped — they're stale anyway.
+        if v.get("score", 0) < MIN_TRADE_SCORE:
+            continue
+        # Enter position
+        size = portfolio * POSITION_PCT
+        if size <= 0:
+            continue
+        trades.append({
+            "mint": mint,
+            "symbol": v.get("symbol", "?"),
+            "entry_price": alert_price,
+            "entry_ts": time.time(),
+            "size": size,
+            "status": "open",
+        })
+        traded_mints.add(mint)
+        logger.warning("[%s] ENTER $%s @ $%.8f size=%.2f %s",
+                       label, v.get("symbol"), alert_price, size, currency)
+
+    # Check open positions for exits
+    for t in trades:
+        if t["status"] != "open":
+            continue
+        current_price = get_price(t["mint"])
+        if not current_price:
+            # Dead — total loss
+            t["status"] = "closed"
+            t["exit_reason"] = "rugged"
+            t["exit_mult"] = 0
+            t["pnl"] = -t["size"]
+            portfolio += t["pnl"]
+            logger.warning("[%s] RUGGED $%s loss=%.2f",
+                           label, t["symbol"], t["size"])
+            continue
+        mult = current_price / t["entry_price"] if t["entry_price"] else 0
+        age = time.time() - t["entry_ts"]
+        exit_reason = None
+        if mult >= TP_MULT:
+            exit_reason = "take_profit_3x"
+        elif mult <= SL_MULT:
+            exit_reason = "stop_loss"
+        elif age >= MAX_HOLD_SECS:
+            exit_reason = "max_hold"
+        if exit_reason:
+            t["status"] = "closed"
+            t["exit_reason"] = exit_reason
+            t["exit_mult"] = round(mult, 2)
+            t["pnl"] = round(t["size"] * (mult - 1), 4)
+            portfolio += t["pnl"]
+            logger.warning("[%s] EXIT $%s %s %.2fx pnl=%+.2f %s",
+                           label, t["symbol"], exit_reason, mult,
+                           t["pnl"], currency)
+
+    # Update portfolio
+    if currency == "USD":
+        ch["current_usd"] = round(portfolio, 2)
+    else:
+        ch["current_sol"] = round(portfolio, 4)
+    ch["trades"] = trades
+    save_challenge(challenge_path, ch)
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("challenge-trader", token="scripts/challenge-trader")
+    logger.warning("challenge trader started")
+    while True:
+        try:
+            process_challenge(M2_CHALLENGE, "1 SOL->$2M")
+        except Exception:
+            logger.exception("trader loop failed")
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()

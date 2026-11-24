@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""PROTOTYPE (2026-10-12): Helius websocket listener for new pump.fun pools.
+
+FREE tier only. Subscribes to pump.fun program logs via wss; on a Create
+instruction it resolves the new mint via getTransaction and appends it to
+$FOREX_AGENT_HOME/degen_ws_queue.jsonl, which degen-feed drains into its
+normal scoring pipeline (same hard filters, same RugCheck safety).
+
+Stdlib only — no pip packages (PEP 668 blocks system installs here).
+Connects through the hatch egress proxy via HTTP CONNECT.
+
+RPC budget guard: mint resolution is capped at ~12 getTransaction/min
+(token bucket); overflow creates are counted and dropped, never queued,
+so this prototype cannot starve the other daemons' Helius budget.
+
+STATUS 2026-10-12 ~13:28 WAT: DISABLED BY RATE LIMIT. The wss upgrade
+handshake (wss://mainnet.helius-rpc.com) returns HTTP 429 on the free
+tier — websocket streaming is not usable on this key right now. The
+stdlib WS client itself was verified working (proxy CONNECT + TLS OK);
+only Helius's 429 blocks it. Fallback in use: degen-feed polls
+GeckoTerminal new_pools every 5s (measured: 12/13 clean 200s, no 429s).
+Revisit only if Helius lifts the WS throttle or a key with WS access
+is provided. Do NOT hammer the upgrade endpoint.
+"""
+import base64
+import hashlib
+import json
+import logging
+import os
+import socket
+import ssl
+import struct
+import time
+import urllib.request
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("degen-ws")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+QUEUE_FILE = os.path.join(HOME, "degen_ws_queue.jsonl")
+PROXY = ("hatch-egress-proxy", 3128)
+WS_HOST = "mainnet.helius-rpc.com"
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Mint-resolution budget: max N getTransaction calls per rolling minute.
+RESOLVE_PER_MIN = 12
+# Cap the queue file so a backlog can't grow unbounded.
+QUEUE_MAX_LINES = 200
+
+
+def get_helius_key():
+    try:
+        with open(os.path.join(HOME, "helius", "api_key")) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _http_rpc(payload, api_key, timeout=15):
+    try:
+        req = urllib.request.Request(
+            "https://mainnet.helius-rpc.com/?api-key=%s" % api_key,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+class WSClient:
+    """Minimal RFC 6455 client: text frames + ping/pong + close."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
+
+    def _recv_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("ws closed")
+            self.buf += chunk
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def recv_frame(self):
+        h = self._recv_exact(2)
+        b1, b2 = h[0], h[1]
+        opcode = b1 & 0x0F
+        masked = (b2 & 0x80) != 0
+        length = b2 & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        mask = self._recv_exact(4) if masked else None
+        payload = self._recv_exact(length) if length else b""
+        if mask:
+            payload = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+        return opcode, payload
+
+    def send_frame(self, opcode, payload=b""):
+        # Client frames MUST be masked.
+        mask = os.urandom(4)
+        masked = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+        h = bytes([0x80 | opcode])
+        n = len(payload)
+        if n < 126:
+            h += bytes([0x80 | n])
+        elif n < 65536:
+            h += bytes([0x80 | 126]) + struct.pack("!H", n)
+        else:
+            h += bytes([0x80 | 127]) + struct.pack("!Q", n)
+        self.sock.sendall(h + mask + masked)
+
+    def send_text(self, s):
+        self.send_frame(0x1, s.encode())
+
+    def ping(self):
+        self.send_frame(0x9)
+
+    def recv_text(self, timeout=60):
+        """Next text message; answers pings; raises on close/error."""
+        self.sock.settimeout(timeout)
+        while True:
+            opcode, payload = self.recv_frame()
+            if opcode == 0x1:
+                return payload.decode("utf-8", "replace")
+            if opcode == 0x9:  # ping -> pong
+                self.send_frame(0xA, payload)
+            elif opcode == 0x8:
+                raise ConnectionError("ws close frame")
+
+
+def ws_connect(api_key):
+    raw = socket.create_connection(PROXY, timeout=15)
+    raw.sendall(
+        ("CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n"
+         % (WS_HOST, WS_HOST)).encode())
+    resp = raw.recv(4096).split(b"\r\n")[0]
+    if b"200" not in resp:
+        raw.close()
+        raise ConnectionError("proxy CONNECT failed: %s" % resp)
+    ctx = ssl.create_default_context()  # trusts hatch-egress-ca
+    tls = ctx.wrap_socket(raw, server_hostname=WS_HOST)
+    key = base64.b64encode(os.urandom(16)).decode()
+    # NOTE: api_key lives only in this request line + memory, never logged.
+    req_line = (
+        "GET /?api-key=%s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ) % (api_key, WS_HOST, key)
+    tls.sendall(req_line.encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    if b"101" not in head.split(b"\r\n")[0]:
+        tls.close()
+        raise ConnectionError("ws upgrade failed: %s"
+                              % head.split(b"\r\n")[0])
+    return WSClient(tls)
+
+
+def resolve_mint(sig, api_key):
+    """getTransaction -> mint of a pump.fun Create. None on failure."""
+    resp = _http_rpc(
+        {"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+         "params": [sig, {"encoding": "jsonParsed",
+                          "maxSupportedTransactionVersion": 0}]},
+        api_key, timeout=15)
+    try:
+        tx = (resp or {}).get("result")
+        msg = (tx.get("transaction") or {}).get("message") or {}
+        acct_keys = msg.get("accountKeys") or []
+        for ix in (msg.get("instructions") or []):
+            prog = ix.get("programId", "")
+            if isinstance(prog, dict):
+                continue
+            if prog != PUMP_PROGRAM:
+                # programIdIndex form
+                idx = ix.get("programIdIndex")
+                if idx is None or idx >= len(acct_keys):
+                    continue
+                k = acct_keys[idx]
+                prog = k.get("pubkey", k) if isinstance(k, dict) else k
+                if prog != PUMP_PROGRAM:
+                    continue
+            accts = ix.get("accounts") or []
+            if not accts:
+                continue
+            m0 = accts[0]
+            mint = (m0.get("pubkey", m0) if isinstance(m0, dict) else m0)
+            if isinstance(mint, str) and mint.endswith("pump"):
+                return mint
+    except Exception:
+        pass
+    return None
+
+
+def queue_mint(mint, sig):
+    try:
+        line = json.dumps({"mint": mint, "sig": sig, "ts": time.time()})
+        # keep file bounded
+        if os.path.exists(QUEUE_FILE):
+            with open(QUEUE_FILE) as f:
+                lines = f.read().strip().split("\n")
+            if len(lines) >= QUEUE_MAX_LINES:
+                lines = lines[-QUEUE_MAX_LINES + 1:]
+                with open(QUEUE_FILE, "w") as f:
+                    f.write("\n".join(l for l in lines if l) + "\n")
+        with open(QUEUE_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.warning("queue write failed: %s", e)
+
+
+def main():
+    api_key = get_helius_key()
+    if not api_key:
+        logger.warning("no helius key, exiting")
+        return
+    logger.warning("degen-ws-listener starting (prototype)")
+    seen_mints = set()
+    resolve_times = []  # rolling window for the per-minute budget
+    dropped = 0
+    backoff = 2
+    while True:
+        try:
+            ws = ws_connect(api_key)
+            logger.warning("ws connected, subscribing")
+            ws.send_text(json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                "params": [{"mentions": [PUMP_PROGRAM]},
+                           {"commitment": "processed"}]}))
+            sub_id = None
+            last_ping = time.time()
+            backoff = 2
+            while True:
+                if time.time() - last_ping > 30:
+                    ws.ping()
+                    last_ping = time.time()
+                try:
+                    msg = ws.recv_text(timeout=45)
+                except socket.timeout:
+                    ws.ping()
+                    continue
+                try:
+                    d = json.loads(msg)
+                except Exception:
+                    continue
+                if "result" in d and sub_id is None and isinstance(
+                        d.get("result"), int):
+                    sub_id = d["result"]
+                    logger.warning("subscribed id=%s", sub_id)
+                    continue
+                params = d.get("params") or {}
+                result = params.get("result") or {}
+                value = result.get("value") or {}
+                if value.get("err"):
+                    continue
+                logs = value.get("logs") or []
+                if not any("Instruction: Create" in (l or "")
+                           for l in logs):
+                    continue
+                sig = value.get("signature", "")
+                if not sig:
+                    continue
+                # budget: max RESOLVE_PER_MIN getTransaction calls
+                now = time.time()
+                resolve_times = [t for t in resolve_times
+                                 if now - t < 60]
+                if len(resolve_times) >= RESOLVE_PER_MIN:
+                    dropped += 1
+                    continue
+                resolve_times.append(now)
+                mint = resolve_mint(sig, api_key)
+                if mint and mint not in seen_mints:
+                    seen_mints.add(mint)
+                    if len(seen_mints) > 500:
+                        seen_mints.clear()
+                    queue_mint(mint, sig)
+                    logger.warning("WS NEW POOL %s (sig %s)",
+                                   mint[:10], sig[:10])
+            # unreachable
+        except Exception as e:
+            logger.warning("ws loop failed (%s), reconnect in %ss "
+                           "(dropped_over_budget=%d)",
+                           str(e)[:100], backoff, dropped)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+if __name__ == "__main__":
+    main()

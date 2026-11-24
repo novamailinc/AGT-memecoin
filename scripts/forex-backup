@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# forex-backup — snapshot the paper-trading bot's state.
+#
+# What gets backed up:
+#   storage/local.db   SQLite DB, copied via the sqlite3 backup API so the
+#                      snapshot is consistent even while daemons are writing
+#   data/              broker paper state (virtual balances, fills)
+#   launch_scanner/    private moat: wallet registry + grades, deployer
+#                      history/fingerprints/blacklist proposals, proof/
+#                      footprint measurement, exit-clock + safe-batch datasets
+#                      (no secrets live here — verified 2026-10-09)
+#   live/              live lane ledger + deployment marker (positions,
+#                      bankroll, verdict chain) — the KEY FILE is
+#                      deleted from the staged copy, see below.
+#   agent.env          non-secret config
+#   install-result.json / install-state.json / run/heartbeat.json
+#
+# What NEVER gets backed up: secrets.env (private keys / tokens stay local),
+#   telegram/ (bot token), helius/ (API key), live/keypair.json (the live
+#   mainnet wallet key — it lives only on the deployment machine).
+#
+# Layout: $FOREX_AGENT_HOME/backups/forex-backup-<UTC timestamp>.tar.gz
+# plus a sha256 sidecar and a manifest.jsonl entry.
+# Rotation: keeps the newest $KEEP_MOST snapshots (default 48).
+#
+# Remote upload: `./forex-backup --upload <dest>` where dest is one of
+# github | drive | gmail. Destinations are wired on request; until the
+# user picks one, --upload exits 2 with "not configured".
+set -u
+
+AGENT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HOME_DIR="${FOREX_AGENT_HOME:-$HOME/.forex-agent}"
+BACKUP_DIR="$HOME_DIR/backups"
+KEEP_MOST="${FOREX_BACKUP_KEEP:-48}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+NAME="forex-backup-$STAMP"
+# Stage on the agent-home volume, not /tmp: this host's /tmp is a 512M tmpfs
+# while the SQLite DB alone is ~280M; staging snapshot+copy there overflows
+# /tmp and silently produces archives with 0-byte state files (2026-09-23).
+# An explicitly exported TMPDIR still wins.
+export TMPDIR="${TMPDIR:-$HOME_DIR/tmp}"
+mkdir -p "$TMPDIR"
+WORK="$(mktemp -d)"
+
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+mkdir -p "$BACKUP_DIR"
+
+# Remote upload: `./forex-backup --upload drive` pushes new archives via
+# scripts/forex-backup-upload (Google Drive). Other destinations not wired.
+if [ "${1:-}" = "--upload" ]; then
+    case "${2:-}" in
+        drive) exec "$(dirname "$0")/forex-backup-upload" ;;
+        *) echo "unknown upload destination '${2:-}' (only 'drive' is wired)" >&2; exit 2 ;;
+    esac
+fi
+
+# 1. SQLite-safe DB snapshot
+DB_SRC="${FOREX_AGENT_STORAGE:-$HOME_DIR/storage/local.db}"
+# Backup throttle: copy in batches of $FOREX_BACKUP_PAGES pages, sleeping
+# $FOREX_BACKUP_SLEEP seconds between batches, so daemon writers are never
+# starved for the whole copy (previously a single lock hold crashed daemon
+# ticks with "database is locked"). Default is now -1 (single-step copy):
+# on the current 1.4GB busy DB the old 100/0.1 throttle never finished
+# because every ~10s writer commit restarted the online backup from
+# scratch (2026-09-23, re-confirmed 2026-10-02 — hung hourly runs had to
+# be killed). Single-step completes in ~60s with daemons unaffected.
+# Override with FOREX_BACKUP_PAGES/SLEEP if throttling is ever needed.
+BACKUP_PAGES="${FOREX_BACKUP_PAGES:--1}"
+BACKUP_SLEEP="${FOREX_BACKUP_SLEEP:-0.1}"
+if [ -f "$DB_SRC" ]; then
+    # FAIL-CLOSED (2026-11-17): a failed online backup used to print
+    # "db snapshot ok" anyway and archive a 0-byte local.db — the 09:29
+    # hourly run did exactly that ("database is locked" from a writer
+    # holding the lock) and the empty archive even reached Drive. Any
+    # snapshot failure now aborts before an archive is written.
+    # The python backup() call retries a locked source FOREVER (CPython
+    # backup_step loop), so it runs under `timeout`: a stuck snapshot is
+    # killed (exit 124) and fails closed the same way. Default 1800s —
+    # the snapshot alone takes ~8min on the 1.4GB DB + 8GB WAL, so the
+    # cap is headroom, not a target. Override with FOREX_BACKUP_TIMEOUT.
+    BACKUP_TIMEOUT="${FOREX_BACKUP_TIMEOUT:-1800}"
+    if ! timeout "$BACKUP_TIMEOUT" python3 - "$DB_SRC" "$WORK/local.db" "$BACKUP_PAGES" "$BACKUP_SLEEP" <<'PYEOF'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1])
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst, pages=int(sys.argv[3]), sleep=float(sys.argv[4]))
+dst.close(); src.close()
+PYEOF
+    then
+        echo "ERROR: db snapshot failed for $DB_SRC — aborting, no archive written" >&2
+        exit 1
+    fi
+    if [ ! -s "$WORK/local.db" ]; then
+        echo "ERROR: db snapshot is empty for $DB_SRC — aborting, no archive written" >&2
+        exit 1
+    fi
+    echo "db snapshot ok"
+else
+    echo "warning: no DB at $DB_SRC" >&2
+fi
+
+# 1b. Intelligence event store (coverage audit 2026-11-22): the
+# intelligence pipeline's SQLite event store (events, stream
+# checkpoints, retry queue) lives at $HOME_DIR/intelligence_events.db
+# — a HOME-root .db the staging globs never picked up. Same
+# SQLite-safe online snapshot as local.db; NEVER a plain cp of an
+# active database. A missing store is a warning (the pipeline may
+# never have run here); a FAILED snapshot of an existing store
+# aborts before an archive is written, exactly like the main DB.
+EV_SRC="$HOME_DIR/intelligence_events.db"
+if [ -f "$EV_SRC" ]; then
+    if ! timeout "$BACKUP_TIMEOUT" python3 - "$EV_SRC" "$WORK/intelligence_events.db" "$BACKUP_PAGES" "$BACKUP_SLEEP" <<'PYEOF'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1])
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst, pages=int(sys.argv[3]), sleep=float(sys.argv[4]))
+dst.close(); src.close()
+PYEOF
+    then
+        echo "ERROR: event-store snapshot failed for $EV_SRC — aborting, no archive written" >&2
+        exit 1
+    fi
+    if [ ! -s "$WORK/intelligence_events.db" ]; then
+        echo "ERROR: event-store snapshot is empty for $EV_SRC — aborting, no archive written" >&2
+        exit 1
+    fi
+    echo "event store snapshot ok"
+else
+    echo "warning: no event store at $EV_SRC" >&2
+fi
+
+# 2. Stage files (never secrets.env)
+STAGE="$WORK/stage"
+mkdir -p "$STAGE"
+[ -f "$WORK/local.db" ] && cp "$WORK/local.db" "$STAGE/local.db"
+[ -f "$WORK/intelligence_events.db" ] && cp "$WORK/intelligence_events.db" "$STAGE/intelligence_events.db"
+[ -d "$HOME_DIR/data" ] && cp -r "$HOME_DIR/data" "$STAGE/data"
+# Verdict chain + discovery recorder (coverage audit 2026-11-22):
+# verdict_ledger/ holds the pre-registered verdict history;
+# recorder/ holds the discovery-event journal the grad_select
+# filters index from. A restore without them loses both. Junk tmp
+# files are dropped from the staged copies.
+[ -d "$HOME_DIR/verdict_ledger" ] && cp -r "$HOME_DIR/verdict_ledger" "$STAGE/verdict_ledger"
+[ -d "$HOME_DIR/recorder" ] && cp -r "$HOME_DIR/recorder" "$STAGE/recorder"
+find "$STAGE/verdict_ledger" "$STAGE/recorder" -name "*.tmp*" -delete 2>/dev/null || true
+[ -d "$HOME_DIR/launch_scanner" ] && cp -r "$HOME_DIR/launch_scanner" "$STAGE/launch_scanner"
+# Killswitch halt states (audit 2026-10-18): safety-critical. A restore
+# without these would resurrect halted lanes as UNHALTED.
+[ -d "$HOME_DIR/killswitch" ] && cp -r "$HOME_DIR/killswitch" "$STAGE/killswitch"
+# Live lane state (2026-11-06): the live ledger + deployment marker
+# are safety-critical and ARE backed up — but the live KEY FILE
+# (live/keypair.json) NEVER is: stage the dir, then delete any key
+# material from the staged copy before archiving.
+if [ -d "$HOME_DIR/live" ]; then
+    cp -r "$HOME_DIR/live" "$STAGE/live"
+    rm -f "$STAGE/live/keypair.json" "$STAGE/live"/*.key 2>/dev/null
+    find "$STAGE/live" -name "*.tmp*" -delete 2>/dev/null
+fi
+# HOME-root state files: paper ledgers (incl. degen_mirror_ledger.json),
+# journals, seen-sets, watchlists. Never secrets.env (excluded by design),
+# logs, tmp files, or lock files.
+for f in "$HOME_DIR"/*.json "$HOME_DIR"/*.jsonl; do
+    [ -e "$f" ] || continue
+    bn=$(basename "$f")
+    case "$bn" in
+        *.tmp*|*.lock) continue;;
+        *) cp "$f" "$STAGE/$bn";;
+    esac
+done
+# Drop junk tmp files from the staged launch_scanner copy.
+find "$STAGE/launch_scanner" -name "*.tmp*" -delete 2>/dev/null
+for f in agent.env install-result.json install-state.json; do
+    [ -f "$HOME_DIR/$f" ] && cp "$HOME_DIR/$f" "$STAGE/$f"
+done
+[ -f "$HOME_DIR/run/heartbeat.json" ] && cp "$HOME_DIR/run/heartbeat.json" "$STAGE/heartbeat.json"
+echo "$STAMP" > "$STAGE/backup-timestamp.txt"
+
+# 3. Archive + checksum
+ARCHIVE="$BACKUP_DIR/$NAME.tar.gz"
+tar -czf "$ARCHIVE" -C "$STAGE" .
+sha256sum "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
+SIZE="$(du -h "$ARCHIVE" | cut -f1)"
+
+# 4. Manifest
+SHA="$(cat "$ARCHIVE.sha256")"
+python3 - "$BACKUP_DIR/manifest.jsonl" "$NAME.tar.gz" "$SIZE" "$SHA" <<'PYEOF'
+import json, sys, datetime
+entry = {
+    "file": sys.argv[2],
+    "size": sys.argv[3],
+    "sha256": sys.argv[4],
+    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+with open(sys.argv[1], "a") as f:
+    f.write(json.dumps(entry) + "\n")
+PYEOF
+
+# 5. Rotation: keep newest $KEEP_MOST
+ls -1t "$BACKUP_DIR"/forex-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP_MOST + 1)) | while read -r old; do
+    rm -f "$old" "$old.sha256"
+    echo "pruned $old"
+done
+
+echo "backup ok: $NAME.tar.gz ($SIZE)"

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Mimic-edge trader daemon (2026-11-01, user-ordered redesign).
+
+Runs the mimic_edge lane (daemon/launch_scanner/mimic_edge.py): the
+traced outside bot's full edge on paper — filtered launch spray
+(copycat ticker / serial deployer >= 3 in 24h rejected) from the
+live PumpPortal new-token stream, priced from the live quote at
+decision time with honest adverse fills (curve-direct first),
+$25 paper shots, TWAP sequenced-sell exit (64 slices, ~5min),
+-25% stop on the unsold remainder, 60min max hold, $500 paper
+bankroll, 20 open slots, 120-second launch window + 120-second
+chase guard. Supersedes mimic v1 (v1 entries killswitch-halted,
+draining under v1 rules).
+
+Detection: a live PumpPortal new-token WebSocket ONLY. No
+backfill: a launch found late is stale by definition, so stream
+gaps mean missed launches, not late entries. A dedicated entry
+thread wakes the moment the stream delivers, so fresh candidates
+never wait behind this loop's exit polling (the same stream-wake
+pattern as grad_raw's FIRE-FIRST thread, minus payload pricing:
+entries price from the live quote, never a stale creation price).
+
+Exits are evaluated in this same loop (~5s cycle) via the engine's
+live-quote price path (DexScreener/tape/curve). No armed watcher:
+curve positions have no PumpSwap vaults to watch yet, and the
+quote path is the honest price for them.
+
+Pre-registered verdict: at 100 closes, expectancy <= 0 halts the
+lane permanently (killswitch lane "mimic_edge", human-only
+re-enable).
+
+Paper only. NO Telegram cards — journal/ledger only. Nothing here
+touches real money, keys, or the user's lanes. Free-only:
+PumpPortal public stream + DexScreener/tape quotes.
+"""
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("mimic-edge-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import mimic_edge as _mimic
+    import pumpportal as _pp
+    import killswitch as _ks_check
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+POLL_SECS = 5
+
+
+def main():
+    if not _HAS_DEPS:
+        logger.warning("mimic-edge deps missing: %s", _IMPORT_ERROR)
+        return 1
+    engine = _mimic.make_engine()
+    state = engine.ensure_ledger()
+    # Materialize the killswitch lane entry (not halted) so the lane
+    # is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_mimic.LANE)
+    except Exception:
+        pass
+    feed = _pp.PumpPortalFeed()
+    feed.start()
+
+    # Stream-wake entry thread: wake on stream arrival and run a
+    # fresh-only scan (entries for just-drained launches, priced
+    # from the live quote). The engine's ledger access is
+    # flock-serialized; dedupe/bankroll/caps are re-checked under
+    # the write lock inside consider_candidate.
+    def _entry_loop():
+        while True:
+            try:
+                q = getattr(feed, "_q", None)
+                if q is not None and not q.empty():
+                    _mimic.scan_once(engine, feed=feed,
+                                     fresh_only=True)
+                else:
+                    time.sleep(0.1)
+            except Exception:
+                logger.exception("mimic-edge entry loop failed")
+                time.sleep(1.0)
+
+    threading.Thread(target=_entry_loop, name="mimic-edge-entry",
+                     daemon=True).start()
+
+    logger.warning("mimic-edge-trader started (paper only, TWAP "
+                   "exit, -25%% stop, bankroll $%.2f, state %s, "
+                   "verdict sample %d closes)",
+                   float(state.get("bankroll") or 0), state.get("state"),
+                   _mimic.VERDICT_SAMPLE_CLOSES)
+    while True:
+        try:
+            res = _mimic.scan_once(engine, feed=feed)
+            closes = engine.poll_exits(engine.quote_price)
+            if res.get("opened") or closes:
+                st = engine.account_state()
+                logger.warning(
+                    "mimic-edge-trader: %d stream, %d opened; "
+                    "%d closes; cash $%.2f, %d open, state %s",
+                    res.get("stream", 0), res.get("opened", 0),
+                    len(closes), st.get("bankroll", 0.0),
+                    st.get("n_open", 0), st.get("state"))
+        except Exception:
+            logger.exception("mimic-edge-trader loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

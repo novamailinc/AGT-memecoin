@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Degen fastwatch: independent new-pool detector + lane health monitor.
+
+WHY THIS EXISTS (2026-10-13): The lane missed CRAWLER (82x) during a
+GeckoTerminal degradation. Empirical investigation (same day) showed
+Helius on-chain mint detection is unviable within our free-tier budget:
+- pump.fun program does 200+ txs/min (firehose). Distinguishing creates
+  needs getTransaction per signature: 50+/min. Far over budget.
+- Helius main key: persistently 429. Helius websockets: 429 on upgrade
+  (see degen-ws-listener docstring). DAS searchAssets: cannot query
+  global newest mints. pump.fun frontend API: Cloudflare 530.
+Therefore fastwatch is an INDEPENDENT second poller: offset schedule,
+rate discipline, health monitoring, blind alerts. Two independent
+pollers on different cadences are meaningfully more robust than one,
+and silent blindness becomes a loud alert instead of missed runners.
+
+DESIGN:
+- Polls GeckoTerminal new_pools pages 1-2 every 30s (4 req/min;
+  feed uses ~18/min on a 5s cadence — different schedule, different
+  failure modes). Startup jitter offsets us from the feed.
+- Exponential backoff on fetch failures: 30s -> 60s -> 120s -> 300s max.
+- After 10 consecutive failures: Telegram "lane degraded" alert (1/hr max).
+- New pools (not in feed/watchlist/fastwatch seen sets): light filters
+  (age <= 15min, feed's FDV/reserve floors) then check_safety imported
+  from degen-feed (fail-CLOSED: RugCheck down/unknown = skip, never list).
+- Cards: "EARLY" (no score — too early to score, watch only) + CA +
+  Copy CA button. No track button.
+- Dedup: own seen file + degen_outcomes.json + degen_watchlist_seen.json.
+- Caps: 20/day, 5/hour (own counters, persisted).
+- Coverage stats logged for blind-spot measurement.
+
+Detection-only. No trading, no wallet code, no auto-buy. Free-only.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import logging
+import os
+import random
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("degen-fastwatch")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SEEN_FILE = os.path.join(HOME, "degen_fastwatch_seen.json")
+OUTCOMES_FILE = os.path.join(HOME, "degen_outcomes.json")
+WATCHLIST_SEEN_FILE = os.path.join(HOME, "degen_watchlist_seen.json")
+COUNTERS_FILE = os.path.join(HOME, "degen_fastwatch_counters.json")
+LOG_FILE = os.path.join(HOME, "log", "degen-fastwatch.log")
+
+POLL_SECS = 30
+MAX_AGE_MINUTES = 15
+MAX_PER_DAY = 20
+MAX_PER_HOUR = 5
+SEEN_CAP = 3000
+BLIND_ALERT_THRESHOLD = 10   # consecutive failures before alert
+BLIND_ALERT_COOLDOWN = 3600  # 1/hr max
+BACKOFF_MAX = 300
+
+TELEGRAM_CHAT_ID = "6883056760"
+
+# --- reuse degen-feed's pipeline (import, never duplicate) ---
+_FEED_PATH = os.path.join(SCRIPT_DIR, "degen-feed")
+_loader = importlib.machinery.SourceFileLoader("degen_feed_fw", _FEED_PATH)
+_spec = importlib.util.spec_from_loader("degen_feed_fw", _loader)
+df = importlib.util.module_from_spec(_spec)
+_loader.exec_module(df)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json_atomic(path, obj):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("save failed %s: %s", path, e)
+
+
+def send_card(text, mint):
+    """Copy-CA button only. No track button on early-warning cards."""
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[{
+                "text": "\U0001f4cb Copy CA",
+                "copy_text": {"text": mint},
+            }]],
+        })
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def send_blind_alert(failures):
+    text = (
+        "\u26a0\ufe0f DEGEN LANE DEGRADED \u2014 pool data failing "
+        "(%d consecutive fetch failures). The lane may be missing new "
+        "launches right now. Watching via backup; will alert when clear."
+        % failures)
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("blind alert send failed: %s", e)
+        return False
+
+
+def check_caps(counters):
+    now = time.time()
+    day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    hour = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H")
+    if counters.get("day") != day:
+        counters["day"] = day
+        counters["day_count"] = 0
+    if counters.get("hour") != hour:
+        counters["hour"] = hour
+        counters["hour_count"] = 0
+    if counters.get("day_count", 0) >= MAX_PER_DAY:
+        return False
+    if counters.get("hour_count", 0) >= MAX_PER_HOUR:
+        return False
+    return True
+
+
+def bump_caps(counters):
+    counters["day_count"] = counters.get("day_count", 0) + 1
+    counters["hour_count"] = counters.get("hour_count", 0) + 1
+    save_json_atomic(COUNTERS_FILE, counters)
+
+
+def main():
+    fh = logging.FileHandler(LOG_FILE)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(fh)
+
+    # Startup jitter: offset our schedule from the feed's 5s cadence so a
+    # feed-correlated throttle doesn't take us down with it.
+    jitter = random.uniform(0, POLL_SECS)
+    logger.warning("degen fastwatch started (independent pool detector); "
+                   "jitter %.0fs", jitter)
+    time.sleep(jitter)
+
+    knobs = df.get_weights()
+    min_fdv = knobs.get("min_fdv") or 20000
+    min_reserve = knobs.get("min_reserve") or 8000
+
+    seen = load_json(SEEN_FILE, {})
+    counters = load_json(COUNTERS_FILE, {})
+    consecutive_failures = 0
+    backoff = POLL_SECS
+    last_blind_alert = 0
+    polls = 0
+    pools_seen = 0
+
+    while True:
+        try:
+            pools = df.get_new_pools(pages=(1, 2))
+            polls += 1
+            if not pools:
+                raise RuntimeError("empty pool fetch")
+            consecutive_failures = 0
+            backoff = POLL_SECS
+
+            outcomes = load_json(OUTCOMES_FILE, {})
+            wl_seen = load_json(WATCHLIST_SEEN_FILE, {})
+
+            for pool in pools:
+                mint = pool.get("mint", "")
+                if not mint or mint in seen:
+                    continue
+                seen[mint] = time.time()
+                pools_seen += 1
+                # Dedup against feed + watchlist: never duplicate their cards.
+                if mint in outcomes or mint in wl_seen:
+                    continue
+                # Light filters: age + feed's FDV/reserve floors. No scoring
+                # (too early) — this is a raw early warning, watch only.
+                age = pool.get("age_min", 999)
+                if age > MAX_AGE_MINUTES or age < 0:
+                    continue
+                if pool.get("fdv", 0) < min_fdv:
+                    continue
+                if pool.get("reserve", 0) < min_reserve:
+                    continue
+                # RUNNER-ONLY standing rule (2026-10-18, user order):
+                # early warnings are still user-facing cards — only real
+                # runners with serious liquidity. Fail-closed.
+                _rok, _rwhy = df.passes_runner_gate(pool)
+                if not _rok:
+                    continue
+                # Safety: fail-CLOSED via feed's check_safety.
+                safe, reason, _intel = df.check_safety(mint)
+                if not safe:
+                    logger.warning("FASTWATCH BLOCK %s: %s",
+                                   mint[:8], reason)
+                    continue
+                if not check_caps(counters):
+                    logger.warning("fastwatch cap hit, skipping card")
+                    continue
+                mcap = pool.get("fdv", 0)
+                text = (
+                    "\u26a1 EARLY \u2014 $%s just appeared on-chain "
+                    "(~%.0f min ago, indep. check).\n"
+                    "mcap ~$%.0f \u00b7 too early to score \u2014 watch only, "
+                    "not a pick.\n"
+                    "CA: %s"
+                    % (pool.get("name", "?"), age, mcap, mint))
+                if send_card(text, mint):
+                    bump_caps(counters)
+                    logger.warning("FASTWATCH CARD %s age=%.0fm mcap=%.0f",
+                                   pool.get("name"), age, mcap)
+
+            # Bound seen file
+            if len(seen) > SEEN_CAP:
+                for m in sorted(seen, key=seen.get)[:len(seen) - SEEN_CAP]:
+                    del seen[m]
+            save_json_atomic(SEEN_FILE, seen)
+
+            if polls % 20 == 0:
+                logger.warning("fastwatch healthy: %d polls, %d pools seen",
+                               polls, pools_seen)
+
+        except Exception as e:
+            consecutive_failures += 1
+            logger.warning("fastwatch fetch failure #%d: %s",
+                           consecutive_failures, str(e)[:80])
+            backoff = min(BACKOFF_MAX, backoff * 2 if consecutive_failures > 1
+                          else POLL_SECS)
+            if (consecutive_failures >= BLIND_ALERT_THRESHOLD
+                    and time.time() - last_blind_alert > BLIND_ALERT_COOLDOWN):
+                if send_blind_alert(consecutive_failures):
+                    last_blind_alert = time.time()
+                    logger.warning("blind alert sent")
+
+        time.sleep(backoff)
+
+
+if __name__ == "__main__":
+    main()

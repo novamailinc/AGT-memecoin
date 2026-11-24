@@ -1,0 +1,7 @@
+id: custom.legacy-telegram
+title: custom.legacy-telegram
+description: Use Telegram when the user asks for Telegram or this provider's API.
+include_in_prompt: true
+require_auth: false
+availability:
+  confidential_vm: false

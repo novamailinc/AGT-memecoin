@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Run every test suite in tests/ one at a time and fail loudly on
+any suite that executes zero checks (Phase A, P2-5, 2026-11-22).
+
+Why this exists: the "plain scripts, never pytest" convention was
+false for 10 files (8 rely on tests/conftest.py's path bootstrap,
+which only applies under pytest; 2 more are pytest-only), and
+test_lifecycle.py silently "passed" for months while executing
+zero checks — a green run could mean nothing ran. This runner is
+the gate: a suite is green only when it exits 0 AND executes >= 1
+check; anything else fails the run.
+
+Usage:
+    ~/workspace/Forex-agent/.venv/bin/python scripts/run-test-suites
+    scripts/run-test-suites --suite test_grad.py --suite test_grad_raw.py
+    scripts/run-test-suites --dir /tmp/suite-fixtures --timeout 60
+
+Conventions (each suite is run exactly once, sequentially — never
+concurrently; concurrent full-suite runs have flaked on this VM):
+  * Plain suites run with the venv python, cwd=repo root,
+    PYTHONPATH=repo root (so the conftest-dependent files import
+    daemon/broker/core/agent without pytest).
+  * A suite that executes 0 checks as a plain script AND looks
+    pytest-style (top-level `def test_` / `class Test`) is retried
+    once under pytest (`-p no:cacheprovider -q`); the pytest result
+    stands. A plain suite that executes >= 1 check never retries.
+  * Checks are counted from the output: `PASS ...` / `PASS: ...`
+    lines, `ok ...` lines (test_tape_fallback.py), unittest
+    `Ran N tests`, pytest `N passed` (+ `N failed`).
+  * A suite is RED when rc != 0, or any FAIL line / failure count,
+    or 0 checks executed. The run exits non-zero when any suite
+    is red. One line per suite, then a summary.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_TESTS_DIR = os.path.join(REPO, "tests")
+DEFAULT_TIMEOUT = 600
+
+_PASS_RE = re.compile(r"^PASS[\s:]", re.MULTILINE)
+_OK_RE = re.compile(r"^ok\s", re.MULTILINE)
+_FAIL_RE = re.compile(r"^FAIL[\s:]", re.MULTILINE)
+_FAILURES_RE = re.compile(r"^FAILURES:\s*(\d+)", re.MULTILINE)
+_RAN_RE = re.compile(r"^Ran (\d+) tests?", re.MULTILINE)
+_UNITTEST_FAILED_RE = re.compile(r"^FAILED", re.MULTILINE)
+_PYTEST_PASSED_RE = re.compile(r"(\d+) passed")
+_PYTEST_FAILED_RE = re.compile(r"(\d+) failed")
+_PYTEST_STYLE_RE = re.compile(r"^\s*(def test_|class Test)", re.MULTILINE)
+_TEST_CONTENT_RE = re.compile(
+    r"def test_|class Test|unittest|check\(|pytest", re.MULTILINE)
+
+
+def _has_test_content(path):
+    """True when the file looks like a runnable suite at all (has
+    test functions, unittest, check() calls, or pytest). Helper
+    modules named test_*.py (e.g. test_iface_fakes.py, imported by
+    other suites) have none of these and are skipped, not failed."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return bool(_TEST_CONTENT_RE.search(fh.read()))
+    except OSError:
+        return False
+
+
+def _venv_python():
+    """The repo venv python when it exists, else this interpreter."""
+    candidate = os.path.join(os.path.dirname(REPO), ".venv",
+                             "bin", "python")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return sys.executable
+
+
+def _parse_output(text):
+    """(checks, fails) from one suite's combined output."""
+    checks = len(_PASS_RE.findall(text)) + len(_OK_RE.findall(text))
+    fails = len(_FAIL_RE.findall(text))
+    m = _FAILURES_RE.search(text)
+    if m:
+        fails = max(fails, int(m.group(1)))
+    m = _RAN_RE.search(text)
+    if m:
+        checks += int(m.group(1))
+        if _UNITTEST_FAILED_RE.search(text):
+            fm = re.search(r"failures=(\d+)", text)
+            em = re.search(r"errors=(\d+)", text)
+            fails += (int(fm.group(1)) if fm else 0) + \
+                (int(em.group(1)) if em else 0) or 1
+    return checks, fails
+
+
+def _parse_pytest_output(text):
+    """(checks, fails) from `pytest -q` output."""
+    tail = "\n".join(text.strip().splitlines()[-5:])
+    checks = 0
+    fails = 0
+    m = _PYTEST_PASSED_RE.search(tail)
+    if m:
+        checks += int(m.group(1))
+    m = _PYTEST_FAILED_RE.search(tail)
+    if m:
+        fails += int(m.group(1))
+        checks += int(m.group(1))
+    return checks, fails
+
+
+def _looks_pytest_style(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return bool(_PYTEST_STYLE_RE.search(fh.read()))
+    except OSError:
+        return False
+
+
+def _run_one(python, suite_path, timeout, env):
+    """Run one suite as a plain script; pytest-fallback when it
+    executes 0 checks and looks pytest-style. Returns
+    (rc, checks, fails, output, via_pytest)."""
+    try:
+        proc = subprocess.run(
+            [python, suite_path], capture_output=True, text=True,
+            timeout=timeout, cwd=REPO, env=env)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        rc = proc.returncode
+    except subprocess.TimeoutExpired as e:
+        output = ((e.stdout or b"").decode("utf-8", "replace")
+                  if isinstance(e.stdout, bytes) else (e.stdout or "")) + \
+            ((e.stderr or b"").decode("utf-8", "replace")
+             if isinstance(e.stderr, bytes) else (e.stderr or ""))
+        return "timeout", 0, 1, output + "\n[TIMEOUT]", False
+    checks, fails = _parse_output(output)
+    if checks == 0 and _looks_pytest_style(suite_path):
+        try:
+            proc = subprocess.run(
+                [python, "-m", "pytest", "-p", "no:cacheprovider",
+                 "-q", suite_path],
+                capture_output=True, text=True, timeout=timeout,
+                cwd=REPO, env=env)
+            output = (proc.stdout or "") + (proc.stderr or "")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            return "timeout", 0, 1, output + "\n[TIMEOUT]", True
+        checks, fails = _parse_pytest_output(output)
+        return rc, checks, fails, output, True
+    return rc, checks, fails, output, False
+
+
+def _tail(output, limit=300):
+    lines = [ln for ln in output.splitlines() if ln.strip()]
+    tail = "||".join(lines[-2:]) if lines else ""
+    return tail[:limit]
+
+
+# Live-provider suites (D-08, Phase 2): they spend live provider
+# quota and can trip rate limits, so they NEVER run in the default
+# suite. Opt in with --include-live or RUN_LIVE_TESTS=1 (and the
+# suite itself requires its own env var, e.g.
+# RUN_LIVE_HELIUS_TEST=1). A suite named explicitly with --suite is
+# still run — the operator asked for it by name — but it self-skips
+# (LIVE-SKIP) without its own opt-in env var.
+LIVE_SUITES = frozenset({"test_intelligence_router_live_helius.py"})
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Run the repo test suites with a 0-check gate.")
+    ap.add_argument("--dir", default=DEFAULT_TESTS_DIR,
+                    help="directory holding test_*.py suites")
+    ap.add_argument("--suite", action="append", default=[],
+                    help="run only this suite (basename, with or "
+                         "without .py); repeatable")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                    help="per-suite timeout in seconds (default 600)")
+    ap.add_argument("--include-live", action="store_true",
+                    help="also run live-provider suites (D-08 opt-in; "
+                         "or set RUN_LIVE_TESTS=1). Without this, "
+                         "live suites are skipped in a default run.")
+    args = ap.parse_args(argv)
+
+    tests_dir = os.path.abspath(args.dir)
+    if args.suite:
+        wanted = set()
+        for name in args.suite:
+            wanted.add(name if name.endswith(".py") else name + ".py")
+        suites = [os.path.join(tests_dir, n) for n in sorted(wanted)]
+        missing = [s for s in suites if not os.path.isfile(s)]
+        if missing:
+            print("no such suite(s): %s" % ", ".join(missing),
+                  file=sys.stderr)
+            return 2
+    else:
+        suites = sorted(
+            os.path.join(tests_dir, n)
+            for n in os.listdir(tests_dir)
+            if n.startswith("test_") and n.endswith(".py"))
+    if not suites:
+        print("no suites found in %s" % tests_dir, file=sys.stderr)
+        return 2
+
+    python = _venv_python()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO + (os.pathsep + env["PYTHONPATH"]
+                                if env.get("PYTHONPATH") else "")
+    # Phase 3: suite traffic must never pollute the live router
+    # shadow journal (reserves.rpc observes every call). Test runs
+    # run with the observer off; live daemons never set this.
+    env["ROUTER_SHADOW_OFF"] = "1"
+    include_live = bool(args.include_live
+                        or os.environ.get("RUN_LIVE_TESTS") == "1")
+    red = []
+    skipped = []
+    green = 0
+    total_checks = 0
+    for suite_path in suites:
+        name = os.path.basename(suite_path)
+        # Live-provider suites never run in a default (unfiltered)
+        # listing — they spend live quota (D-08). Explicit --suite
+        # naming still runs the file; the suite itself self-skips
+        # without its own opt-in env var.
+        if (name in LIVE_SUITES and not include_live
+                and not args.suite):
+            print("SKIP %s :: live-provider suite (opt-in only: "
+                  "--include-live or RUN_LIVE_TESTS=1)" % name)
+            skipped.append((name, "live-provider suite (opt-in only)"))
+            continue
+        # Not a suite at all (helper module named test_*.py): skip
+        # visibly instead of failing it for running 0 checks.
+        if not _has_test_content(suite_path):
+            print("SKIP %s :: no test content (helper module, not a "
+                  "suite)" % name)
+            skipped.append((name, "no test content"))
+            continue
+        rc, checks, fails, output, via_pytest = _run_one(
+            python, suite_path, args.timeout, env)
+        total_checks += checks
+        # A retired suite announces itself and exits 0 by design
+        # (e.g. test_stacker.py, killed lane 2026-10-23): skip
+        # visibly instead of failing it for running 0 checks.
+        if checks == 0 and "RETIRED" in output:
+            print("SKIP %s :: retired suite (announces RETIRED, "
+                  "exits 0 by design)" % name)
+            skipped.append((name, "retired"))
+            continue
+        # A live-provider suite that self-skipped (opt-in env var
+        # unset, or auto-quiet active) announces LIVE-SKIP and
+        # exits 0 by design: skip visibly, never red.
+        if checks == 0 and rc == 0 and "LIVE-SKIP" in output:
+            print("SKIP %s :: live-provider suite self-skipped "
+                  "(opt-in unset or provider quiet)" % name)
+            skipped.append((name, "live self-skip"))
+            continue
+        status = "RED" if (rc != 0 or fails > 0 or checks == 0) else "OK"
+        via = " [pytest]" if via_pytest else ""
+        print("SUITE %s rc=%s PASS=%d FAIL=%d%s :: %s"
+              % (name, rc, checks, fails, via, _tail(output)))
+        if status == "RED":
+            red.append((name, rc, checks, fails))
+        else:
+            green += 1
+    print("TOTAL: %d suites, %d green, %d red, %d skipped, "
+          "%d checks executed"
+          % (len(suites), green, len(red), len(skipped), total_checks))
+    if skipped:
+        for name, reason in skipped:
+            print("SKIPPED: %s (%s)" % (name, reason))
+    if red:
+        for name, rc, checks, fails in red:
+            print("RED: %s (rc=%s, checks=%d, fails=%d)"
+                  % (name, rc, checks, fails))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Realtime sync daemon (2026-10-21; P1/P7/P9 2026-10-23).
+
+Maintains the live tape (daemon/launch_scanner/rt_sync.py) over every
+mint the system cares about — open positions, recent bus signals — on a
+~5s sweep, and drives the mirror/CEO/grad exit engines event-style
+through their own poll_exits(price_fn) whenever an open position's price
+moves. The 120s exit daemons remain as backstop.
+
+P1/P9a (2026-10-23): ARMED positions (peak >= 1.5x) are additionally
+priced by PUSH — an accountSubscribe watcher (armed_watch.py) on their
+PumpSwap pool vaults; every swap pushes a price and wakes this loop to
+evaluate that lane's exits on the event. P7: the tape carries a
+LIVE/STALE/RECONCILING freshness state; after any sweep gap the first
+sweep reconciles open positions and journals >20% moves that happened
+while dark to ~/.forex-agent/reconciliation_log.jsonl.
+
+Paper only; this daemon never opens positions, never sends cards,
+never touches the user's lane. Free-only: DexScreener batch quotes +
+Helius standard WSS (PumpPortal trade streams are a paid tier and
+are refused by design in this codebase).
+"""
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("realtime-sync")
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_sys.path.insert(0, _ROOT)
+_sys.path.insert(0, os.path.join(_ROOT, "daemon", "launch_scanner"))
+
+try:
+    import rt_sync as _rt
+    import mirror as _mirror
+    import ceo as _ceo
+    import grad as _grad
+    import armed_watch as _aw
+    _HAS_ALL = True
+except ImportError as e:  # pragma: no cover
+    _HAS_ALL = False
+    _IMPORT_ERROR = e
+
+# P4 event recorder: fail-soft, like grad.py's reserves import —
+# a missing recorder never stops the sync loop.
+try:
+    import recorder as _recorder
+except Exception:
+    try:
+        from daemon.launch_scanner import recorder as _recorder
+    except Exception:
+        _recorder = None
+
+# 2-second heartbeat (2026-10-23, user order): this daemon beats
+# into ~/.forex-agent/run/heartbeat.json at the ordered cadence
+# from a dedicated thread — the main loop's sweep cadence (5s,
+# wake-driven) must not gate liveness proof. Fail-soft, like the
+# recorder: a missing heartbeat module never stops the sync loop.
+try:
+    import heartbeat as _heartbeat
+except Exception:
+    try:
+        from daemon.launch_scanner import heartbeat as _heartbeat
+    except Exception:
+        _heartbeat = None
+
+
+def _heartbeat_loop():
+    """Beat every BEAT_INTERVAL_S (2s) into the shared heartbeat
+    doc, forever. Runs in a daemon thread; never raises."""
+    if _heartbeat is None:
+        return
+    while True:
+        try:
+            _heartbeat.beat("realtime-sync")
+        except Exception:
+            pass
+        time.sleep(_heartbeat.BEAT_INTERVAL_S)
+
+DIRTY_EVAL_GAP_S = 1.0  # min seconds between push-driven evals per lane
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("realtime-sync", token="scripts/realtime-sync")
+    if not _HAS_ALL:
+        logger.warning("realtime-sync deps missing: %s", _IMPORT_ERROR)
+        return 1
+    threading.Thread(target=_heartbeat_loop, daemon=True,
+                     name="heartbeat-2s").start()
+    tape = _rt.Tape()
+    tape_fn = _rt.make_price_fn(tape)
+    health = _rt.TapeHealth()
+    wake = threading.Event()
+    dirty = set()
+    dirty_lock = threading.Lock()
+
+    def lane_price_fn(chain, mint, spot_index=None):
+        # Armed Solana positions: pushed reserves price wins; the
+        # tape prices everything else (and HL gets 0.0 as before).
+        if (chain or "") == "solana":
+            wp = watcher.price(str(mint))
+            if wp > 0:
+                return wp
+        return tape_fn(chain, mint, spot_index)
+
+    def on_armed_price(mint, px, ts):
+        with dirty_lock:
+            dirty.add(mint)
+        wake.set()
+
+    def on_watch_state(state, info):
+        logger.warning("rt_sync armed watch: %s %s", state, info)
+        if state == "RECONCILED":
+            for mv in (info or {}).get("moved") or []:
+                rec = dict(mv)
+                rec["ts"] = time.time()
+                rec["source"] = "rt_sync-armed-watch"
+                _rt.journal_reconciliation(rec)
+
+    watcher = _aw.ArmedWatcher(on_price=on_armed_price,
+                               on_state=on_watch_state)
+    watcher.start()
+
+    watched = {}
+    last_watch = 0.0
+    last_sweep = 0.0
+    last_eval = {"mirror": 0.0, "ceo": 0.0, "grad": 0.0}
+    last_dirty_eval = {"mirror": 0.0, "ceo": 0.0, "grad": 0.0}
+    last_prices = {"mirror": {}, "ceo": {}, "grad": {}}
+    lanes = (("mirror", _mirror, "mirror"), ("ceo", _ceo, "ceo"),
+             ("grad", _grad, "grad"))
+    logger.warning("realtime-sync started (paper only, sweep %.0fs, "
+                   "armed push watcher on)", _rt.SWEEP_S)
+    while True:
+        t0 = time.time()
+        try:
+            swept = False
+            if t0 - last_sweep >= _rt.SWEEP_S or not watched:
+                if t0 - last_watch >= _rt.WATCH_REBUILD_S or not watched:
+                    watched = _rt.build_watched_set(now=t0)
+                    tape.prune(watched.keys())
+                    last_watch = t0
+                    # Refresh the armed set from the engines' own
+                    # ledgers (Solana positions with a pool pair).
+                    cands = {}
+                    for _kind, module, _lane in lanes:
+                        for mint, pos in \
+                                module.open_positions().items():
+                            if (pos.get("chain") or "solana") \
+                                    == "solana" and pos.get("pair"):
+                                cands[mint] = pos
+                    watcher.set_positions(
+                        _aw.armed_positions(cands))
+                ctx = health.begin_sweep(tape, watched, t0)
+                updated = _rt.refresh_tape(tape, watched, t0)
+                # P4: one quote record per open-position mint per
+                # sweep (the sweep IS the cadence — no extra throttle
+                # needed). Bus-only / tracked mints are not recorded.
+                if _recorder is not None:
+                    for _mint, _row in watched.items():
+                        try:
+                            if not (set(_row.get("kinds") or ())
+                                    & {"ceo", "mirror", "grad"}):
+                                continue
+                            _trow = tape.rows.get(_mint) or {}
+                            _px = float(_trow.get("price") or 0)
+                            if _px <= 0:
+                                continue
+                            _recorder.record("quote", {
+                                "mint": _mint, "price": _px,
+                                "liquidity": float(
+                                    _trow.get("liquidity") or 0),
+                                "tape_source": str(
+                                    _trow.get("tape_source") or ""),
+                                "chain": str(_row.get("chain")
+                                             or "solana"),
+                            }, ts=t0)
+                        except Exception:
+                            continue
+                for state, info in health.end_sweep(
+                        tape, watched, t0, ctx, updated):
+                    logger.warning("rt_sync tape %s %s", state, info)
+                last_sweep = t0
+                swept = True
+            with dirty_lock:
+                dirty_now = set(dirty)
+                dirty.clear()
+            for kind, module, lane in lanes:
+                mints = _rt.open_mints(watched, kind)
+                if not mints:
+                    continue
+                changed = set()
+                if swept and t0 - last_eval[lane] \
+                        >= _rt.MIN_EVAL_GAP_S:
+                    changed |= set(_rt.exit_eval_needed(
+                        tape, mints, last_prices[lane], t0))
+                hot = dirty_now & mints
+                if hot and t0 - last_dirty_eval[lane] \
+                        >= DIRTY_EVAL_GAP_S:
+                    changed |= hot
+                if not changed:
+                    continue
+                closes = module.poll_exits(lane_price_fn)
+                if swept:
+                    last_eval[lane] = t0
+                if hot:
+                    last_dirty_eval[lane] = t0
+                for m in mints:
+                    px = tape.price(m, t0)
+                    if px > 0:
+                        last_prices[lane][m] = px
+                if closes:
+                    logger.warning(
+                        "rt_sync %s exits: %d close(s) (%s)",
+                        lane, len(closes),
+                        ",".join(sorted(changed)[:4]))
+            if swept:
+                _rt.write_tape(tape, t0)
+        except Exception:
+            logger.exception("realtime-sync cycle failed")
+        dt = time.time() - t0
+        wake.wait(timeout=max(0.2, _rt.SWEEP_S - dt))
+        wake.clear()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

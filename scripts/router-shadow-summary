@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Router shadow summary (Phase 3).
+
+Reads the live shadow journal
+(~/.forex-agent/acquisition_router_shadow.jsonl) and prints the
+agreement of the central router's decisions with live behaviour
+over the journal's window (or --since <unix-ts> / --minutes N).
+
+Agreement rate = (exact + fallback_consistent) / (exact +
+fallback_consistent + divergent). no_serve / refused are reported
+separately and never folded into the rate. Read-only: prints and
+exits; never touches a ledger, a daemon, or a provider.
+"""
+import json
+import os
+import sys
+import time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from daemon.intelligence.acquisition.shadow_observer import (  # noqa: E402
+    ShadowObserver)
+
+
+def main():
+    since = None
+    args = sys.argv[1:]
+    if "--minutes" in args:
+        minutes = float(args[args.index("--minutes") + 1])
+        since = time.time() - minutes * 60.0
+    if "--since" in args:
+        since = float(args[args.index("--since") + 1])
+    home = os.environ.get("FOREX_AGENT_HOME") \
+        or os.path.expanduser("~/.forex-agent")
+    summary = ShadowObserver(home=home).summarize(since_ts=since)
+    print(json.dumps(summary, indent=2, default=str))
+    counts = summary["counts"]
+    print("---")
+    print("window: %s observations" % summary["total"])
+    if summary["first_ts"] and summary["last_ts"]:
+        span = summary["last_ts"] - summary["first_ts"]
+        print("span: %.1f minutes (%s .. %s)"
+              % (span / 60.0,
+                 time.strftime("%H:%M:%S UTC",
+                               time.gmtime(summary["first_ts"])),
+                 time.strftime("%H:%M:%S UTC",
+                               time.gmtime(summary["last_ts"]))))
+    print("counts: %s" % counts)
+    rate = summary["agreement_rate"]
+    print("agreement rate: %s"
+          % ("%.4f" % rate if rate is not None else "n/a (no judged calls)"))
+    print("exact rate: %s"
+          % ("%.4f" % summary["exact_rate"]
+             if summary["exact_rate"] is not None else "n/a"))
+    for entry in summary["divergences"]:
+        print("DIVERGENT: %s primary=%s candidates=%s served=%s"
+              % (entry.get("method"), entry.get("primary"),
+                 entry.get("candidates"), entry.get("served")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

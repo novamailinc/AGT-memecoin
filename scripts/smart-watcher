@@ -1,0 +1,1384 @@
+#!/usr/bin/env python3
+"""Smart-wallet watcher: real-time bridge to degen lane.
+
+Polls tracked smart wallets through the shared paced RPC transport.
+When a wallet buys a NEW mint, immediately enriches it and fires
+a 🎲 DEGEN card if it passes safety + basic filters.
+
+This is the highest-conviction signal — smart money moving first.
+"""
+import json
+import logging
+import math
+import os
+import time
+import urllib.request
+import sys as _sys
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "launch_scanner"))
+try:
+    from robust_http import get_json as _robust_get
+    _HAS_ROBUST = True
+except ImportError:
+    _HAS_ROBUST = False
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+try:
+    from smartwatch_filters import (wallet_group, is_stale, eval_convergence,
+                                    is_expired, load_convergence,
+                                    save_convergence, add_sighting, serialized_convergence,
+                                    CONVERGENCE_WINDOW_S)
+    from toxicity import check_toxicity, check_toxicity_detailed
+    _HAS_FILTERS = True
+except ImportError:
+    _HAS_FILTERS = False
+    def serialized_convergence(fn):return fn
+try:
+    import lp_lock
+    _HAS_LPLOCK = True
+except ImportError:
+    _HAS_LPLOCK = False
+try:
+    # P9b (2026-10-23): realtime wake stream + reconciliation journal.
+    import logstream as _ls
+    import rt_sync as _rt_journal
+    _HAS_STREAM = True
+except ImportError:
+    _HAS_STREAM = False
+try:
+    import saturation
+    _HAS_SATURATION = True
+except ImportError:
+    _HAS_SATURATION = False
+import urllib.parse
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("smart-watcher")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "degen_seen.json")
+TRACK_FILE = os.path.join(HOME, "degen_outcomes.json")
+
+POLL_SECS = 30  # 2026-10-12: was 60. Tighter, but conservative: Helius
+# free tier 429s on per-second bursts (observed), so inter-wallet spacing
+# is KEPT. Missed buys came mostly from the narrow sig window + slow
+# sequential tx fetches, both fixed below.
+SIG_LIMIT = 30  # was 10: with limit=10, >10 txs between polls meant the
+# last_sig cursor jumped over intermediate txs and their buys were lost
+# forever. 30 alone does NOT cover sniper bursts (seen 8 overflows in ~2h
+# on 2026-10-12) -- so a full window pages BACK with `before` until the
+# previous cursor is reached, instead of skipping.
+PAGEBACK_MAX = 3  # extra pages per cycle; caps burst cost at 4 RPC calls
+
+# Hourly card cap (2026-10-18): the watcher had NO cap and fired 11 cards
+# in 15 min (user: "spam of degen ca"). Mirrors degen-feed's standing
+# 3/hour (user 2026-10-14: fewer cards, higher bar — quality over quantity).
+MAX_CARDS_PER_HOUR = 3
+# PERMANENT KILL 2026-10-29 (user order: shut down not-useful cards
+# forever): smart-watcher copy cards are OFF. The wallets these cards
+# pitch lost on both paper trials (watcher v1/v2 KILLED) and smart money
+# is watchlist-only since 2026-10-20, so pitching their buys as a reason
+# to buy contradicts a standing user decision. The watcher itself keeps
+# running: its bus fires still feed the smart_select trial, convergences
+# still resolve, the mirror/outcomes bookkeeping still runs — only the
+# Telegram card is suppressed, and each suppression is logged.
+_CARDS_ENABLED = False
+_cards_this_hour = 0
+_cards_hour_start = 0
+
+# RUNNER-ONLY standing rule (2026-10-18, user order): every lane hunts ONLY
+# real running signals — real runners with serious liquidity. Hard floor.
+RUNNER_MIN_LIQ = 25_000.0
+RUNNER_MIN_MCAP = 50_000.0
+RUNNER_BIG_MCAP = 500_000.0  # big established buys count as runners
+
+# Convergence retry (2026-10-20, DACITY post-mortem): the first converged
+# attempt fires seconds after the smart wallets buy — often BEFORE
+# RugCheck has indexed the token and before liq/mcap cross the runner
+# bar. It used to set card_fired=True on ANY outcome, burning the mint
+# forever; DACITY then ran 40 minutes to ~$1.6M mcap with no re-check.
+# Now ONLY a sent card resolves a convergence. Blocked/stale/capped
+# attempts retry every RETRY_EVERY_S for RETRY_WINDOW_S from the first
+# sighting, each retry re-running the full gate stack on CURRENT data.
+RETRY_WINDOW_S = 1800
+RETRY_EVERY_S = 60
+
+
+def _cap_allow():
+    """Hourly card budget. Returns True if a card may fire now."""
+    global _cards_this_hour, _cards_hour_start
+    now = time.time()
+    if now - _cards_hour_start >= 3600:
+        _cards_hour_start = now
+        _cards_this_hour = 0
+    if _cards_this_hour >= MAX_CARDS_PER_HOUR:
+        return False
+    _cards_this_hour += 1
+    return True
+
+
+def _http(url, data=None, timeout=15):
+    # Use robust client when available
+    if _HAS_ROBUST:
+        try:
+            from robust_http import post_json as _rp
+            if data:
+                return _rp(url, data, timeout=timeout, tries=3)
+            from robust_http import get_json as _rg
+            return _rg(url, timeout=timeout, tries=4)
+        except Exception:
+            return None
+    try:
+        headers = {"User-Agent": "forex-agent/1.0",
+                   "Content-Type": "application/json"}
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def get_helius_key():
+    # Try main key, fall back to discovery (main may hit monthly limit)
+    for name in ["api_key", "api_key_discovery"]:
+        try:
+            with open(os.path.join(HOME, "helius", name)) as f:
+                k = f.read().strip()
+            if k:
+                # Quick validity check
+                try:
+                    data = json.dumps({"jsonrpc": "2.0", "id": 1,
+                                       "method": "getSlot"}).encode()
+                    req = urllib.request.Request(
+                        f"https://mainnet.helius-rpc.com/?api-key={k}",
+                        data=data,
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        d = json.load(r)
+                    if "result" in d:
+                        return k
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return None
+
+
+def get_wallets():
+    # Prefer ACTIVE graded wallets, fall back to registry
+    # (Phase 1: muted wallets are excluded — dead weight with 0 hits)
+    try:
+        from wallet_grader import active_wallets
+        aw = active_wallets()
+        if aw:
+            return aw
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(HOME, "launch_scanner",
+                               "smart_wallets.json")) as f:
+            reg = json.load(f)
+            # Exclude muted wallets (Phase 1 farmer/dead-weight filter)
+            return [w for w, d in reg.items()
+                    if not (isinstance(d, dict) and d.get("muted"))]
+    except Exception:
+        return []
+
+
+def _shared_rpc_transport():
+    # Same production path as reserve reads. Imports remain lazy so
+    # script tools that only render cards do not need RPC setup.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo not in _sys.path:
+        _sys.path.insert(0, repo)
+    from daemon.launch_scanner import reserves
+    return reserves
+
+
+def rpc(method, params, api_key=None):
+    """Shared Alchemy-first paced RPC, with existing controlled fallbacks.
+
+    api_key remains for caller compatibility, never used to create a
+    second unpaced Helius-only path. This changes routing, not polling
+    cadence; no request is made by importing this module.
+    """
+    return _shared_rpc_transport().rpc(method, params)
+
+
+_UNFETCHED = object()
+
+
+def get_buy_details(wallet, sig, api_key, tx=_UNFETCHED, strict=False):
+    """Extract wallet buys from a transaction.
+
+    Returns [{mint, tokens_bought, sol_spent, block_ts}]. strict=True
+    distinguishes unavailable/invalid evidence (None) from valid no-buy ([]).
+    sol_spent is the
+    wallet's total SOL outflow in the tx (buy + fee); for multi-mint txs it
+    is split equally across the bought mints (documented approximation —
+    the staleness filter fail-opens when the price can't be parsed).
+    """
+    if tx is _UNFETCHED:
+        tx = rpc("getTransaction",
+                 [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}], api_key)
+    if not tx:
+        return None if strict else []
+    from wallet_transaction import wallet_balance_evidence
+    evidence=wallet_balance_evidence(wallet,sig,tx)
+    if evidence is None:return None if strict else []
+    before,after=evidence['before'],evidence['after']
+    buys=[{'mint':mint,'tokens_bought':amount-before.get(mint,0.0),
+           'block_ts':evidence['block_ts'],'signature':sig,
+           'acquisition_provenance':'successful_transaction_balance_delta'}
+          for mint,amount in after.items()
+          if mint.endswith('pump') and amount>before.get(mint,0.0)]
+    for buy in buys:buy['sol_spent']=evidence['sol_out']/len(buys)
+    if any(not math.isfinite(buy['tokens_bought']) or not math.isfinite(buy['sol_spent']) for buy in buys):
+        return None if strict else []
+    return buys
+
+
+def get_sold_mints(wallet, sig, api_key, tx=_UNFETCHED, details=False):
+    """Validated wallet balance decreases, not instruction-proven swaps.
+
+    Closed accounts contribute zero post balance. Same-wallet account
+    transfers aggregate before comparison. Existing >50% selector retained.
+    details=True carries causal identity and block time for durable recording.
+    """
+    if tx is _UNFETCHED:
+        tx=rpc('getTransaction',[sig,{'encoding':'json','maxSupportedTransactionVersion':0}],api_key)
+    if get_buy_details(wallet,sig,api_key,tx=tx,strict=True) is None:
+        return []
+    meta=tx['meta'];before,after={},{}
+    for field,target in (('preTokenBalances',before),('postTokenBalances',after)):
+        for balance in meta[field]:
+            if balance['owner']==wallet:
+                mint=balance['mint']
+                target[mint]=target.get(mint,0.0)+float(balance['uiTokenAmount']['uiAmount'])
+    out=[]
+    for mint,pre in before.items():
+        post=after.get(mint,0.0)
+        if mint.endswith('pump') and pre>0 and post<pre:
+            fraction=(pre-post)/pre
+            if fraction>0.5:
+                out.append({'mint':mint,'sold_fraction':fraction,'signature':sig,
+                            'block_ts':float(tx['blockTime']),
+                            'provenance':'successful_transaction_balance_decrease'}
+                           if details else (mint,fraction))
+    return out
+
+
+def _record_sells(wallet, sells):
+    """Persist causal sell evidence, never guess a buy match or hold time."""
+    import smartgrade
+    return smartgrade.record_wallet_sells(wallet,sells)
+
+
+def _instant_safety_fallback(mint):
+    """Instant on-chain verdict when RugCheck has no report yet
+    (2026-10-20). Returns (safe, reason, report) when the chain gives
+    a definitive verdict, or None when it cannot — the caller then
+    stays fail-closed exactly as before."""
+    try:
+        import instant_safety
+        rep = instant_safety.check(mint, timeout=8)
+    except Exception:
+        return None
+    if not rep or rep.get("unknown"):
+        return None
+    if rep.get("passed"):
+        return True, "ok (instant on-chain verified)", rep
+    return False, "SAFETY BLOCK: instant check: %s" % "; ".join(
+        (rep.get("fails") or [])[:2]), rep
+
+
+def check_safety(mint):
+    """Returns (safe: bool, reason: str, report: dict|None)."""
+    try:
+        data = _http(
+            "https://api.rugcheck.xyz/v1/tokens/%s/report" % mint,
+            timeout=8)
+        if not data:
+            fb = _instant_safety_fallback(mint)
+            if fb is not None:
+                return fb
+            # 2026-10-12: fail-CLOSED (user: "I don't want rug coin").
+            return False, "SAFETY BLOCK: safety unknown (RugCheck unreachable)", None
+        for r in (data.get("risks") or []):
+            name = (r.get("name") or "").lower()
+            level = (r.get("level") or "").lower()
+            if level == "danger" and any(
+                    k in name for k in ("honeypot", "cannot sell",
+                                        "transfer blocked")):
+                return False, r.get("name", "?"), data
+        return True, "ok", data
+    except Exception:
+        fb = _instant_safety_fallback(mint)
+        if fb is not None:
+            return fb
+        # 2026-10-12: fail-CLOSED (user: "I don't want rug coin").
+        return False, "SAFETY BLOCK: safety unknown (RugCheck error)", None
+
+
+# Phase 1 token gates (2026-10-15 smart-money research):
+# The gap between 0.6% and 38.9% hit rates is token-level filtering.
+SCAM_NAME_PATTERNS = (
+    "rug", "scam", "honeypot", "drain", "steal", "fake",
+    "elonmusk", "vitalik", "czbinance",  # impersonation bait
+    "1000x", "100x", "moonshot",  # promise bait
+    "airdrop", "claim",  # phishing bait
+)
+
+
+def check_token_gates(mint, symbol="", report=None):
+    """Token-level gates before firing a smart-money card.
+
+    Returns (pass: bool, reason: str).
+    Research: token filters separate 38.9% hit rate from 0.6%.
+    """
+    # 1. Scam name filter
+    sym_lower = (symbol or "").lower()
+    for pat in SCAM_NAME_PATTERNS:
+        if pat in sym_lower:
+            return False, f"GATE BLOCK: scam-name pattern '{pat}'"
+    # 2. Bundle check: top-10 concentration from RugCheck
+    #    (coordinated early buying = dump setup, not a pick)
+    try:
+        holders = (report or {}).get("topHolders") or []
+        holders = [h for h in holders if isinstance(h, dict)]
+        if holders:
+            pcts = sorted((float(h.get("pct") or 0) for h in holders),
+                          reverse=True)
+            top10 = sum(pcts[:10])
+            if top10 > 40:
+                return False, f"GATE BLOCK: bundle top10={top10:.0f}%"
+    except Exception:
+        pass
+    # 3. Duplicate-name check: copycats are exit-liquidity traps.
+    #    (Light check: symbol with pump suffix + numbers is often a copy)
+    if sym_lower.endswith("pump") or sym_lower.endswith("bonk"):
+        # Allow if it's the original, block obvious numbered copies
+        import re
+        if re.search(r'\d{2,}$', sym_lower):
+            return False, "GATE BLOCK: numbered copycat"
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Staleness + convergence filters (2026-10-17 smart-wallet rebuild).
+# Research: skip signals where the token already pumped >=50% since the
+# wallet's buy; fire only on >=2 INDEPENDENT wallets within 15 min.
+# ---------------------------------------------------------------------------
+
+_sol_usd_cache = {"ts": 0.0, "price": 0.0}
+
+
+def get_sol_usd():
+    """Cached SOL/USD (5 min). 0.0 on failure -> staleness fail-open."""
+    now = time.time()
+    if now - _sol_usd_cache["ts"] < 300 and _sol_usd_cache["price"] > 0:
+        return _sol_usd_cache["price"]
+    try:
+        pairs = _http(
+            "https://api.dexscreener.com/tokens/v1/solana/"
+            "So11111111111111111111111111111111111111112",
+            timeout=8)
+        if pairs:
+            p = float(pairs[0].get("priceUsd") or 0)
+            if p > 0:
+                _sol_usd_cache["ts"] = now
+                _sol_usd_cache["price"] = p
+                return p
+    except Exception:
+        pass
+    return _sol_usd_cache["price"]
+
+
+def load_registry():
+    """Full wallet registry {addr: {...}} for group mapping."""
+    try:
+        with open(os.path.join(HOME, "launch_scanner",
+                               "smart_wallets.json")) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _window_txns(info, window):
+    """(buys, sells) for one DexScreener txns window ("m5"/"h1"/"h24"),
+    or (None, None) when the window was not in the enrich payload.
+    A present window with 0 buys is a MEASURED 0 and returns as such."""
+    try:
+        txns = (info or {}).get("txns") or {}
+        w = txns.get(window) or {}
+        if not isinstance(w, dict) or "buys" not in w or "sells" not in w:
+            return None, None
+        return int(w.get("buys") or 0), int(w.get("sells") or 0)
+    except Exception:
+        return None, None
+
+
+def _pair_age_min(info, now_ts=None):
+    """Pair age in minutes from DexScreener pairCreatedAt (epoch ms).
+    None when unmeasured or in the future — never guessed."""
+    try:
+        created = float((info or {}).get("pairCreatedAt") or 0)
+        if created <= 0:
+            return None
+        if created < 1e11:  # seconds, not ms
+            created *= 1000.0
+        age = (float(now_ts or time.time()) - created / 1000.0) / 60.0
+        if age < 0:
+            return None
+        return round(age, 2)
+    except Exception:
+        return None
+
+
+def _safety_score(report):
+    """The safety report's own measured score, when it carries one:
+    RugCheck payloads expose score_normalised (0-100); instant-safety
+    fallback reports expose score (0-100). None otherwise. This is a
+    SAFETY score — journaled as safety_score, never as a signal score."""
+    try:
+        if not isinstance(report, dict):
+            return None
+        v = report.get("score_normalised")
+        if v is None and "passed" in report:
+            v = report.get("score")
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _measured_features(info, rec=None, n_groups=None, report=None):
+    """The REAL measured values behind a converged card (2026-10-23
+    producer fix). This lane measures NO total signal score: it fires
+    on convergence (>=2 independent wallet groups, see
+    smartwatch_filters) plus the runner-gate tape in `info` (DexScreener
+    enrich). Those measured inputs are the score components, and they
+    are what published records must carry — the old hardcoded score=85
+    published to the bus / mirror / outcomes made 30/36 CEO closes
+    carry a constant (85.0/buys=0/age=0.0) as if it were a measurement.
+
+    Returns {"components": {...}, "wallets": [...], "wallet_groups":
+    [...]} plus buys/sells (m5 window), age_min and safety_score ONLY
+    when actually measured — absent fields are omitted by callers,
+    never zero- or constant-filled. Smart money stays watchlist-only:
+    nothing here produces a score for any other lane to consume."""
+    info = info or {}
+    rec = rec or {}
+    sightings = [s for s in (rec.get("sightings") or [])
+                 if isinstance(s, dict)]
+    wallets = []
+    groups = []
+    for s in sightings:
+        w = str(s.get("wallet") or "")
+        if w and w not in wallets:
+            wallets.append(w)
+        g = str(s.get("group") or "")
+        if g and g not in groups:
+            groups.append(g)
+    if n_groups is None:
+        n_groups = len(groups) or None
+    comp = {}
+    if n_groups:
+        comp["convergence_groups"] = int(n_groups)
+    if sightings:
+        comp["sightings"] = len(sightings)
+    sol_total = sum(float(s.get("sol_spent") or 0) for s in sightings)
+    if sol_total > 0:
+        comp["sol_spent_total"] = round(sol_total, 6)
+    for win in ("m5", "h1", "h24"):
+        b, s_ = _window_txns(info, win)
+        if b is not None:
+            comp["buys_%s" % win] = b
+            comp["sells_%s" % win] = s_
+    if info.get("has_mom"):
+        comp["chg_m5"] = float(info.get("chg_m5") or 0)
+        comp["chg_h1"] = float(info.get("chg_h1") or 0)
+    if rec.get("runup_mult"):
+        try:
+            comp["runup_mult"] = float(rec["runup_mult"])
+        except Exception:
+            pass
+    if rec.get("anchor_price_usd"):
+        try:
+            comp["anchor_price_usd"] = float(rec["anchor_price_usd"])
+        except Exception:
+            pass
+    if float(info.get("vol") or 0) > 0:
+        comp["vol_h24"] = float(info["vol"])
+    feat = {"components": comp, "wallets": wallets,
+            "wallet_groups": groups}
+    b, s_ = _window_txns(info, "m5")
+    if b is not None:
+        feat["buys"] = b
+        feat["sells"] = s_
+    age = _pair_age_min(info)
+    if age is not None:
+        feat["age_min"] = age
+    ss = _safety_score(report)
+    if ss is not None:
+        feat["safety_score"] = ss
+        comp["safety_score"] = ss
+    return feat
+
+
+def fire_card(mint, info, safety_reason, n_wallets, wallet_names,
+              rec=None, report=None):
+    """Build + send the converged smart-money card; track the outcome.
+
+    Published records (signal bus, paper mirror, degen_outcomes) carry
+    the measured features from _measured_features — real m5 buys/sells,
+    pair age, hitting wallets, convergence + tape components. No total
+    score is published: this lane never measured one (see
+    _measured_features), so the key is omitted, not constant-filled."""
+    price = float(info.get("price", 0) or 0)
+    feat = _measured_features(info, rec=rec, n_groups=n_wallets,
+                              report=report)
+    evidence = {"smart_wallets": n_wallets,
+                "wallet_names": wallet_names,
+                "wallets": feat["wallets"],
+                "wallet_groups": feat["wallet_groups"],
+                "safety": safety_reason,
+                "components": feat["components"]}
+    if "age_min" in feat:
+        evidence["age_min"] = feat["age_min"]
+    if "safety_score" in feat:
+        evidence["safety_score"] = feat["safety_score"]
+    if _HAS_CARDS:
+        card_text = build_card(
+            symbol=info["symbol"],
+            # build_card uses score ONLY to pick the headline color and
+            # never prints it. Every card reaching here has passed the
+            # runner gate, so is_runner=True selects the color on a
+            # measured fact; score=0 is unused on that path and no
+            # total score is claimed anywhere on the card.
+            score=0,
+            is_runner=True,
+            mint=mint,
+            entry_price=price,
+            current_price=price,
+            mcap=info["mcap"],
+            liquidity=info["liq"],
+            age_min=feat.get("age_min", 0),
+            buys_5m=feat.get("buys", 0),
+            sells_5m=feat.get("sells", 0),
+            smart_wallets=n_wallets,
+            safety=safety_reason,
+            risk_note="💸 If this rugs, you lose 0.010 SOL.",
+            chain="solana",
+            source="smart-watcher",
+            supply=(lp_lock.token_supply("solana", mint)
+                    if _HAS_LPLOCK else ""),
+            saturation=(saturation.saturation_line(info["symbol"])
+                        if _HAS_SATURATION else ""),
+        )
+    else:
+        card_text = "\n".join([
+            "🎲 DEGEN — $%s 🧠 SMART MONEY ×%d" % (info["symbol"],
+                                                  n_wallets),
+            "⚡ Wallets %s just bought (converged)" % wallet_names,
+            "⚠️ HIGH RISK — real-money gamble, not a pick.",
+            "CA: %s" % mint,
+            "mcap %s · vol %s · liq %s" % (
+                fmt(info["mcap"]), fmt(info["vol"]), fmt(info["liq"])),
+            "🛡️ safety: %s" % safety_reason,
+            "💸 If this rugs, you lose 0.010 SOL.",
+        ])
+    if _CARDS_ENABLED:
+        _card_sent = send_card(card_text, mint=mint, chain="solana",
+                               source="smart-watcher")
+    else:
+        # Cards killed (see _CARDS_ENABLED): suppress the Telegram card
+        # but resolve the convergence and publish the bus signal exactly
+        # as a sent card would, so the smart_select trial keeps feeding
+        # and the mint is never retried.
+        logger.warning("SMART-WATCHER card suppressed (permanently "
+                       "killed): %s", mint[:12])
+        _card_sent = True
+    if _card_sent:
+        # Phase 0: publish the fired signal to the normalized bus.
+        try:
+            from signal_bus import make_signal, publish
+            sig = make_signal(
+                "solana", "smart-watcher", mint, symbol=info["symbol"],
+                tier="converged",
+                mcap=info.get("mcap", 0), liquidity=info.get("liq", 0),
+                evidence=evidence)
+            # make_signal zero-defaults the fields this lane does not
+            # measure as a total (score) or did not measure for this
+            # token (buys/sells/age): substitute the REAL measured
+            # values where they exist and OMIT the keys where they
+            # don't — never publish a zero/constant as a measurement.
+            if rec and rec.get('fire_event_id'):
+                sig['event_id']=rec['fire_event_id']
+                sig['ts']=rec['fire_created_ts']
+                sig['evidence']['transaction_signatures']=sorted({
+                    item['transaction_signature'] for item in rec.get('sightings',[])
+                    if isinstance(item.get('transaction_signature'),str)})
+            sig.pop("score", None)  # no total score is measured here
+            if "buys" in feat:
+                sig["buys"] = feat["buys"]
+                sig["sells"] = feat["sells"]
+            else:
+                sig.pop("buys", None)
+                sig.pop("sells", None)
+            if "age_min" in feat:
+                sig["age_min"] = feat["age_min"]
+            else:
+                sig.pop("age_min", None)
+            if publish(sig) is not True:
+                logger.error('smart watcher bus signal was not accepted for %s',mint[:12])
+                return False
+        except Exception:
+            logger.exception('smart watcher bus publish failed for %s',mint[:12])
+            return False
+        # Paper mirror (2026-10-17): every Solana card opens a $1 paper
+        # position with honest fills + the user's exit ladder. Never
+        # affects the card. Solana only. No score is passed: the lane
+        # measures none, and the real components ride in evidence
+        # (mirror journals evidence into entry_snapshot/entry_features).
+        try:
+            from mirror import mirror_card
+            opened, why = mirror_card(
+                "solana", "smart-watcher", mint, symbol=info["symbol"],
+                tier="converged",
+                mcap=info.get("mcap", 0), liquidity=info.get("liq", 0),
+                evidence=evidence)
+            if not opened:
+                logger.warning("mirror skip %s: %s", mint[:12], why)
+        except Exception:
+            pass
+        try:
+            outcomes = {}
+            if os.path.exists(TRACK_FILE):
+                with open(TRACK_FILE) as f:
+                    outcomes = json.load(f)
+            record = {
+                "symbol": info["symbol"],
+                "alert_ts": time.time(),
+                "alert_price": info["price"],
+                "alert_mcap": info["mcap"],
+                "source": "smart_wallet",
+                "smart_wallets": n_wallets,
+                "converged": True,
+                "wallet_names": wallet_names,
+                "wallets": feat["wallets"],
+                "wallet_groups": feat["wallet_groups"],
+                "components": feat["components"],
+            }
+            if "buys" in feat:
+                record["buys"] = feat["buys"]
+                record["sells"] = feat["sells"]
+            if "age_min" in feat:
+                record["age_min"] = feat["age_min"]
+            if "safety_score" in feat:
+                record["safety_score"] = feat["safety_score"]
+            outcomes[mint] = record
+            with open(TRACK_FILE, "w") as f:
+                json.dump(outcomes, f)
+        except Exception:
+            pass
+        return True
+    return False
+
+
+def try_fire_converged_card(mint, rec, n_groups, retry=False):
+    """Safety + enrich + token gates + staleness, then fire.
+
+    Returns one of "fired" / "blocked" / "stale" / "capped".
+
+    Staleness (2026-10-21, CEO fix): the run-up since the FIRST
+    sighting's MARKET price (anchor_price_usd) is journaled on the
+    record at every attempt (runup_mult), and a band applies on
+    retries too — 1.5x on the first attempt, 2.0x on retries. The old
+    retry exemption was the hole: 8 of the last 9 converged cards
+    fired via retry with NO staleness check, and the follower-grade
+    ledger shows copying these wallets at card price loses ~44-48%
+    per follow — the pack's move is usually DONE by card time.
+    Retries still judge the live tape via the runner gate; the 2.0x
+    band only cuts cards where the move already doubled past the
+    price when the pack first appeared.
+    """
+    logger.warning("CONVERGENCE FIRE%s: %d independent wallets on %s",
+                   " (retry)" if retry else "", n_groups, mint[:8])
+
+    def _block(why):
+        # Every block records its reason on the record so the HELD /
+        # RETRY lines (and any later autopsy) can say WHY in one line.
+        # The enrich path below used to return silently — 13 attempts
+        # on two dead coins left no trace of the reason (2026-10-20).
+        rec["last_block_reason"] = why
+        return "blocked"
+
+    safe, reason, report = check_safety(mint)
+    if not safe:
+        logger.warning("SAFETY BLOCK %s: %s", mint[:8], reason)
+        return _block("safety: %s" % reason)
+    info = enrich(mint)
+    if not info or info["mcap"] < 10000:
+        return _block("enrich: no market data" if not info else
+                      "enrich: mcap $%.0f < $10k" % info["mcap"])
+    # RUNNER-ONLY (2026-10-18): real runners with serious liquidity only.
+    ok, why = passes_runner_gate(info)
+    if not ok:
+        logger.warning("RUNNER BLOCK %s: %s", mint[:8], why)
+        return _block(why)
+    gate_ok, gate_reason = check_token_gates(
+        mint, info.get("symbol", ""), report)
+    if not gate_ok:
+        logger.warning("GATE BLOCK %s: %s", mint[:8], gate_reason)
+        return _block(gate_reason)
+    # Toxicity veto (2026-10-17 rebuild): copier-farming fingerprints —
+    # bump bots, one-sided wash flow, sniper-swarm launches. Fail-open.
+    toxic, tox_reason, tox_cov = check_toxicity_detailed(info)
+    # Unknown-vs-safe (2026-11-23): journal which fingerprints actually
+    # RAN on this mint, so a card that passed on absent data reads as
+    # unverifiable in the record, not as clean. No veto-behavior
+    # change: only the coverage journal is new.
+    rec["toxicity_coverage"] = tox_cov
+    if any(v.startswith("unverifiable") for v in tox_cov.values()):
+        logger.warning("TOXICITY COVERAGE %s: %s", mint[:8],
+                       ", ".join("%s=%s" % kv
+                                 for kv in sorted(tox_cov.items())))
+    if toxic:
+        logger.warning("TOXIC BLOCK %s: %s", mint[:8], tox_reason)
+        return _block(tox_reason)
+    # Staleness: pump skip vs the MARKET price at first sighting
+    # (anchor_price_usd, snapshotted in handle_sighting). Band: 1.5x
+    # first attempt, 2.0x on retries. The measured run-up is journaled
+    # on the record either way so the lane verdict can tune the bands
+    # from data, not opinion.
+    # NEVER anchor on the tx-implied buy_price_sol again: that field
+    # is net balance-delta accounting and reads ~300x off market on
+    # bundled/split buys — proven on KIMCHI (2026-10-21): recorded
+    # anchor $0.0204/token vs true ~$0.000065 at graduation (996.8M
+    # supply). The old gate compared against fiction and never fired.
+    sightings = sorted(rec.get("sightings") or [],
+                       key=lambda s: s.get("buy_ts") or 0)
+    anchor = 0.0
+    px = 0.0
+    try:
+        anchor = float(rec.get("anchor_price_usd") or 0)
+        px = float(info.get("price") or 0)
+    except Exception:
+        anchor, px = 0.0, 0.0
+    if anchor <= 0 and px > 0:
+        # No sighting-time snapshot (DexScreener indexing lag): anchor
+        # HERE so retries judge from this price; this attempt fails
+        # open on staleness exactly once.
+        rec["anchor_price_usd"] = px
+        rec["anchor_ts"] = time.time()
+        anchor = px
+    runup = (px / anchor) if (anchor > 0 and px > 0) else None
+    if runup is not None:
+        rec["runup_mult"] = round(runup, 3)
+        rec["runup_ts"] = time.time()
+    band = 2.0 if retry else 1.5
+    if runup is not None and runup >= band:
+        logger.warning("STALE SKIP %s: pumped +%.0f%% since first "
+                       "sighting (band +%.0f%%, %s)", mint[:8],
+                       (runup - 1) * 100, (band - 1) * 100,
+                       "retry" if retry else "first attempt")
+        rec["last_block_reason"] = (
+            "stale: +%.0f%% since first sighting"
+            % ((runup - 1) * 100))
+        return "stale"
+    wallet_names = ", ".join(sorted({str(s.get("wallet") or "")[:6]
+                                     for s in sightings if s.get("wallet")}))
+    if not _cap_allow():
+        logger.warning("CAP SKIP %s: hourly card cap (%d) reached",
+                       mint[:8], MAX_CARDS_PER_HOUR)
+        rec["last_block_reason"] = "hourly card cap reached"
+        return "capped"
+    if fire_card(mint, info, reason, n_groups, wallet_names,
+                 rec=rec, report=report):
+        return "fired"
+    return _block("card send failed")
+
+
+def _attempt_fire(mint, rec, n_groups, seen, retry):
+    """One converged-card attempt with burn bookkeeping.
+
+    Only a SENT card resolves the convergence (card_fired + seen).
+    Any other outcome leaves the record open for retry_convergences()
+    until RETRY_WINDOW_S from the first sighting. Caller saves the
+    ledger. Never raises (try_fire_converged_card never raises either;
+    the guard here keeps a surprise exception from burning the mint).
+    """
+    now = time.time()
+    rec["attempts"] = int(rec.get("attempts") or 0) + 1
+    rec["last_attempt_ts"] = now
+    try:
+        outcome = try_fire_converged_card(mint, rec, n_groups,
+                                          retry=retry)
+    except Exception:
+        logger.exception("converged fire attempt failed for %s",
+                         mint[:8])
+        outcome = "blocked"
+    if outcome == "fired":
+        rec["card_fired"] = True
+        seen.add(mint)
+        logger.warning("SMART CARD sent (converged x%d%s) %s",
+                       n_groups, ", retry" if retry else "", mint[:8])
+    return outcome
+
+
+def _persist_fire_intent(ledger,rec):
+    """Intent identity must survive before a downstream publish can happen."""
+    if not isinstance(rec.get('fire_event_id'),str) or not rec['fire_event_id']:
+        import uuid
+        rec['fire_event_id']='smart-watcher:'+uuid.uuid4().hex
+        rec['fire_created_ts']=time.time()
+    return save_convergence(ledger)
+
+
+def _retry_pending(rec, now):
+    """True while a converged record may still earn a card via retry."""
+    try:
+        if rec.get("card_fired"):
+            return False
+        _n, converged = eval_convergence(rec.get("sightings") or [])
+        if not converged:
+            return False
+        first = float(rec.get("first_ts") or 0)
+        return bool(first) and (now - first) <= RETRY_WINDOW_S
+    except Exception:
+        return False
+
+
+@serialized_convergence
+def handle_sighting(wallet, buy, registry, seen):
+    """Route one detected wallet buy through the convergence filter.
+
+    Single-wallet buy: recorded, no card (awaits a 2nd independent wallet
+    within 5 min). Converged: full pipeline + staleness check, then card.
+    Only a SENT card resolves the mint (added to `seen`); a blocked
+    first attempt stays open for the retry sweep — a coin seconds old
+    routinely fails safety-indexing / the runner bar on attempt #1 and
+    qualifies minutes later while it is actually running.
+    """
+    if not _HAS_FILTERS:
+        logger.error("FILTERS MISSING: smartwatch_filters not importable; "
+                     "refusing to fire unfiltered card")
+        return False
+    now = time.time()
+    mint = buy.get("mint", "")
+    if not mint:
+        return False
+    ledger = load_convergence()
+    rec = ledger.get(mint) or {}
+    if rec.get("card_fired") or mint in seen:
+        return True
+    group = wallet_group(wallet, registry)
+    buy_ts = buy.get("block_ts") or now
+    tokens = buy.get("tokens_bought") or 0
+    sol_spent = buy.get("sol_spent") or 0
+    buy_price = (sol_spent / tokens) if tokens > 0 and sol_spent > 0 else 0.0
+    rec = add_sighting(ledger, mint, wallet, group, buy_ts, buy_price,
+                       sol_spent, now)
+    for sighting in rec.get('sightings',[]):
+        if sighting.get('wallet')==wallet and not sighting.get('transaction_signature'):
+            if isinstance(buy.get('signature'),str) and buy['signature']:
+                sighting['transaction_signature']=buy['signature']
+            break
+    # Anchor snapshot (2026-10-21): MARKET price when the pack first
+    # touched this mint. Staleness/run-up is judged against this —
+    # never against the tx-implied buy price (net-delta accounting,
+    # ~300x off market on bundled buys; see try_fire docstring).
+    # Fail-soft: a missing anchor is retried on the next sighting and
+    # finally anchored at the first fire attempt.
+    if not rec.get("anchor_price_usd"):
+        try:
+            _ainfo = enrich(mint)
+            if _ainfo and float(_ainfo.get("price") or 0) > 0:
+                rec["anchor_price_usd"] = float(_ainfo["price"])
+                rec["anchor_ts"] = now
+        except Exception:
+            pass
+    n_groups, converged = eval_convergence(rec.get("sightings") or [])
+    if not converged:
+        saved = save_convergence(ledger)
+        logger.warning("CONVERGENCE HOLD: %s bought %s (1 group, "
+                       "awaiting 2nd wallet)", wallet[:6], mint[:8])
+        return saved
+    last = float(rec.get("last_attempt_ts") or 0)
+    if last and now - last < RETRY_EVERY_S:
+        return save_convergence(ledger)  # attempt spacing — the retry sweep owns the next try
+    if not _persist_fire_intent(ledger,rec):
+        return False
+    proposed_seen=set(seen)
+    outcome = _attempt_fire(mint, rec, n_groups, proposed_seen, retry=False)
+    saved = save_convergence(ledger)
+    if saved:
+        seen.update(proposed_seen)
+    if outcome != "fired":
+        logger.warning("CONVERGENCE HELD %s: %s (%s) — retrying for "
+                       "up to %dm while it keeps running", mint[:8],
+                       outcome, rec.get("last_block_reason") or "?",
+                       RETRY_WINDOW_S // 60)
+
+    return saved
+
+
+@serialized_convergence
+def sweep_expired_convergence(seen):
+    """Expire single-wallet sightings past the 5-min window (no card)."""
+    if not _HAS_FILTERS:
+        return
+    ledger = load_convergence()
+    now = time.time()
+    changed = False
+    proposed_seen=set(seen)
+    for mint, rec in list(ledger.items()):
+        if not isinstance(rec, dict) or rec.get("card_fired"):
+            continue
+        if mint in seen and not _retry_pending(rec, now):
+            rec["card_fired"] = True
+            changed = True
+            continue
+        n, converged = eval_convergence(rec.get("sightings") or [])
+        if converged:
+            continue  # fires on the next sighting; keep waiting
+        if is_expired(rec.get("first_ts", 0), now, CONVERGENCE_WINDOW_S):
+            logger.warning("CONVERGENCE EXPIRED %s: %d group(s) in 30m, "
+                           "no card", mint[:8], n)
+            rec["card_fired"] = True
+            proposed_seen.add(mint)
+            changed = True
+    if changed and save_convergence(ledger):
+        seen.update(proposed_seen)
+
+
+@serialized_convergence
+def retry_convergences(seen):
+    """Re-attempt converged cards that were blocked on their first try.
+
+    The first attempt lands seconds after the smart wallets buy — often
+    before RugCheck has indexed the token and before liq/mcap cross the
+    runner bar. Retries re-run the FULL gate stack on current data every
+    RETRY_EVERY_S until RETRY_WINDOW_S from the first sighting; only a
+    sent card resolves the record. Never raises.
+    """
+    if not _HAS_FILTERS:
+        return
+    try:
+        ledger = load_convergence()
+        now = time.time()
+        changed = False
+        proposed_seen=set(seen)
+        for mint, rec in list(ledger.items()):
+            if not isinstance(rec, dict) or rec.get("card_fired"):
+                continue
+            n_groups, converged = eval_convergence(
+                rec.get("sightings") or [])
+            if not converged:
+                continue
+            first = float(rec.get("first_ts") or 0)
+            if first and now - first > RETRY_WINDOW_S:
+                rec["card_fired"] = True
+                rec["resolved"] = "retry-window-expired"
+                proposed_seen.add(mint)
+                changed = True
+                logger.warning(
+                    "CONVERGENCE EXPIRED %s: %d group(s), %d attempt(s), "
+                    "no card in %dm", mint[:8], n_groups,
+                    int(rec.get("attempts") or 0), RETRY_WINDOW_S // 60)
+                continue
+            last = float(rec.get("last_attempt_ts") or 0)
+            if last and now - last < RETRY_EVERY_S:
+                continue
+            if not _persist_fire_intent(ledger,rec):
+                continue
+            outcome = _attempt_fire(mint, rec, n_groups, proposed_seen,
+                                    retry=True)
+            changed = True
+            if outcome != "fired":
+                logger.warning("CONVERGENCE RETRY %s: %s (%s) "
+                               "(attempt %d)", mint[:8], outcome,
+                               rec.get("last_block_reason") or "?",
+                               int(rec.get("attempts") or 0))
+        if changed and save_convergence(ledger):
+            seen.update(proposed_seen)
+    except Exception:
+        logger.exception("convergence retry sweep failed")
+
+
+def passes_runner_gate(info):
+    """RUNNER-ONLY gate (2026-10-18 standing rule): real runners with
+    serious liquidity. Fail-closed on unknown liq. Big established buys
+    (mcap >= $500k) count as runners without needing a green candle.
+    Returns (True, "") or (False, reason)."""
+    liq = info.get("liq") or 0
+    if liq < RUNNER_MIN_LIQ:
+        return False, "runner: liq < $25k"
+    mcap = info.get("mcap") or 0
+    if mcap < RUNNER_MIN_MCAP:
+        return False, "runner: mcap < $50k"
+    if mcap >= RUNNER_BIG_MCAP:
+        return True, ""
+    if not info.get("has_mom"):
+        return False, "runner: no momentum data"
+    if not (info.get("chg_m5", 0) > 0 or info.get("chg_h1", 0) > 0):
+        return False, "runner: not rising"
+    return True, ""
+
+
+def enrich(mint):
+    pairs = _http(
+        "https://api.dexscreener.com/tokens/v1/solana/%s" % mint)
+    if not pairs:
+        return None
+    p0 = pairs[0]
+    chg = p0.get("priceChange") or {}
+    return {
+        "mcap": float(p0.get("marketCap") or p0.get("fdv") or 0),
+        "price": float(p0.get("priceUsd") or 0),
+        "vol": float((p0.get("volume") or {}).get("h24") or 0),
+        "liq": float((p0.get("liquidity") or {}).get("usd") or 0),
+        "symbol": (p0.get("baseToken") or {}).get("symbol") or "?",
+        "chg_m5": float(chg.get("m5") or 0),
+        "chg_h1": float(chg.get("h1") or 0),
+        # RUNNER-ONLY: absent momentum fields must fail closed, not read as 0.
+        # (DexScreener tokens/v1 carries m5/h1/h6/h24 — no m15.)
+        "has_mom": chg.get("m5") is not None or chg.get("h1") is not None,
+        # Toxicity veto inputs (2026-10-17 rebuild)
+        "txns": p0.get("txns") or {},
+        "volume": p0.get("volume") or {},
+        "pairCreatedAt": p0.get("pairCreatedAt") or 0,
+    }
+
+
+def _tap_cb(chain, source, mint):
+    """64-byte-safe tap callback via signal_bus.track_callback.
+
+    The full "track:<chain>:<source>:<mint>" overflows Telegram's
+    64-byte callback_data cap (BUTTON_DATA_INVALID — the card never
+    delivers). Short source codes resolve back to full names in the
+    telegram tap parser, so the journal keeps full attribution."""
+    try:
+        from signal_bus import track_callback
+        return track_callback(chain, source, mint)
+    except Exception:
+        return "track:%s:%s:%s" % (chain, source, mint)
+
+
+def send_card(text, mint="", chain="solana", source="smart-watcher"):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = None
+        if mint:
+            # Phase 0: chain+source ride in the callback so the tap journal
+            # can attribute the user's manual buy to this card's provenance.
+            keyboard = json.dumps({
+                "inline_keyboard": [[
+                    {
+                        "text": "📋 Copy CA",
+                        "copy_text": {"text": mint},
+                    },
+                    {
+                        "text": "📍 I bought this",
+                        "callback_data": _tap_cb(chain or "solana",
+                                                 source or "smart-watcher",
+                                                 mint),
+                    },
+                ]],
+            })
+        payload = {"chat_id": "6883056760", "text": text}
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def fmt(v):
+    if not v:
+        return "?"
+    if v >= 1e6:
+        return "$%.1fM" % (v / 1e6)
+    if v >= 1e3:
+        return "$%.0fk" % (v / 1e3)
+    return "$%.0f" % v
+
+
+def load_seen():
+    try:
+        with open(SEEN_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_seen(seen):
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(sorted(seen)[-500:], f)
+    except Exception:
+        pass
+
+
+class _WalletWake:
+    """P9b realtime wake (2026-10-23): ONE Helius WSS connection with
+    a logsSubscribe(mentions=[wallet]) per tracked wallet (the same
+    low-level WSClient the launch logstream uses). Any wallet
+    transaction pushes instantly and wakes the main loop, which then
+    runs its normal signature-walk cycle immediately — the 30s poll
+    becomes the BACKSTOP (it is also the processor: buy extraction /
+    convergence logic is unchanged). Stream gaps are journaled via
+    rt_sync.journal_reconciliation; the catch-up cycle on reconnect
+    walks signatures back to the pre-gap cursor, so a gap loses
+    nothing (the page-back logic already covers bursts)."""
+
+    def __init__(self, api_key, wallets, wake):
+        self._wake = wake
+        self._wallets = list(wallets)
+        self._url = ("wss://mainnet.helius-rpc.com/?api-key=%s"
+                     % api_key)
+        self._stop = threading.Event()
+        self._down_since = None
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run,
+                                        name="smart-watcher-wake",
+                                        daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        backoff = 5.0
+        while not self._stop.is_set():
+            try:
+                self._serve()
+            except Exception as e:
+                logger.warning("smart-watcher stream down: %s", e)
+                if self._down_since is None:
+                    self._down_since = time.time()
+            if self._stop.wait(backoff):
+                break
+            backoff = min(backoff * 2, 120.0)
+
+    def _serve(self):
+        ws = _ls.WSClient(self._url)
+        try:
+            ws.connect()
+            for i, w in enumerate(self._wallets):
+                ws.send_text(json.dumps({
+                    "jsonrpc": "2.0", "id": i + 1,
+                    "method": "logsSubscribe",
+                    "params": [{"mentions": [w]},
+                               {"commitment": "confirmed"}]}))
+            logger.warning("smart-watcher stream: subscribed to %d "
+                           "wallets", len(self._wallets))
+            if self._down_since is not None:
+                gap = time.time() - self._down_since
+                self._down_since = None
+                try:
+                    _rt_journal.journal_reconciliation({
+                        "ts": time.time(),
+                        "source": "smart-watcher-stream",
+                        "gap_s": round(gap, 1),
+                        "note": "stream reconnected; catch-up "
+                                "signature walk reconciles the gap"})
+                except Exception:
+                    pass
+                self._wake.set()  # immediate catch-up cycle
+            while not self._stop.is_set():
+                msg = ws.recv_text()
+                if msg is None:
+                    raise _ls.WSError("server closed the stream")
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                if data.get("method") == "logsNotification":
+                    self._wake.set()
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+def _persist_seen_before_ack(seen):
+    import tempfile
+    directory=os.path.dirname(SEEN_FILE) or '.'
+    os.makedirs(directory,exist_ok=True)
+    fd,name=tempfile.mkstemp(dir=directory,prefix='.seen-')
+    try:
+        with os.fdopen(fd,'w') as f:
+            json.dump(sorted(seen)[-500:],f);f.flush();os.fsync(f.fileno())
+        os.replace(name,SEEN_FILE)
+        directory_fd=os.open(directory,os.O_RDONLY)
+        try:os.fsync(directory_fd)
+        finally:os.close(directory_fd)
+    finally:
+        if os.path.exists(name):os.unlink(name)
+
+
+def poll_wallet(wallet, api_key, registry, seen, intake):
+    """One existing-cadence poll with durable at-least-once intake.
+
+    No extra retry loop: pending details are tried once per normal cycle.
+    A transport/null/malformed detail stays pending across process restart.
+    Page failure does not advance the cursor; bounded page overflow is
+    explicitly recorded as incomplete coverage, not silently called complete.
+    """
+    state = intake.wallet(wallet)
+    try:
+        first = rpc("getSignaturesForAddress", [wallet, {"limit": SIG_LIMIT}], api_key)
+        if first and isinstance(first, list):
+            prev = state['cursor'] if state else None
+            newest = first[0].get('signature')
+            if not state:
+                # Preserve startup posture: establish a starting cursor,
+                # not a fabricated promise of pre-start backfill.
+                intake.stage(wallet, None, newest, [], gap='bootstrap_no_prestart_backfill')
+            else:
+                page, discovered, pages, gap, complete = first, [], 0, None, False
+                while page:
+                    found = False
+                    if not isinstance(page,list):
+                        raise ValueError('malformed signature page')
+                    for item in page:
+                        if not isinstance(item,dict):
+                            raise ValueError('malformed signature record')
+                        sig = item.get('signature')
+                        if not isinstance(sig,str) or not sig:
+                            raise ValueError('malformed signature page')
+                        if sig == prev:
+                            found = True;break
+                        if sig not in discovered:discovered.append(sig)
+                    if found or len(page) < SIG_LIMIT:
+                        if not found:gap='cursor_not_found_in_available_history'
+                        complete=True;break
+                    if pages >= PAGEBACK_MAX:
+                        gap='pageback_limit_incomplete_history';complete=True;break
+                    page=rpc('getSignaturesForAddress',
+                             [wallet, {'limit':SIG_LIMIT,'before':page[-1]['signature']}],api_key)
+                    pages+=1
+                    if not page:break
+                if complete:
+                    intake.stage(wallet,prev,newest,list(reversed(discovered)),gap=gap)
+    except (ValueError,TypeError,AttributeError):
+        # Malformed discovery cannot starve already durable detail work.
+        logger.warning('signature discovery unavailable for %s',wallet[:6])
+    state=intake.wallet(wallet)
+    pending=(state or {}).get('pending',[])[:SIG_LIMIT*(PAGEBACK_MAX+1)]
+    def fetch(signature):
+        try:
+            return _shared_rpc_transport().rpc_typed(
+                'getTransaction',[signature,{'encoding':'json','maxSupportedTransactionVersion':0}])
+        except Exception:
+            return None,'error'
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        details=list(pool.map(fetch,pending))
+    for signature,(tx,kind) in zip(pending,details):
+        # A bounded batch and durable rotation preserve retry liveness
+        # without a new timer or retry storm on a single poison detail.
+        intake.defer(wallet,signature)
+        if kind!='ok' or not isinstance(tx,dict):
+            continue
+        meta=tx.get('meta')
+        if not isinstance(meta,dict) or 'err' not in meta:
+            continue
+        transaction=tx.get('transaction')
+        if not isinstance(transaction,dict):
+            continue
+        signatures=transaction.get('signatures')
+        if not isinstance(signatures,list) or not signatures or signatures[0]!=signature:
+            continue
+        if meta['err'] is not None:
+            if not isinstance(meta['err'],(str,dict)) or not meta['err']:
+                continue
+            # Definitively failed execution is terminal, not a buy.
+            intake.acknowledge(wallet,signature);continue
+        buys=get_buy_details(wallet,signature,api_key,tx=tx,strict=True)
+        if buys is None:
+            continue
+        # Invalid successful payloads and valid zero-buy transactions
+        # need separate classification; keep unknown shape pending.
+        if not all(isinstance(meta.get(k),list) for k in
+                   ('preBalances','postBalances','preTokenBalances','postTokenBalances')):
+            continue
+        for buy in buys:
+            if buy['mint'] not in seen:
+                if handle_sighting(wallet,buy,registry,seen) is not True:
+                    raise OSError('sighting was not durably accepted')
+        sold=get_sold_mints(wallet,signature,api_key,tx=tx,details=True)
+        if sold and _record_sells(wallet,sold) is not True:
+            raise OSError('sell evidence was not durably accepted')
+        # Seen is durable before acknowledging intake. Crash before
+        # this point retries rather than losing the acquisition.
+        _persist_seen_before_ack(seen)
+        intake.acknowledge(wallet,signature)
+
+
+def main():
+    api_key = get_helius_key()
+    if not api_key and not _shared_rpc_transport()._alchemy_key():
+        logger.warning("no configured primary or fallback RPC credential, exiting")
+        return
+    wallets = get_wallets()
+    if not wallets:
+        logger.warning("no wallets, exiting")
+        return
+    wake = None
+    if _HAS_STREAM and api_key:
+        wake = threading.Event()
+        try:
+            _WalletWake(api_key, wallets, wake).start()
+            logger.warning("smart-watcher: realtime wake stream on "
+                           "(logsSubscribe x%d); poll is backstop",
+                           len(wallets))
+        except Exception:
+            logger.exception("smart-watcher stream failed to start; "
+                             "poll-only")
+            wake = None
+    logger.warning("smart watcher started: %d wallets", len(wallets))
+    registry = load_registry()
+
+    seen = load_seen()
+    from wallet_intake import WalletIntake
+    intake = WalletIntake(HOME)
+    while True:
+        try:
+            registry = load_registry()  # pick up label/mute changes
+            for wallet in wallets:
+                try:
+                    poll_wallet(wallet, api_key, registry, seen, intake)
+                except Exception:
+                    logger.exception('wallet intake unavailable for %s', wallet[:6])
+                time.sleep(0.5)
+            sweep_expired_convergence(seen)
+            retry_convergences(seen)
+            save_seen(seen)
+        except Exception:
+            logger.exception("watcher loop failed")
+        if wake is not None:
+            # Event-driven: a wallet tx wakes us instantly; the poll
+            # interval is only the backstop when the stream is quiet.
+            wake.wait(POLL_SECS)
+            wake.clear()
+        else:
+            time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

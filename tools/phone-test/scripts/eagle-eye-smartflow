@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Eagle Eye Engine 3 — Smartflow: smart money flow tracking.
+
+SILENT DATA LAYER — writes to SQLite, sends ZERO Telegram signals.
+
+Owns stage='established'. Every 2-5 minutes:
+- Reads graded ACTIVE wallets from wallet_grader
+- For each established token, checks DexScreener buyer data for
+  smart-money presence signals
+- Computes a smartflow score: wallet-grade-weighted buyer interest
+- Updates momentum.factors_json with smartflow component
+
+This is SIGNAL INTELLIGENCE, not copy-trading. We track WHERE
+smart money flows; lanes decide what to do.
+
+Usage: scripts/eagle-eye-smartflow [--once]
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+from robust_http import get_json
+import eagle_eye_db as db
+
+try:
+    import killswitch
+    _HAS_KS = True
+except ImportError:
+    _HAS_KS = False
+
+try:
+    from wallet_grader import active_wallets
+    _HAS_GRADER = True
+except ImportError:
+    _HAS_GRADER = False
+
+ENGINE_ID = db.ENGINE_SMARTFLOW
+POLL_S = 180  # 3 minutes — wallet flows are slow
+
+DS_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{}"
+MAX_TOKENS = 100
+
+
+def get_active_wallet_set() -> set:
+    """Graded ACTIVE wallets. Empty set if grader has no data."""
+    if not _HAS_GRADER:
+        return set()
+    try:
+        return set(active_wallets())
+    except Exception:
+        return set()
+
+
+def fetch_batch(mints: list) -> dict:
+    if not mints:
+        return {}
+    result = {}
+    for i in range(0, len(mints), 30):
+        batch = mints[i:i + 30]
+        try:
+            data = get_json(DS_BATCH.format(",".join(batch)),
+                            tries=3, timeout=20)
+            for t in (data if isinstance(data, list) else []):
+                # /tokens/v1 returns baseToken.address (not tokenAddress)
+                addr = t.get("baseToken", {}).get("address", "")
+                if addr:
+                    result[addr] = t
+        except Exception as e:
+            print(f"  [{ENGINE_ID}] batch failed: {e}", flush=True)
+        time.sleep(0.5)
+    return result
+
+
+def compute_smartflow(buyers_h1: int, sellers_h1: int,
+                      volume_h1: float, liq_usd: float) -> dict:
+    """Smartflow score 0-25: sustained buyer interest on established tokens.
+
+    Established tokens don't spike like new launches — we look for
+    steady accumulation: growing buyer counts, healthy buy pressure,
+    volume supporting the move.
+    """
+    score = 0.0
+    factors = {}
+
+    # Buyer growth signal
+    total_h1 = buyers_h1 + sellers_h1
+    if total_h1 >= 10:
+        b_ratio = buyers_h1 / max(sellers_h1, 1)
+        if b_ratio >= 1.5:
+            s = min(10.0, (b_ratio - 1.5) * 8 + 4)
+            score += s
+            factors["buyer_dominance"] = round(s, 1)
+
+    # Volume health: h1 volume vs liquidity (turnover)
+    if liq_usd > 0 and volume_h1 > 0:
+        turnover_h1 = volume_h1 / liq_usd
+        if 0.05 <= turnover_h1 <= 2.0:  # healthy, not wash or dead
+            s = 8.0
+            score += s
+            factors["turnover_healthy"] = s
+        elif turnover_h1 > 2.0:
+            score += 4.0
+            factors["turnover_hot"] = 4.0
+
+    # Participation depth
+    if buyers_h1 >= 50:
+        s = min(7.0, buyers_h1 / 20)
+        score += s
+        factors["buyer_depth"] = round(s, 1)
+
+    return {"score": round(min(25.0, score), 1), "factors": factors}
+
+
+def poll_established(conn) -> int:
+    """Score established tokens for smart money flows."""
+    tokens = db.get_by_stage(conn, db.STAGE_ESTABLISHED, limit=MAX_TOKENS)
+    if not tokens:
+        return 0
+
+    # Active wallets (for future per-wallet flow correlation)
+    wallets = get_active_wallet_set()
+
+    ds_data = fetch_batch([t["mint"] for t in tokens])
+    updated = 0
+
+    for t in tokens:
+        mint = t["mint"]
+        ds = ds_data.get(mint)
+        if not ds:
+            continue
+        txns = ds.get("txns", {})
+        volume = ds.get("volume", {})
+        h1 = txns.get("h1", {})
+        buyers = int(h1.get("buyers", 0) or 0)
+        sellers = int(h1.get("sellers", 0) or 0)
+        vol_h1 = float(volume.get("h1", 0) or 0)
+        liq = float(ds.get("liquidity", {}).get("usd", 0) or 0)
+
+        sf = compute_smartflow(buyers, sellers, vol_h1, liq)
+
+        # Merge into existing momentum factors
+        m = db.get_momentum(conn, mint)
+        factors = {}
+        if m and m.get("factors_json"):
+            try:
+                import json as _j
+                factors = _j.loads(m["factors_json"])
+            except Exception:
+                pass
+        factors["smartflow"] = sf["score"]
+        factors["smartflow_detail"] = sf["factors"]
+        factors["active_wallets_tracked"] = len(wallets)
+
+        # Boost composite score with smartflow
+        base_score = m["momentum_score"] if m else 0
+        new_score = min(100.0, base_score + sf["score"] * 0.4)
+
+        conn.execute(
+            "UPDATE momentum SET momentum_score=?, factors_json=?, ts=?"
+            " WHERE mint=?",
+            (new_score, __import__("json").dumps(factors),
+             time.time(), mint))
+        conn.execute(
+            "UPDATE tokens SET score=?, score_updated_at=? WHERE mint=?",
+            (new_score, time.time(), mint))
+        conn.commit()
+
+        # Established runners → CANDIDATE
+        if new_score >= 70 and t["state"] in (db.WATCHLIST, db.NEW):
+            db.set_state(conn, mint, db.CANDIDATE)
+            db.record_runner(conn, mint, t.get("symbol", "?"), new_score)
+            print(f"  [{ENGINE_ID}] SMARTFLOW RUNNER {t.get('symbol','?')}:"
+                  f" {new_score:.0f}", flush=True)
+
+        updated += 1
+
+    return updated
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args()
+
+    if _HAS_KS and not killswitch.gate("eagle_eye"):
+        print(f"[{ENGINE_ID}] halted by killswitch", flush=True)
+        return
+
+    conn = db.get_db()
+    print(f"🦅 [{ENGINE_ID}] starting (silent)", flush=True)
+
+    while True:
+        start = time.time()
+        err = ""
+        touched = 0
+        try:
+            touched = poll_established(conn)
+            if touched:
+                print(f"  [{ENGINE_ID}] {touched} established scored",
+                      flush=True)
+        except Exception as e:
+            err = str(e)[:200]
+            print(f"  [{ENGINE_ID}] error: {err}", flush=True)
+
+        cycle_ms = int((time.time() - start) * 1000)
+        db.update_engine_heartbeat(conn, ENGINE_ID, touched, cycle_ms, err)
+
+        if args.once:
+            break
+        elapsed = time.time() - start
+        time.sleep(max(1, POLL_S - elapsed))
+
+
+if __name__ == "__main__":
+    main()

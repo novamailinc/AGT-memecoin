@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""Signal Refinery Phase 2 — Ethereum breakout adapter (reworked 2026-10-18).
+
+Catches ESTABLISHED RUNNERS breaking out on volume and feeds the ONE
+destination: the existing degen lane, as cards. The user gambles their
+OWN real money on these cards.
+
+Why the rework: the old eth/new_pools source went stale (median pool age
+138 min vs the 90-min window — 83% of pools died on age alone), and in
+2026 Ethereum has no real memecoin launchpad; its runners are established
+coins breaking out on volume. So this feed hunts BREAKOUTS, not births.
+
+Source: GeckoTerminal eth/trending_pools (pages 1-2, 180s polls).
+
+Breakout-first funnel (HIGH bars kept — never lowered for more cards):
+  1. DISCOVERY: trending_pools — tokens the market is already watching.
+  2. SURVIVAL PRE-FILTER: liq >= $20k, mcap $500k-$50M (established
+     runners, not dust). No age window — breakouts have no age.
+  3. BREAKOUT GATE: h1 volume >= 3x the pool's own h24 hourly average,
+     h1 price change positive, h1 vol >= $10k, m15 buyers >= 10.
+  4. MANIPULATION FILTERS: wash-spam guard, sell_presence
+     (0 < sell share <= 40%).
+  5. SAFETY VETOES: GoPlus token_security + Honeypot.is sell sim via
+     daemon/launch_scanner/safety.py. Fail-CLOSED on unknown
+     (user: "I don't want rug coin").
+  6. SCORE: breakout-strength scoring; tier "breakout-pick" needs >= 55.
+
+What this is NOT:
+- No paper entries, no paper lanes, no positions on Ethereum. The bot
+  trades nothing from this feed; every buy stays manual. (The paper
+  mirror hook is kept but its cost gate COST-BLOCKs $1 ETH entries at
+  ~400% — expected and correct; cards still fire for manual gambles.)
+- Not a launch sniper: hunts volume breakouts on established runners.
+
+Guardrails:
+- Respects the per-chain feed kill switch (signal_bus.feed_enabled):
+  a paused ETH feed sends no cards and publishes nothing.
+- Own daily card budget: MAX_CARDS_PER_DAY = 1. Solana/Base feeds
+  untouched.
+- Every fired signal is published to the normalized signal bus with
+  chain="ethereum", source="eth-runner".
+
+Free-only: stdlib HTTP, free public APIs. No keys, no paid tiers.
+"""
+import json
+import logging
+import os
+import sys as _sys
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("eth-runner-feed")
+
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+try:
+    from robust_http import get_json as _robust_get
+    _HAS_ROBUST = True
+except ImportError:
+    _HAS_ROBUST = False
+try:
+    from card_design import build_card
+    _HAS_CARDS = True
+except ImportError:
+    _HAS_CARDS = False
+try:
+    import safety as _safety
+    _HAS_SAFETY = True
+except ImportError:
+    _HAS_SAFETY = False
+try:
+    import lp_lock
+    _HAS_LPLOCK = True
+except ImportError:
+    _HAS_LPLOCK = False
+try:
+    from signal_bus import make_signal, publish, feed_enabled
+    _HAS_BUS = True
+except ImportError:
+    _HAS_BUS = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "eth_runner_seen.json")
+OUTCOME_FILE = os.path.join(HOME, "eth_runner_outcomes.json")
+DAILY_FILE = os.path.join(HOME, "eth_runner_daily.json")
+
+POLL_SECS = 180  # trending snapshot; breakouts develop over minutes-hours
+MAX_CARDS_PER_DAY = 1
+
+# ---- survival pre-filter knobs (established runners, not dust) ----
+MIN_LIQ_USD = 25_000.0  # RUNNER-ONLY rule 2026-10-18: serious liquidity everywhere.
+MIN_MCAP_USD = 500_000.0
+MAX_MCAP_USD = 50_000_000.0
+# ---- breakout gate knobs ----
+MIN_BREAKOUT_RATIO = 3.0  # h1 vol vs the pool's own h24 hourly average
+MIN_H1_VOL_USD = 10_000.0
+MIN_M15_BUYERS = 10     # gas makes each buyer more real than on Base
+# ---- manipulation filter knobs ----
+MAX_BUYS_PER_BUYER_M15 = 6.0
+MAX_SELL_SHARE = 0.40
+# ---- score knobs ----
+MIN_SCORE = 55.0          # between Solana (45) and Base (60)
+
+DEXES = ("uniswap_v2", "uniswap_v3", "uniswap-v4-ethereum", "sushiswap",
+         "sushiswap-v3-ethereum", "curve", "balancer-v2",
+         "pancakeswap-v3-eth")
+
+
+def _http(url, timeout=12):
+    if _HAS_ROBUST:
+        try:
+            return _robust_get(url, timeout=timeout, tries=3)
+        except Exception:
+            return None
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "forex-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def _f(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _i(v):
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fetch_page(page):
+    return _http("https://api.geckoterminal.com/api/v2/networks/eth/"
+                 "trending_pools?page=%d" % page)
+
+
+def _parse_pools(data, now):
+    """Down to candidate dicts. Never raises."""
+    out = []
+    if not data or "data" not in data:
+        return out
+    for p in data["data"]:
+        try:
+            a = p.get("attributes", {}) or {}
+            rel = p.get("relationships", {}) or {}
+            dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
+            if dex_id and dex_id not in DEXES:
+                continue
+            base_id = ((rel.get("base_token") or {}).get("data") or {}
+                       ).get("id", "")
+            if not base_id.startswith("eth_0x"):
+                continue
+            mint = base_id.replace("eth_", "")
+            if len(mint) != 42:
+                continue
+            quote_id = ((rel.get("quote_token") or {}).get("data") or {}
+                        ).get("id", "")
+            if mint.lower() == quote_id.replace("eth_", "").lower():
+                continue
+            created_str = a.get("pool_created_at", "")
+            try:
+                created = datetime.fromisoformat(
+                    created_str.replace("Z", "+00:00"))
+                age_min = (now - created).total_seconds() / 60
+            except Exception:
+                continue
+            if age_min < 0:
+                continue
+            tx = a.get("transactions") or {}
+            vol = a.get("volume_usd") or {}
+            chg = a.get("price_change_percentage") or {}
+            mcap = _f(a.get("market_cap_usd")) or _f(a.get("fdv_usd"))
+            out.append({
+                "mint": mint,
+                "name": (a.get("name", "?") or "?").split(" / ")[0],
+                "age_min": age_min,
+                "dex": dex_id or "?",
+                "pair": a.get("address", "") or "",
+                "mcap": mcap,
+                "fdv": _f(a.get("fdv_usd")),
+                "liq": _f(a.get("reserve_in_usd")),
+                "price_usd": _f(a.get("base_token_price_usd")),
+                "tx": {w: {"buys": _i((tx.get(w) or {}).get("buys")),
+                           "sells": _i((tx.get(w) or {}).get("sells")),
+                           "buyers": _i((tx.get(w) or {}).get("buyers")),
+                           }
+                       for w in ("m5", "m15", "m30", "h1")},
+                "vol": {w: _f(vol.get(w))
+                        for w in ("m5", "m15", "m30", "h1", "h24")},
+                "chg": {w: _f(chg.get(w)) for w in ("m5", "m15", "h1")},
+            })
+        except Exception:
+            continue
+    return out
+
+
+def get_pools(pages):
+    now = datetime.now(timezone.utc)
+    merged, seen = [], set()
+    for page in pages:
+        data = _fetch_page(page)
+        if not data:
+            continue
+        for pool in _parse_pools(data, now):
+            if pool["mint"] in seen:
+                continue
+            seen.add(pool["mint"])
+            merged.append(pool)
+    return merged
+
+
+def passes_prefilter(pool):
+    """Survival pre-filter on cheap fields: liq + established mcap zone.
+    No age window — breakouts have no age. (ok, reason)."""
+    if pool["liq"] < MIN_LIQ_USD:
+        return False, "liq < $25k"
+    if not (MIN_MCAP_USD <= pool["mcap"] <= MAX_MCAP_USD):
+        return False, "mcap out of established zone"
+    return True, ""
+
+
+def _breakout_ratio(pool):
+    """h1 volume vs the pool's own h24 hourly average. Judges each pool
+    against itself, so a $50M runner and a $800k runner compete fairly."""
+    h24 = pool["vol"]["h24"]
+    if h24 <= 0:
+        return 0.0
+    return pool["vol"]["h1"] / (h24 / 24.0)
+
+
+def passes_breakout(pool):
+    """The breakout gate: this hour must be exceptional FOR THIS POOL.
+    (ok, reason)."""
+    if pool["vol"]["h24"] <= 0:
+        return False, "no h24 baseline"
+    if pool["vol"]["h1"] < MIN_H1_VOL_USD:
+        return False, "h1 vol < $10k"
+    ratio = _breakout_ratio(pool)
+    if ratio < MIN_BREAKOUT_RATIO:
+        return False, "h1 vol %.1fx of hourly avg (<%.0fx)" % (
+            ratio, MIN_BREAKOUT_RATIO)
+    if pool["chg"]["h1"] <= 0:
+        return False, "h1 not green"
+    if pool["tx"]["m15"]["buyers"] < MIN_M15_BUYERS:
+        return False, "too few m15 buyers"
+    return True, "%.1fx breakout" % ratio
+
+
+def check_safety(mint):
+    """EVM safety: GoPlus + Honeypot.is sell sim. Fail-CLOSED on unknown."""
+    if not _HAS_SAFETY:
+        return False, "safety module missing", {}
+    try:
+        rep = _safety.check_token("ethereum", mint, timeout=12,
+                                  limits={"evm_sell_sim_enabled": True,
+                                          "evm_sell_sim_timeout_s": 3.0})
+    except Exception as e:
+        return False, "safety error: %s" % e, {}
+    if rep.get("unknown"):
+        return False, "SAFETY BLOCK: safety unknown (GoPlus unreachable)", {}
+    if not rep.get("passed"):
+        return False, "SAFETY BLOCK: %s" % "; ".join(rep["fails"][:2]), {}
+    intel = {"score": rep.get("score", 0), "flags": rep.get("flags") or []}
+    return True, "ok", intel
+
+
+def passes_manipulation(pool):
+    """Stage 4: manipulation filters. (ok, reason)."""
+    m15, m5 = pool["tx"]["m15"], pool["tx"]["m5"]
+    if m15["buyers"] > 0 and m15["buys"] / m15["buyers"] > MAX_BUYS_PER_BUYER_M15:
+        return False, "wash: buys/buyer %.1f" % (
+            m15["buys"] / m15["buyers"])
+    n = m15["buys"] + m15["sells"]
+    sell_share = m15["sells"] / n if n else 0
+    if m15["sells"] == 0 and m15["buys"] > 0:
+        return False, "no sells (manufactured)"
+    if sell_share > MAX_SELL_SHARE:
+        return False, "distribution (sell share %.0f%%)" % (sell_share * 100)
+    n5 = m5["buys"] + m5["sells"]
+    if n5 and m5["sells"] / n5 > MAX_SELL_SHARE:
+        return False, "m5 distribution"
+    return True, ""
+
+
+def _buy_share(tx):
+    n = tx["buys"] + tx["sells"]
+    return tx["buys"] / n if n else 0.0
+
+
+def score_pool(pool):
+    """0-100 breakout score. Card tier needs >= 55."""
+    m15 = pool["tx"]["m15"]
+    reasons, score = [], 0.0
+
+    ratio = _breakout_ratio(pool)
+    if ratio >= 8:
+        score += 30; reasons.append("h1 vol %.0fx hourly avg \U0001f680" % ratio)
+    elif ratio >= 5:
+        score += 26; reasons.append("h1 vol %.0fx hourly avg" % ratio)
+    elif ratio >= 3:
+        score += 20; reasons.append("h1 vol %.1fx hourly avg" % ratio)
+
+    h1chg = pool["chg"]["h1"]
+    if h1chg >= 50:
+        score += 15; reasons.append("h1 +%d%% \U0001f525" % h1chg)
+    elif h1chg >= 20:
+        score += 10; reasons.append("h1 +%d%%" % h1chg)
+    elif h1chg > 0:
+        score += 5
+
+    b = m15["buyers"]
+    if b >= 50:
+        score += 20; reasons.append("%d m15 buyers \U0001f525" % b)
+    elif b >= 25:
+        score += 14; reasons.append("%d m15 buyers" % b)
+    elif b >= 10:
+        score += 8; reasons.append("%d m15 buyers" % b)
+
+    bs15 = _buy_share(m15)
+    if bs15 >= 0.70:
+        score += 15; reasons.append("buyers in control %d%%" % (bs15 * 100))
+    elif bs15 >= 0.60:
+        score += 10
+    elif bs15 >= 0.50:
+        score += 5
+
+    mcap = pool["mcap"]
+    if 1_000_000 <= mcap <= 20_000_000:
+        score += 10; reasons.append("mcap %s (runner zone)" % fmt(mcap))
+    elif 500_000 <= mcap <= 50_000_000:
+        score += 5
+
+    return round(score, 1), reasons
+
+
+def tap_callback(mint):
+    """track:ethereum:er:<mint> — short code keeps it under Telegram's
+    64-byte callback cap; the parser resolves "er" -> "eth-runner"."""
+    try:
+        from signal_bus import track_callback
+        return track_callback("ethereum", "eth-runner", mint)
+    except Exception:
+        return "track:ethereum:er:%s" % mint
+
+
+def feed_live():
+    """True when the per-chain kill switch leaves the ETH feed on."""
+    if not _HAS_BUS:
+        return True
+    return bool(feed_enabled("ethereum"))
+
+
+def send_card(text, mint):
+    try:
+        with open(os.path.join(HOME, "telegram", "bot_token")) as f:
+            token = f.read().strip()
+        keyboard = json.dumps({
+            "inline_keyboard": [[
+                {"text": "📋 Copy CA",
+                 "copy_text": {"text": mint}},
+                {"text": "📍 I bought this",
+                 "callback_data": tap_callback(mint)},
+            ]],
+        })
+        payload = {"chat_id": "6883056760", "text": text,
+                   "reply_markup": keyboard}
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token, data=data)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()).get("ok", False)
+    except Exception as e:
+        logger.warning("send failed: %s", e)
+        return False
+
+
+def fmt(v):
+    if not v:
+        return "?"
+    if v >= 1e6:
+        return "$%.1fM" % (v / 1e6)
+    if v >= 1e3:
+        return "$%.0fk" % (v / 1e3)
+    return "$%.0f" % v
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+
+def daily_budget_left():
+    """Own daily card budget (Solana/Base counters untouched)."""
+    today = time.strftime("%Y-%m-%d")
+    d = load_json(DAILY_FILE, {})
+    if d.get("date") != today:
+        d = {"date": today, "count": 0}
+    return MAX_CARDS_PER_DAY - d.get("count", 0), d
+
+
+def bump_daily(d):
+    d["count"] = d.get("count", 0) + 1
+    save_json(DAILY_FILE, d)
+
+
+def record_outcome(pool, score):
+    try:
+        outs = load_json(OUTCOME_FILE, {})
+        outs[pool["mint"]] = {
+            "symbol": pool["name"], "alert_ts": time.time(),
+            "alert_price": pool.get("price_usd", 0),
+            "alert_mcap": pool["mcap"], "score": score,
+            "age_min": round(pool["age_min"], 1),
+            "breakout_x": round(_breakout_ratio(pool), 2),
+            "tier": "breakout-pick",
+        }
+        save_json(OUTCOME_FILE, outs)
+    except Exception:
+        pass
+
+
+def build_text(pool, score, reasons, safety_reason, lp_badge=""):
+    m5 = pool["tx"]["m5"]
+    supply = ""
+    if _HAS_LPLOCK:
+        try:
+            supply = lp_lock.token_supply("ethereum", pool["mint"])
+        except Exception as exc:
+            logger.warning("supply lookup failed: %s", exc)
+    if _HAS_CARDS:
+        return build_card(
+            symbol=pool["name"], score=score, mint=pool["mint"],
+            entry_price=pool.get("price_usd", 0),
+            current_price=pool.get("price_usd", 0),
+            mcap=pool["mcap"] or pool["fdv"], liquidity=pool["liq"],
+            buyers=m5.get("buyers", 0), age_min=pool["age_min"],
+            buys_5m=m5.get("buys", 0), sells_5m=m5.get("sells", 0),
+            safety=safety_reason, is_runner=True,
+            risk_note=("⛓ ETH breakout — established runner breaking out "
+                       "on volume. The bot does not trade Ethereum; "
+                       "this card is a signal only. 🐢 Slowest decay: "
+                       "let the runner portion breathe. 💸 If this rugs, "
+                       "you lose your full stake."),
+            chain="ethereum", source="eth-runner", lp_lock=lp_badge,
+            supply=supply,
+        )
+    lines = [
+        "🏃 ETH RUNNER — $%s (score %.0f/100)" % (pool["name"], score),
+        "⚡ ALREADY RUNNING — %d min old" % pool["age_min"],
+        "⚠️ HIGH RISK — real-money gamble, not a pick.",
+        "CA: %s" % pool["mint"],
+        "mcap %s · liq %s" % (fmt(pool["mcap"] or pool["fdv"]),
+                              fmt(pool["liq"])),
+        "5m: %d buys / %d sells (%d buyers)" % (
+            m5.get("buys", 0), m5.get("sells", 0), m5.get("buyers", 0)),
+    ]
+    for r in reasons[:5]:
+        lines.append("  • %s" % r)
+    lines.append("🛡️ safety: %s" % safety_reason)
+    if lp_badge:
+        lines.append(lp_badge)
+    return "\n".join(lines)
+
+
+def main():
+    logger.warning("eth-breakout feed started (signals-only)")
+    seen = set(load_json(SEEN_FILE, []))
+    feed_paused_logged = False
+    while True:
+        try:
+            # Per-chain kill switch: a paused ETH feed sends no cards and
+            # publishes nothing. Other chains never touched by this check.
+            if not feed_live():
+                if not feed_paused_logged:
+                    logger.warning("eth feed PAUSED by kill switch — "
+                                   "sleeping, no cards, no bus publish")
+                    feed_paused_logged = True
+                time.sleep(120)
+                continue
+            feed_paused_logged = False
+
+            left, daily = daily_budget_left()
+            if left <= 0:
+                time.sleep(300)
+                continue
+
+            # trending_pools pages 1-2: 2 req/180s, far under the 30/min
+            # free cap. Trending is a slow-moving set; depth beats speed.
+            pools = get_pools((1, 2))
+
+            candidates = []
+            for pool in pools:
+                if pool["mint"] in seen:
+                    continue
+                seen.add(pool["mint"])
+                ok, _why = passes_prefilter(pool)
+                if not ok:
+                    continue
+                ok, why = passes_breakout(pool)
+                if not ok:
+                    continue
+                pool["_breakout"] = why
+                ok, _why = passes_manipulation(pool)
+                if not ok:
+                    continue
+                candidates.append(pool)
+
+            # Safety in parallel (I/O bound); fail-CLOSED on unknown.
+            results = []
+            if candidates:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    results = list(ex.map(
+                        check_safety, [p["mint"] for p in candidates]))
+
+            for pool, (safe, safety_reason, intel) in zip(candidates,
+                                                          results):
+                if not safe:
+                    logger.warning("SAFETY BLOCK %s: %s", pool["name"],
+                                   safety_reason)
+                    continue
+                score, reasons = score_pool(pool)
+                if score < MIN_SCORE:
+                    logger.warning("SKIP %s: score %.0f < %.0f",
+                                   pool["name"], score, MIN_SCORE)
+                    continue
+                left, daily = daily_budget_left()
+                if left <= 0:
+                    break
+                # LP-lock badge: display-only, runs only for the winning
+                # candidate (<=1/day). Never blocks the card (fail-soft).
+                lp_badge = ""
+                if _HAS_LPLOCK:
+                    try:
+                        lp_badge = lp_lock.badge(lp_lock.check_lp_lock(
+                            "ethereum", pool.get("dex", ""),
+                            pool.get("pair", "")))
+                    except Exception as exc:
+                        logger.warning("lp_lock badge failed: %s", exc)
+                card = build_text(pool, score, reasons, safety_reason,
+                                  lp_badge)
+                if send_card(card, pool["mint"]):
+                    bump_daily(daily)
+                    record_outcome(pool, score)
+                    if _HAS_BUS:
+                        m5 = pool["tx"]["m5"]
+                        publish(make_signal(
+                            "ethereum", "eth-runner", pool["mint"],
+                            symbol=pool["name"], score=score,
+                            tier="breakout-pick", age_min=pool["age_min"],
+                            mcap=pool["mcap"] or pool["fdv"],
+                            liquidity=pool["liq"],
+                            buys=m5["buys"], sells=m5["sells"],
+                            evidence={"safety": safety_reason,
+                                      "reasons": reasons[:4],
+                                      "dex": pool["dex"],
+                                      "m15_buyers": pool["tx"]["m15"]["buyers"],
+                                      "breakout_x": round(
+                                          _breakout_ratio(pool), 2)}))
+                    logger.warning("ETH BREAKOUT CARD %s score=%.0f age=%.0fm",
+                                   pool["name"], score, pool["age_min"])
+                    # Paper mirror (2026-10-17): $1 paper position with
+                    # honest per-chain costs + the user's exit ladder.
+                    # Never affects the card.
+                    try:
+                        from mirror import mirror_card
+                        opened, why = mirror_card(
+                            "ethereum", "eth-runner", pool["mint"],
+                            symbol=pool["name"], score=score,
+                            tier="breakout-pick",
+                            mcap=pool["mcap"] or pool["fdv"],
+                            liquidity=pool["liq"],
+                            evidence={"safety": safety_reason,
+                                      "reasons": reasons[:4],
+                                      "age_min": pool.get("age_min", 0),
+                                      "breakout_x": round(
+                                          _breakout_ratio(pool), 2)})
+                        if not opened:
+                            logger.warning("mirror skip %s: %s",
+                                           pool["mint"][:12], why)
+                    except Exception:
+                        pass
+                    break  # daily budget is 1; done for today
+            save_json(SEEN_FILE, sorted(seen)[-2000:])
+        except Exception:
+            logger.exception("eth-runner loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    main()

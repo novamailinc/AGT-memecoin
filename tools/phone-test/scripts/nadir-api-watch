@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Nadir Phase 1 auto-trigger: checks API health every run.
+When GeckoTerminal + DexScreener both respond cleanly 3x in a row,
+runs the Phase 1 probe and writes DONE marker so cron stops triggering.
+"""
+import json, os, sys, subprocess
+sys.path.insert(0, "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts")
+from nadir_http import http_json
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+STATE = os.path.join(HOME, "nadir_phase1", "api_watch_state.json")
+DONE = os.path.join(HOME, "nadir_phase1", "PHASE1_DONE")
+
+def api_ok(url, timeout=20):
+    try:
+        http_json(url, timeout=timeout, tries=3)
+        return True
+    except Exception:
+        return False
+
+def main():
+    if os.path.exists(DONE):
+        print("Phase 1 already done, exiting")
+        return
+    try:
+        state = json.load(open(STATE))
+    except Exception:
+        state = {"consecutive_ok": 0}
+
+    g = api_ok("https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1")
+    # DexScreener: use pairs endpoint (more reliable than search)
+    d = api_ok("https://api.dexscreener.com/latest/dex/pairs/solana/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB5")
+
+    if g and d:
+        state["consecutive_ok"] = state.get("consecutive_ok", 0) + 1
+        print("APIs OK (%d/3)" % state["consecutive_ok"])
+    else:
+        state["consecutive_ok"] = 0
+        print("APIs not ready (gecko=%s dex=%s)" % (g, d))
+
+    json.dump(state, open(STATE, "w"))
+
+    if state["consecutive_ok"] >= 3:
+        print("APIs stable - discovering 30d+ old tokens")
+        # Discover age-appropriate tokens via GeckoTerminal
+        try:
+            pools = http_json(
+                "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
+                tries=4).get("data", [])
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            old_mints = []
+            for p in pools:
+                a = p.get("attributes", {})
+                try:
+                    created = datetime.fromisoformat(
+                        a.get("pool_created_at", "").replace("Z", "+00:00"))
+                    age_days = (now - created).days
+                except Exception:
+                    continue
+                if age_days < 35:
+                    continue
+                rel = p.get("relationships", {})
+                base = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
+                if base.startswith("solana_"):
+                    mint = base.replace("solana_", "")
+                    # mcap filter via attributes
+                    fdv = float(a.get("fdv_usd") or 0)
+                    if 100_000 <= fdv <= 10_000_000 and mint not in old_mints:
+                        old_mints.append(mint)
+                if len(old_mints) >= 20:
+                    break
+            if len(old_mints) >= 15:
+                json.dump(old_mints,
+                          open(os.path.join(HOME, "nadir_phase1",
+                                            "probe_mints.json"), "w"))
+                print("discovered %d age-appropriate mints" % len(old_mints))
+            else:
+                print("only %d old mints found, need 15+" % len(old_mints))
+                return
+        except Exception as e:
+            print("discovery fail: %s" % str(e)[:80])
+            return
+        print("running Phase 1 probe")
+        r = subprocess.run(
+            [sys.executable,
+             "/home/hatch/workspace/Forex-agent/Forex-agent-main/scripts/nadir-phase1-probe"],
+            capture_output=True, text=True, timeout=900,
+            env={**os.environ, "FOREX_AGENT_HOME": HOME})
+        print(r.stdout[-2000:])
+        open(DONE, "w").write("done at %s" % str(__import__("datetime").datetime.now()))
+        print("PHASE1 DONE marker written")
+
+if __name__ == "__main__":
+    main()

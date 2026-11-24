@@ -1,0 +1,935 @@
+#!/usr/bin/env python3
+"""Decision memory for the paper-only grad lanes (2026-11-17).
+
+The systematic version of the Rule A discovery: every paper entry
+logs the features that mattered, every close settles that record
+with its outcome, and a nightly reflector turns the settled
+decisions into TEMPLATED lessons from the lane's own stats — no
+LLM, no model prose, no RPC.
+
+Lanes: grad_select, grad_raw, tranche, tranche_protect. Each lane
+gets ``<HOME>/lessons/<lane>_lessons.jsonl`` (one JSON record per
+line, created by this code, never shipped with data) and a
+generated ``<lane>_lessons.json`` written by scripts/lessons-reflect.
+
+Contract:
+  * ADVISORY ONLY in v1. Lessons are context, never a filter:
+    nothing in this module gates, rejects, or sizes an entry.
+    The evaluation path may journal which lesson ids were in
+    context (``lessons_in_context``); CEO auto-tune may read them
+    via :func:`get_lessons`. Entry behaviour is unchanged.
+  * Pure Python, stdlib only. Every public function never raises.
+  * Idempotent settlement: a close settles its pending record
+    once; re-running settles nothing twice, and a close with no
+    pending record is recorded exactly once from the close record
+    itself (``settle_from_close``), deduped by (mint, entry_ts).
+  * Point-in-time seed: every generated lesson carries
+    ``resolved_at`` — the close_ts of the newest settled decision
+    it is based on. The stretch item (point-in-time lesson
+    application) is NOT built here.
+  * Home resolution: ``home`` passed explicitly wins; otherwise
+    ``FOREX_AGENT_HOME`` at call time; otherwise
+    ``~/.forex-agent``. Callers that run an engine instance pass
+    ``os.path.dirname(LEDGER_PATH)`` so temp ledgers in tests stay
+    isolated from the live runtime.
+  * Writes are atomic (per-process tmp + os.replace) under a
+    per-file flock, so a crash or reboot never leaves a torn
+    jsonl behind.
+
+Paper only. Nothing here touches real money, keys, or wallets.
+"""
+
+import fcntl
+import json
+import math
+import os
+import time
+
+LANES = ("grad_select", "grad_raw", "tranche", "tranche_protect")
+
+LEDGER_FILES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+}
+
+FAST_AGE_S = 30.0  # Rule A bar; mirrors grad_select.ENTRY_MAX_AGE_S
+
+# Band edges, shared by the reflector and the tests. TTG = time
+# from coin creation to graduation (curve speed); curve_trades =
+# bonding-curve signatures at graduation; copycat = OTHER
+# same-ticker launches in the trailing 24h.
+DEPLOYER_BANDS = ("0", "1-2", ">=3")
+CURVE_TTG_BANDS = ("<=60s", "60-600s", ">600s")
+CURVE_TRADES_BANDS = ("<=100", "101-250", ">250")
+COPYCAT_BANDS = ("0", "1-2", ">=3")
+
+
+def _home(home=None):
+    if home:
+        return str(home)
+    return os.environ.get(
+        "FOREX_AGENT_HOME",
+        os.path.join(os.path.expanduser("~"), ".forex-agent"))
+
+
+def lessons_dir(home=None):
+    """<HOME>/lessons, created on demand. Never raises."""
+    try:
+        d = os.path.join(_home(home), "lessons")
+        os.makedirs(d, exist_ok=True)
+        return d
+    except Exception:
+        return os.path.join(_home(home), "lessons")
+
+
+def decisions_path(lane, home=None):
+    return os.path.join(lessons_dir(home), "%s_lessons.jsonl" % lane)
+
+
+def generated_path(lane, home=None):
+    return os.path.join(lessons_dir(home), "%s_lessons.json" % lane)
+
+
+def ledger_path(lane, home=None):
+    return os.path.join(_home(home), LEDGER_FILES.get(lane, ""))
+
+
+class _file_lock:
+    """Exclusive flock on <path>.lock. Never raises."""
+
+    def __init__(self, path):
+        self._path = path + ".lock"
+        self._fh = None
+
+    def __enter__(self):
+        try:
+            self._fh = open(self._path, "a+")
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            self._fh = None
+        return self
+
+    def __exit__(self, *a):
+        try:
+            if self._fh is not None:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                self._fh.close()
+        except Exception:
+            pass
+        return False
+
+
+def _read_all(lane, home=None):
+    """All decision records for a lane, in file order. [] if none."""
+    try:
+        p = decisions_path(lane, home)
+        if not os.path.exists(p):
+            return []
+        out = []
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+        return out
+    except Exception:
+        return []
+
+
+def _write_all(lane, records, home=None):
+    """Rewrite the lane's jsonl atomically (per-process tmp +
+    os.replace). Never raises."""
+    try:
+        p = decisions_path(lane, home)
+        tmp = "%s.tmp-%d" % (p, os.getpid())
+        with open(tmp, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _num(v):
+    """float(v) or None — never raises, never coerces junk."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_features(entry_features, pos_or_close=None):
+    """Flatten the features that mattered into one dict.
+
+    ``entry_features`` is a lane close/position record's
+    entry_features: the select measurements live under
+    ``select`` (grad_select / grad_raw), ``tranche`` or
+    ``tranche_protect``; the pool-age / mcap / liquidity live at
+    the top level. Missing measurements stay None (unknown) —
+    never a placeholder, never a 0 that would farm a band.
+    """
+    ef = entry_features if isinstance(entry_features, dict) else {}
+    sel = None
+    for key in ("select", "tranche", "tranche_protect"):
+        if isinstance(ef.get(key), dict):
+            sel = ef[key]
+            break
+    sel = sel or {}
+    rec = pos_or_close if isinstance(pos_or_close, dict) else {}
+    grad_age = _num(sel.get("grad_age_s"))
+    if grad_age is None:
+        grad_age = _num(ef.get("grad_age_s"))
+    entry_price = _num(ef.get("filled_price"))
+    if entry_price is None:
+        entry_price = _num(ef.get("quoted_price"))
+    if entry_price is None:
+        entry_price = _num(rec.get("entry_price"))
+    return {
+        "grad_age_s": grad_age,
+        "deployer_launches_24h": _num(
+            sel.get("deployer_launches_24h")),
+        "curve_trades": _num(sel.get("curve_trades")),
+        "ttg_s": _num(sel.get("ttg_s")),
+        "copycat_others_24h": _num(sel.get("ticker_others_24h")),
+        "entry_price": entry_price,
+        "mcap": _num(ef.get("mcap")),
+        "liquidity": _num(ef.get("liquidity")),
+    }
+
+
+def _key(rec):
+    return (str(rec.get("mint") or ""),
+            _num(rec.get("entry_ts")))
+
+
+def log_decision(lane, mint, entry_ts, features, symbol=None,
+                 lessons_in_context=None, home=None):
+    """Append a PENDING decision record at entry.
+
+    Idempotent per (mint, entry_ts): a second call for the same
+    entry MERGES features (fills measurements that were None —
+    the entry path logs pool age/mcap/liq first, the detection
+    stamp follows with the select measurements) instead of
+    appending a duplicate. A settled record for the same key is
+    never touched. Returns True when a record was written or
+    merged, False otherwise. Never raises."""
+    try:
+        mint = str(mint or "")
+        if not mint or lane not in LANES:
+            return False
+        feats = {k: _num(v) for k, v in
+                 (features or {}).items()} if isinstance(features, dict) \
+            else {}
+        with _file_lock(decisions_path(lane, home)):
+            recs = _read_all(lane, home)
+            for rec in recs:
+                if _key(rec) == (mint, _num(entry_ts)):
+                    if rec.get("status") == "settled":
+                        return False
+                    merged = dict(rec.get("features") or {})
+                    fts = dict(rec.get("feature_ts") or {})
+                    now = time.time()
+                    for k, v in feats.items():
+                        if merged.get(k) is None and v is not None:
+                            merged[k] = v
+                            # First-recorded time for this value;
+                            # never overwritten once set (values
+                            # are immutable once recorded).
+                            fts.setdefault(k, now)
+                    rec["features"] = merged
+                    if fts:
+                        rec["feature_ts"] = fts
+                    if symbol and not rec.get("symbol"):
+                        rec["symbol"] = symbol
+                    if lessons_in_context:
+                        rec["lessons_in_context"] = list(
+                            lessons_in_context)[:8]
+                    _write_all(lane, recs, home)
+                    return True
+            now = time.time()
+            recs.append({
+                "kind": "decision", "lane": lane, "mint": mint,
+                "symbol": symbol or "",
+                "status": "pending",
+                "entry_ts": _num(entry_ts),
+                "features": feats,
+                "feature_ts": {k: now for k, v in feats.items()
+                               if v is not None},
+                "lessons_in_context": list(
+                    lessons_in_context or [])[:8],
+                "logged_ts": now,
+            })
+            _write_all(lane, recs, home)
+            return True
+    except Exception:
+        return False
+
+
+def settle_decision(lane, mint, entry_ts, pnl_usd, realized_mult,
+                    close_reason, close_ts, home=None,
+                    exit_price_kind=None):
+    """Settle a PENDING record at close. Idempotent: a close
+    settles its pending record once; a second call for the same
+    (mint, entry_ts) is a no-op returning False. Returns True
+    only when a record was settled by this call. Never raises.
+
+    exit_price_kind is recorded with the settled decision (Stage-C
+    visibility, 2026-11-22) and gates LEARNING only: generate_lessons
+    excludes non-current-price outcomes from lesson statistics (4.6:
+    never learn from incomplete trade records). It never gates an
+    exit or changes a settlement amount."""
+    try:
+        mint = str(mint or "")
+        if not mint or lane not in LANES:
+            return False
+        with _file_lock(decisions_path(lane, home)):
+            recs = _read_all(lane, home)
+            changed = False
+            for rec in recs:
+                if _key(rec) == (mint, _num(entry_ts)):
+                    if rec.get("status") == "settled":
+                        return False
+                    rec["status"] = "settled"
+                    rec["pnl_usd"] = _num(pnl_usd)
+                    rec["realized_mult"] = _num(realized_mult)
+                    rec["close_reason"] = str(close_reason or "")
+                    rec["close_ts"] = _num(close_ts)
+                    rec["settled_ts"] = time.time()
+                    rec["exit_price_kind"] = str(
+                        exit_price_kind or "unknown")
+                    changed = True
+                    break
+            if changed:
+                _write_all(lane, recs, home)
+            return changed
+    except Exception:
+        return False
+
+
+def settle_from_close(lane, close_rec, home=None):
+    """Settle the decision for one ledger close record.
+
+    Settles the pending record when one exists; when the entry
+    predates decision logging (or the stamp path missed it),
+    appends a settled record built from the close record's own
+    entry_features instead — so every close lands in the log
+    exactly once, deduped by (mint, entry_ts). Returns True when
+    a record was settled or created, False when it was already
+    settled. Never raises."""
+    try:
+        rec = close_rec if isinstance(close_rec, dict) else {}
+        mint = str(rec.get("mint") or "")
+        if not mint or lane not in LANES:
+            return False
+        if settle_decision(
+                lane, mint, rec.get("entry_ts"), rec.get("pnl_usd"),
+                rec.get("realized_mult"), rec.get("closed_reason"),
+                rec.get("close_ts"), home=home,
+                exit_price_kind=rec.get("exit_price_kind")):
+            return True
+        with _file_lock(decisions_path(lane, home)):
+            recs = _read_all(lane, home)
+            for r in recs:
+                if _key(r) == _key(rec) and \
+                        r.get("status") == "settled":
+                    return False
+            now = time.time()
+            feats = extract_features(rec.get("entry_features") or {},
+                                     rec)
+            recs.append({
+                "kind": "decision", "lane": lane, "mint": mint,
+                "symbol": str(rec.get("symbol") or ""),
+                "status": "settled",
+                "entry_ts": _num(rec.get("entry_ts")),
+                "features": feats,
+                "feature_ts": {k: now for k, v in feats.items()
+                               if v is not None},
+                "lessons_in_context": [],
+                "logged_ts": now,
+                "pnl_usd": _num(rec.get("pnl_usd")),
+                "realized_mult": _num(rec.get("realized_mult")),
+                "close_reason": str(rec.get("closed_reason") or ""),
+                "close_ts": _num(rec.get("close_ts")),
+                "settled_ts": now,
+                "exit_price_kind": str(
+                    rec.get("exit_price_kind") or "unknown"),
+                "source": "close",
+            })
+            _write_all(lane, recs, home)
+            return True
+    except Exception:
+        return False
+
+
+def load_decisions(lane, home=None):
+    """All decision records for a lane (pending + settled)."""
+    try:
+        if lane not in LANES:
+            return []
+        return _read_all(lane, home)
+    except Exception:
+        return []
+
+
+def decisions_from_ledger(lane, ledger_file=None, home=None):
+    """Settled decisions rebuilt from a lane ledger's closes.
+
+    The ledgers keep only the last 500 closes, so this is a
+    bounded backfill, not a full history — and it is how the
+    reflector produces lessons on real data from day one, before
+    the pending log has accumulated settled records of its own.
+    Never raises."""
+    try:
+        if lane not in LANES:
+            return []
+        path = ledger_file or ledger_path(lane, home)
+        if not path or not os.path.exists(path):
+            return []
+        with open(path) as f:
+            d = json.load(f)
+        out = []
+        for c in (d.get("closes") or []):
+            if not isinstance(c, dict) or not c.get("mint"):
+                continue
+            out.append({
+                "kind": "decision", "lane": lane,
+                "mint": str(c.get("mint") or ""),
+                "symbol": str(c.get("symbol") or ""),
+                "status": "settled",
+                "entry_ts": _num(c.get("entry_ts")),
+                "features": extract_features(
+                    c.get("entry_features") or {}, c),
+                "lessons_in_context": [],
+                "pnl_usd": _num(c.get("pnl_usd")),
+                "realized_mult": _num(c.get("realized_mult")),
+                "close_reason": str(c.get("closed_reason") or ""),
+                "close_ts": _num(c.get("close_ts")),
+                "exit_price_kind": str(c.get("exit_price_kind") or "unknown"),
+                "source": "ledger",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def merged_settled_decisions(lane, ledger_file=None, home=None):
+    """Settled decisions from the jsonl log + the ledger, deduped
+    by (mint, entry_ts). The jsonl record wins a tie (it may carry
+    lessons_in_context the ledger lacks). Sorted by close_ts.
+    Never raises."""
+    try:
+        merged = {}
+        for rec in decisions_from_ledger(lane, ledger_file, home):
+            merged[_key(rec)] = rec
+        for rec in _read_all(lane, home):
+            if rec.get("status") == "settled":
+                merged[_key(rec)] = rec
+        out = [r for r in merged.values()
+               if _num(r.get("close_ts")) is not None]
+        out.sort(key=lambda r: _num(r.get("close_ts")) or 0)
+        return out
+    except Exception:
+        return []
+
+
+# ---- templated lesson generation --------------------------------------
+
+def _band(value, edges, labels):
+    """Band label for a numeric value, or 'unknown' when missing."""
+    if value is None:
+        return "unknown"
+    for edge, label in zip(edges, labels):
+        if value <= edge:
+            return label
+    return labels[-1]
+
+
+# Feature keys consumed by lesson banding (_band_of). Knowledge-time
+# replay tracks first-recorded timestamps for these values.
+_BAND_FEATURE_KEYS = ("grad_age_s", "deployer_launches_24h", "ttg_s",
+                      "curve_trades", "copycat_others_24h")
+
+
+def _band_of(dimension, features):
+    if dimension == "entry_speed":
+        age = features.get("grad_age_s")
+        if age is None:
+            return "unknown"
+        return "fast (age<=30s)" if age <= FAST_AGE_S \
+            else "slow (age>30s)"
+    if dimension == "deployer":
+        n = features.get("deployer_launches_24h")
+        if n is None:
+            return "unknown"
+        return "0" if n == 0 else ("1-2" if n <= 2 else ">=3")
+    if dimension == "curve_speed":
+        return _band(features.get("ttg_s"),
+                     (60.0, 600.0), ("<=60s", "60-600s", ">600s"))
+    if dimension == "curve_trades":
+        return _band(features.get("curve_trades"),
+                     (100.0, 250.0), ("<=100", "101-250", ">250"))
+    if dimension == "copycat":
+        n = features.get("copycat_others_24h")
+        if n is None:
+            return "unknown"
+        return "0" if n == 0 else ("1-2" if n <= 2 else ">=3")
+    return "unknown"
+
+
+def _fmt_money(v):
+    return "%s$%.2f" % ("+" if v >= 0 else "-", abs(v))
+
+
+def _lesson_text(dimension, band, closes, wins, net_pnl):
+    wr = (100.0 * wins / closes) if closes else 0.0
+    if dimension == "entry_speed":
+        return ("%s entries: %s on %d closes, %d wins "
+                "(%.1f%% win rate)" % (band, _fmt_money(net_pnl),
+                                      closes, wins, wr))
+    if dimension == "deployer":
+        return ("deployer with %s launches in 24h: %s on %d closes, "
+                "%d wins (%.1f%% win rate)"
+                % (band, _fmt_money(net_pnl), closes, wins, wr))
+    if dimension == "curve_speed":
+        return ("curve time-to-graduation %s: %s on %d closes, "
+                "%d wins (%.1f%% win rate)"
+                % (band, _fmt_money(net_pnl), closes, wins, wr))
+    if dimension == "curve_trades":
+        return ("curve with %s signatures: %s on %d closes, %d wins "
+                "(%.1f%% win rate)"
+                % (band, _fmt_money(net_pnl), closes, wins, wr))
+    if dimension == "copycat":
+        return ("copycat count %s other same-ticker launches in 24h: "
+                "%s on %d closes, %d wins (%.1f%% win rate)"
+                % (band, _fmt_money(net_pnl), closes, wins, wr))
+    if dimension == "overall":
+        return ("all settled decisions: %s on %d closes, %d wins "
+                "(%.1f%% win rate)" % (_fmt_money(net_pnl), closes,
+                                      wins, wr))
+    return "%s %s: %s on %d closes, %d wins" % (
+        dimension, band, _fmt_money(net_pnl), closes, wins)
+
+
+def _qualified_for_learning(rec):
+    """4.6 hygiene: a settled decision feeds lesson statistics only
+    when its outcome was priced from a current observed quote
+    (exit_provenance.CURRENT). Stale estimates, zero write-downs and
+    unclassified/legacy records are incomplete trade records and are
+    EXCLUDED from learning; their count is reported, never learned
+    from. Anything unreadable or unlabeled fails closed (excluded)."""
+    try:
+        if rec.get("exit_price_kind") != "current_price_simulated_fill":
+            return False
+        if not rec.get("mint") or not isinstance(rec.get("features"), dict):
+            return False
+        nums = {}
+        for key in ("pnl_usd", "realized_mult", "entry_ts", "close_ts"):
+            value = _num(rec.get(key))
+            if value is None or not math.isfinite(value):
+                return False
+            nums[key] = value
+        if not str(rec.get("close_reason") or "").strip():
+            return False
+        if nums["entry_ts"] < 0 or nums["close_ts"] < nums["entry_ts"] \
+                or nums["realized_mult"] < 0:
+            return False
+        for value in rec["features"].values():
+            if value is not None:
+                parsed = _num(value)
+                if parsed is None or not math.isfinite(parsed):
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+
+def _summarize(rows):
+    closes = len(rows)
+    wins = sum(1 for r in rows
+               if (_num(r.get("pnl_usd")) or 0) > 0)
+    net = round(sum(_num(r.get("pnl_usd")) or 0 for r in rows), 2)
+    resolved = max((_num(r.get("close_ts")) or 0 for r in rows),
+                   default=0) or None
+    return closes, wins, net, resolved
+
+
+def _recorded_economics(rows):
+    """Recorded figures, not executable proceeds or qualified performance."""
+    valid = [_num(r.get("pnl_usd")) for r in rows]
+    valid = [v for v in valid if v is not None and math.isfinite(v)]
+    return {"records": len(rows), "finite_pnl_records": len(valid),
+            "invalid_or_missing_pnl_records": len(rows) - len(valid),
+            "recorded_pnl_usd": round(sum(valid), 4),
+            "evidence_status": "simulated_unvalidated_not_executable_truth"}
+
+
+def generate_lessons(lane, decisions, generated_at=None):
+    """Templated lessons from settled decisions.
+
+    One lesson per non-empty band of each dimension (entry_speed,
+    deployer, curve_speed, curve_trades, copycat) plus one overall
+    lesson. Text is templated from the numbers only — no LLM, no
+    model prose. Every lesson carries ``resolved_at``: the
+    close_ts of the newest settled decision it is based on.
+    4.6 hygiene: lesson statistics learn ONLY from outcomes priced
+    from a current observed quote (exit_price_kind
+    "current_price_simulated_fill"); stale estimates, write-downs and
+    unclassified records are incomplete trade records and are
+    excluded from the numbers, with their count reported per lesson
+    and per payload. Returns a payload dict ready for
+    :func:`write_lessons`. Never raises."""
+    try:
+        settled = [r for r in (decisions or [])
+                   if isinstance(r, dict)
+                   and r.get("status") == "settled"
+                   and _num(r.get("close_ts")) is not None]
+        gen = generated_at or time.time()
+        qualified = [r for r in settled if _qualified_for_learning(r)]
+        excluded = [r for r in settled if not _qualified_for_learning(r)]
+        lessons = []
+        dims = ("entry_speed", "deployer", "curve_speed",
+                "curve_trades", "copycat")
+        for dim in dims:
+            groups = {}
+            for r in qualified:
+                band = _band_of(dim, r.get("features") or {})
+                groups.setdefault(band, []).append(r)
+            xgroups = {}
+            for r in excluded:
+                band = _band_of(dim, r.get("features") or {})
+                xgroups.setdefault(band, []).append(r)
+            for band in sorted(groups):
+                rows = groups[band]
+                closes, wins, net, resolved = _summarize(rows)
+                lessons.append({
+                    "id": "%s:%s:%s" % (lane, dim, band),
+                    "lane": lane, "dimension": dim, "band": band,
+                    "text": _lesson_text(dim, band, closes, wins,
+                                         net),
+                    "closes": closes, "wins": wins,
+                    "net_pnl_usd": net,
+                    "win_rate": round(
+                        wins / closes, 4) if closes else 0.0,
+                    "excluded_unqualified": len(xgroups.get(band, [])),
+                    "resolved_at": resolved,
+                    "generated_at": gen,
+                })
+        closes, wins, net, resolved = _summarize(qualified)
+        if closes:
+            lessons.append({
+                "id": "%s:overall:all" % lane,
+                "lane": lane, "dimension": "overall", "band": "all",
+                "text": _lesson_text("overall", "all", closes, wins,
+                                     net),
+                "closes": closes, "wins": wins, "net_pnl_usd": net,
+                "win_rate": round(wins / closes, 4) if closes else 0.0,
+                "excluded_unqualified": len(excluded),
+                "resolved_at": resolved, "generated_at": gen,
+            })
+        # Stage-C visibility (owner-approved 2026-11-22): the
+        # payload states the provenance of the outcomes the lessons
+        # were templated from, and that the numbers are simulated
+        # and unvalidated - never qualified performance.
+        try:
+            try:
+                from daemon.launch_scanner import \
+                    exit_provenance as _pk
+            except ImportError:
+                import exit_provenance as _pk  # type: ignore
+            _bd = _pk.sample_breakdown(settled)
+            _vis = {
+                "price_kind_breakdown": _bd,
+                "qualification_status": _pk.QUALIFICATION_STATUS,
+                "fill_model_validated": _pk.FILL_MODEL_VALIDATED,
+            }
+        except Exception:
+            _vis = {}
+        return {
+            "lane": lane, "generated_at": gen,
+            "resolved_at": resolved if closes else None,
+            "n_settled": len(settled),
+            "n_qualified": len(qualified),
+            "n_qualified_semantics": "eligible_for_advisory_statistics_only_not_performance_qualified",
+            "all_settled_recorded_economics": _recorded_economics(settled),
+            "included_recorded_economics": _recorded_economics(qualified),
+            "excluded_recorded_economics": _recorded_economics(excluded),
+            "excluded_by_price_kind": {kind: _recorded_economics([r for r in excluded
+                if str(r.get("exit_price_kind") or "unknown") == kind])
+                for kind in sorted({str(r.get("exit_price_kind") or "unknown")
+                                    for r in excluded})},
+            "n_excluded_unqualified": len(excluded),
+            "learning_price_kind": "current_price_simulated_fill",
+            "learning_evidence_status": "simulated_unvalidated_not_performance_qualified",
+            "lessons": lessons,
+            "visibility": _vis,
+        }
+    except Exception:
+        return {"lane": lane, "generated_at": generated_at or 0,
+                "resolved_at": None, "n_settled": 0, "lessons": []}
+
+
+def generate_lessons_as_of(lane, decisions, as_of_ts,
+                           generated_at=None, mode="outcome_event"):
+    """Point-in-time lesson payload (section 4.4).
+
+    mode="outcome_event" (default): computed ONLY from decisions
+    whose close_ts (the outcome event time) is at or before
+    as_of_ts. This is an outcome-event cutoff ONLY - it is NOT
+    knowledge-time: a record closed before the cutoff but recorded
+    or reclassified later (late backfill) is still included, and
+    feature availability timestamps are not tracked.
+
+    mode="knowledge_time": computed ONLY from settled decisions
+    whose settled_ts (the append time stamped by the settle paths
+    when the outcome was RECORDED) is at or before as_of_ts - the
+    subset the bot had recorded by as_of. Records lacking a finite
+    settled_ts (ledger-rebuilt or legacy records) have unknown
+    first-knowledge time: they are EXCLUDED and counted in
+    unknown_availability_excluded, never silently treated as
+    known. Records recorded after their close (any settled_ts >
+    close_ts, no lateness threshold) are included when recorded by
+    as_of and counted in recorded_after_close_included. Feature
+    availability is tracked per banded-dimension value
+    (_BAND_FEATURE_KEYS): feature_ts[k] is the time value k was
+    FIRST recorded (log_decision stamps it at append and at each
+    merge fill; merge fills only None values, so recorded values
+    are immutable and the first-recorded time is exact). A
+    visible record whose banded features were all recorded by
+    as_of replays exactly what the record held at as_of; a record
+    with any banded feature recorded after as_of is excluded and
+    counted in feature_recorded_after_as_of, and a record lacking
+    feature_ts (legacy) is excluded and counted in
+    feature_availability_unknown. knowledge_replay_limits labels
+    the remaining gap: post-hoc file edits are unversioned, so
+    this is an append-time replay of the known-availability
+    subset, not a verified leak-free reconstruction guarded
+    against file tampering.
+
+    Both modes: only records with status "settled" are eligible
+    (pending records are skipped before any counting, so the
+    counts below describe the eligible set only; a record with a
+    close_ts but no/unknown status is NOT assumed pending - it is
+    excluded and counted in status_unknown_excluded). Timestamps
+    are coerced with the module's numeric coercion (numeric
+    strings accepted). Records that are not dicts or lack a
+    finite close_ts are excluded and counted in
+    malformed_excluded; a record whose settled_ts precedes its
+    close_ts (recorded before the outcome happened) is
+    inconsistent: excluded in knowledge_time mode, counted in
+    inconsistent_time_excluded in both modes. Any nonzero
+    exclusion sets partial_history=True: the payload is not the
+    full recorded history. Non-finite or missing as_of, and
+    unknown modes, are rejected (labeled, never silently full
+    history); an as_of in the future is labeled explicitly.
+    Never raises."""
+    try:
+        cutoff = _num(as_of_ts)
+        if cutoff is None or not math.isfinite(cutoff):
+            return {"lane": lane, "generated_at": generated_at or 0,
+                    "resolved_at": None, "n_settled": 0,
+                    "lessons": [], "error": "invalid_as_of"}
+        if mode not in ("outcome_event", "knowledge_time"):
+            return {"lane": lane, "generated_at": generated_at or 0,
+                    "resolved_at": None, "n_settled": 0,
+                    "lessons": [], "error": "invalid_mode"}
+        gen = generated_at or time.time()
+        visible = []
+        unknown_availability = 0
+        recorded_after_close = 0
+        inconsistent_time = 0
+        malformed = 0
+        status_unknown = 0
+        feature_after = 0
+        feature_unknown = 0
+        for r in (decisions or []):
+            if not isinstance(r, dict):
+                malformed += 1
+                continue
+            status = r.get("status")
+            if status != "settled":
+                if status not in ("pending", "settled") \
+                        and _num(r.get("close_ts")) is not None:
+                    # Settled-looking record of unknown status:
+                    # counted honestly, never assumed pending.
+                    status_unknown += 1
+                continue  # only settled records are eligible
+            ct = _num(r.get("close_ts"))
+            if ct is None or not math.isfinite(ct):
+                malformed += 1
+                continue
+            st = _num(r.get("settled_ts"))
+            inconsistent = (
+                st is not None and math.isfinite(st) and st < ct)
+            if mode == "outcome_event":
+                if ct <= cutoff:
+                    visible.append(r)
+                    if inconsistent:
+                        inconsistent_time += 1
+                continue
+            if st is None or not math.isfinite(st):
+                unknown_availability += 1
+                continue
+            if st > cutoff:
+                continue
+            if inconsistent:
+                inconsistent_time += 1
+                continue
+            fts = r.get("feature_ts")
+            fts = fts if isinstance(fts, dict) else {}
+            fvals = r.get("features")
+            fvals = fvals if isinstance(fvals, dict) else {}
+            used = [k for k in _BAND_FEATURE_KEYS
+                    if _num(fvals.get(k)) is not None]
+            f_ts = {k: _num(fts.get(k)) for k in used}
+            if any(v is None or not math.isfinite(v)
+                   for v in f_ts.values()):
+                feature_unknown += 1
+                continue
+            if any(v > cutoff for v in f_ts.values()):
+                feature_after += 1
+                continue
+            visible.append(r)
+            if st > ct:
+                recorded_after_close += 1
+        payload = generate_lessons(lane, visible,
+                                   generated_at=generated_at)
+        payload["as_of"] = cutoff
+        payload["as_of_in_future"] = bool(cutoff > gen)
+        payload["cutoff_mode"] = mode
+        payload["cutoff_semantics"] = (
+            "outcome_event_time_only_not_knowledge_time"
+            if mode == "outcome_event"
+            else "append_recorded_time_known_availability_subset")
+        payload["malformed_excluded"] = malformed
+        payload["inconsistent_time_excluded"] = inconsistent_time
+        payload["status_unknown_excluded"] = status_unknown
+        payload["partial_history"] = bool(
+            malformed or inconsistent_time or status_unknown
+            or unknown_availability or feature_after
+            or feature_unknown)
+        if mode == "knowledge_time":
+            payload["unknown_availability_excluded"] = \
+                unknown_availability
+            payload["recorded_after_close_included"] = \
+                recorded_after_close
+            payload["feature_recorded_after_as_of_excluded"] = \
+                feature_after
+            payload["feature_availability_unknown_excluded"] = \
+                feature_unknown
+            payload["knowledge_replay_limits"] = (
+                "append-time replay of the known-availability "
+                "subset only: banded-feature first-recorded "
+                "timestamps are tracked for records logged via "
+                "log_decision (values immutable once recorded), "
+                "legacy records without them are excluded, and "
+                "post-hoc file edits are unversioned, so this is "
+                "not a verified leak-free reconstruction guarded "
+                "against file tampering")
+        return payload
+    except Exception:
+        return {"lane": lane, "generated_at": generated_at or 0,
+                "resolved_at": None, "n_settled": 0, "lessons": []}
+
+
+def write_lessons(lane, payload, home=None):
+    """Write the generated lessons file atomically. Never raises."""
+    try:
+        if lane not in LANES:
+            return False
+        p = generated_path(lane, home)
+        tmp = "%s.tmp-%d" % (p, os.getpid())
+        with open(tmp, "w") as f:
+            f.write(json.dumps(payload, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def read_lessons(lane, home=None):
+    """The generated lessons payload, or None when absent."""
+    try:
+        if lane not in LANES:
+            return None
+        p = generated_path(lane, home)
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _rank(lessons):
+    """Most material first: |net pnl|, then closes, then id."""
+    return sorted(lessons or [],
+                  key=lambda l: (-abs(_num(l.get("net_pnl_usd")) or 0),
+                                 -int(l.get("closes") or 0),
+                                 str(l.get("id") or "")))
+
+
+def get_lessons(lane, n=5, home=None):
+    """Top ``n`` lessons for a lane, most material first.
+
+    Advisory context only — callers must never gate on this.
+    [] when no generated file exists yet. Never raises."""
+    try:
+        payload = read_lessons(lane, home)
+        if not payload:
+            return []
+        return _rank(payload.get("lessons") or [])[:max(0, int(n))]
+    except Exception:
+        return []
+
+
+def lessons_in_context(lane, n=5, home=None):
+    """Lesson ids currently in context for a lane (for journaling
+    at decision time). Never raises."""
+    try:
+        return [str(l.get("id") or "") for l in
+                get_lessons(lane, n=n, home=home) if l.get("id")]
+    except Exception:
+        return []
+
+
+def context_block(lane, n=5, home=None):
+    """Human-readable context block for a lane (journal / CEO
+    read). Advisory only. Never raises."""
+    try:
+        top = get_lessons(lane, n=n, home=home)
+        if not top:
+            return ("Decision-memory lessons for %s: none yet "
+                    "(no settled decisions reflected)." % lane)
+        lines = ["Decision-memory lessons for %s (advisory only — "
+                 "never gate entries):" % lane]
+        payload = read_lessons(lane, home) or {}
+        lines.append("Simulated, unvalidated subset: %s included of %s settled; %s excluded. Not qualified performance. Selective missingness can bias this subset." % (
+            payload.get("n_qualified", "unknown"), payload.get("n_settled", "unknown"),
+            payload.get("n_excluded_unqualified", "unknown")))
+        for l in top:
+            lines.append("- %s" % l.get("text", ""))
+        return "\n".join(lines)
+    except Exception:
+        return "Decision-memory lessons for %s: unavailable." % lane

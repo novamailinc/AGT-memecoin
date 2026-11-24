@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Latency report (P5, 2026-10-23).
+
+Per-lane stage latencies for the graduation lanes, from the stamps
+the engines now persist on every position/close:
+  born_ts    pool creation (GeckoTerminal) or stream receipt time
+  seen_ts    first watchlist sighting
+  decided_ts entry decision instant
+  entry_ts   position opened (entered)
+Stages: detection lag = seen-born, queue = decided-seen,
+decision+fill = entered-decided, total = entered-born.
+Prints count/median/p90 per stage per lane. Read-only.
+"""
+import json
+import os
+import statistics
+import sys
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+LANES = (("grad", "grad_ledger.json"),
+         ("grad_raw", "grad_raw_ledger.json"))
+
+
+def _pct(vals, q):
+    if not vals:
+        return None
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(q * len(s)))]
+
+
+def lane_rows(path):
+    try:
+        with open(path) as f:
+            led = json.load(f)
+    except Exception:
+        return [], 0
+    rows = list((led.get("positions") or {}).values()) \
+        + list(led.get("closes") or [])
+    stamped, unstamped = [], 0
+    for r in rows:
+        if r.get("born_ts") and r.get("entry_ts"):
+            stamped.append(r)
+        elif r.get("entry_ts"):
+            unstamped += 1
+    return stamped, unstamped
+
+
+def main():
+    for lane, fn in LANES:
+        rows, unstamped = lane_rows(os.path.join(HOME, fn))
+        print("== %s: %d stamped entries (%d unstamped legacy)"
+              % (lane, len(rows), unstamped))
+        if not rows:
+            continue
+        stages = {"detection (seen-born)": [], "queue (decided-seen)": [],
+                  "fill (entered-decided)": [], "total (entered-born)": []}
+        for r in rows:
+            b, s, d, e = (r.get("born_ts"), r.get("seen_ts"),
+                          r.get("decided_ts"), r.get("entry_ts"))
+            if b and s:
+                stages["detection (seen-born)"].append(s - b)
+            if s and d:
+                stages["queue (decided-seen)"].append(d - s)
+            if d and e:
+                stages["fill (entered-decided)"].append(e - d)
+            if b and e:
+                stages["total (entered-born)"].append(e - b)
+        for name, vals in stages.items():
+            vals = [v for v in vals if v >= 0]
+            if not vals:
+                print("   %-26s n=0" % name)
+                continue
+            print("   %-26s n=%-4d median %7.1fs  p90 %7.1fs  max %7.1fs"
+                  % (name, len(vals), statistics.median(vals),
+                     _pct(vals, 0.9), max(vals)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

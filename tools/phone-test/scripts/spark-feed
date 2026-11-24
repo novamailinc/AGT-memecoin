@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""Spark feed: ignition signal FEED for the lanes (feed-only by user instruction).
+
+Spark watches new Solana launches in the 30-180s ignition window.
+When a coin shows ignition fingerprints (holder velocity spike +
+buy pressure + acceleration) AND passes the bundle veto (not a
+coordinated dump) AND passes RugCheck safety, Spark RECORDS a TTL'd
+ignition signal (spark_signals.json, 8-min TTL). It does NOT fire its
+own cards and does NOT open its own paper positions — per the user's
+explicit instruction, Spark feeds the lanes, it does not drop signals.
+
+Consumers: scripts/degen-v2-feed reads the signal via
+spark.get_spark(mint) and applies SPARK_BONUS (+15) at scoring time;
+spark-boosted entries are tagged source="v2_spark" so the kill
+criteria (spark-boosted vs baseline) survives.
+
+Push detection: Solana program-log WebSocket catches new mints at
+t=0; GeckoTerminal new_pools stays as polling backup.
+
+Kill switch: feed gated on the "spark" lane (halts the feed if the
+lane ever goes negative).
+"""
+import json
+import os
+import sys
+import time
+import logging
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from robust_http import get_json
+import killswitch
+
+try:
+    import spark as spark_mod
+    _HAS_SPARK = True
+except ImportError:
+    _HAS_SPARK = False
+
+# Push-based mint detection via Solana program-log WebSocket.
+# Replaces polling GeckoTerminal's new_pools API (which has indexing
+# delay). Mints are detected at creation (t=0), then checked for
+# ignition when they enter the 30-180s window.
+try:
+    from logstream import LogStream, HTTP_RPC_URLS
+    _HAS_LOGSTREAM = True
+except ImportError:
+    _HAS_LOGSTREAM = False
+
+
+def _helius_rpc_urls():
+    """Authenticated Helius RPC URLs, preferred when the key files exist.
+
+    Main key first, discovery key as fallback — the main key hits its
+    monthly cap ("max usage reached"; smart-watcher's get_helius_key does
+    the same main->discovery fallback for exactly this condition), and
+    the public endpoints 403 getTransaction (jsonParsed), which would
+    otherwise silently neuter push mint resolution. Keys live at
+    ``$FOREX_AGENT_HOME/helius/api_key`` / ``api_key_discovery`` (0600)
+    and are never logged (logstream redacts query strings from endpoint
+    labels).
+    """
+    urls = []
+    for name in ("api_key", "api_key_discovery"):
+        try:
+            key = open(os.path.join(HOME, "helius", name)).read().strip()
+        except Exception:
+            continue
+        if key:
+            urls.append("https://mainnet.helius-rpc.com/?api-key=" + key)
+    return urls
+
+try:
+    from holder_tracker import record as holder_record, \
+        wash_detected as holder_wash
+    _HAS_HOLDERS = True
+except ImportError:
+    _HAS_HOLDERS = False
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+SEEN_FILE = os.path.join(HOME, "spark_seen.json")
+WATCHLIST_FILE = os.path.join(HOME, "spark_watchlist.json")
+DAILY_CAP_FILE = os.path.join(HOME, "spark_daily.json")
+MAX_SIGNALS_PER_DAY = 10
+# How long to listen on the push stream each run (seconds)
+LISTEN_SEC = 15
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("spark-feed")
+
+
+def _daily_count():
+    try:
+        d = json.load(open(DAILY_CAP_FILE))
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if d.get("date") == today:
+            return d.get("count", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _bump_daily_count():
+    try:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        d = {"date": today, "count": _daily_count() + 1}
+        json.dump(d, open(DAILY_CAP_FILE, "w"))
+    except Exception:
+        pass
+
+
+def load_seen():
+    try:
+        return set(json.load(open(SEEN_FILE)))
+    except Exception:
+        return set()
+
+
+def save_seen(s):
+    try:
+        json.dump(sorted(s), open(SEEN_FILE, "w"))
+    except Exception:
+        pass
+
+
+def load_watchlist():
+    """Mints detected via push stream, waiting to enter ignition window."""
+    try:
+        return json.load(open(WATCHLIST_FILE))
+    except Exception:
+        return {}
+
+
+def save_watchlist(wl):
+    try:
+        json.dump(wl, open(WATCHLIST_FILE, "w"))
+    except Exception:
+        pass
+
+
+def collect_push_mints():
+    """Listen on the program-log WebSocket for LISTEN_SEC, return new mints.
+
+    Returns [{mint, ts}]. Falls back to empty on any failure (polling
+    via get_new_pools still runs as backup).
+    """
+    if not _HAS_LOGSTREAM:
+        return []
+    try:
+        # Authenticated Helius RPCs win when the key files exist — the
+        # public endpoints 403 getTransaction (jsonParsed), which silently
+        # neuters push mint resolution, and the main key may be at its
+        # monthly cap (discovery key is the fallback). Mirrors
+        # _ensure_logstream in daemon/launch_scanner/__init__.py and the
+        # main->discovery fallback in scripts/smart-watcher.
+        urls = list(HTTP_RPC_URLS)
+        for hurl in reversed(_helius_rpc_urls()):
+            if hurl not in urls:
+                urls.insert(0, hurl)
+        ls = LogStream(http_rpcs=urls)
+        ls.start()
+        time.sleep(LISTEN_SEC)
+        mints = ls.drain()
+        ls.stop()
+        log.info(f"push stream: {len(mints)} new mints in {LISTEN_SEC}s "
+                 f"(healthy={ls.healthy})")
+        return mints
+    except Exception as e:
+        log.warning(f"push stream FAIL: {e}")
+        return []
+
+
+def get_new_pools():
+    try:
+        d = get_json("https://api.geckoterminal.com/api/v2/networks/solana/new_pools",
+                     tries=4, timeout=20)
+        return d.get("data", [])
+    except Exception as e:
+        log.warning(f"new_pools FAIL: {e}")
+        return []
+
+
+def get_rug_report(mint):
+    try:
+        d = get_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report",
+                     tries=3, timeout=15)
+        return d or None
+    except Exception:
+        return None
+
+
+def check_rug_report(report):
+    if not report:
+        return True, "api down, fail-open"
+    risks = report.get("risks", [])
+    for r in risks:
+        name = r.get("name", "").lower()
+        if any(k in name for k in ("honeypot", "cannot sell", "mint authority",
+                                   "freeze authority", "high tax")):
+            return False, name
+    return True, "ok"
+
+
+def top10_from_report(report):
+    try:
+        holders = (report or {}).get("topHolders") or []
+        holders = [h for h in holders if isinstance(h, dict)]
+        if not holders:
+            return None
+        pcts = sorted((float(h.get("pct") or 0) for h in holders), reverse=True)
+        return sum(pcts[:10]) if pcts else None
+    except Exception:
+        return None
+
+
+def get_token_price(mint):
+    try:
+        d = get_json(f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
+                     tries=2, timeout=10)
+        attrs = (d.get("data") or {}).get("attributes", {})
+        return float(attrs.get("price_usd") or 0)
+    except Exception:
+        return 0.0
+
+
+def pool_age_sec(pool, now):
+    try:
+        import datetime
+        created = pool.get("attributes", {}).get("pool_created_at", "")
+        ct = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+        return now - ct.timestamp()
+    except Exception:
+        return 0
+
+
+def build_watchlist_token(mint, age_sec):
+    """Build a token dict for a push-detected mint.
+
+    Fetches pool data from GeckoTerminal by mint address. Returns None
+    if the pool isn't indexed yet (too early — will retry next run).
+    """
+    try:
+        d = get_json(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}/pools",
+            tries=2, timeout=10)
+        pools = d.get("data", [])
+        if not pools:
+            return None
+        pool = pools[0]
+        attrs = pool.get("attributes", {})
+        txns = attrs.get("transactions", {})
+        h1 = txns.get("h1", {}) or {}
+        buys = h1.get("buys", 0) or 0
+        sells = h1.get("sells", 0) or 0
+        # Holder velocity from tracker
+        vel, accel = 0.0, 0.0
+        wash = False
+        if _HAS_HOLDERS:
+            try:
+                vel, accel = holder_record(mint)
+                tx5m = int((txns.get("m5", {}) or {}).get("txns", 0) or 0)
+                wash = holder_wash(mint, tx5m)
+            except Exception:
+                pass
+        return {
+            "mint": mint,
+            "symbol": attrs.get("name", "?").split("/")[0].strip(),
+            "age_sec": age_sec,
+            "fdv": float(attrs.get("fdv_usd", 0) or 0),
+            "liquidity": float(attrs.get("reserve_in_usd", 0) or 0),
+            "holder_velocity": vel,
+            "holder_accel": accel,
+            "buy_sell_ratio": buys / max(sells, 1),
+            "wash_flag": wash,
+            "top10_pct": None,  # filled by caller from RugCheck
+        }
+    except Exception:
+        return None
+
+
+def main():
+    if not _HAS_SPARK:
+        log.warning("spark module not available, skipping")
+        return
+    # Kill switch gate: feed stops if the spark lane ever halts
+    if not killswitch.gate("spark"):
+        log.info("spark halted by killswitch, skipping scan")
+        return
+    seen = load_seen()
+    now = time.time()
+
+    # 1. Push detection: collect new mints from the program-log stream
+    push_mints = collect_push_mints()
+    watchlist = load_watchlist()
+    for m in push_mints:
+        mint = m.get("mint", "")
+        if mint and mint not in watchlist and mint not in seen:
+            watchlist[mint] = {"ts": m.get("ts", now), "sig": m.get("signature", "")[:16]}
+    # Prune watchlist: drop mints older than 5 min (past ignition window)
+    watchlist = {m: w for m, w in watchlist.items()
+                 if now - w.get("ts", 0) < 300}
+    save_watchlist(watchlist)
+    log.info(f"spark watchlist: {len(watchlist)} mints awaiting ignition window")
+
+    # 2. Polling backup: GeckoTerminal new_pools (catches anything the
+    #    push stream missed, e.g. during websocket outages)
+    pools = get_new_pools()
+    log.info(f"spark polling backup: {len(pools)} pools")
+    new_signals = 0
+
+    # 3. Check watchlist mints in the ignition window (30-180s)
+    for mint, w in list(watchlist.items()):
+        try:
+            age_sec = now - w.get("ts", now)
+            if not (spark_mod.SPARK_AGE_MIN_SEC <= age_sec <= spark_mod.SPARK_AGE_MAX_SEC):
+                continue
+            if mint in seen:
+                continue
+            # Build token data for ignition check
+            token = build_watchlist_token(mint, age_sec)
+            if not token:
+                continue
+            # Safety first: RugCheck hard blocks
+            report = get_rug_report(mint)
+            safe, reason = check_rug_report(report)
+            if not safe:
+                log.info(f"spark rug blocked ({reason}): {mint[:8]}")
+                seen.add(mint)
+                continue
+            token["top10_pct"] = top10_from_report(report)
+            # Ignition detection (includes bundle veto internally)
+            ignited, reasons, metrics = spark_mod.detect_ignition(token)
+            seen.add(mint)
+            if not ignited:
+                continue
+            # Daily signal cap (noise guard — lanes apply their own caps)
+            if _daily_count() >= MAX_SIGNALS_PER_DAY:
+                log.info("spark daily signal cap reached, skipping")
+                break
+            # FEED-ONLY: record the ignition signal for the lanes.
+            # No cards, no paper entries from Spark itself.
+            spark_mod.record_spark(mint, token["symbol"], reasons, metrics)
+            log.info(f"spark signal -> lanes: {token['symbol']}: "
+                     f"{' | '.join(reasons)} (push)")
+            _bump_daily_count()
+            new_signals += 1
+            if new_signals >= 3:
+                break
+        except Exception as e:
+            log.warning(f"spark watchlist error: {e}")
+            continue
+
+    # 4. Polling backup: check GeckoTerminal pools in ignition window
+    #    (same logic, for mints the push stream missed)
+    for pool in pools:
+        try:
+            age_sec = pool_age_sec(pool, now)
+            if not (spark_mod.SPARK_AGE_MIN_SEC <= age_sec <= spark_mod.SPARK_AGE_MAX_SEC):
+                continue
+            mint = pool.get("relationships", {}).get("base_token", {}) \
+                .get("data", {}).get("id", "").split("_")[-1]
+            if not mint or mint in seen:
+                continue
+            attrs = pool.get("attributes", {})
+            # Safety first: RugCheck hard blocks
+            report = get_rug_report(mint)
+            safe, reason = check_rug_report(report)
+            if not safe:
+                log.info(f"spark rug blocked ({reason}): {mint[:8]}")
+                seen.add(mint)
+                continue
+            # Holder velocity from tracker
+            vel, accel = 0.0, 0.0
+            wash = False
+            if _HAS_HOLDERS:
+                try:
+                    vel, accel = holder_record(mint)
+                    txns = attrs.get("transactions", {})
+                    tx5m = int((txns.get("m5", {}) or {}).get("txns", 0) or 0)
+                    wash = holder_wash(mint, tx5m)
+                except Exception:
+                    pass
+            txns = attrs.get("transactions", {})
+            h1 = txns.get("h1", {}) or {}
+            buys = h1.get("buys", 0) or 0
+            sells = h1.get("sells", 0) or 0
+            token = {
+                "mint": mint,
+                "symbol": attrs.get("name", "?").split("/")[0].strip(),
+                "age_sec": age_sec,
+                "fdv": float(attrs.get("fdv_usd", 0) or 0),
+                "liquidity": float(attrs.get("reserve_in_usd", 0) or 0),
+                "holder_velocity": vel,
+                "holder_accel": accel,
+                "buy_sell_ratio": buys / max(sells, 1),
+                "wash_flag": wash,
+                "top10_pct": top10_from_report(report),
+            }
+            # Ignition detection (includes bundle veto internally)
+            ignited, reasons, metrics = spark_mod.detect_ignition(token)
+            seen.add(mint)
+            if not ignited:
+                continue
+            # Daily signal cap (noise guard - lanes apply their own caps)
+            if _daily_count() >= MAX_SIGNALS_PER_DAY:
+                log.info("spark daily signal cap reached, skipping")
+                break
+            # FEED-ONLY: record the ignition signal for the lanes.
+            # No cards, no paper entries from Spark itself.
+            spark_mod.record_spark(mint, token["symbol"], reasons, metrics)
+            log.info(f"spark signal -> lanes: {token['symbol']}: "
+                     f"{' | '.join(reasons)}")
+            _bump_daily_count()
+            new_signals += 1
+            if new_signals >= 3:
+                break
+        except Exception as e:
+            log.warning(f"spark pool error: {e}")
+            continue
+    save_seen(seen)
+    log.info(f"spark scan done: {new_signals} signals fed to lanes")
+
+
+if __name__ == "__main__":
+    main()

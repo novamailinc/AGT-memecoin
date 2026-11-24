@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""Devnet demo trader (2026-10-30, user-ordered; 3-lane mirror
+2026-10-31, user-ordered).
+
+Mirrors PAPER entries from the three profitable lanes (grad_select,
+tranche, grad_raw) onto real Solana devnet execution: every time one
+of those lanes opens a new paper position, this lane sends one tiny
+SELF-transfer (0.0001 SOL) through the devnet-only executor and
+records the confirmed signature, submission time, confirmation time,
+and latency in its own ledger. Each lane is journaled separately
+(select keys are bare mints for backward compatibility; tranche and
+grad_raw keys are lane-scoped), so one coin open in two lanes mirrors
+twice, once per lane. grad_raw is halted, so it mirrors nothing
+until an explicit unhalt order; it is wired, not firing.
+
+WHAT THIS PROVES: the execution path on real chain rails — sign,
+submit, land, confirm, handle failures, halt on persistent failure —
+in real time, alongside the paper lane.
+
+WHAT THIS DOES NOT PROVE: profit on chain. There is no memecoin DEX
+liquidity on devnet, so no swap ever happens here; the transfers are
+self-transfers by design (the same shape the devnet adapter performs
+per devnet fill).
+
+WHAT THE TRADING MIRROR ADDS (v1, 2026-10-30, user-ordered;
+3 lanes 2026-10-31): a SOL-denominated demo trading account that
+behaves like a real account — entries, exits, realized P&L, a moving
+demo balance — by mirroring paper trades into its own ledger
+(~/.forex-agent/devnet_demo_trading_ledger.json). grad_select keeps
+the top-level account; tranche and grad_raw each get a sub-account
+under "lanes", so per-lane demo P&L stays attributable. The demo balance is
+LEDGER-TRACKED by construction: devnet cannot swap, so no on-chain
+trade is possible or attempted, and the on-chain wallet remains the
+fee reservoir, not the trading balance. Demo P&L is the paper P&L
+scaled by the stake ratio (0.1 SOL demo stake / paper notional USD);
+it is a proportional mirror, not a currency conversion and not
+on-chain SOL.
+
+SAFETY, by construction:
+  * Devnet ONLY. The RPC client refuses any non-devnet host, and the
+    executor verifies the wallet pubkey against DEVNET_EXPECTED_PUBKEY
+    before signing anything.
+  * Fixed amount (0.0001 SOL), self-transfer only, no swaps, no
+    mainnet code path, no user keys. The keypair is the pre-existing
+    devnet-only file (~/.forex-agent/devnet/keypair.json, 0600,
+    created 2026-09-22); it must never share a seed with a mainnet
+    wallet and is never funded with real SOL.
+  * Failure halt: 5 consecutive failed submissions halt firing
+    (ledger "halted" stays set across restarts; a human clears it).
+    Ledger-read failures never halt and never fire.
+  * Single instance: an exclusive flock on devnet-demo-trader.lock is
+    held for the process lifetime; a second starter exits with code 42
+    before any ledger, keypair, or chain interaction.
+  * First-run seeding: already-open paper positions are journaled as
+    pre-existing and never fire (no stale flood), exactly like the
+    grad_select entry-card backfill.
+
+Paper lanes keep running untouched; this lane only READS the
+three lane ledgers. It never writes to them.
+"""
+import fcntl
+import json
+import logging
+import os
+import sys
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("devnet-demo-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+
+try:
+    from broker.memecoin.execution.devnet_executor import DevnetExecutor
+    from broker.memecoin.execution import rpc as rpc_mod
+    from broker.memecoin.wallet import FileKeyProvider
+    _HAS_EXEC = True
+    _EXEC_IMPORT_ERROR = None
+except ImportError as e:
+    _HAS_EXEC = False
+    _EXEC_IMPORT_ERROR = e
+
+try:
+    import heartbeat as _hb
+except Exception:
+    _hb = None
+
+HOME = os.path.expanduser(os.environ.get("FOREX_AGENT_HOME", "~/.forex-agent"))
+KEYPAIR_JSON = os.path.expanduser(os.environ.get(
+    "DEVNET_KEYPAIR_JSON", os.path.join(HOME, "devnet", "keypair.json")))
+EXPECTED_PUBKEY = os.environ.get(
+    "DEVNET_EXPECTED_PUBKEY", "5dqSy5pjEbM4yXpDahAhAzkcUn2g7rUnvPtTeUhbwvq1").strip()
+SELECT_LEDGER = os.path.join(HOME, "grad_select_ledger.json")
+TRANCHE_LEDGER = os.path.join(HOME, "tranche_ledger.json")
+RAW_LEDGER = os.path.join(HOME, "grad_raw_ledger.json")
+LANE_LEDGERS = (("grad_select", SELECT_LEDGER),
+                ("tranche", TRANCHE_LEDGER),
+                ("grad_raw", RAW_LEDGER))
+DEMO_LEDGER = os.path.join(HOME, "devnet_demo_ledger.json")
+LOG_PATH = os.path.join(HOME, "log", "devnet-demo-trader.log")
+
+TRANSFER_SOL = 0.0001
+POLL_SECS = 30.0
+FAIL_HALT_AFTER = 5
+
+# --- SOL-denominated demo trading mirror (v1; multi-lane 2026-10-31) ---
+TRADE_LEDGER = os.path.join(HOME, "devnet_demo_trading_ledger.json")
+TRADE_DRYRUN_FILE = os.path.join(HOME, "devnet_demo_trading_dryrun")
+DEMO_STAKE_SOL = 0.1
+PAPER_STAKE_USD_FALLBACK = 25.0
+UNRESOLVED_AFTER_POLLS = 2
+
+# --- Single-instance guard (2026-10-31) -------------------------------
+# Orphans of this trader were killed three times (PIDs 1945, 1845, 1857,
+# all 2026-10-30): every supervisor restart spawned a duplicate because
+# the old supervisor could not adopt a venv-python process (fixed
+# 2026-10-31 in scripts/supervisor), and nothing stopped a second
+# starter of any kind. This lock closes every path: the trader holds an
+# exclusive non-blocking flock for its whole lifetime; a second starter
+# of any origin (supervisor, watchdog, manual) exits immediately with
+# code 42 before touching any ledger, keypair, or chain call. flock is
+# released automatically when the holder dies, so there is no stale
+# lock to clear and no restart path is blocked.
+SINGLETON_LOCK_PATH = os.path.join(HOME, "devnet-demo-trader.lock")
+SINGLETON_LOCK_EXIT_CODE = 42
+_LOCK_FD = None  # held open for the process lifetime; never close it
+
+
+def acquire_singleton_lock(lock_path=SINGLETON_LOCK_PATH):
+    """Hold the singleton lock; return the fd, or None if held.
+
+    The fd must stay open (see _LOCK_FD): closing it releases the lock.
+    """
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def default_state():
+    return {
+        "wallet": None,
+        "balance_start": None,
+        "balance_now": None,
+        "started_ts": time.time(),
+        "seeded": False,
+        "halted": False,
+        "fail_streak": 0,
+        "transfers": [],
+        "journal": {},
+        "counts": {"transfers": 0, "confirmed": 0, "failed": 0},
+        "purpose": ("execution demo only; self-transfers prove sign/submit/"
+                    "confirm on real devnet rails; no trading P&L exists "
+                    "by design"),
+    }
+
+
+def load_state():
+    try:
+        with open(DEMO_LEDGER) as f:
+            st = json.load(f)
+        if isinstance(st, dict) and "journal" in st:
+            return st
+    except Exception:
+        pass
+    return default_state()
+
+
+def save_state(st):
+    # PID-unique tmp: two trader processes once raced on a shared tmp
+    # path and crashed os.replace with FileNotFoundError (2026-10-30).
+    tmp = DEMO_LEDGER + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, DEMO_LEDGER)
+
+
+def seed_journal(known_mints, now):
+    """First-run seeding: every already-known mint is pre-existing."""
+    return {m: {"preexisting": True, "seen_ts": now} for m in known_mints}
+
+
+def _journal_key(lane, mint):
+    """Journal key for a lane's mint.
+
+    grad_select keeps bare mint keys (backward compatibility with the
+    ledger written since 2026-10-30); other lanes are lane-scoped so
+    one coin open in two lanes mirrors once per lane.
+    """
+    if lane == "grad_select":
+        return mint
+    return "%s:%s" % (lane, mint)
+
+
+def fresh_mints(positions, journal, lane="grad_select"):
+    """Paper positions not yet mirrored (positions-only scan)."""
+    return [m for m in (positions or {}).keys()
+            if _journal_key(lane, m) not in journal]
+
+
+def _record_transfer(st, kind, mint, sig, submitted_ts, confirmed_ts,
+                     lane=None):
+    rec = {
+        "kind": kind, "mint": mint, "sig": sig,
+        "submitted_ts": submitted_ts, "confirmed_ts": confirmed_ts,
+        "latency_s": round(confirmed_ts - submitted_ts, 2),
+    }
+    if lane is not None:
+        rec["lane"] = lane
+    st["transfers"].append(rec)
+    st["counts"]["transfers"] += 1
+    st["counts"]["confirmed"] += 1
+    st["fail_streak"] = 0
+
+
+def _record_failure(st):
+    st["counts"]["failed"] += 1
+    st["fail_streak"] += 1
+    if st["fail_streak"] >= FAIL_HALT_AFTER:
+        st["halted"] = True
+        logger.warning("devnet-demo HALTED after %d consecutive failures",
+                        st["fail_streak"])
+
+
+def mirror_once(st, positions, closes, executor, now, lane="grad_select"):
+    """One mirror iteration for one lane. Returns list of mints fired.
+
+    Pure decision + firing logic (testable with a fake executor).
+    Never raises for ledger-shape problems; executor failures are
+    counted, and 5 in a row halt firing (globally, all lanes).
+    Seeding is per lane: a lane's first scan journals its current
+    positions+closes as pre-existing and fires nothing.
+    """
+    seeded_lanes = st.setdefault("seeded_lanes", {})
+    if lane == "grad_select" and st.get("seeded"):
+        seeded_lanes.setdefault("grad_select", True)
+    if not seeded_lanes.get(lane):
+        known = set((positions or {}).keys())
+        for c in (closes or []):
+            if isinstance(c, dict) and c.get("mint"):
+                known.add(c["mint"])
+        journal = st.get("journal") or {}
+        for m in known:
+            journal.setdefault(_journal_key(lane, m),
+                               {"preexisting": True, "seen_ts": now})
+        st["journal"] = journal
+        seeded_lanes[lane] = True
+        if lane == "grad_select":
+            st["seeded"] = True
+        logger.warning("devnet-demo %s seeded: %d preexisting mints, "
+                       "never fired", lane, len(known))
+        return []
+    if st.get("halted"):
+        return []
+    journal = st.get("journal") or {}
+    fired = []
+    for mint in fresh_mints(positions, journal, lane):
+        submitted = time.time()
+        try:
+            sig = executor.transfer_sol(executor.wallet_pubkey, TRANSFER_SOL)
+        except Exception as e:
+            logger.warning("devnet-demo transfer failed for %s:%s: %s",
+                           lane, mint, e)
+            _record_failure(st)
+            if st.get("halted"):
+                break
+            continue
+        confirmed = time.time()
+        _record_transfer(st, "entry_mirror", mint, sig, submitted, confirmed,
+                         lane=lane)
+        journal[_journal_key(lane, mint)] = {"sig": sig, "ts": confirmed,
+                                             "lane": lane}
+        fired.append(mint)
+        logger.warning("devnet-demo mirrored %s:%s sig=%s latency=%.2fs",
+                       lane, mint, sig, confirmed - submitted)
+    st["journal"] = journal
+    return fired
+
+
+def _beat():
+    if _hb is not None:
+        try:
+            _hb.beat("devnet-demo-trader")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# SOL-denominated demo trading mirror (v1; multi-lane 2026-10-31).
+# trade_mirror_once is lane-agnostic: the caller passes one lane's
+# positions/closes and that lane's state (top-level for grad_select,
+# tst["lanes"][lane] for the others).
+#
+# Accounting, stated plainly so no reader mistakes it for on-chain SOL:
+#   * Demo stake is a fixed 0.1 SOL per demo trade (CEO sizing call).
+#   * Demo P&L for a paper P&L event = paper P&L USD x (0.1 / paper
+#     notional USD). The factor is the STAKE RATIO, not an exchange
+#     rate; no SOL/USD price is involved anywhere.
+#   * Demo balance = starting on-chain balance + cumulative net demo
+#     P&L. Each leg's cost fraction settles when the leg realizes, so
+#     mid-position the balance is the account value with open
+#     positions carried at cost. At full close, a position's total demo
+#     P&L equals the paper close's pnl_usd x the stake ratio exactly
+#     (the close record reconciles any unbooked legs).
+#   * Pre-existing paper positions at activation are seen-but-never-
+#     demo-opened; their closes never touch this ledger. A close record
+#     for a mint never seen open (opened and closed between polls) is
+#     likewise ignored, never backfilled.
+#   * Closes are ledger-only in v1: no on-chain close receipts.
+# ---------------------------------------------------------------------------
+
+def default_trade_state():
+    return {
+        "wallet": None,
+        "starting_balance_sol": None,
+        "balance_sol": None,
+        "realized_sol": 0.0,
+        "onchain_balance_sol": None,
+        "started_ts": time.time(),
+        "activated": False,
+        "seen_mints": {},
+        "open_positions": {},
+        "closed_positions": [],
+        "unresolved": [],
+        "counts": {"opened": 0, "closed": 0, "wins": 0, "losses": 0,
+                   "legs_booked": 0, "unresolved": 0},
+        "purpose": ("SOL-denominated demo trading mirror of grad_select "
+                    "paper trades; LEDGER-TRACKED ONLY: devnet has no "
+                    "trading pools, so no on-chain swap is possible or "
+                    "attempted; the on-chain wallet is the fee reservoir, "
+                    "not the trading balance."),
+    }
+
+
+def load_trade_state():
+    try:
+        with open(TRADE_LEDGER) as f:
+            st = json.load(f)
+        if (isinstance(st, dict) and "seen_mints" in st
+                and "open_positions" in st):
+            return st
+    except Exception:
+        pass
+    return default_trade_state()
+
+
+def save_trade_state(st):
+    tmp = TRADE_LEDGER + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, TRADE_LEDGER)
+
+
+def _lane_trade_state(tst, lane):
+    """Per-lane trading-mirror state.
+
+    grad_select keeps the top-level account (backward compatibility);
+    other lanes live under tst["lanes"][lane] with their own balances
+    and counts, so per-lane demo P&L stays attributable.
+    """
+    if lane == "grad_select":
+        return tst
+    lanes = tst.setdefault("lanes", {})
+    sub = lanes.get(lane)
+    if sub is None:
+        sub = default_trade_state()
+        sub["purpose"] = ("SOL-denominated demo trading mirror of %s "
+                          "paper trades; LEDGER-TRACKED ONLY." % lane)
+        lanes[lane] = sub
+    return sub
+
+
+def _leg_net_pnl_usd(leg, notional_usd):
+    """Net P&L of one done paper leg: gross realized minus cost fraction.
+
+    Returns None when the leg is not done or its frac/realized is
+    missing (caller skips it; the close reconciliation captures it).
+    """
+    if not isinstance(leg, dict) or not leg.get("done"):
+        return None
+    realized = leg.get("realized_usd")
+    frac = leg.get("frac")
+    if realized is None or frac is None:
+        return None
+    try:
+        return float(realized) - float(frac) * float(notional_usd)
+    except (TypeError, ValueError):
+        return None
+
+
+def _close_pnl_usd(close):
+    """Paper P&L of a close record, with fallbacks.
+
+    Prefers pnl_usd (denomination-fixed by the paper lane), then
+    realized - entry notional, then summed done legs minus notional.
+    Returns None only when nothing prices the close.
+    """
+    if not isinstance(close, dict):
+        return None
+    pnl = close.get("pnl_usd")
+    if pnl is not None:
+        try:
+            return float(pnl)
+        except (TypeError, ValueError):
+            pass
+    notional = close.get("entry_notional_usd", PAPER_STAKE_USD_FALLBACK)
+    try:
+        notional = float(notional)
+    except (TypeError, ValueError):
+        notional = PAPER_STAKE_USD_FALLBACK
+    realized = close.get("realized_usd")
+    if realized is not None:
+        try:
+            return float(realized) - notional
+        except (TypeError, ValueError):
+            pass
+    legs = close.get("legs") or {}
+    tot = 0.0
+    ok = False
+    for leg in legs.values():
+        if (isinstance(leg, dict) and leg.get("done")
+                and leg.get("realized_usd") is not None):
+            try:
+                tot += float(leg["realized_usd"])
+                ok = True
+            except (TypeError, ValueError):
+                pass
+    if ok:
+        return tot - notional
+    return None
+
+
+def trade_mirror_once(tst, positions, closes, now, dryrun=False):
+    """One trading-mirror iteration. Returns list of action strings.
+
+    Mutates tst in memory only; the caller persists it iff not dryrun,
+    so dry-run mode can never write the real trading ledger. Never
+    raises for ledger-shape problems (callers wrap it regardless).
+    """
+    actions = []
+    prefix = "DRYRUN trade " if dryrun else "trade "
+    positions = positions or {}
+    closes = closes or []
+    if not tst.get("activated"):
+        seen = {}
+        for m in positions.keys():
+            seen[m] = {"preexisting": True, "seen_ts": now}
+        for c in closes:
+            if isinstance(c, dict) and c.get("mint"):
+                seen.setdefault(c["mint"],
+                                {"preexisting": True, "seen_ts": now})
+        tst["seen_mints"] = seen
+        tst["activated"] = True
+        actions.append(prefix + "activated: %d preexisting mints seen, "
+                       "never demo-opened" % len(seen))
+        return actions
+    seen = tst.setdefault("seen_mints", {})
+    open_demo = tst.setdefault("open_positions", {})
+    close_by_mint = {}
+    for c in closes:
+        if isinstance(c, dict) and c.get("mint"):
+            close_by_mint[c["mint"]] = c
+    # 1. New demo opens: paper positions never seen before.
+    for mint, pos in positions.items():
+        if mint in seen or mint in open_demo:
+            continue
+        if not isinstance(pos, dict):
+            seen[mint] = {"seen_ts": now}
+            continue
+        entry_price = pos.get("entry_price")
+        notional = pos.get("notional_usd", PAPER_STAKE_USD_FALLBACK)
+        try:
+            entry_price = float(entry_price) if entry_price is not None else None
+        except (TypeError, ValueError):
+            entry_price = None
+        try:
+            notional = float(notional)
+        except (TypeError, ValueError):
+            notional = PAPER_STAKE_USD_FALLBACK
+        open_demo[mint] = {
+            "mint": mint, "symbol": pos.get("symbol"),
+            "entry_ts": pos.get("entry_ts", now),
+            "entry_price": entry_price,
+            "paper_notional_usd": notional,
+            "stake_sol": DEMO_STAKE_SOL,
+            "legs_booked": {},
+            "booked_paper_pnl_usd": 0.0,
+            "booked_demo_pnl_sol": 0.0,
+            "absent_polls": 0,
+        }
+        seen[mint] = {"seen_ts": now}
+        tst["counts"]["opened"] += 1
+        actions.append(prefix + "opened demo %s stake=%.4f SOL entry=%s"
+                       % (mint, DEMO_STAKE_SOL, entry_price))
+    # 2. Update open demo positions: legs, closes, vanish handling.
+    for mint in list(open_demo.keys()):
+        dpos = open_demo[mint]
+        ppos = positions.get(mint)
+        if ppos is not None and isinstance(ppos, dict):
+            dpos["absent_polls"] = 0
+            notional = dpos.get("paper_notional_usd") or PAPER_STAKE_USD_FALLBACK
+            scale = DEMO_STAKE_SOL / notional if notional else 0.0
+            for key, leg in (ppos.get("legs") or {}).items():
+                if key in dpos["legs_booked"]:
+                    continue
+                net = _leg_net_pnl_usd(leg, notional)
+                if net is None:
+                    continue
+                demo_pnl = net * scale
+                dpos["legs_booked"][key] = {
+                    "realized_usd": leg.get("realized_usd"),
+                    "net_pnl_usd": net, "demo_pnl_sol": demo_pnl,
+                    "exit_reason": leg.get("exit_reason"),
+                }
+                dpos["booked_paper_pnl_usd"] += net
+                dpos["booked_demo_pnl_sol"] += demo_pnl
+                tst["balance_sol"] = (tst.get("balance_sol") or 0.0) + demo_pnl
+                tst["realized_sol"] = (tst.get("realized_sol") or 0.0) + demo_pnl
+                tst["counts"]["legs_booked"] += 1
+                actions.append(prefix + "leg %s booked %s net_pnl_usd=%.2f "
+                               "demo_pnl_sol=%.6f" % (key, mint, net, demo_pnl))
+            continue
+        close = close_by_mint.get(mint)
+        if close is not None:
+            pnl = _close_pnl_usd(close)
+            notional = close.get("entry_notional_usd",
+                                 dpos.get("paper_notional_usd")
+                                 or PAPER_STAKE_USD_FALLBACK)
+            try:
+                notional = float(notional)
+            except (TypeError, ValueError):
+                notional = PAPER_STAKE_USD_FALLBACK
+            scale = DEMO_STAKE_SOL / notional if notional else 0.0
+            if pnl is None:
+                tst["unresolved"].append({"mint": mint,
+                                          "reason": "close_unpriceable",
+                                          "ts": now})
+                tst["counts"]["unresolved"] += 1
+                del open_demo[mint]
+                actions.append(prefix + "close unpriceable %s; kept booked pnl"
+                               % mint)
+                continue
+            total_demo_pnl = pnl * scale
+            remainder = total_demo_pnl - dpos["booked_demo_pnl_sol"]
+            if abs(remainder) > 1e-12:
+                tst["balance_sol"] = (tst.get("balance_sol") or 0.0) + remainder
+                tst["realized_sol"] = (tst.get("realized_sol") or 0.0) + remainder
+                actions.append(prefix + "close remainder booked %s "
+                               "remainder_sol=%.6f" % (mint, remainder))
+            dpos["close_ts"] = close.get("close_ts", now)
+            dpos["closed_reason"] = close.get("closed_reason")
+            dpos["paper_pnl_usd"] = pnl
+            dpos["demo_pnl_sol"] = total_demo_pnl
+            tst["closed_positions"].append(dpos)
+            tst["counts"]["closed"] += 1
+            if total_demo_pnl > 0:
+                tst["counts"]["wins"] += 1
+            elif total_demo_pnl < 0:
+                tst["counts"]["losses"] += 1
+            del open_demo[mint]
+            actions.append(prefix + "closed demo %s paper_pnl_usd=%.2f "
+                           "demo_pnl_sol=%.6f reason=%s"
+                           % (mint, pnl, total_demo_pnl,
+                              close.get("closed_reason")))
+            continue
+        dpos["absent_polls"] = dpos.get("absent_polls", 0) + 1
+        if dpos["absent_polls"] >= UNRESOLVED_AFTER_POLLS:
+            tst["unresolved"].append({
+                "mint": mint, "reason": "vanished_without_close", "ts": now,
+                "booked_demo_pnl_sol": dpos["booked_demo_pnl_sol"]})
+            tst["counts"]["unresolved"] += 1
+            del open_demo[mint]
+            actions.append(prefix + "unresolved %s vanished without close "
+                           "record; kept booked pnl" % mint)
+    # 3. Closes for never-demo-opened mints: mark seen, never backfill.
+    for mint in close_by_mint:
+        if mint not in seen and mint not in open_demo:
+            seen[mint] = {"seen_ts": now, "missed_between_polls": True}
+            actions.append(prefix + "close seen for never-opened %s; "
+                           "ignored, no backfill" % mint)
+    return actions
+
+
+def main():
+    global _LOCK_FD
+    _LOCK_FD = acquire_singleton_lock()
+    if _LOCK_FD is None:
+        logger.warning("devnet-demo another instance holds the singleton "
+                       "lock; exiting without touching state")
+        return SINGLETON_LOCK_EXIT_CODE
+    logger.warning("devnet-demo single-instance lock acquired")
+    if not _HAS_EXEC:
+        logger.warning("devnet-demo deps missing: %s", _EXEC_IMPORT_ERROR)
+        return 1
+    provider = FileKeyProvider(KEYPAIR_JSON)
+    try:
+        ex = DevnetExecutor(key_provider=provider,
+                            rpc_url=rpc_mod.DEFAULT_DEVNET_RPC,
+                            expected_pubkey=EXPECTED_PUBKEY)
+        pubkey = ex.connect()
+    except Exception as e:
+        logger.warning("devnet-demo connect failed: %s", e)
+        return 1
+    st = load_state()
+    st["wallet"] = pubkey
+    try:
+        st["balance_now"] = ex.get_balance_sol()
+    except Exception as e:
+        logger.warning("devnet-demo balance read failed: %s", e)
+    if st.get("balance_start") is None:
+        st["balance_start"] = st["balance_now"]
+    # Trading mirror mode: dry-run = in-memory state only, never reads
+    # or writes the real trading ledger. Flag file (supervisor-safe,
+    # no env plumbing) or DEVNET_TRADE_DRYRUN=1 enables it.
+    trade_dryrun = (os.environ.get("DEVNET_TRADE_DRYRUN") == "1"
+                    or os.path.exists(TRADE_DRYRUN_FILE))
+    if trade_dryrun:
+        tst = default_trade_state()
+        logger.warning("devnet-demo TRADING MIRROR DRY-RUN: actions "
+                       "logged only, nothing written to %s", TRADE_LEDGER)
+    else:
+        tst = load_trade_state()
+    # Startup self-test: one transfer proving the path immediately,
+    # even before the first paper entry arrives.
+    try:
+        submitted = time.time()
+        sig = ex.transfer_sol(pubkey, TRANSFER_SOL)
+        confirmed = time.time()
+        _record_transfer(st, "startup_test", None, sig, submitted, confirmed)
+        logger.warning("devnet-demo startup test confirmed sig=%s "
+                        "latency=%.2fs balance=%.4f SOL",
+                        sig, confirmed - submitted,
+                        st["balance_now"] or -1)
+    except Exception as e:
+        logger.warning("devnet-demo startup test failed: %s", e)
+        _record_failure(st)
+    save_state(st)
+    logger.warning("devnet-demo-trader started (DEVNET ONLY wallet=%s "
+                    "balance=%.4f SOL, %.4f SOL per mirror transfer, "
+                    "lanes grad_select+tranche+grad_raw, "
+                    "trading mirror %s, stake %.4f SOL/trade, "
+                    "LEDGER-TRACKED demo balance only)",
+                    pubkey, st["balance_now"] or -1, TRANSFER_SOL,
+                    "DRY-RUN" if trade_dryrun else "LIVE",
+                    DEMO_STAKE_SOL)
+    while True:
+        try:
+            _beat()
+            if st.get("halted"):
+                time.sleep(POLL_SECS)
+                continue
+            try:
+                st["balance_now"] = ex.get_balance_sol()
+            except Exception:
+                pass
+            for lane, path in LANE_LEDGERS:
+                try:
+                    with open(path) as f:
+                        ledger = json.load(f)
+                except Exception as e:
+                    logger.warning("devnet-demo %s ledger read failed: %s",
+                                   lane, e)
+                    continue
+                mirror_once(st, ledger.get("positions") or {},
+                            ledger.get("closes") or [], ex, time.time(),
+                            lane=lane)
+                if st.get("halted"):
+                    break
+                # --- SOL-denominated trading mirror (per lane) ---
+                try:
+                    lst = _lane_trade_state(tst, lane)
+                    if lst.get("starting_balance_sol") is None:
+                        try:
+                            bal = ex.get_balance_sol()
+                        except Exception as e:
+                            logger.warning("devnet-demo trade mirror waiting "
+                                           "for balance read: %s", e)
+                            bal = None
+                        if bal is not None:
+                            lst["starting_balance_sol"] = bal
+                            lst["balance_sol"] = bal
+                            lst["wallet"] = pubkey
+                    if lst.get("starting_balance_sol") is not None:
+                        tacts = trade_mirror_once(
+                            lst, ledger.get("positions") or {},
+                            ledger.get("closes") or [], time.time(),
+                            trade_dryrun)
+                        for a in tacts:
+                            logger.warning("devnet-demo [%s] %s", lane, a)
+                        lst["onchain_balance_sol"] = st.get("balance_now")
+                except Exception:
+                    logger.exception("devnet-demo trade mirror failed (%s)",
+                                     lane)
+            if not trade_dryrun:
+                save_trade_state(tst)
+            save_state(st)
+        except Exception:
+            logger.exception("devnet-demo loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

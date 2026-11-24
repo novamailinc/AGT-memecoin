@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+"""Bot self-audit (2026-10-20): auto-repair health check for the paper bot.
+
+Runs once per invocation (cron / CEO weekly cycle), detects operational
+faults, repairs the small safe subset autonomously, and appends one JSON
+line to ~/.forex-agent/self_audit.jsonl:
+    {ts, ok: [...], repaired: [...], problems: [...]}
+Problems it cannot repair land in "problems" for the weekly CEO report.
+
+Detection (read-only):
+  1. Every watchdog-supervised daemon alive. The supervised list is
+     DERIVED from scripts/forex-watchdog + scripts/forex-daemons at run
+     time — never a second hardcoded copy that can drift.
+  2. State freshness + parseability: signal bus mtime, spark_seen.json
+     mtime, mirror/CEO ledger parse, killswitch state parse, and every
+     *ledger*.json in the agent home parses. A freshness check whose
+     component is recorded as decommissioned in the registry at
+     ~/.forex-agent/decommissioned.json is skipped (reported as an ok
+     note, never a problem); removing the registry entry — or setting
+     its "decommissioned" flag false — restores the check with no code
+     change. A missing/corrupt registry means NO component is treated
+     as decommissioned (fail toward alerting, never toward silence).
+  3. Latest backup archive younger than 2.5h.
+  4. Disk space on the agent home > 1GB free.
+  5. DexScreener + RugCheck endpoints reachable (one light GET each).
+  6. Toolkit suite (memecoin-toolkit/run_all_tests.sh) passes — run
+     AT MOST once per 24h, gated by ~/.forex-agent/toolkit_last_check.json;
+     report-only (a failure is unfixable-by-audit, never edited here).
+  7. Grad entry flow (2026-11-08): the grad lanes (grad_select /
+     tranche / tranche_protect) have taken a new entry recently.
+     The 43h drought of 2026-11-06→08 was invisible to this audit
+     (traders alive, killswitches unhalted, problems []) because
+     entry flow was never checked. Halted lanes and lanes whose
+     trader is already dead are skipped — the halt / dead-daemon
+     problem already covers those states.
+
+Repairs allowed (each logged): run `bash scripts/forex-watchdog` ONCE
+if any daemon is dead; delete a stale (>1h) *.lock file next to the
+ledgers ONLY when an flock probe proves no process holds it; rotate a
+log file over 50MB (gzip to <name>.1.gz, then truncate).
+
+NEVER: edits code, changes killswitch state, deletes ledgers or state,
+restarts healthy daemons, sends Telegram messages.
+
+Usage: bot-self-audit [--dry-run]   (dry-run: findings only, no repairs,
+no jsonl append). Exit 0 unless catastrophic.
+Free-only: stdlib only.
+"""
+import argparse
+import fcntl
+import gzip
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.environ.get("FOREX_AGENT_HOME",
+                      os.path.expanduser("~/.forex-agent"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WATCHDOG_PATH = os.path.join(REPO, "scripts", "forex-watchdog")
+DAEMONS_PATH = os.path.join(REPO, "scripts", "forex-daemons")
+AUDIT_LOG = os.path.join(HOME, "self_audit.jsonl")
+LOG_DIR = os.path.join(HOME, "log")
+BACKUP_DIR = os.path.join(HOME, "backups")
+RUN_DIR = os.path.join(HOME, "run")
+BUS_PATH = os.path.join(HOME, "launch_scanner", "signal_bus.jsonl")
+HEARTBEAT_PATH = os.path.join(RUN_DIR, "heartbeat.json")
+# Realtime beats (2026-10-23): watcher-trader + realtime-sync beat
+# into run/heartbeat.json every 2s. 30s = 15 missed beats — beyond
+# that the emitter is dead/wedged, not jittering.
+HEARTBEAT_STALE_S = 30
+HEARTBEAT_SOURCES = ("realtime-sync", "watcher-trader")
+SPARK_SEEN_PATH = os.path.join(HOME, "spark_seen.json")
+KILLSWITCH_STATE = os.path.join(HOME, "killswitch", "state.json")
+DECOMMISSIONED_NAME = "decommissioned.json"
+
+BACKUP_MAX_AGE_S = 2.5 * 3600
+DISK_MIN_FREE = 1 * 1024 ** 3
+BUS_STALE_S = 24 * 3600  # decommission-aware 2026-10-31: the bus's bulk producers (smart-watcher, degen-feed) were killed by user order, so surviving producers are sparse by design and 8h+ gaps are normal; daemon liveness (check 1) remains the dead-feed backstop
+SPARK_STALE_S = 30 * 60
+LOCK_STALE_S = 3600
+ROTATE_BYTES = 50 * 1024 * 1024
+HTTP_TIMEOUT = 10
+TOOLKIT_RUNNER = "/home/hatch/workspace/memecoin-toolkit/run_all_tests.sh"
+TOOLKIT_STAMP_NAME = "toolkit_last_check.json"
+TOOLKIT_INTERVAL_S = 24 * 3600
+# Measured 2026-10-20: run_all_tests.sh completes in ~23s, well within
+# ~10 minutes, so the suite runs SYNCHRONOUSLY inside the audit when due
+# (simpler and correct; no detached/background collection). The timeout
+# is set safely above the measured time.
+TOOLKIT_TIMEOUT_S = 600
+
+ENDPOINTS = {
+    "dexscreener": ("https://api.dexscreener.com/tokens/v1/solana/"
+                    "So11111111111111111111111111111111111111112"),
+    "rugcheck": ("https://api.rugcheck.xyz/v1/tokens/"
+                 "So11111111111111111111111111111111111111112/report/summary"),
+}
+
+
+# ---- supervised-daemon derivation (from the watchdog itself) ---------------
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def supervised_daemons():
+    """Derive the supervised set from forex-daemons + forex-watchdog.
+
+    Returns [{"name", "kind": "core"|"script", "pattern"}]. Core daemons
+    (forex-daemons DAEMONS="...") are checked via their run/*.pid files;
+    standalone daemons via the watchdog's own pgrep -f "scripts/<name>"
+    patterns (comment lines ignored; the eagle-eye for-loop expanded).
+    """
+    out = []
+    seen = set()
+
+    def add(name, kind, pattern):
+        if name and name not in seen:
+            seen.add(name)
+            out.append({"name": name, "kind": kind, "pattern": pattern})
+
+    # Core daemons from forex-daemons.
+    m = re.search(r'^DAEMONS="([^"]+)"', _read_text(DAEMONS_PATH), re.M)
+    if m:
+        for name in m.group(1).split():
+            add(name, "core", "daemon." + name)
+
+    # Standalone daemons from forex-watchdog pgrep lines (skip comments).
+    wd = _read_text(WATCHDOG_PATH)
+    lines = [ln for ln in wd.splitlines()
+             if not ln.lstrip().startswith("#")]
+    body = "\n".join(lines)
+    # Expand `for _ee in a b c; do` used with a "scripts/$_ee" pattern.
+    loop_names = []
+    lm = re.search(r"for\s+_ee\s+in\s+([^;]+);", body)
+    if lm:
+        loop_names = lm.group(1).split()
+    for pat in re.findall(r'pgrep\s+-f\s+"([^"]+)"', body):
+        pat = pat.rstrip("$")
+        if "$_ee" in pat:
+            for name in loop_names:
+                add(name, "script", pat.replace("$_ee", name))
+        elif pat.startswith("scripts/"):
+            add(pat[len("scripts/"):], "script", pat)
+    return out
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def daemon_alive(entry):
+    """Liveness per the supervisor's own semantics."""
+    if entry["kind"] == "core":
+        try:
+            with open(os.path.join(RUN_DIR, entry["name"] + ".pid")) as f:
+                pid = int(re.sub(r"\D", "", f.read()) or 0)
+        except Exception:
+            return False
+        return pid > 0 and _pid_alive(pid)
+    # script daemon: any live process whose cmdline carries the pattern
+    pat = entry["pattern"]
+    me = os.getpid()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        return False
+    for p in pids:
+        pid = int(p)
+        if pid == me:
+            continue
+        cl = _cmdline(pid)
+        if pat in cl and "bot-self-audit" not in cl:
+            return True
+    return False
+
+
+def find_dead_daemons(entries=None):
+    entries = entries if entries is not None else supervised_daemons()
+    return [e["name"] for e in entries if not daemon_alive(e)]
+
+
+# ---- read-only checks --------------------------------------------------------
+
+SANITY_STAMP_NAME = "ledger_sanity_stamp.json"
+# A 50x multiple or a $25 P&L on a $1 paper shot is absurd — flag for
+# human review (2026-10-23: a $60,749 phantom close sat in a ledger
+# while the audit reported "ok" because it only checked parseability).
+SANITY_MAX_MULT = 50.0
+SANITY_MAX_ABS_PNL = 25.0
+# Equity more than doubling between audit runs is anomalous — but
+# only the part NOT explained by recorded closes is flagged
+# (principal-aware since 2026-10-24; see _check_ledger_sanity).
+SANITY_BANKROLL_JUMP = 2.0
+SANITY_MAX_PROBLEMS = 15
+
+
+def _read_sanity_stamp():
+    try:
+        with open(os.path.join(HOME, SANITY_STAMP_NAME)) as _sf:
+            d = json.load(_sf)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_sanity_stamp(data):
+    try:
+        with open(os.path.join(HOME, SANITY_STAMP_NAME), "w") as _sf:
+            json.dump(data, _sf)
+    except Exception:
+        pass
+
+
+def _check_ledger_sanity():
+    """Flag-only anomaly scan of every ledger (2026-10-23). Each
+    anomaly is reported ONCE (ids persist in the stamp), into
+    problems; ledgers are never edited here — a bad row is voided
+    by a human. Returns (ok_notes, problems). Never raises."""
+    ok_notes, problems = [], []
+    try:
+        ledger_files = sorted(
+            os.path.join(HOME, n) for n in os.listdir(HOME)
+            if "ledger" in n and n.endswith(".json"))
+    except Exception:
+        ledger_files = []
+    stamp = _read_sanity_stamp()
+    flagged = set(stamp.get("_flagged") or [])
+    new_stamp = {}
+    for path in ledger_files:
+        name = os.path.basename(path)
+        try:
+            with open(path) as _lf:
+                d = json.load(_lf)
+        except Exception:
+            continue  # parseability is checked separately
+        for c in (d.get("closes") or [])[-500:]:
+            if not isinstance(c, dict):
+                continue
+            try:
+                mult = float(c.get("realized_mult") or 0)
+                pnl = float(c.get("pnl_usd") or 0)
+            except (TypeError, ValueError):
+                continue
+            # Stake-aware (2026-10-25): lanes now stake $25, so the
+            # old $1-era absolute pnl cap false-flagged every big
+            # legit close (grad_select +$195.19 at 8.8x is exactly
+            # $25 x 8.8 - $25). Flag only (a) phantom-scale
+            # multiples, (b) an absurd implied notional, or (c)
+            # pnl inconsistent with the close's own realized/mult
+            # math. The mult cap still catches phantom prints.
+            _flag = abs(mult) > SANITY_MAX_MULT
+            try:
+                _realized = float(c.get("realized_usd") or 0)
+            except (TypeError, ValueError):
+                _realized = 0.0
+            if not _flag and mult > 0 and _realized:
+                _impl = _realized / mult
+                if _impl > 100.0:
+                    _flag = True
+                # Pnl-consistency only where realized_mult has
+                # enough precision to reconstruct from: below 0.1x
+                # the 4-decimal rounding of realized_mult swamps
+                # the math (a true 0.00017x rounds to 0.0002x and
+                # fakes a $3+ gap on a legit $25 rug death).
+                elif mult >= 0.1 and \
+                        abs(pnl - _realized * (mult - 1.0) / mult) > 1.0:
+                    _flag = True
+            if _flag:
+                cid = "%s|%s|%s" % (
+                    name, str(c.get("mint") or ""),
+                    str(c.get("close_ts") or ""))
+                if cid not in flagged:
+                    flagged.add(cid)
+                    if len(problems) < SANITY_MAX_PROBLEMS:
+                        problems.append(
+                            "ledger anomaly: %s close %s realized=%.1fx "
+                            "pnl=$%.2f (human review — never auto-edited)"
+                            % (name, str(c.get("mint") or "")[:12],
+                               mult, pnl))
+        cash = 0.0
+        try:
+            cash = float(d.get("bankroll") or 0)
+        except (TypeError, ValueError):
+            pass
+        # Principal-aware equity (2026-10-24): a close returns its $1
+        # principal to cash, so raw cash can legitimately jump in a hot
+        # close window — the 2026-10-23 21:01 flag on grad_raw was a
+        # false alarm caused by comparing cash alone. Equity (cash +
+        # open principal) moves only via P&L, and the jump check below
+        # flags only growth NOT explained by recorded closes.
+        open_principal = 0.0
+        _positions = d.get("positions") or []
+        if isinstance(_positions, dict):
+            _positions = list(_positions.values())
+        for _p in _positions:
+            if not isinstance(_p, dict):
+                continue
+            _sz = None
+            for _k in ("notional_usd", "size_usd", "size", "notional"):
+                if _p.get(_k) is not None:
+                    try:
+                        _sz = float(_p[_k])
+                    except (TypeError, ValueError):
+                        _sz = None
+                    break
+            open_principal += _sz if _sz is not None else 1.0
+        equity = cash + open_principal
+        total_pnl = 0.0
+        for _c in (d.get("closes") or d.get("closed") or []):
+            if not isinstance(_c, dict):
+                continue
+            _v = _c.get("pnl_usd")
+            if _v is None:
+                _v = _c.get("pnl")
+            try:
+                total_pnl += float(_v or 0)
+            except (TypeError, ValueError):
+                continue
+        _closes_list = d.get("closes") or d.get("closed") or []
+        new_stamp[name] = {"equity": round(equity, 4),
+                           "total_pnl": round(total_pnl, 4),
+                           "closes_count": len(_closes_list),
+                           "created_ts": d.get("created_ts")}
+        prev = stamp.get(name)
+        if isinstance(prev, dict):
+            # Ledger-reset signature (2026-10-24): a ledger whose
+            # created_ts moved FORWARD or whose closes_count SHRANK
+            # vs the previous stamp was silently re-seeded blank
+            # (the grad_select loss: file unreadable after a VM
+            # reset, next boot re-created it at $100). A legitimate
+            # recovery restores the ORIGINAL created_ts (backward)
+            # and a HIGHER closes_count, so it never trips this.
+            # Stamps lacking the fields (pre-2026-10-24) record
+            # silently this run and compare from the next.
+            _p_ct, _c_ct = prev.get("created_ts"), d.get("created_ts")
+            _p_cc, _c_cc = prev.get("closes_count"), len(_closes_list)
+            _reset_why = None
+            if isinstance(_p_ct, (int, float)) and \
+                    isinstance(_c_ct, (int, float)) and \
+                    _c_ct > _p_ct:
+                _reset_why = ("created_ts advanced %s -> %s"
+                              % (_p_ct, _c_ct))
+            elif isinstance(_p_cc, int) and _c_cc < _p_cc:
+                _reset_why = ("closes_count shrank %d -> %d"
+                              % (_p_cc, _c_cc))
+            if _reset_why and len(problems) < SANITY_MAX_PROBLEMS:
+                problems.append(
+                    "ledger anomaly: %s RESET SIGNATURE — %s since "
+                    "last audit; the ledger was likely re-seeded "
+                    "blank (human review — recover from verdict "
+                    "chain / backups; never auto-edited)"
+                    % (name, _reset_why))
+        # Legacy stamps stored raw cash floats — skip the jump check
+        # once and re-stamp in the new format.
+        if isinstance(prev, dict):
+            try:
+                prev_equity = float(prev.get("equity"))
+                prev_pnl = float(prev.get("total_pnl"))
+            except (TypeError, ValueError):
+                prev_equity = prev_pnl = None
+            if prev_equity is not None and prev_equity > 10 and \
+                    equity > prev_equity * SANITY_BANKROLL_JUMP:
+                unexplained = (equity - prev_equity) - \
+                    (total_pnl - prev_pnl)
+                if unexplained > SANITY_MAX_ABS_PNL and \
+                        len(problems) < SANITY_MAX_PROBLEMS:
+                    problems.append(
+                        "ledger anomaly: %s equity grew $%.2f -> $%.2f "
+                        "with $%.2f unexplained by recorded closes "
+                        "since last audit (human review — never "
+                        "auto-edited)" % (name, prev_equity, equity,
+                                          unexplained))
+    new_stamp["_flagged"] = sorted(flagged)[-2000:]
+    _write_sanity_stamp(new_stamp)
+    if not problems:
+        ok_notes.append("ledger sanity: no absurd closes or bankroll "
+                        "jumps in %d ledger(s)" % len(ledger_files))
+    return ok_notes, problems
+
+
+def _mtime_age(path):
+    """Seconds since mtime, or None if the file is missing."""
+    try:
+        return time.time() - os.path.getmtime(path)
+    except Exception:
+        return None
+
+
+# ---- entry-drought check (2026-11-08) ---------------------------------------
+# The 2026-11-06→08 drought (43h, zero grad entries) was invisible to
+# this audit because entry flow was never checked: traders alive,
+# killswitches unhalted, problems []. A silent feed failure is a
+# filter/feed fault, never a quiet day.
+DROUGHT_LANES = {
+    "grad_select": ("grad_select_ledger.json", "grad-select-trader"),
+    "tranche": ("tranche_ledger.json", "tranche-trader"),
+    "tranche_protect": ("tranche_protect_ledger.json",
+                        "tranche-protect-trader"),
+}
+# Calibration from live ledgers (2026-11-08): the union of the three
+# lanes never went silent >1.19h over Nov 3-6 (1,064 entries; median
+# union gap ~1 min); worst single-lane healthy gap was grad_select
+# 5.13h (tranche_protect's 24.3h gap was its Nov 4 halt, which this
+# check skips). Aggregate 6h is ~5x the worst healthy union gap and
+# catches a shared-feed failure within hours; single-lane 12h is
+# >2x the worst healthy per-lane gap and catches one wedged lane.
+DROUGHT_AGGREGATE_S = 6 * 3600
+DROUGHT_SINGLE_S = 12 * 3600
+
+
+def _lane_last_entry_ts(ledger_path):
+    """Latest entry_ts across open positions + stored closes, or None.
+
+    None covers both an unreadable file (the parseability check owns
+    that — this check stays silent) and a readable file with no
+    entries at all (the caller flags that separately)."""
+    try:
+        with open(ledger_path) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    last = 0.0
+    positions = d.get("positions") or []
+    if isinstance(positions, dict):
+        positions = list(positions.values())
+    for rec in list(positions) + list(d.get("closes") or []):
+        if not isinstance(rec, dict):
+            continue
+        try:
+            ts = float(rec.get("entry_ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts > last:
+            last = ts
+    return last if last > 0 else None
+
+
+def _check_entry_drought(dead_daemons=None):
+    """Grad entry-flow check. Returns (ok_notes, problems). Never raises.
+
+    Reads live ledger state fresh on every run. A lane is skipped
+    (ok note, never a problem) when it is halted in killswitch state
+    or its trader is already dead — those states have their own
+    problem lines. Two tiers: (1) every live lane silent longer than
+    DROUGHT_AGGREGATE_S — the shared-feed failure signature, one
+    problem per silent lane; (2) a single live lane silent longer
+    than DROUGHT_SINGLE_S. Each problem names the lane, the last
+    entry time, and the hours silent."""
+    ok_notes, problems = [], []
+    dead = set(dead_daemons or [])
+    try:
+        with open(os.path.join(HOME, "killswitch", "state.json")) as f:
+            ks = json.load(f)
+    except Exception:
+        ks = {}
+    if not isinstance(ks, dict):
+        ks = {}
+    now = time.time()
+    ages = {}  # lane -> hours since last entry (live lanes only)
+    for lane, (ledger_name, trader) in DROUGHT_LANES.items():
+        try:
+            halted = bool(ks.get("lanes", {}).get(lane, {}).get("halted"))
+        except Exception:
+            halted = False  # unknown halt state fails toward alerting
+        if halted:
+            ok_notes.append("entry drought: %s halted, check skipped"
+                            % lane)
+            continue
+        if trader in dead:
+            ok_notes.append("entry drought: %s trader dead, check "
+                            "skipped (dead-daemon problem covers it)"
+                            % lane)
+            continue
+        path = os.path.join(HOME, ledger_name)
+        last = _lane_last_entry_ts(path)
+        if last is None:
+            if _json_parses(path):
+                problems.append(
+                    "entry drought: %s has NO entries recorded in its "
+                    "ledger" % lane)
+            continue  # unreadable: parseability check owns it
+        ages[lane] = (now - last) / 3600.0
+        if ages[lane] <= 0:
+            ages[lane] = 0.0
+    live = list(ages)
+    if live:
+        agg = [lane for lane in live
+               if ages[lane] > DROUGHT_AGGREGATE_S / 3600.0]
+        if len(agg) == len(live):
+            # Tier 1: every live lane silent — shared-feed failure.
+            for lane in live:
+                last = now - ages[lane] * 3600.0
+                problems.append(
+                    "entry drought: %s no entries for %.1fh (last "
+                    "entry %s) — all live grad lanes silent, "
+                    "shared-feed failure suspected"
+                    % (lane, ages[lane],
+                       time.strftime("%Y-%m-%d %H:%M UTC",
+                                     time.gmtime(last))))
+        else:
+            # Tier 2: a single wedged lane.
+            for lane in live:
+                if ages[lane] > DROUGHT_SINGLE_S / 3600.0:
+                    last = now - ages[lane] * 3600.0
+                    problems.append(
+                        "entry drought: %s no entries for %.1fh (last "
+                        "entry %s)"
+                        % (lane, ages[lane],
+                           time.strftime("%Y-%m-%d %H:%M UTC",
+                                         time.gmtime(last))))
+    if not problems:
+        flowing = ", ".join("%s %.1fh" % (lane, ages[lane])
+                            for lane in live)
+        if flowing:
+            ok_notes.append("grad entries flowing (hours since last "
+                            "entry: %s)" % flowing)
+    return ok_notes, problems
+
+
+def _check_helius_429_alert():
+    """Helius 429-spike alert (2026-11-18, resilience build).
+
+    scripts/helius-429-watch writes ~/.forex-agent/helius_429_alert.json
+    on its cadence; an active spike is a problem (background callers
+    auto-shed, entries may stall). A missing file means the watch has
+    never run — ok_note, not a problem (the watch cron is deployed
+    separately). A stale file (>30 min) is a problem: the watch may
+    have died. Never raises."""
+    ok_notes, problems = [], []
+    path = os.path.join(HOME, "helius_429_alert.json")
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except Exception:
+        ok_notes.append("helius 429 alert: no alert file yet (watch "
+                        "has not run)")
+        return ok_notes, problems
+    if not isinstance(state, dict):
+        problems.append("helius 429 alert file corrupt: %s" % path)
+        return ok_notes, problems
+    age = time.time() - float(state.get("updated_ts") or 0)
+    if age > 30 * 60:
+        problems.append("helius 429 alert file stale: %.1f min old "
+                        "(watch may have died)" % (age / 60.0))
+        return ok_notes, problems
+    if state.get("active"):
+        problems.append(
+            "HELIUS 429 SPIKE: %d 429s in the last %.0f min "
+            "(threshold %d) — background callers auto-shed; entries "
+            "resume when the flag lifts"
+            % (state.get("count_10m", 0),
+               float(state.get("window_s") or 600.0) / 60.0,
+               state.get("threshold", 5)))
+    else:
+        ok_notes.append("helius 429s quiet (%d in the last %.0f min)"
+                        % (state.get("count_10m", 0),
+                           float(state.get("window_s") or 600.0) / 60.0))
+    return ok_notes, problems
+
+
+def _json_parses(path):
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except Exception:
+        return False
+
+
+# ---- decommissioned-components registry -------------------------------------
+# Registry-driven silencing, never hardcoded: the audit consults
+# <HOME>/decommissioned.json on every run:
+#   {"version": 1, "components": {"<name>": {"decommissioned": true,
+#     "decommissioned_at": "...", "reason": "...", ...}}}
+# A component listed there with "decommissioned": true has its
+# freshness check skipped. Revival is data-only: remove the entry or
+# set the flag false and the check resumes on the next run — no code
+# edit. Missing/corrupt registry -> {} (no component decommissioned):
+# the audit fails toward alerting, never toward silence.
+
+def _decommissioned_path():
+    # Derived from the CURRENT HOME global at call time so tests can
+    # isolate the registry by reassigning HOME (same pattern as the
+    # toolkit stamp path).
+    return os.path.join(HOME, DECOMMISSIONED_NAME)
+
+
+def _decommissioned_components():
+    """{component_name: record} for components flagged decommissioned
+    in the registry. Never raises; missing/corrupt reads as {}."""
+    try:
+        with open(_decommissioned_path()) as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    comps = data.get("components")
+    if not isinstance(comps, dict):
+        comps = data  # tolerate a bare {name: record} mapping
+    out = {}
+    for name, rec in comps.items():
+        if rec is True:
+            out[str(name)] = {}
+        elif isinstance(rec, dict) and rec.get("decommissioned"):
+            out[str(name)] = rec
+    return out
+
+
+def _check_spark_freshness(decommissioned=None):
+    """spark_seen freshness check. Returns (ok_msg, problem_msg) with
+    exactly one of the two non-None. When the registry marks the spark
+    component decommissioned (its producer, the spark-feed cron, was
+    disabled 2026-10-23 and its only consumer degen-v2 is structurally
+    killed), the stale file is expected: report an ok skip note
+    instead of a false-positive problem."""
+    if decommissioned is None:
+        decommissioned = _decommissioned_components()
+    rec = decommissioned.get("spark")
+    if rec is not None:
+        when = rec.get("decommissioned_at") or "date not recorded"
+        return ("spark_seen check skipped: spark decommissioned %s "
+                "(per %s)" % (when, DECOMMISSIONED_NAME), None)
+    age = _mtime_age(SPARK_SEEN_PATH)
+    if age is None:
+        return (None, "spark_seen missing: %s" % SPARK_SEEN_PATH)
+    if age > SPARK_STALE_S:
+        return (None, "spark_seen stale: %.0f min old" % (age / 60.0))
+    return ("spark_seen fresh (%.0f min)" % (age / 60.0), None)
+
+
+def _toolkit_stamp_path():
+    return os.path.join(HOME, TOOLKIT_STAMP_NAME)
+
+
+def _read_toolkit_stamp():
+    try:
+        with open(_toolkit_stamp_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _write_toolkit_stamp(data):
+    try:
+        with open(_toolkit_stamp_path(), "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # fail-soft: a stamp write failure never breaks the audit
+
+
+def _check_toolkit_suite():
+    """Toolkit suite check, at most once per 24h. Returns (ok, problem).
+
+    Design: measured runtime ~23s (2026-10-20), so when due the suite
+    runs synchronously here with TOOLKIT_TIMEOUT_S as a safety margin.
+    Report-only: failures are unfixable-by-audit — this function NEVER
+    edits or attempts to fix toolkit code, it only records the result
+    in the stamp file and reports it.
+    """
+    now = time.time()
+    stamp = _read_toolkit_stamp()
+    if stamp is not None:
+        try:
+            last_ts = float(stamp.get("ts"))
+        except Exception:
+            last_ts = None
+        if last_ts is not None and 0 <= now - last_ts < TOOLKIT_INTERVAL_S:
+            age_h = (now - last_ts) / 3600.0
+            if stamp.get("ok"):
+                last = "passed"
+                if stamp.get("total"):
+                    last = "passed (%s)" % stamp["total"]
+                return ("toolkit suite skipped (checked %.1fh ago: %s)"
+                        % (age_h, last), None)
+            return ("toolkit suite skipped (checked %.1fh ago: %s)"
+                    % (age_h, stamp.get("result") or "failed"), None)
+    start = time.time()
+    try:
+        proc = subprocess.run(["bash", TOOLKIT_RUNNER],
+                              timeout=TOOLKIT_TIMEOUT_S,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+    except subprocess.TimeoutExpired:
+        duration = time.time() - start
+        _write_toolkit_stamp({"ts": start, "ok": False,
+                              "result": "timeout",
+                              "duration_s": round(duration, 1),
+                              "total": None})
+        return (None, "toolkit suite TIMEOUT after %.0fs "
+                "[unfixable-by-audit]: report only, audit never "
+                "edits toolkit code" % duration)
+    except Exception as e:
+        return (None, "toolkit suite check failed: %s" % e)
+    duration = time.time() - start
+    output = proc.stdout or ""
+    total = None
+    passed = failed = None
+    m = re.search(r"TOTAL:\s*(\d+) passed,\s*(\d+) failed", output)
+    if m:
+        passed, failed = int(m.group(1)), int(m.group(2))
+        total = "%d passed, %d failed" % (passed, failed)
+    if proc.returncode == 0:
+        _write_toolkit_stamp({"ts": start, "ok": True,
+                              "result": "passed",
+                              "duration_s": round(duration, 1),
+                              "passed": passed, "failed": failed,
+                              "total": total,
+                              "exit_code": proc.returncode})
+        detail = total or "no TOTAL line parsed"
+        return ("toolkit suite passed (%s, %.0fs)" % (detail, duration),
+                None)
+    _write_toolkit_stamp({"ts": start, "ok": False,
+                          "result": "failed",
+                          "duration_s": round(duration, 1),
+                          "passed": passed, "failed": failed,
+                          "total": total,
+                          "exit_code": proc.returncode})
+    detail = total or "no TOTAL line parsed"
+    return (None, "toolkit suite FAILED (%s, exit %d) "
+            "[unfixable-by-audit]: report only, audit never edits "
+            "toolkit code" % (detail, proc.returncode))
+
+
+def collect_findings():
+    """All read-only detection. Returns a findings dict."""
+    f = {"ok": [], "problems": [], "dead_daemons": [],
+         "deletable_locks": [], "held_locks": [], "big_logs": []}
+
+    # (1) daemons alive
+    entries = supervised_daemons()
+    dead = find_dead_daemons(entries)
+    f["dead_daemons"] = dead
+    alive = [e["name"] for e in entries if e["name"] not in dead]
+    if alive:
+        f["ok"].append("daemons alive: %s" % ", ".join(sorted(alive)))
+    for name in dead:
+        f["problems"].append("daemon dead: %s" % name)
+
+    # (2) state freshness + parseability
+    age = _mtime_age(BUS_PATH)
+    if age is None:
+        f["problems"].append("signal bus missing: %s" % BUS_PATH)
+    elif age > BUS_STALE_S:
+        f["problems"].append("signal bus stale: %.1fh old" % (age / 3600.0))
+    else:
+        f["ok"].append("signal bus fresh (%.0f min)" % (age / 60.0))
+    spark_ok, spark_problem = _check_spark_freshness()
+    if spark_ok:
+        f["ok"].append(spark_ok)
+    if spark_problem:
+        f["problems"].append(spark_problem)
+    # (2b) realtime heartbeat cadence: the trading arm and the core
+    # exit machinery beat every 2s into run/heartbeat.json (merged
+    # doc owned section-wise; the watchdog writes the rest). A beats
+    # section that exists but is stale means an emitter stopped
+    # ticking while its process may still look alive.
+    try:
+        with open(HEARTBEAT_PATH) as _hbf:
+            _hb_doc = json.load(_hbf)
+        _beats = _hb_doc.get("beats") if isinstance(_hb_doc, dict) \
+            else None
+    except Exception:
+        _beats = None
+    if not isinstance(_beats, dict) or not _beats:
+        f["ok"].append("realtime beats: none recorded yet "
+                       "(daemon liveness checks govern)")
+    else:
+        for _src in HEARTBEAT_SOURCES:
+            _rec = _beats.get(_src) or {}
+            try:
+                _ts = float(_rec.get("ts") or 0)
+            except (TypeError, ValueError):
+                _ts = 0
+            if _ts <= 0:
+                f["ok"].append("realtime beats: %s not beating yet"
+                               % _src)
+                continue
+            _age = time.time() - _ts
+            if _age > HEARTBEAT_STALE_S:
+                f["problems"].append(
+                    "realtime heartbeat stale: %s %.0fs old "
+                    "(2s cadence)" % (_src, _age))
+            else:
+                f["ok"].append("realtime heartbeat fresh: %s "
+                               "(%.0fs)" % (_src, _age))
+    for label, path in (("killswitch state", KILLSWITCH_STATE),):
+        if _json_parses(path):
+            f["ok"].append("%s parses" % label)
+        else:
+            f["problems"].append("%s missing/unparseable: %s" % (label, path))
+    # (6) every ledger file parses
+    try:
+        ledger_files = sorted(
+            os.path.join(HOME, n) for n in os.listdir(HOME)
+            if "ledger" in n and n.endswith(".json"))
+    except Exception:
+        ledger_files = []
+    for path in ledger_files:
+        if _json_parses(path):
+            f["ok"].append("ledger parses: %s" % os.path.basename(path))
+        else:
+            f["problems"].append("ledger UNPARSEABLE: %s" % path)
+
+    # (6b) ledger sanity: absurd closes / bankroll jumps (flag-only,
+    # never repairs — the 2026-10-23 phantom close sat in a ledger
+    # while this audit reported "ok").
+    try:
+        _s_ok, _s_problems = _check_ledger_sanity()
+        f["ok"].extend(_s_ok)
+        f["problems"].extend(_s_problems)
+    except Exception as e:
+        f["problems"].append("ledger sanity check failed: %s" % e)
+
+    # (6c) entry drought: grad lanes silently taking no new entries
+    # (2026-11-08: a 43h drought was invisible to this audit).
+    try:
+        _d_ok, _d_problems = _check_entry_drought(dead)
+        f["ok"].extend(_d_ok)
+        f["problems"].extend(_d_problems)
+    except Exception as e:
+        f["problems"].append("entry drought check failed: %s" % e)
+
+    # (6d) Helius 429-spike alert (2026-11-18, resilience build):
+    # the watch writes helius_429_alert.json; an active spike is a
+    # problem even before entries stall.
+    try:
+        _a_ok, _a_problems = _check_helius_429_alert()
+        f["ok"].extend(_a_ok)
+        f["problems"].extend(_a_problems)
+    except Exception as e:
+        f["problems"].append("helius 429 alert check failed: %s" % e)
+
+    # (3) backup freshness
+    try:
+        archives = [os.path.join(BACKUP_DIR, n)
+                    for n in os.listdir(BACKUP_DIR)
+                    if n.startswith("forex-backup-") and n.endswith(".tar.gz")]
+    except Exception:
+        archives = []
+    if not archives:
+        f["problems"].append("no backup archives in %s" % BACKUP_DIR)
+    else:
+        newest = max(archives, key=lambda p: os.path.getmtime(p))
+        age = time.time() - os.path.getmtime(newest)
+        if age > BACKUP_MAX_AGE_S:
+            f["problems"].append("latest backup stale: %.1fh old (%s)"
+                                 % (age / 3600.0, os.path.basename(newest)))
+        else:
+            f["ok"].append("backup fresh (%.1fh, %s)"
+                           % (age / 3600.0, os.path.basename(newest)))
+
+    # (4) disk space
+    try:
+        free = shutil.disk_usage(HOME).free
+        if free < DISK_MIN_FREE:
+            f["problems"].append("disk low: %.2f GB free" % (free / 1024 ** 3))
+        else:
+            f["ok"].append("disk ok (%.1f GB free)" % (free / 1024 ** 3))
+    except Exception as e:
+        f["problems"].append("disk check failed: %s" % e)
+
+    # (5) endpoints reachable
+    for name, url in ENDPOINTS.items():
+        if _endpoint_ok(url):
+            f["ok"].append("endpoint reachable: %s" % name)
+        else:
+            f["problems"].append("endpoint UNREACHABLE: %s" % name)
+
+    # (7) toolkit suite (<= once/24h, report-only; fail-soft)
+    try:
+        tk_ok, tk_problem = _check_toolkit_suite()
+        if tk_ok:
+            f["ok"].append(tk_ok)
+        if tk_problem:
+            f["problems"].append(tk_problem)
+    except Exception as e:
+        f["problems"].append("toolkit suite check failed: %s" % e)
+
+    # repair candidates: stale locks + oversized logs (detection only here)
+    locks = classify_locks()
+    f["deletable_locks"] = locks["deletable"]
+    f["held_locks"] = locks["held"]
+    f["big_logs"] = find_big_logs()
+    return f
+
+
+def _endpoint_ok(url):
+    """Reachable = any HTTP response at all (even 4xx). One light GET,
+    gzip header, 10s timeout, body read capped."""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "forex-agent-self-audit/1.0",
+            "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            r.read(512)
+        return True
+    except urllib.error.HTTPError:
+        return True  # the server answered; reachability is what we test
+    except Exception:
+        return False
+
+
+def classify_locks():
+    """{deletable, held, fresh} for *.lock files next to the ledgers.
+
+    Deletable = older than LOCK_STALE_S AND an flock probe succeeds
+    (nobody holds it). If the probe fails or errors, the file is held /
+    left alone — when unsure, skip (mirror the flock pattern).
+    """
+    out = {"deletable": [], "held": [], "fresh": []}
+    try:
+        names = [n for n in os.listdir(HOME) if n.endswith(".lock")]
+    except Exception:
+        return out
+    for n in names:
+        path = os.path.join(HOME, n)
+        age = _mtime_age(path)
+        if age is None or age <= LOCK_STALE_S:
+            out["fresh"].append(path)
+            continue
+        try:
+            fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                out["deletable"].append(path)
+            except (BlockingIOError, OSError):
+                out["held"].append(path)
+            finally:
+                os.close(fd)
+        except Exception:
+            out["held"].append(path)  # unsure -> skip
+    return out
+
+
+def find_big_logs():
+    out = []
+    try:
+        for n in sorted(os.listdir(LOG_DIR)):
+            # Live logs only — NEVER archives. Rotating a .gz produced
+            # the .log.1.gz.1.gz nesting chains (found 2026-10-21).
+            if n.endswith(".gz"):
+                continue
+            path = os.path.join(LOG_DIR, n)
+            try:
+                if os.path.isfile(path) and \
+                        os.path.getsize(path) > ROTATE_BYTES:
+                    out.append(path)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+# ---- repair planning + application -------------------------------------------
+
+def plan_repairs(findings):
+    """Pure decision: findings -> repair actions. Never touches disk."""
+    plan = []
+    if findings.get("dead_daemons"):
+        plan.append({"action": "run_watchdog",
+                     "targets": list(findings["dead_daemons"])})
+    for path in findings.get("deletable_locks") or []:
+        plan.append({"action": "delete_lock", "path": path})
+    for path in findings.get("big_logs") or []:
+        plan.append({"action": "rotate_log", "path": path})
+    return plan
+
+
+def _repair_delete_lock(path):
+    """Re-probe the flock, then unlink. Returns (done, note)."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return False, "lock gained a holder, skipped: %s" % path
+        os.unlink(path)
+        os.close(fd)
+        return True, "deleted stale lock %s" % path
+    except Exception as e:
+        return False, "lock delete failed (%s): %s" % (e, path)
+
+
+def _repair_rotate_log(path):
+    if path.endswith(".gz"):
+        return False, "refuse to rotate an archive: %s" % path
+    try:
+        gz_path = path + ".1.gz"
+        with open(path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1024 * 256)
+        with open(path, "w"):
+            pass  # truncate
+        return True, "rotated log %s -> %s" % (path, gz_path)
+    except Exception as e:
+        return False, "log rotate failed (%s): %s" % (e, path)
+
+
+def _repair_run_watchdog(targets):
+    """Run the watchdog once; re-check the previously dead daemons."""
+    notes = []
+    try:
+        subprocess.run(["bash", WATCHDOG_PATH], timeout=240,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env=dict(os.environ, FOREX_AGENT_HOME=HOME))
+    except Exception as e:
+        return [], ["watchdog run failed: %s" % e]
+    entries = {e["name"]: e for e in supervised_daemons()}
+    still_dead = []
+    for name in targets:
+        e = entries.get(name)
+        if e is None or not daemon_alive(e):
+            still_dead.append(name)
+    revived = [n for n in targets if n not in still_dead]
+    if revived:
+        notes.append("ran forex-watchdog; revived: %s" % ", ".join(revived))
+    problems = ["daemon STILL dead after watchdog: %s" % n
+                for n in still_dead]
+    return notes, problems
+
+
+def apply_repairs(plan):
+    """Execute planned repairs. Returns (repaired, new_problems)."""
+    repaired, problems = [], []
+    for action in plan:
+        kind = action.get("action")
+        if kind == "run_watchdog":
+            notes, probs = _repair_run_watchdog(action.get("targets", []))
+            repaired.extend(notes)
+            problems.extend(probs)
+        elif kind == "delete_lock":
+            done, note = _repair_delete_lock(action["path"])
+            (repaired if done else problems).append(note)
+        elif kind == "rotate_log":
+            done, note = _repair_rotate_log(action["path"])
+            (repaired if done else problems).append(note)
+    return repaired, problems
+
+
+# ---- main ----------------------------------------------------------------------
+
+def run_audit(dry_run=False):
+    findings = collect_findings()
+    ok = list(findings["ok"])
+    problems = list(findings["problems"])
+    plan = plan_repairs(findings)
+    repaired = []
+    if dry_run:
+        for a in plan:
+            if a["action"] == "run_watchdog":
+                problems.append("dry-run: would run forex-watchdog "
+                                "(dead: %s)" % ", ".join(a["targets"]))
+            elif a["action"] == "delete_lock":
+                problems.append("dry-run: would delete stale lock %s"
+                                % a["path"])
+            elif a["action"] == "rotate_log":
+                problems.append("dry-run: would rotate log %s" % a["path"])
+    else:
+        repaired, extra = apply_repairs(plan)
+        problems.extend(extra)
+    entry = {"ts": time.time(), "ok": ok, "repaired": repaired,
+             "problems": problems}
+    if not dry_run:
+        try:
+            with open(AUDIT_LOG, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+    return entry
+
+
+def _summary_line(entry, dry_run=False):
+    def _short(items, limit=4):
+        s = "; ".join(items[:limit])
+        if len(items) > limit:
+            s += " (+%d more)" % (len(items) - limit)
+        return s or "-"
+    return ("self-audit%s: ok=%d repaired=[%s] problems=[%s]" % (
+        " (dry-run)" if dry_run else "", len(entry["ok"]),
+        _short(entry["repaired"]), _short(entry["problems"])))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="bot-self-audit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print findings; perform no repairs")
+    args = ap.parse_args(argv)
+    if not os.path.isdir(HOME) or not os.path.exists(WATCHDOG_PATH):
+        print("self-audit: CATASTROPHIC — agent home or watchdog missing")
+        return 2
+    try:
+        entry = run_audit(dry_run=args.dry_run)
+    except Exception as e:
+        print("self-audit: FAILED (%s)" % e)
+        return 1
+    print(_summary_line(entry, dry_run=args.dry_run))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

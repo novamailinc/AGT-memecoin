@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Moon-bag graduation trader daemon (2026-10-26, user-ordered).
+
+Runs the moon-bag lane (daemon/launch_scanner/moon_lane.py):
+grad_raw's every-graduation spray with NO safety gate and NO veto,
+$1 paper shots, $100 paper bankroll, NO daily cap (the bankroll
+is the limit) — EXCEPT the exit: the final 25% leg rides a 50%
+trailing stop (not 30%) and there is NO 24h time stop. Legs A
+(50%@2x) and B (25%@3x) and the -50% hard stop are exactly
+grad_raw's. The experiment isolates the final-leg exit so the
+100-close verdict can be compared head-to-head with grad_raw on
+expectancy per close and win rate (never raw dollars: $1 vs $25
+stakes).
+
+Detection: a live PumpPortal migration WebSocket plus a
+GeckoTerminal newest-pools backfill every ~60s over a 30-minute
+window. Exits are evaluated in this same loop (~5s cycle), with
+grad_raw's FIRE-FIRST migration-tx payload pricing on the
+stream-wake thread.
+
+Pre-registered verdict: at 100 closes, expectancy <= 0 halts the
+lane permanently (killswitch lane "moon", human-only re-enable).
+
+Paper only. NO Telegram cards — journal/ledger only, like grad_raw
+v1. Nothing here touches real money, keys, or the user's lanes.
+Free-only: PumpPortal public stream + GeckoTerminal + DexScreener.
+"""
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("moon-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import moon_lane as _raw
+    import pumpportal as _pp
+    import killswitch as _ks_check
+    import armed_watch as _aw
+    import dossiers as _dossiers
+    import rt_sync as _rt
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+# P4 event recorder: fail-soft, like grad.py's reserves import —
+# a missing recorder never stops the lane.
+try:
+    import recorder as _recorder
+except Exception:
+    try:
+        from daemon.launch_scanner import recorder as _recorder
+    except Exception:
+        _recorder = None
+
+POLL_SECS = 5
+GT_BACKFILL_EVERY_S = 60
+GT_BACKFILL_PAGES = 5
+
+
+def main():
+    if not _HAS_DEPS:
+        logger.warning("moon deps missing: %s", _IMPORT_ERROR)
+        return 1
+    engine = _raw.make_engine()
+    state = engine.ensure_ledger()
+    # Materialize the killswitch lane entry (not halted) so the lane
+    # is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_raw.LANE)
+    except Exception:
+        pass
+    feed = _pp.PumpPortalFeed()
+    feed.start()
+
+    # P1/P9a: armed positions (peak >= 1.5x) are priced by PUSH —
+    # accountSubscribe on their pool vaults; every swap re-prices
+    # and re-evaluates exits on the event, not the 5s clock. The
+    # loop's own poll remains as backstop with the same price_fn.
+    def _armed_price_fn(chain, mint, spot_index=None):
+        wp = watcher.price(mint)
+        if wp > 0:
+            return wp
+        return engine.quote_price(chain, mint, spot_index)
+
+    def _on_armed_price(mint, px, ts):
+        try:
+            engine.poll_exits(_armed_price_fn)
+        except Exception:
+            pass
+
+    def _on_watch_state(state, info):
+        logger.warning("moon armed watch: %s %s", state, info)
+        if state == "RECONCILED":
+            for mv in (info or {}).get("moved") or []:
+                rec = dict(mv)
+                rec["ts"] = time.time()
+                rec["source"] = "moon-armed-watch"
+                _rt.journal_reconciliation(rec)
+
+    watcher = _aw.ArmedWatcher(on_price=_on_armed_price,
+                               on_state=_on_watch_state)
+    watcher.start()
+
+    def _observe(items):
+        # P8: births open dossiers; migrations stamp them.
+        _dossiers.observe_births(items)
+        _dossiers.observe_migrations(items)
+        # P4: record births + migrations for offline replay.
+        if _recorder is not None:
+            for item in items or []:
+                try:
+                    src = (item or {}).get("source")
+                    if src == "pumpportal-new":
+                        kind = "birth"
+                    elif src == "pumpportal-migration":
+                        kind = "migration"
+                    else:
+                        continue
+                    body = dict(item)
+                    body.setdefault("lane", _raw.LANE)
+                    _recorder.record(kind, body)
+                except Exception:
+                    continue
+
+    # FIRE-FIRST entry thread: wake on stream arrival and run a
+    # fresh-only scan (entries for just-drained migrations, priced
+    # from the migration tx). The engine's ledger access is
+    # flock-serialized and the armed watcher already calls poll_exits
+    # from its own thread, so a second scan thread follows an
+    # existing concurrency pattern; dedupe/bankroll/caps are
+    # re-checked under the write lock inside consider_candidate.
+    def _entry_loop():
+        while True:
+            try:
+                q = getattr(feed, "_q", None)
+                if q is not None and not q.empty():
+                    _raw.scan_once(engine, feed=feed, gt_rows=None,
+                                   on_items=_observe, fresh_only=True)
+                else:
+                    time.sleep(0.1)
+            except Exception:
+                logger.exception("moon entry loop failed")
+                time.sleep(1.0)
+
+    threading.Thread(target=_entry_loop, name="moon-entry",
+                     daemon=True).start()
+
+    logger.warning("moon-trader started (paper only, NO safety "
+                   "gate, bankroll $%.2f, state %s, verdict sample "
+                   "%d closes)",
+                   float(state.get("bankroll") or 0), state.get("state"),
+                   _raw.VERDICT_SAMPLE_CLOSES)
+    last_gt = 0.0
+    while True:
+        try:
+            gt_rows = None
+            now = time.time()
+            if now - last_gt >= GT_BACKFILL_EVERY_S:
+                last_gt = now
+                gt_rows = engine.fetch_candidates(GT_BACKFILL_PAGES)
+            res = _raw.scan_once(engine, feed=feed, gt_rows=gt_rows,
+                                 on_items=_observe)
+            closes = engine.poll_exits(_armed_price_fn)
+            watcher.set_positions(
+                _aw.armed_positions(engine.open_positions()))
+            if res.get("opened") or closes:
+                st = engine.account_state()
+                logger.warning(
+                    "moon-trader: %d stream, %d opened; %d closes; "
+                    "cash $%.2f, %d open, state %s",
+                    res.get("stream", 0), res.get("opened", 0),
+                    len(closes), st.get("bankroll", 0.0),
+                    st.get("n_open", 0), st.get("state"))
+        except Exception:
+            logger.exception("moon-trader loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

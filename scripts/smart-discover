@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Smart-wallet discovery via winner-tracing (2026-10-17 rebuild).
+
+The proven pattern: our 10th wallet was added because it was early on two
+big runners. This script traces a winner's EARLIEST on-chain buyers,
+vets them behaviorally, and stages PASS candidates in
+discovery_proposals.json for human approval. It never adds wallets —
+/smartadd (or the user) decides.
+
+Usage:
+    scripts/smart-discover <mint> [--symbol X] [--early-min 10]
+    scripts/smart-discover --from-winners   # trace best peak>=3x in degen_peaks.json
+
+Method (all on the research-only discovery Helius key, own rate bucket):
+  1. Page the mint's signatures back toward creation (cap 20 pages).
+  2. Extract distinct buyers from the earliest transactions, ranked by
+     buy time. Window: first --early-min minutes after the mint's first tx.
+  3. Vet the top 10 earliest: skip already-tracked; fetch recent swaps;
+     compute median hold time and farmer ratio.
+     Verdicts: PASS / FARMER (median hold <90s over 3+ roundtrips) /
+     DORMANT (<5 recent swaps).
+
+Honest limits: no funding-source (pack) tracing in v1 — a documented gap.
+The 14-day rotation + follower grader catch bad additions. Slot-level
+first-block analysis is skipped (no free source); blockTime ordering is
+the proxy.
+"""
+import json
+import logging
+import os
+import statistics
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("smart-discover")
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+REGISTRY = os.path.join(HOME, "launch_scanner", "smart_wallets.json")
+PROPOSALS = os.path.join(HOME, "launch_scanner", "discovery_proposals.json")
+PEAKS = os.path.join(HOME, "degen_peaks.json")
+
+MAX_PAGES = 20
+PAGE_LIMIT = 1000
+VET_SIGS = 40
+VET_TXS = 25
+VET_TOP_N = 10
+FARMER_HOLD_S = 90
+
+
+def _discovery_key():
+    for name in ("api_key_discovery", "api_key"):
+        try:
+            with open(os.path.join(HOME, "helius", name)) as f:
+                k = f.read().strip()
+            if k:
+                return k
+        except Exception:
+            continue
+    return None
+
+
+def _rpc(method, params, api_key):
+    url = "https://mainnet.helius-rpc.com/?api-key=%s" % api_key
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                       "params": params}).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "forex-agent/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode()).get("result")
+    except Exception as exc:
+        logger.debug("rpc %s failed: %s", method, exc)
+        return None
+
+
+def _sigs_for(addr, api_key, limit=PAGE_LIMIT, before=None):
+    params = [addr, {"limit": limit}]
+    if before:
+        params[1]["before"] = before
+    return _rpc("getSignaturesForAddress", params, api_key) or []
+
+
+def _tx(sig, api_key):
+    return _rpc("getTransaction",
+                [sig, {"encoding": "json",
+                       "maxSupportedTransactionVersion": 0}], api_key)
+
+
+def _buyers_of_mint(tx, target_mint):
+    """{owner: tokens_bought} for wallets that gained target_mint in tx."""
+    out = {}
+    try:
+        meta = tx.get("meta") or {}
+        pre = {}
+        for b in (meta.get("preTokenBalances") or []):
+            if b.get("mint") == target_mint:
+                key = (b.get("owner"), b.get("mint"))
+                pre[key] = float(
+                    (b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        for b in (meta.get("postTokenBalances") or []):
+            if b.get("mint") != target_mint:
+                continue
+            owner = b.get("owner") or ""
+            if not owner:
+                continue
+            post_amt = float(
+                (b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            bought = post_amt - pre.get((owner, target_mint), 0)
+            if bought > 0:
+                out[owner] = out.get(owner, 0) + bought
+    except Exception:
+        pass
+    return out
+
+
+def trace_early_buyers(mint, api_key, early_min=10.0):
+    """Return [(wallet, buy_ts, buy_rank)] earliest distinct buyers.
+
+    Pages toward creation (cap MAX_PAGES); keeps buyers within early_min
+    of the mint's first seen tx. Never raises (returns what it got).
+    """
+    try:
+        pages = []
+        before = None
+        for _ in range(MAX_PAGES):
+            sigs = _sigs_for(mint, api_key, before=before)
+            if not sigs:
+                break
+            pages.append(sigs)
+            before = sigs[-1].get("signature")
+            if len(sigs) < PAGE_LIMIT:
+                break  # reached the oldest page
+            time.sleep(0.2)
+        if not pages:
+            return []
+        # oldest page last -> reverse to chronological
+        ordered = []
+        for pg in reversed(pages):
+            ordered.extend(reversed(pg))
+        if not ordered:
+            return []
+        t0 = ordered[0].get("blockTime") or 0
+        window_s = early_min * 60.0
+        # fetch txs for sigs inside the early window (cap: first 300)
+        in_window = [s for s in ordered
+                     if (s.get("blockTime") or 0) - t0 <= window_s][:300]
+        logger.warning("tracing %d early txs for %s", len(in_window),
+                       mint[:8])
+        first_buy = {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for sig_d, tx in zip(
+                    in_window,
+                    ex.map(lambda s: _tx(s.get("signature"), api_key),
+                           in_window)):
+                if not tx:
+                    continue
+                bts = tx.get("blockTime") or sig_d.get("blockTime") or 0
+                for owner in _buyers_of_mint(tx, mint):
+                    if owner not in first_buy:
+                        first_buy[owner] = bts
+        ranked = sorted(first_buy.items(), key=lambda kv: kv[1])
+        return [(w, ts, i + 1) for i, (w, ts) in enumerate(ranked)]
+    except Exception as exc:
+        logger.warning("trace_early_buyers failed: %s", exc)
+        return []
+
+
+def _wallet_swaps(wallet, tx):
+    """[(mint, side, block_ts)] for one wallet tx. side: buy|sell."""
+    out = []
+    try:
+        meta = tx.get("meta") or {}
+        bts = tx.get("blockTime") or 0
+        pre = {}
+        for b in (meta.get("preTokenBalances") or []):
+            if b.get("owner") == wallet:
+                pre[b.get("mint")] = float(
+                    (b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+        for b in (meta.get("postTokenBalances") or []):
+            if b.get("owner") != wallet:
+                continue
+            mint = b.get("mint") or ""
+            if not mint:
+                continue
+            post_amt = float(
+                (b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            delta = post_amt - pre.get(mint, 0)
+            if delta > 0:
+                out.append((mint, "buy", bts))
+            elif delta < 0:
+                out.append((mint, "sell", bts))
+    except Exception:
+        pass
+    return out
+
+
+def vet_wallet(wallet, api_key):
+    """Behavioral vetting. Returns dict with verdict. Never raises."""
+    res = {"wallet": wallet, "n_swaps": 0, "median_hold_s": None,
+           "farmer_ratio": 0.0, "verdict": "DORMANT"}
+    try:
+        sigs = _sigs_for(wallet, api_key, limit=VET_SIGS)
+        if not sigs:
+            return res
+        txs = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for tx in ex.map(lambda s: _tx(s.get("signature"), api_key),
+                              sigs[:VET_TXS]):
+                if tx:
+                    txs.append(tx)
+        buys = {}   # mint -> first buy ts
+        holds = []
+        n_swaps = 0
+        for tx in sorted(txs, key=lambda t: t.get("blockTime") or 0):
+            for mint, side, bts in _wallet_swaps(wallet, tx):
+                n_swaps += 1
+                if side == "buy" and mint not in buys and bts:
+                    buys[mint] = bts
+                elif side == "sell" and mint in buys and bts:
+                    holds.append(max(0, bts - buys.pop(mint)))
+        res["n_swaps"] = n_swaps
+        if holds:
+            res["median_hold_s"] = round(statistics.median(holds), 1)
+            res["farmer_ratio"] = round(
+                sum(1 for h in holds if h < FARMER_HOLD_S) / len(holds), 2)
+        if n_swaps < 5:
+            res["verdict"] = "DORMANT"
+        elif len(holds) >= 3 and res["median_hold_s"] < FARMER_HOLD_S:
+            res["verdict"] = "FARMER"
+        else:
+            res["verdict"] = "PASS"
+        return res
+    except Exception as exc:
+        logger.warning("vet_wallet failed for %s: %s", wallet[:8], exc)
+        res["verdict"] = "ERROR"
+        return res
+
+
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+            return data if isinstance(data, (dict, list)) else default
+    except Exception:
+        return default
+
+
+def _save_proposals(proposals):
+    try:
+        tmp = PROPOSALS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "proposals": proposals}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, PROPOSALS)
+        return True
+    except Exception as exc:
+        logger.warning("save proposals failed: %s", exc)
+        return False
+
+
+def _best_winner():
+    peaks = _load_json(PEAKS, {})
+    best = None
+    for mint, r in (peaks or {}).items():
+        if not isinstance(r, dict):
+            continue
+        pm = float(r.get("peak_mult") or 0)
+        if pm >= 3.0 and (best is None or pm > best[1]):
+            best = (mint, pm, r.get("symbol") or "?")
+    return best
+
+
+def main():
+    args = sys.argv[1:]
+    early_min = 10.0
+    if "--early-min" in args:
+        i = args.index("--early-min")
+        try:
+            early_min = float(args[i + 1])
+        except (IndexError, ValueError):
+            pass
+    mint = None
+    symbol = "?"
+    if "--from-winners" in args:
+        best = _best_winner()
+        if not best:
+            print("no peak>=3x winners in degen_peaks.json")
+            return 1
+        mint, pm, symbol = best
+        print("tracing best winner: $%s peak %.1fx" % (symbol, pm))
+    else:
+        rest = [a for a in args if not a.startswith("--")]
+        if not rest:
+            print("usage: smart-discover <mint> [--early-min N] | --from-winners")
+            return 1
+        mint = rest[0]
+        if "--symbol" in args:
+            i = args.index("--symbol")
+            try:
+                symbol = args[i + 1]
+            except IndexError:
+                pass
+
+    api_key = _discovery_key()
+    if not api_key:
+        print("no helius key found")
+        return 1
+
+    registry = _load_json(REGISTRY, {})
+    buyers = trace_early_buyers(mint, api_key, early_min=early_min)
+    print("distinct early buyers in window: %d" % len(buyers))
+    if not buyers:
+        return 0
+
+    proposals = _load_json(PROPOSALS, {})
+    if isinstance(proposals, dict):
+        existing = {(p.get("wallet")) for p in (proposals.get("proposals") or [])}
+        plist = proposals.get("proposals") or []
+    else:
+        existing, plist = set(), []
+    tracked = set(registry)
+
+    added = 0
+    t0 = buyers[0][1] if buyers else 0
+    for wallet, bts, rank in buyers[:VET_TOP_N]:
+        if wallet in tracked or wallet in existing:
+            print("• %s — already tracked/proposed, skip" % wallet[:10])
+            continue
+        vet = vet_wallet(wallet, api_key)
+        delay = max(0, bts - t0) if bts and t0 else 0
+        print("• %s rank#%d +%ds buy — %s (swaps=%d, med_hold=%ss, farmer=%.0f%%)" % (
+            wallet[:10], rank, delay, vet["verdict"], vet["n_swaps"],
+            vet["median_hold_s"], vet["farmer_ratio"] * 100))
+        time.sleep(0.3)
+        if vet["verdict"] == "PASS":
+            plist.append({
+                "wallet": wallet,
+                "discovered_ts": time.time(),
+                "source": "winner-trace:%s" % symbol,
+                "source_mint": mint,
+                "buy_rank": rank,
+                "buy_delay_s": delay,
+                "vetting": {k: v for k, v in vet.items() if k != "wallet"},
+                "status": "proposed",
+            })
+            added += 1
+    if added:
+        _save_proposals(plist)
+    print("\n%d PASS candidate(s) staged in discovery_proposals.json "
+          "(approve via /smartadd)" % added)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

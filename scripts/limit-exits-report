@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Limit-exits report (2026-11-21, exit-study follow-up).
+
+Compares the LIMIT-ORDER exit model against what the live lanes
+actually realized — per lane, from the paper ledgers. Read-only:
+no ledger writes, no network, no live decisions. The limit model
+never exited anything; this script only replays the
+counterfactual from what the close records carry.
+
+MODEL (labelled as such everywhere — never measured P&L): each
+close is replayed against its recorded peak_mult with its lane's
+ladder (limit_exits.peak_replay_mult): leg A banks at its target
+if the peak reached it, leg B the same, and the unbanked
+remainder exits at the recorded realized_mult. Banked legs are
+priced gross of exit fees; the remainder carries the live
+close's fee treatment inside realized_mult.
+
+What this model can and cannot show:
+- CAN: rung banks the live poll missed. The exit study found
+  46% of hard-stop closes peaked >=1.5x before dying — those
+  are the closes where the model gains.
+- CANNOT: the hard-stop slippage saving (poll exit 0.26x vs
+  limit-model stop fill 0.475x). The close record keeps only the
+  last 10 quote-journal entries, so the full price path is not
+  recoverable and the remainder replays at its recorded
+  realized_mult. That saving needs a live LimitModel fed every
+  exit eval (see limit_exits.compare); it is shown here only as
+  a separate, clearly-labelled stop-slippage BOUND (hard-stop
+  closes, no leg banked per peak, remainder re-priced at
+  0.475x instead of realized_mult) — an upper bound, not a
+  second delta, and NOT added to the model net.
+
+A close is skipped (counted, never estimated) when it lacks
+entry_notional_usd, pnl_usd/realized_usd, peak_mult, or
+realized_mult, or when it is a TWAP close (no ladder to replay).
+
+Usage:
+  scripts/limit-exits-report [--lane grad_select] [--json]
+      [--home /path/to/.forex-agent]
+  Ledgers: $FOREX_AGENT_HOME (default /home/hatch/.forex-agent).
+"""
+import argparse
+import json
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+
+try:
+    import limit_exits as _le
+except Exception:
+    _le = None
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+
+LANES = {
+    "grad_select": "grad_select_ledger.json",
+    "grad_raw": "grad_raw_ledger.json",
+    "tranche": "tranche_ledger.json",
+    "tranche_protect": "tranche_protect_ledger.json",
+}
+
+# Hard-stop fill the limit model credits (stop * 0.95 haircut).
+STOP_FILL_MULT = 0.50 * 0.95
+
+
+def _num(x):
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return v
+
+
+def _load_lane(lane, home):
+    path = os.path.join(home, LANES[lane])
+    with open(path) as f:
+        return json.load(f)
+
+
+def analyze(lane, home):
+    """Aggregate actual vs limit-model for one lane's closes."""
+    d = _load_lane(lane, home)
+    closes = d.get("closes", []) or []
+    legs = _le.ladder_for_lane(lane)
+    agg = {"lane": lane, "closes": len(closes), "modelled": 0,
+           "skipped": 0, "skipped_twap": 0,
+           "actual_net_all": 0.0, "actual_net_modelled": 0.0,
+           "model_net": 0.0, "delta": 0.0,
+           "banked_a": 0, "banked_b": 0,
+           "rung_overshoot_usd": 0.0,
+           "stop_bound_n": 0, "stop_bound_saving": 0.0}
+    for c in closes:
+        if not isinstance(c, dict):
+            agg["skipped"] += 1
+            continue
+        pnl = _num(c.get("pnl_usd"))
+        if pnl is None:
+            realized = _num(c.get("realized_usd"))
+            notional0 = _num(c.get("entry_notional_usd"))
+            if realized is not None and notional0 is not None:
+                pnl = realized - notional0
+        if pnl is not None:
+            agg["actual_net_all"] += pnl
+        if isinstance(c.get("twap"), dict) or not c.get("legs"):
+            # TWAP closes never ran the ladder: nothing to replay.
+            agg["skipped"] += 1
+            agg["skipped_twap"] += 1
+            continue
+        notional = _num(c.get("entry_notional_usd"))
+        peak = _num(c.get("peak_mult"))
+        rm = _num(c.get("realized_mult"))
+        if notional is None or notional <= 0 or pnl is None \
+                or peak is None or peak <= 0 or rm is None or rm < 0:
+            agg["skipped"] += 1
+            continue
+        model_rm = _le.peak_replay_mult(peak, rm, legs)
+        if model_rm is None:
+            agg["skipped"] += 1
+            continue
+        agg["modelled"] += 1
+        agg["actual_net_modelled"] += pnl
+        model_pnl = model_rm * notional - notional
+        agg["model_net"] += model_pnl
+        cfg = _le._norm_legs(legs)
+        if peak >= cfg["a"]["target"]:
+            agg["banked_a"] += 1
+        if peak >= cfg["b"]["target"]:
+            agg["banked_b"] += 1
+        # Diagnostic (not part of the delta): rung overshoot the
+        # live poll captured — banked legs that filled ABOVE their
+        # target. The exact-rung model forfeits this by
+        # construction, which is most of why the model delta reads
+        # negative (see NOTE at the end of the report).
+        entry_px = _num(c.get("entry_price"))
+        if entry_px is not None and entry_px > 0:
+            for key in ("a", "b"):
+                leg = (c.get("legs") or {}).get(key) or {}
+                if not isinstance(leg, dict) or not leg.get("done"):
+                    continue
+                exit_px = _num(leg.get("exit_price"))
+                if exit_px is None or exit_px <= 0:
+                    continue
+                exit_mult = exit_px / entry_px
+                if exit_mult > cfg[key]["target"]:
+                    agg["rung_overshoot_usd"] += \
+                        cfg[key]["frac"] * (exit_mult
+                                            - cfg[key]["target"]) \
+                        * notional
+        # Stop-slippage BOUND (separate from the model delta):
+        # hard-stop close, no leg banked per peak, remainder
+        # exited below the 0.475x limit-model stop fill.
+        reason = str(c.get("closed_reason") or "")
+        if reason.startswith("hard_stop") \
+                and peak < cfg["a"]["target"] and rm < STOP_FILL_MULT:
+            agg["stop_bound_n"] += 1
+            agg["stop_bound_saving"] += (STOP_FILL_MULT - rm) \
+                * notional
+    agg["actual_net_all"] = round(agg["actual_net_all"], 2)
+    agg["actual_net_modelled"] = round(agg["actual_net_modelled"], 2)
+    agg["model_net"] = round(agg["model_net"], 2)
+    agg["delta"] = round(agg["model_net"]
+                         - agg["actual_net_modelled"], 2)
+    agg["rung_overshoot_usd"] = round(agg["rung_overshoot_usd"], 2)
+    agg["stop_bound_saving"] = round(agg["stop_bound_saving"], 2)
+    return agg
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--lane", choices=sorted(LANES), default=None)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--home", default=None)
+    args = ap.parse_args()
+    if _le is None:
+        print("limit_exits module not importable", file=sys.stderr)
+        return 1
+    home = args.home or HOME
+    lanes = [args.lane] if args.lane else sorted(LANES)
+    rows = []
+    for lane in lanes:
+        try:
+            rows.append(analyze(lane, home))
+        except FileNotFoundError:
+            print("ledger missing for %s" % lane, file=sys.stderr)
+        except Exception as e:
+            print("limit-exits-report %s failed: %s" % (lane, e),
+                  file=sys.stderr)
+    if args.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    print("LIMIT-EXITS REPORT (MODEL — not measured P&L): ladder "
+          "rungs as resting limit orders, remainder at the recorded "
+          "realized_mult")
+    print("Ledger home: %s" % home)
+    tot = {"closes": 0, "modelled": 0, "skipped": 0,
+           "actual_net_all": 0.0, "actual_net_modelled": 0.0,
+           "model_net": 0.0, "delta": 0.0,
+           "rung_overshoot_usd": 0.0,
+           "stop_bound_n": 0, "stop_bound_saving": 0.0}
+    for r in rows:
+        print("\n%s: closes=%d modelled=%d skipped=%d "
+              "(of which TWAP=%d)"
+              % (r["lane"], r["closes"], r["modelled"],
+                 r["skipped"], r["skipped_twap"]))
+        print("  actual net (modelled closes): $%.2f | actual net "
+              "(all closes): $%.2f"
+              % (r["actual_net_modelled"], r["actual_net_all"]))
+        print("  MODEL net: $%.2f | DELTA (model - actual): %s$%.2f"
+              % (r["model_net"], "+" if r["delta"] >= 0 else "-",
+                 abs(r["delta"])))
+        print("  peak reached leg A target on %d closes, leg B on %d"
+              % (r["banked_a"], r["banked_b"]))
+        print("  rung overshoot live captured (banked legs filled "
+              "above target): $%.2f — the exact-rung model forfeits "
+              "this by construction"
+              % r["rung_overshoot_usd"])
+        print("  stop-slippage BOUND (not in the delta): %d "
+              "unbanked hard-stop closes below 0.475x would save "
+              "+$%.2f if the remainder had filled at the 0.475x "
+              "limit-model stop instead"
+              % (r["stop_bound_n"], r["stop_bound_saving"]))
+        for k in tot:
+            tot[k] += r[k]
+    if len(rows) > 1:
+        print("\nPOOLED: closes=%d modelled=%d skipped=%d"
+              % (tot["closes"], tot["modelled"], tot["skipped"]))
+        print("  actual net (modelled): $%.2f | MODEL net: $%.2f | "
+              "DELTA: %s$%.2f"
+              % (tot["actual_net_modelled"], tot["model_net"],
+                 "+" if tot["delta"] >= 0 else "-",
+                 abs(tot["delta"])))
+        print("  stop-slippage BOUND pooled: %d closes, +$%.2f "
+              "upper bound (needs live quote-path replay to verify)"
+              % (tot["stop_bound_n"], tot["stop_bound_saving"]))
+        print("  rung overshoot pooled: $%.2f live captured above "
+              "the rungs"
+              % tot["rung_overshoot_usd"])
+    print("\nNOTE: the peak replay captures missed rung banks only. "
+          "It cannot show the stop-slippage saving (median stop "
+          "close banks 0.26x vs the 0.475x limit-model stop fill) "
+          "because closes keep only the last 10 quote-journal "
+          "entries — the full price path is not recoverable. "
+          "That saving is the separate BOUND above.")
+    print("READ THE DELTA WITH CARE: it is negative mostly because "
+          "the model credits banked legs at exactly the rung while "
+          "live poll exits routinely bank ABOVE it (price runs past "
+          "the rung between polls) — pooled rung overshoot is "
+          "$%.2f in this window, forfeited by the model by "
+          "construction. A real resting limit order fills at the "
+          "rung OR BETTER, so the exact-rung model understates "
+          "limit orders on winners. The fair comparison needs a "
+          "live LimitModel fed every exit eval (limit_exits.compare "
+          "on the quote path), not this peak replay."
+          % (tot["rung_overshoot_usd"] if len(rows) > 1
+             else (rows[0]["rung_overshoot_usd"] if rows else 0.0)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

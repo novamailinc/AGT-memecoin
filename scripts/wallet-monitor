@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Wallet Monitor: real-time tracking of graded smart-money wallets.
+
+Uses PumpPortal free WebSocket (wss://pumpportal.fun/api/data) with
+subscribeAccountTrade for all ACTIVE graded wallets.
+
+CRITICAL: ONE WS connection for ALL subscriptions. Multiple connections
+→ hourly ban (per PumpPortal docs).
+
+When a tracked wallet buys, we emit a SIGNAL (not an auto-buy):
+- The wallet's grade + the token's safety + our own entry logic decide.
+- This is SIGNAL INTELLIGENCE, never blind copy-trading.
+
+Paper-only. Telegram alerts. Killswitch gated.
+
+Usage: scripts/wallet-monitor [--once] [--wallets w1,w2,...]
+  --once: single poll cycle then exit (for cron)
+  (default: persistent WS loop with auto-reconnect)
+"""
+import asyncio
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.parse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+PUMPPORTAL_WS = "wss://pumpportal.fun/api/data"
+ALERT_DEDUP_S = 300  # don't re-alert same (wallet, mint) within 5 min
+
+_alerted = {}  # (wallet, mint) -> ts
+
+
+def send_telegram(text: str):
+    try:
+        token = open(os.path.join(HOME, "telegram", "bot_token")).read().strip()
+        data = urllib.parse.urlencode(
+            {"chat_id": "6883056760", "text": text,
+             "parse_mode": "Markdown", "disable_web_page_preview": True}
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        print(f"telegram failed: {e}", flush=True)
+
+
+def get_active_wallets() -> list:
+    """Get ACTIVE graded wallets for monitoring."""
+    try:
+        from wallet_grader import active_wallets
+        wallets = active_wallets()
+        if wallets:
+            return wallets
+    except Exception as e:
+        print(f"wallet_grader unavailable: {e}", flush=True)
+    # Fallback: smartmoney registry
+    try:
+        reg_file = os.path.join(HOME, "launch_scanner", "smart_wallets.json")
+        reg = json.load(open(reg_file))
+        return list(reg.keys())[:20]
+    except Exception:
+        return []
+
+
+def killswitch_ok() -> bool:
+    try:
+        import killswitch
+        return killswitch.gate("wallet_monitor")
+    except Exception:
+        return True  # fail-open if killswitch unavailable (monitor only)
+
+
+def should_alert(wallet: str, mint: str) -> bool:
+    key = (wallet, mint)
+    now = time.time()
+    if now - _alerted.get(key, 0) < ALERT_DEDUP_S:
+        return False
+    _alerted[key] = now
+    return True
+
+
+def handle_trade(msg: dict):
+    """Process a subscribeAccountTrade message."""
+    try:
+        tx_type = msg.get("txType", "")
+        if tx_type != "buy":
+            return  # we only signal on buys
+
+        wallet = msg.get("traderPublicKey", "")
+        mint = msg.get("mint", "")
+        symbol = msg.get("symbol", "?")
+        sol_amount = msg.get("solAmount", 0)
+        mcap = msg.get("marketCapSol", 0)
+
+        if not wallet or not mint:
+            return
+
+        # Record for pack detection
+        try:
+            import packdetect_v2
+            packdetect_v2.record_buy(wallet, mint)
+        except Exception:
+            pass
+
+        # Record for fresh sniffer (seen wallets)
+        try:
+            import fresh_sniffer
+            if fresh_sniffer.is_fresh(wallet):
+                fresh_sniffer.mark_seen(wallet)
+        except Exception:
+            pass
+
+        if not should_alert(wallet, mint):
+            return
+
+        # Get wallet grade for context
+        grade_info = ""
+        try:
+            from wallet_grader import load_grades
+            g = load_grades().get(wallet, {})
+            wr = g.get("win_rate", 0)
+            n = g.get("n_trades", 0)
+            grade_info = f"\nGrade: {wr:.0%} WR / {n} trades"
+        except Exception:
+            pass
+
+        text = (
+            f"🧠 SMART BUY (signal, not auto-buy)\n"
+            f"Wallet `{wallet[:8]}...` bought ${symbol}\n"
+            f"Size: {sol_amount:.2f} SOL | Mcap: {mcap:.1f} SOL"
+            f"{grade_info}\n"
+            f"Mint: `{mint}`\n"
+            f"_Signal intelligence — our logic decides entry._"
+        )
+        send_telegram(text)
+        print(f"SIGNAL: {wallet[:8]} bought {symbol} ({mint[:8]})", flush=True)
+
+    except Exception as e:
+        print(f"handle_trade error: {e}", flush=True)
+
+
+async def monitor_loop(wallets: list):
+    """Single WS connection, subscribe to all wallets."""
+    try:
+        import websockets
+    except ImportError:
+        print("websockets not installed; run: pip install websockets", flush=True)
+        # Fallback: poll mode
+        await poll_fallback(wallets)
+        return
+
+    while True:
+        if not killswitch_ok():
+            print("killswitch halted wallet_monitor, sleeping 60s", flush=True)
+            await asyncio.sleep(60)
+            continue
+
+        try:
+            async with websockets.connect(PUMPPORTAL_WS) as ws:
+                print(f"WS connected, subscribing to {len(wallets)} wallets", flush=True)
+                # Single message with all wallets (one connection!)
+                await ws.send(json.dumps({
+                    "method": "subscribeAccountTrade",
+                    "keys": wallets,
+                }))
+                # Confirm subscription
+                resp = await asyncio.wait_for(ws.recv(), timeout=10)
+                print(f"subscribed: {resp[:200]}", flush=True)
+
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        handle_trade(msg)
+                    except Exception as e:
+                        print(f"msg error: {e}", flush=True)
+
+        except Exception as e:
+            print(f"WS error: {e}, reconnecting in 10s", flush=True)
+            await asyncio.sleep(10)
+
+
+async def poll_fallback(wallets: list):
+    """Fallback: periodic Helius polling if websockets unavailable."""
+    print("Using Helius poll fallback", flush=True)
+    # This is a stub — the existing smartmoney.py poller handles this.
+    # The WS path is preferred.
+    print("Fallback: use scripts/smart-watcher for Helius polling", flush=True)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wallets", default="",
+                    help="comma-separated wallet list (overrides graded)")
+    ap.add_argument("--once", action="store_true",
+                    help="print wallet list and exit (for cron checks)")
+    args = ap.parse_args()
+
+    if args.wallets:
+        wallets = [w.strip() for w in args.wallets.split(",") if w.strip()]
+    else:
+        wallets = get_active_wallets()
+
+    if not wallets:
+        print("No wallets to monitor", flush=True)
+        return
+
+    # Banana Gun guidance: track 3-6 wallets max for active monitoring
+    # We allow up to 20 but warn
+    if len(wallets) > 20:
+        print(f"WARNING: {len(wallets)} wallets exceeds recommended 20",
+              flush=True)
+        wallets = wallets[:20]
+
+    print(f"Monitoring {len(wallets)} wallets", flush=True)
+
+    if args.once:
+        for w in wallets:
+            print(f"  {w}", flush=True)
+        return
+
+    asyncio.run(monitor_loop(wallets))
+
+
+if __name__ == "__main__":
+    main()

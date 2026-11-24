@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+# Runtime data (created by installer/daemons — never commit)
+*.db
+*.db-journal
+install-state.json
+secrets.env
+*.pid
+# Secret/key material (never commit, whatever the filename)
+keypair.json
+devnet/
+helius/
+telegram/
+live/
+*.pem
+*.key
+*.env
+# Node
+node_modules/
+# OS
+.DS_Store

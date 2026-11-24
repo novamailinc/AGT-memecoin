@@ -1,0 +1,79 @@
+#!/bin/bash
+# code-snapshot — rollback points for bot code (user directive 2026-10-21).
+#
+#   code-snapshot snapshot <label> <file...>   snapshot files (repo-relative
+#                                              or absolute under the repo)
+#   code-snapshot list                         list snapshots
+#   code-snapshot restore <snapshot-dir>       copy files back (a pre-restore
+#                                              snapshot of current state is
+#                                              taken first, automatically)
+#
+# Snapshots live OUTSIDE the repo at ~/workspace/Forex-agent/code-snapshots/
+# so a rollback never depends on the tree it restores. Each snapshot holds
+# the files at their repo-relative paths plus a MANIFEST with sha256 sums.
+set -u
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+STORE="$HOME/workspace/Forex-agent/code-snapshots"
+mkdir -p "$STORE"
+
+rel_of() {
+    # path -> repo-relative path
+    local p="$1"
+    case "$p" in
+        /*) p="${p#$REPO/}" ;;
+    esac
+    printf '%s' "$p"
+}
+
+do_snapshot() {
+    local label="$1"; shift
+    local stamp dir
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)-$label"
+    dir="$STORE/$stamp"
+    mkdir -p "$dir"
+    : > "$dir/MANIFEST"
+    local f rel
+    for f in "$@"; do
+        rel="$(rel_of "$f")"
+        if [ ! -f "$REPO/$rel" ]; then
+            echo "skip (not found): $rel" >&2
+            continue
+        fi
+        mkdir -p "$dir/$(dirname "$rel")"
+        cp -p "$REPO/$rel" "$dir/$rel"
+        (cd "$REPO" && sha256sum "$rel") >> "$dir/MANIFEST"
+    done
+    echo "$dir"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    snapshot)
+        shift; label="${1:-snap}"; shift
+        if [ "$#" -eq 0 ]; then echo "usage: code-snapshot snapshot <label> <file...>" >&2; exit 2; fi
+        do_snapshot "$label" "$@"
+        ;;
+    list)
+        ls -1 "$STORE"
+        ;;
+    restore)
+        src="${2:-}"
+        if [ -z "$src" ] || [ ! -d "$src" ]; then
+            echo "usage: code-snapshot restore <snapshot-dir>" >&2; exit 2
+        fi
+        # Safety: snapshot current state of the affected files first.
+        files="$(cd "$src" && find . -type f ! -name MANIFEST | sed 's|^\./||')"
+        pre="$(do_snapshot "pre-restore" $files)"
+        echo "pre-restore snapshot: $pre"
+        for rel in $files; do
+            mkdir -p "$REPO/$(dirname "$rel")"
+            cp -p "$src/$rel" "$REPO/$rel"
+            echo "restored: $rel"
+        done
+        (cd "$REPO" && sha256sum -c "$src/MANIFEST") && echo "restore verified (sha256 OK)"
+        ;;
+    *)
+        echo "usage: code-snapshot {snapshot <label> <file...>|list|restore <dir>}" >&2
+        exit 2
+        ;;
+esac

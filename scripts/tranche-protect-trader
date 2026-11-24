@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Tranche-protect test trader daemon (2026-10-30, user-ordered).
+
+Runs the TRANCHE lane (daemon/launch_scanner/tranche.py):
+grad_select's entries (four evidence filters, fail-closed) with
+5FG8SAT5-style exits: 25%@1.5x / 25%@3x / 50% trail 30% /
+-50% stop / 24h, plus one dip buyback per position (after >= 1
+tranche banked, on >= 30% retrace from peak, price >= entry,
+proceeds cover cost, age < 24h: rebuy 25% of original tokens
+at honest fill, funded from banked proceeds, riding remaining
+legs). NO safety gate, NO veto — same as grad_select.
+
+Detection: live PumpPortal migration WebSocket + GeckoTerminal
+newest-pools backfill every ~60s over a 30-minute window,
+FIRE-FIRST migration-tx payload pricing (grad_raw's machinery).
+Exits are evaluated in this same loop (~5s cycle) and by the
+armed watcher on push prices; buybacks are checked every 60s.
+
+Pre-registered verdict: at 100 closes OR 7 days after lane
+creation, whichever comes first, expectancy <= 0 halts the
+lane permanently (killswitch lane "tranche_protect", human-only
+re-enable); zero closes at the deadline also halts. Reported
+raw + ex-top-1 + same-window head-to-head vs grad_select
+(same entries, different exits).
+
+Paper only. NO Telegram cards in v1 (ledger + verdict chain
+only). Nothing here touches real money, keys, or the user's
+lanes. Free-only: PumpPortal stream + GeckoTerminal +
+DexScreener + Helius RPC.
+"""
+import logging
+import os
+import sys as _sys
+import threading
+import time
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("tranche-protect-trader")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_sys.path.insert(0, os.path.join(_HERE, "..", "daemon", "launch_scanner"))
+_sys.path.insert(0, os.path.join(_HERE, ".."))
+try:
+    import tranche_protect as _tr
+    import grad_select as _sel
+    import pumpportal as _pp
+    import killswitch as _ks_check
+    import armed_watch as _aw
+    import dossiers as _dossiers
+    import rt_sync as _rt
+    import heartbeat as _hb
+    _HAS_DEPS = True
+except ImportError as e:
+    _HAS_DEPS = False
+    _IMPORT_ERROR = e
+
+# P4 event recorder: fail-soft — a missing recorder never stops
+# the lane.
+try:
+    import recorder as _recorder
+except Exception:
+    try:
+        from daemon.launch_scanner import recorder as _recorder
+    except Exception:
+        _recorder = None
+
+POLL_SECS = 5
+GT_BACKFILL_EVERY_S = 60
+GT_BACKFILL_PAGES = 5
+
+
+def _heartbeat_loop():
+    """Emit the tranche-protect-trader heartbeat on an independent
+    2-second thread (filter evaluation can block the trading loop
+    on RPC round-trips; the cadence proof must not depend on it)."""
+    while True:
+        try:
+            _hb.beat("tranche-protect-trader")
+        except Exception:
+            pass
+        time.sleep(_hb.BEAT_INTERVAL_S)
+
+
+def main():
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+    from daemon.common import guard_singleton
+    guard_singleton("tranche-protect-trader", token="scripts/tranche-protect-trader")
+    if not _HAS_DEPS:
+        logger.warning("tranche deps missing: %s", _IMPORT_ERROR)
+        return 1
+    engine = _tr.make_engine()
+    state = engine.ensure_ledger()
+    # Materialize the killswitch lane entry (not halted) so the
+    # lane is visible in killswitch status from day one.
+    try:
+        _ks_check.check_lane(_tr.LANE)
+    except Exception:
+        pass
+    # Trial registry + verdict-ledger seed checkpoint (fail-soft,
+    # idempotent).
+    try:
+        _tr.register_trial()
+        _tr.seed_checkpoint(engine)
+    except Exception:
+        pass
+    threading.Thread(target=_heartbeat_loop, name="tranche-heartbeat",
+                     daemon=True).start()
+    feed = _pp.PumpPortalFeed()
+    feed.start()
+
+    # Armed positions (peak >= 1.5x) are priced by PUSH, exactly
+    # as in the grad-select daemon; the loop's poll is the backstop.
+    def _armed_price_fn(chain, mint, spot_index=None):
+        wp = watcher.price(mint)
+        if wp > 0:
+            return wp
+        return engine.quote_price(chain, mint, spot_index)
+
+    def _on_armed_price(mint, px, ts):
+        try:
+            engine.poll_exits(_armed_price_fn)
+        except Exception:
+            pass
+
+    def _on_watch_state(state, info):
+        logger.warning("tranche armed watch: %s %s", state, info)
+        if state == "RECONCILED":
+            for mv in (info or {}).get("moved") or []:
+                rec = dict(mv)
+                rec["ts"] = time.time()
+                rec["source"] = "tranche-armed-watch"
+                _rt.journal_reconciliation(rec)
+
+    watcher = _aw.ArmedWatcher(on_price=_on_armed_price,
+                               on_state=_on_watch_state)
+    watcher.start()
+
+    # FASTER EXITS (2026-11-20, item 1b): dedicated exit-poll thread.
+    # The main loop below still polls (backstop); this thread polls
+    # every ~10s while any position is <15 min old, so a slow scan
+    # can no longer delay exits. Latency-only: the same poll_exits
+    # with the same price_fn — same decisions, same pricing, inside
+    # the pacer. Fail-soft: a missing helper leaves the previous
+    # cadence byte-identical.
+    try:
+        import exit_cadence as _ec
+    except Exception:
+        _ec = None
+    if _ec is not None:
+        _exit_poller = _ec.ExitPoller(
+            poll_fn=lambda: engine.poll_exits(_armed_price_fn),
+            positions_fn=engine.open_positions,
+            on_error=lambda e: logger.warning(
+                "tranche-protect exit poller: %s", e))
+        _exit_poller.start()
+
+    def _observe(items):
+        # P8: births open dossiers; migrations stamp them.
+        _dossiers.observe_births(items)
+        _dossiers.observe_migrations(items)
+        # Shared recorder index: fold births/migrations in at once
+        # (the recorder files catch up behind it).
+        _sel.note_items(items)
+        # P4: record births + migrations for offline replay.
+        if _recorder is not None:
+            for item in items or []:
+                try:
+                    src = (item or {}).get("source")
+                    if src == "pumpportal-new":
+                        kind = "birth"
+                    elif src == "pumpportal-migration":
+                        kind = "migration"
+                    else:
+                        continue
+                    body = dict(item)
+                    body.setdefault("lane", _tr.LANE)
+                    _recorder.record(kind, body)
+                except Exception:
+                    continue
+
+    # FIRE-FIRST entry thread: wake on stream arrival and run a
+    # fresh-only scan (filters evaluated inline for this cycle's
+    # candidates, then payload-priced entries). Watchlist retries
+    # and the GT backfill stay in the main loop.
+    def _entry_loop():
+        while True:
+            try:
+                q = getattr(feed, "_q", None)
+                if q is not None and not q.empty():
+                    _tr.scan_once(engine, feed=feed, gt_rows=None,
+                                  on_items=_observe, fresh_only=True)
+                else:
+                    time.sleep(0.1)
+            except Exception:
+                logger.exception("tranche entry loop failed")
+                time.sleep(1.0)
+
+    threading.Thread(target=_entry_loop, name="tranche-entry",
+                     daemon=True).start()
+
+    logger.warning("tranche-protect-trader started (paper only, NO safety "
+                   "gate, evidence filters ON, tranche exits, "
+                   "bankroll $%.2f, state %s, verdict sample %d "
+                   "closes or 7 days)",
+                   float(state.get("bankroll") or 0), state.get("state"),
+                   _tr.VERDICT_SAMPLE_CLOSES)
+    last_gt = 0.0
+    while True:
+        try:
+            gt_rows = None
+            now = time.time()
+            if now - last_gt >= GT_BACKFILL_EVERY_S:
+                last_gt = now
+                gt_rows = engine.fetch_candidates(GT_BACKFILL_PAGES)
+            res = _tr.scan_once(engine, feed=feed, gt_rows=gt_rows,
+                                on_items=_observe)
+            # Time-only exit FIRST: the 24h stop fires on the last
+            # known price with no price read at all, so it works
+            # even when every pricing source is down.
+            closes = engine.poll_time_exits() + engine.poll_exits(_armed_price_fn)
+            try:
+                buys = _tr.maybe_buyback(engine)
+            except Exception:
+                logger.exception("tranche buyback failed")
+                buys = []
+            watcher.set_positions(
+                _aw.armed_positions(engine.open_positions()))
+            _tr.maybe_verdict_report(engine)
+            if res.get("opened") or closes or \
+                    res.get("tranche_rejected") or buys:
+                st = engine.account_state()
+                logger.warning(
+                    "tranche-protect-trader: %d stream, %d opened, %d "
+                    "filter-rejected %s; %d closes; %d buybacks; "
+                    "cash $%.2f, %d open, state %s",
+                    res.get("stream", 0), res.get("opened", 0),
+                    res.get("tranche_rejected", 0),
+                    res.get("tranche_reasons") or {},
+                    len(closes), len(buys), st.get("bankroll", 0.0),
+                    st.get("n_open", 0), st.get("state"))
+        except Exception:
+            logger.exception("tranche-protect-trader loop failed")
+        time.sleep(POLL_SECS)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

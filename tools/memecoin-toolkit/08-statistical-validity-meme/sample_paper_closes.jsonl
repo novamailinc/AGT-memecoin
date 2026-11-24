@@ -1,0 +1,6 @@
+{"mint": "8vdJA3MYhUhirZZzjZ5i8jXhNkHgrCnirCrqDG23pump", "symbol": "MANIFEST", "source": "", "leg": null, "realized_mult": 1.838, "peak_mult": 2.6971, "rug": false, "exit_reason": "trail_stop", "outcome_kind": "paper"}
+{"mint": "Nr8nxhyniXk4hgwKAyKmdVvh1VRfJWTDokQtGw7pump", "symbol": "GRAILS", "source": "", "leg": null, "realized_mult": 3.027, "peak_mult": 3.027, "rug": false, "exit_reason": "take_profit", "outcome_kind": "paper"}
+{"mint": "62BYSfbsTiG1zd7vBcY1ubpiZGvPAbTuvSpwg4WYkdei", "symbol": "SPONGIEZ", "source": "", "leg": null, "realized_mult": 0.1493, "peak_mult": 2.1229, "rug": false, "exit_reason": "stop_loss", "outcome_kind": "paper"}
+{"mint": "GpTtQsyKpukVSpAHL4NhKzF88rkLrRHKMnaiwjuLpump", "symbol": "DIHVIDENDS", "source": "", "leg": null, "realized_mult": 0.024, "peak_mult": 1.2355, "rug": true, "exit_reason": "stop_loss", "outcome_kind": "paper"}
+{"mint": "DvchhPfxne9ph26iyx3CW9L7jrNefv2eFzbNtraEpump", "symbol": "THICC", "source": "", "leg": null, "realized_mult": 0.6525, "peak_mult": 1.2298, "rug": false, "exit_reason": "stop_loss", "outcome_kind": "paper"}
+{"mint": "Do4VN39zVA66MFEKUTfE2TDjAMuZ4yNHmyJHWwYhVvi9", "symbol": "CREAM", "source": "", "leg": null, "realized_mult": 1.0716, "peak_mult": 1.5734, "rug": false, "exit_reason": "trail_stop", "outcome_kind": "paper"}

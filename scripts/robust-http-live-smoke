@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Opt-in PUBLIC endpoint diagnostic, excluded from default tests.
+Makes GeckoTerminal and DexScreener requests. No credentials required.
+Run only with explicit network-test authority. Never a performance test.
+"""
+import argparse
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'daemon', 'launch_scanner'))
+import robust_http
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--allow-public-network', action='store_true', required=True)
+    parser.parse_args()
+    urls = (
+        'https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1',
+        'https://api.dexscreener.com/latest/dex/pairs/solana/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB5',
+    )
+    for url in urls:
+        result = robust_http.get_json(url, tries=1, timeout=5)
+        print(url.split('/')[2], 'JSON object' if isinstance(result, dict) else 'unexpected shape')

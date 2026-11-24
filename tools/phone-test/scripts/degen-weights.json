@@ -1,0 +1,28 @@
+{
+  "_note": "ANTI-RUG fix 2026-10-11 23:01 WAT \u2014 5/5 recent alerts rugged, all were $12-25k FDV with fake 5m spikes",
+  "_updated": "2026-10-25T02:21:12.747325Z",
+  "weights": {
+    "freshness": 1.0,
+    "buy_pressure": 1.0,
+    "buyer_count": 1.0,
+    "momentum": 1.0,
+    "fdv_zone": 1.0,
+    "smart_money_bonus": 25.0
+  },
+  "thresholds": {
+    "min_score": 60,
+    "min_fdv": 20000.0,
+    "max_fdv": 600000.0,
+    "min_reserve": 8000.0,
+    "min_buyers_m5": 8,
+    "min_buy_sell_ratio": 1.5,
+    "max_age_minutes": 10
+  },
+  "_bounds": {
+    "weight_min": 0.5,
+    "weight_max": 2.0,
+    "min_score_floor": 40,
+    "min_score_ceiling": 60
+  },
+  "_repair_20261025": "Weights restored to neutral 1.0: Oct 23 + Oct 25 auto-tunes were computed with ZERO genuine winner score components (tracker-only components dicts counted as features); see degen-learner fix."
+}

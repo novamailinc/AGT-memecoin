@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Nadir-v0 Phase 2: replay signal engine on historical candles.
+Bar-by-bar, no look-ahead. Feeds signals into paper ledger.
+
+Usage: python3 nadir-phase2-replay
+Reads: ~/.forex-agent/nadir_phase1/phase2_<SYM>.json
+"""
+import json, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "daemon", "launch_scanner"))
+from nadir_signal import evaluate_signal
+from nadir_paper import Ledger
+from nadir_report import daily_snapshot
+
+HOME = os.environ.get("FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+PHASE1 = os.path.join(HOME, "nadir_phase1")
+
+# Nadir-v0 universe gates (from blueprint)
+UNIVERSE = {
+    "mcap_min": 100_000, "mcap_max": 10_000_000,
+    "liq_min": 25_000, "vol24h_min": 10_000, "trades24h_min": 100,
+}
+
+def load_candles(sym):
+    path = os.path.join(PHASE1, f"phase2_{sym}.json")
+    d = json.load(open(path))
+    return d["candles"], d.get("pool", "")
+
+def replay(sym, mint):
+    candles, pool = load_candles(sym)
+    print(f"=== Phase 2 replay: {sym} ({len(candles)} candles) ===")
+    ledger = Ledger()
+    signals = 0
+    # Need 720 candles of history before first evaluation (30d lookback)
+    for i in range(720, len(candles)):
+        window = candles[i-720:i]  # strictly past data only
+        now = candles[i]
+        ts = now["ts"]
+        # Convert to Candle tuples: (ts, o, h, l, c, v)
+        c_tuples = [(c["ts"], c["o"], c["h"], c["l"], c["c"], c["v"])
+                    for c in window]
+        curr = now["c"]
+        sig = evaluate_signal(
+            mint=mint,
+            symbol=sym,
+            candles=c_tuples,
+            mcap=5_000_000,
+            liquidity=1_000_000,
+            vol_24h=500_000,
+            trades_24h=500,
+            buys_24h=300,
+            sells_24h=200,
+            median_vol_14d=400_000,
+            pool_age_days=365,
+            safety_ok=True,
+            safety_reason="",
+        )
+        if sig.get("signal"):
+            signals += 1
+            pos = ledger.enter(mint, sym, ts, curr)
+            if pos:
+                dd = sig["details"].get("drawdown_pct", 0)
+                print(f"  SIGNAL @ candle {i}: price=${curr:.6f} dd={dd:.1f}%")
+        # Update open positions with current price
+        ledger.on_price(mint, ts, curr)
+    # Close any remaining at end
+    if candles:
+        last = candles[-1]
+        for p in ledger.positions:
+            if p.exit_ts is None:
+                ledger._close(p, last["ts"], last["c"], "replay_end")
+    snap = daily_snapshot(ledger, f"phase2-{sym}")
+    print(f"\n--- {sym} Phase 2 results ---")
+    print(f"  signals fired: {signals}")
+    print(f"  closed positions: {snap['closed']}")
+    print(f"  net P&L: {snap['net_pnl_sol']:.6f} SOL")
+    print(f"  expectancy/trade: {snap['expectancy_per_trade']:.6f} SOL")
+    print(f"  win rate: {snap['win_rate']:.1%}")
+    print(f"  exits: {snap['exits']}")
+    return snap
+
+if __name__ == "__main__":
+    # ORCA mint
+    ORCA_MINT = "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo"
+    results = {}
+    for sym, mint in [("ORCA", ORCA_MINT)]:
+        try:
+            results[sym] = replay(sym, mint)
+        except FileNotFoundError:
+            print(f"{sym}: no candle file, skipping")
+        except Exception as e:
+            print(f"{sym}: replay FAIL {e}")
+            import traceback; traceback.print_exc()
+    # Save
+    out = os.path.join(PHASE1, "phase2_results.json")
+    json.dump(results, open(out, "w"), indent=1, default=str)
+    print(f"\nresults saved to {out}")

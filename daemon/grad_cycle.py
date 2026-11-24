@@ -578,6 +578,17 @@ def load_engine(lane):
     return importlib.import_module("daemon.launch_scanner." + _ENGINES[lane]).make_engine()
 
 
+FEED_SPOOL_ENV = "AGT_GRAD_FEED_SPOOL"   # path of the graduation spool (daemon/grad_feed_spool.py); unset = NO feed, entries stay inert
+
+
+def _spool_feed(lane):
+    path = os.environ.get(FEED_SPOOL_ENV)
+    if not path:
+        return None
+    from daemon import grad_feed_spool  # noqa: PLC0415
+    return grad_feed_spool.SpoolFeed(path, path + ".cursor-" + lane + ".json")
+
+
 def main_entry(argv=None):
     if not enabled():
         logger.warning("grad_cycle disabled (%s != 1): exiting without doing anything", ENV_FLAG)
@@ -593,7 +604,7 @@ def main_entry(argv=None):
         except Exception as e:
             logger.error("grad_cycle: lane %s engine failed to load (%r): refusing to start", lane, e)
             return 2
-        engines.append((lane, eng, make_select_scan_fn(eng) if lane == "grad_select" else None))
+        engines.append((lane, eng, make_select_scan_fn(eng, feed=_spool_feed(lane)) if lane == "grad_select" else None))
     # Exits use each lane's own default read-only price route (price_fn None, price_route="lane_default"). Each engine has its OWN ledger, so
     # faults, journals and clear records are per lane. No graduation feed is opened here (needs a reviewed adapter): entries stay inert.
     d = GradCycleDaemon(price_route="lane_default")

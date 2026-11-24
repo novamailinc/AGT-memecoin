@@ -96,7 +96,7 @@ def _executor(tmp_home, provider, rpc, **kw):
 
 
 def main():
-    import tests._guard_fixture as _GF; _GF.admit_registry_for_fixture()  # disclosed fixture: registry admission for armed-path tests
+    import tests._guard_fixture as _GF; _GF.admit_registry_for_fixture(); _GF.stub_owner_admission()  # disclosed fixtures: registry label + owner-admission step replaced for armed-path tests with fake RPC/Jupiter (no authorization artifact exists; stub is process-scoped for this script)
     kp = _make_keypair()
     secret = json.dumps(list(bytes(kp.to_bytes())))
     provider = _StaticProvider(secret)

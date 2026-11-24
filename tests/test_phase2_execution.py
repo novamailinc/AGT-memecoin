@@ -615,6 +615,12 @@ class TestExecutorBundle(unittest.TestCase):
         self.ata = associated_token_address(self.pubkey, self.tok)
         self.tmp = tempfile.TemporaryDirectory()
         self.stake_1sol = 1_000_000_000
+        # DISCLOSED fixture (2026-11-24): arming/sending now requires a registry label AND owner admission; neither exists for these
+        # fake-RPC/Jupiter armed-path tests, so the label goes to a throwaway home and ONLY the owner-admission step is replaced (scoped, restored).
+        import tests._guard_fixture as _GF
+        _GF.admit_registry_for_fixture()
+        _p = _GF.stub_owner_admission()
+        self.addCleanup(_p.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

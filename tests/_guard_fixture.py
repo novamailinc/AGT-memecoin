@@ -164,12 +164,17 @@ def admit_registry_for_fixture(state="MAINNET_CANARY"):
     Registry(home)._write({"v": 1, "state": state,
                            "binding": {"strategy_version": "fx", "config_hash": "fx", "data_period": "fx"},
                            "evidence": {}, "audit": []})
-    # DISCLOSED (2026-11-24): owner admission (core.qualification_admission) now also gates arming/sending;
-    # no authorization artifact exists, so armed-path tests with fake RPC/Jupiter replace ONLY that
-    # owner-admission step for this process. Registry-label and marker checks stay real.
-    from broker.memecoin.execution import mainnet_executor as _M
-    _M.MainnetExecutor._require_owner_admission = lambda self, st: None
     return home
+
+
+def stub_owner_admission():
+    """TEST FIXTURE ONLY: replaces the owner-admission step for the calling test. Returns a started
+    mock.patch; the caller MUST register p.stop. Registry-label and marker checks stay real."""
+    from unittest import mock
+    from broker.memecoin.execution import mainnet_executor as _M
+    p = mock.patch.object(_M.MainnetExecutor, '_require_owner_admission', lambda self, st: None)
+    p.start()
+    return p
 
 
 def stamped_quote(mod, fn):

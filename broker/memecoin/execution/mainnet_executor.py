@@ -70,6 +70,7 @@ from broker.memecoin.execution.jito import DEFAULT_TIP_LAMPORTS
 from broker.memecoin.execution.jupiter import JupiterClient
 from broker.memecoin.wallet import WalletKeyProvider
 from daemon import solana_ids as _solana_ids
+from core.qualification_admission import admit as _admit
 
 logger = logging.getLogger("broker.memecoin.execution.mainnet_executor")
 
@@ -106,8 +107,7 @@ def associated_token_address(wallet_pubkey: str, mint: str) -> str:
 def deployment_marker_path(live_home: Optional[str] = None) -> str:
     """Path of the deployment marker. Created by the user on his own
     deployment machine; its absence means 'not a deployment machine'."""
-    home = live_home or os.environ.get(
-        "FOREX_AGENT_HOME", "/home/hatch/.forex-agent")
+    home = live_home or (os.environ.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent"))
     return os.path.join(home, "live", "deployment.json")
 
 
@@ -154,7 +154,8 @@ class MainnetExecutor:
                  dry_run: bool = True,
                  sol_price_fn=None,
                  fee_policy=None,
-                 jito=None):
+                 jito=None,
+                 admission_provider=None):
         # Construction is always dry-run. Only arm_live() may enable
         # sends after checking the exact deployment-marker arming flag.
         # Do not coerce false/truthy configuration into a sending mode.
@@ -192,6 +193,9 @@ class MainnetExecutor:
         self._sol_price_fn = sol_price_fn
         self._fee_policy = fee_policy
         self._jito = jito
+        # Owner-admission inputs source (callable -> dict of report_text/running/policy/authorization/
+        # authenticate/emergency_stop_ok). None = no authorization exists = arming and sending refuse.
+        self._admission_provider = admission_provider
         self._wallet_pubkey: Optional[str] = None
         self._sol_price_cache: Dict[str, Any] = {"ts": 0.0, "price": None}
         self._decimals_cache: Dict[str, int] = {}
@@ -209,15 +213,68 @@ class MainnetExecutor:
         """Fail unless this machine carries a deployment marker."""
         return read_deployment_marker(self._live_home)
 
+    _ADMITTED_STATES = ("MAINNET_CANARY", "MAINNET_RESTRICTED", "MAINNET_EXPANDED")
+
+    def _require_admission(self) -> None:
+        """Fail closed unless the qualification registry is readable and in a mainnet-admitted
+        state. Consulted at arming AND again on every live send, so a pause/revocation after
+        arming blocks sends. The marker alone never admits. No approval mechanism is created
+        here: the offline registry cannot enter these states, so by default nothing arms."""
+        try:
+            from core.qualification import Registry
+            st = Registry().status()
+        except Exception as exc:
+            raise BrokerError(CONFIG_INVALID,
+                              "qualification registry unavailable (%s): live stays off"
+                              % type(exc).__name__)
+        if st.get("availability") != "ok" or st.get("state") not in self._ADMITTED_STATES:
+            raise BrokerError(CONFIG_INVALID,
+                              "qualification registry does not admit live execution "
+                              "(availability=%s state=%s): live stays off"
+                              % (st.get("availability"), st.get("state")))
+        self._require_owner_admission(st)
+
+    def _require_owner_admission(self, registry_status) -> None:
+        """The registry LABEL is a locally editable file and never admits by itself. Live also needs the
+        pure verifier core.qualification_admission.admit() to answer allow is True for caller-provided,
+        authenticated inputs (evaluator report bound by digest + owner authorization). No provider, a
+        provider that raises or returns a non-dict, or any answer other than allow is True refuses."""
+        prov = self._admission_provider
+        if not callable(prov):
+            raise BrokerError(CONFIG_INVALID,
+                              "no owner admission provider (no authorization artifact): live stays off")
+        try:
+            inputs = prov()
+            if not isinstance(inputs, dict):
+                raise TypeError("admission inputs not a dict")
+            res = _admit(registry_status=registry_status, now=time.time(), **inputs)
+        except Exception as exc:
+            raise BrokerError(CONFIG_INVALID,
+                              "owner admission unavailable (%s): live stays off" % type(exc).__name__)
+        if not isinstance(res, dict) or res.get("allow") is not True:
+            raise BrokerError(CONFIG_INVALID,
+                              "owner admission refused: %s" % (
+                                  list(res.get("reasons") or [])[:6] if isinstance(res, dict) else "bad result"))
+
+    def _require_live_send_admission(self) -> None:
+        """Registry + owner admission and the marker's armed flag, re-checked. Called at the top of
+        execute_swap AND immediately before the network send, so an expiry or revocation that lands
+        during quote/simulate/sign still blocks the send. Fail closed; never raises anything but BrokerError."""
+        self._require_admission()
+        if self.require_deployment().get("armed") is not True:
+            raise BrokerError(CONFIG_INVALID,
+                              "deployment marker no longer carries \"armed\": true: send refused")
+
     def arm_live(self) -> None:
         """Arm live sends. Requires the deployment marker to carry
-        "armed": true. Deliberate, logged, reversible with disarm()."""
+        "armed": true AND registry admission. Deliberate, logged, reversible with disarm()."""
         marker = self.require_deployment()
         if marker.get("armed") is not True:
             raise BrokerError(
                 CONFIG_INVALID,
                 "deployment marker does not carry \"armed\": true — "
                 "live sends stay off (dry-run)")
+        self._require_admission()
         self._dry_run = False
         logger.warning("mainnet executor ARMED on machine %r",
                        str(marker.get("machine")))
@@ -365,6 +422,8 @@ class MainnetExecutor:
         confirm_timeout. With use_bundle=False (the default) the
         existing path runs exactly as before.
         """
+        if not self._dry_run:
+            self._require_live_send_admission()  # revocation after arming blocks the send path
         self._require_connected()
         self.require_deployment()
         bundle_mode = bool(use_bundle)
@@ -608,6 +667,8 @@ class MainnetExecutor:
             return result
 
         # -- send + confirm ----------------------------------------------
+        if not self._dry_run:
+            self._require_live_send_admission()  # last check before the network send
         bundle_id = None
         if bundle_mode:
             sent_bundle = self._jito.send_bundle([b64, tip_b64], tip)

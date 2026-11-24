@@ -188,6 +188,9 @@ def _executor(tmp_home, kp, provider, rpc, jupiter, **kw):
 
 
 def main():
+    # DISCLOSED fixture (2026-11-24): live arming/sending now requires a registry label AND owner admission; neither exists for these
+    # fake-RPC/Jupiter armed-path tests, so the registry label is written to a throwaway home and ONLY the owner-admission step is replaced.
+    import tests._guard_fixture as _GF; _GF.admit_registry_for_fixture(); _GF.stub_owner_admission()
     from solders.keypair import Keypair
     kp = Keypair()
     secret = json.dumps(list(bytes(kp.to_bytes())))

@@ -14,7 +14,9 @@ R4  (flag on, kill A, concurrency): a same-candidate retry process and a poll_ex
     entries_day count 1, record directory empty, AT MOST ONE class-B adoption across both children (captured from the recover_pass return value; zero if the retry's own op replay committed first), retry result in {opened, already open (race)} consistent with who adopted (reported, INFO).
 R5  (flag on, frozen recovery, known exits continue): a legitimate position is open; a corrupt record file is planted in the entry-intent directory (an UNREADABLE record is the freeze condition); poll_exits at 3x still performs the 2 exit credits (as the S1/TP2/TP3 baselines), while a new-mint entry is refused with a reason naming the record and fail-closed,
     no new debit, and the corrupt file is byte-identical afterward.
-R6  (flag-off comparison): the same entry with flag "0" and flag "1" in two homes: lane position, account debit and cash fields are EQUAL; the flag-off home has NO entry-intents directory; the flag-on home's directory exists and is empty. R6b: flag "0" + kill A + poll_exits:
+R6  (flag-off comparison): the same entry with flag "0" and flag "1" in two homes: lane position, account debit and cash fields are EQUAL; the flag-off home has NO entry-intents directory; the flag-on home's directory exists and is empty. R7  (flag on, populated same-day counter): first entry opens normally (counter {today,1}); a SECOND entry (mint 2) is killed after its debit (seam A); a fresh poll recovery ADOPTS it: lane holds both positions, mint-2 pa_pos_id == killed, debits 2, cash 8.0, counter == {today, 2}. (HYPOTHESIS: the second entry passes the marks gate with one existing lane position, as P2/S1 observed for second entries.)
+R8  same setup, recovery process patched to a LATER day while the stored counter day still equals the original entry day: counter == {original day, 2}; the entry is charged to its own day, not the later one.
+R6b: flag "0" + kill A + poll_exits:
     the orphan is NOT recovered (lane 0, account open 1), i.e. flag-off behavior is the unchanged baseline.
 CLAIM LIMITS: one machine, SIGKILL not power loss; fixture stubs; R1 hypothesis (second mint opened) is from the marks-gate source read and is reported with its result either way; R4 is one interleaving class, not a race proof;
 not covered: other openers, status/account visibility of orphan states, non-demo mode, ledger-corruption variants."""
@@ -51,7 +53,8 @@ class _Seam(set):
         token("SEAM_REACHED", pa_pos_id=str(x), intents=intents_map(), accts=acct(), rec_files=rec_files())
         os.kill(os.getpid(), signal.SIGKILL)
 GR._INFLIGHT_OPEN = _Seam()
-r = GR.consider_candidate(mkcand(1), time.time()); token("SURVIVED", r=str(r)); os._exit(99)
+n = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+r = GR.consider_candidate(mkcand(n), time.time()); token("SURVIVED", r=str(r)); os._exit(99)
 '''
 KB = PRE + r'''
 def _kill_before_debit(*a, **k):
@@ -89,8 +92,8 @@ r = GR.consider_candidate(mkcand(1), time.time())
 print(json.dumps({"name": name, "ok": bool(r[0]), "why": str(r[1]), "after": full()}, default=str))
 '''
 def go(h): fh = open(os.path.join(h, "ctl", "GO"), "w"); fh.write("1"); fh.flush(); os.fsync(fh.fileno()); fh.close()
-def kill_phase(h, code, flag, label):
-    pk = B.spawn(code, h, "k" + label, flag)
+def kill_phase(h, code, flag, label, n=None):
+    pk = B.spawn(code, h, "k" + label, flag, *([] if n is None else [n]))
     try: pk.wait(timeout=min(30, max(1.0, B.left())))
     except Exception: raise B.Stop("kill child did not exit")
     t = B.tok(h, "k" + label, "SEAM_REACHED", 1.0)
@@ -128,6 +131,21 @@ def r3():
     p, r = run(h, POLL, "p1", "1", "now", 1.0); b, a = r["before"], r["after"]
     check("R3 class A ran %s: record unlinked, same single lane position, one debit, bankroll decremented ONCE, entries_day unchanged from before recovery (%s)" % ([x[2] for x in r["acts"]], a["entries_day"]),
           [x[2] for x in r["acts"]] == ["A"] and a["rec_files"] == [] and a["lane"] == b["lane"] and len(debits(a["j"])) == 1 and a["bankroll"] == b["bankroll"] and a["entries_day"] == b["entries_day"] and a["entries_day"]["count"] == 1)
+def r7(future=False):
+    lab = "R8" if future else "R7"; h = B.newhome(); p0, r0 = run(h, OPEN1, "o1", "1")
+    check("%s setup: first entry opened normally, counter populated %s" % (lab, r0["after"]["entries_day"]), p0.returncode == 0 and r0["ok"] is True and r0["after"]["entries_day"].get("count") == 1)
+    t = kill_phase(h, KA, "1", lab, 2); pid = t["pa_pos_id"]
+    p, r = run(h, POLL, "p1", "1", "future" if future else "now", 1.0); b, a = r["before"], r["after"]
+    check("%s pre-recovery: record present, lane holds ONLY the first mint %s, account open %d, counter still %s" % (lab, sorted(b["lane"]["positions"]), len(b["acct"]), b["entries_day"]), len(b["rec_files"] or []) == 1 and sorted(b["lane"]["positions"]) == ["GradMint1pump"] and len(b["acct"]) == 2 and b["entries_day"].get("count") == 1)
+    lp = a["lane"]["positions"]; st = debits(a["j"])
+    check("%s ADOPTED second position: classes %s, lane mints %s, GradMint2pump pa_pos_id == killed %s, tokens == account qty for BOTH, record dir empty" % (lab, [x[2] for x in r["acts"]], sorted(lp), pid),
+          p.returncode == 0 and [x[2] for x in r["acts"]] == ["B"] and sorted(lp) == ["GradMint1pump", "GradMint2pump"] and lp["GradMint2pump"]["pa_pos_id"] == pid and len(a["acct"]) == 2 and a["rec_files"] == []
+          and all(abs(float(x["qty"]) - float(lp[x["mint"]]["tokens"])) < 1e-9 for x in a["acct"]))
+    check("%s two debits %s, cash %s == 10 - sum, bankroll %s == start %s - sum" % (lab, st, a["j"]["cash"], a["bankroll"], a["bankroll_start"]),
+          len(st) == 2 and abs(float(a["j"]["cash"]) - (10.0 - sum(st))) < 1e-5 and abs(float(a["bankroll"]) - (float(a["bankroll_start"]) - sum(st))) < 1e-5)
+    exp_date = b["entries_day"].get("date")
+    check("%s daily counter %s == {date %s, count 2}%s" % (lab, a["entries_day"], exp_date, " (recovery process pretends a LATER day, stored counter day == the original entry day: still charged to that day)" if future else " (same day)"),
+          a["entries_day"] == {"date": exp_date, "count": 2} and (future or exp_date == time.strftime("%Y-%m-%d", time.gmtime())))
 def r4():
     h = B.newhome(); t = kill_phase(h, KA, "1", "R4"); pid = t["pa_pos_id"]
     pe = B.spawn(ENTER, h, "e1", "1", 1, "barrier"); pp = B.spawn(POLLB, h, "p1", "1", "now", 1.0)
@@ -161,7 +179,7 @@ def r6():
     check("R6b flag off + kill A + poll_exits: orphan NOT recovered (lane %s, account open %d, no dir %s): baseline behavior unchanged" % (a["lane"]["positions"], len(a["acct"]), a["rec_files"]), a["lane"]["positions"] == {} and len(a["acct"]) == 1 and a["rec_files"] is None)
 def main():
     try:
-        for n, f in (("R1", r1), ("R1x", lambda: r1(True)), ("R2", r2), ("R3", r3), ("R4", r4), ("R5", r5), ("R6", r6)): B.scen(n, f)
+        for n, f in (("R1", r1), ("R1x", lambda: r1(True)), ("R2", r2), ("R3", r3), ("R4", r4), ("R5", r5), ("R6", r6), ("R7", r7), ("R8", lambda: r7(True))): B.scen(n, f)
     finally: B.reap_all()
     alive = [p.pid for p in B.KIDS if p.poll() is None]
     check("all children reaped (still alive: %s), total %d children spawned" % (alive, len(B.KIDS)), not alive)

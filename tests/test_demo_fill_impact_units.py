@@ -34,13 +34,14 @@ def main():
     jp = os.path.join(d, "j.json")
     f = filler("0.02", jp); r = f.buy("op-eq", MINT, 1.0, 2.0)
     check("boundary: ratio 0.02 (2.0%) at cap 2.0 fills (strict >)", r.get("status") == "filled", r.get("status"))
-    check("fill record: price_impact_pct is true percent (2.0)", abs(r["price_impact_pct"] - 2.0) < 1e-9, r.get("price_impact_pct"))
-    check("fill record: raw quote value kept verbatim", r.get("price_impact_raw") == "0.02", r.get("price_impact_raw"))
-    check("fill record: unit stamp percent_v2", r.get("price_impact_unit") == "percent_v2", r.get("price_impact_unit"))
+    check("fill record: price_impact_pct is true percent (2.0)", abs(r["provenance"]["price_impact_pct"] - 2.0) < 1e-9, r["provenance"].get("price_impact_pct"))
+    check("fill record: raw quote value kept verbatim", r["provenance"].get("price_impact_raw") == "0.02", r["provenance"].get("price_impact_raw"))
+    check("fill record: unit stamp percent_v2", r["provenance"].get("price_impact_unit") == "percent_v2", r["provenance"].get("price_impact_unit"))
     j = json.load(open(jp))["fills"]["op-eq"]
-    check("journal on disk carries the same pct/raw/unit", j.get("price_impact_unit") == "percent_v2" and j.get("price_impact_raw") == "0.02")
+    check("journal on disk carries the same pct/raw/unit", j["provenance"].get("price_impact_unit") == "percent_v2" and j["provenance"].get("price_impact_raw") == "0.02")
     s = f.sell("op-sell", MINT, r["qty_tokens"], 2.0)
-    check("sell record (real sim sell block) carries unit stamp and raw", s.get("price_impact_unit") == "percent_v2" and s.get("price_impact_raw") == "0.02" and abs(s["price_impact_pct"] - 2.0) < 1e-9, {k: s.get(k) for k in ("price_impact_pct", "price_impact_raw", "price_impact_unit")})
+    sp = s["provenance"]
+    check("sell record (real sim sell block) carries unit stamp and raw", sp.get("price_impact_unit") == "percent_v2" and sp.get("price_impact_raw") == "0.02" and abs(sp["price_impact_pct"] - 2.0) < 1e-9, {k: sp.get(k) for k in ("price_impact_pct", "price_impact_raw", "price_impact_unit")})
     reason, det = skip_reason(filler("0.0201", os.path.join(d, "j2.json")), "op-over")
     check("boundary: ratio 0.0201 (2.01%) over cap 2.0 refused price_impact_over_cap", reason == "price_impact_over_cap", reason)
     f3 = filler("0.0201", os.path.join(d, "j3.json")); skip_reason(f3, "op-over3")
@@ -62,15 +63,18 @@ def main():
     p4 = os.path.join(d, "old.json")
     fo = filler("0.02", p4)
     real = dict(fo.buy("op-seed", MINT, 1.0, 2.0))
-    old = {k: v for k, v in real.items() if k not in ("price_impact_unit", "price_impact_raw")}
-    old["price_impact_pct"] = 0.02          # pre-fix stored the ratio under the _pct name
+    import copy
+    old = copy.deepcopy(real)               # impact fields live in fill["provenance"] (demo_fill._prov), not at the top level
+    for k in ("price_impact_unit", "price_impact_raw"):
+        old["provenance"].pop(k, None)
+    old["provenance"]["price_impact_pct"] = 0.02   # pre-fix stored the ratio under the _pct name
     fo._save("op-old", old)
     stored = dict(filler("0.02", p4).get_fill("op-old"))
     r4 = dict(filler("0.02", p4).buy("op-old", MINT, 1.0, 2.0))
     check("old record: replay returns the stored fill exactly (no executor call, nothing recomputed)", r4 == stored, {k: (r4.get(k), stored.get(k)) for k in set(r4) | set(stored) if r4.get(k) != stored.get(k)})
-    check("old record: carries NO unit stamp and NO raw value after replay", r4.get("price_impact_unit") is None and r4.get("price_impact_raw") is None and "price_impact_unit" not in r4)
-    check("old record: stored pct still the old ratio value, never multiplied", r4.get("price_impact_pct") == 0.02)
-    check("a NEW fill on the same journal is stamped while the old one stays unstamped", filler("0.02", p4).buy("op-new", MINT, 1.0, 2.0).get("price_impact_unit") == "percent_v2"
+    check("old record: carries NO unit stamp and NO raw value after replay", "price_impact_unit" not in r4["provenance"] and "price_impact_raw" not in r4["provenance"])
+    check("old record: stored pct still the old ratio value, never multiplied", r4["provenance"].get("price_impact_pct") == 0.02)
+    check("a NEW fill on the same journal is stamped while the old one stays unstamped", filler("0.02", p4).buy("op-new", MINT, 1.0, 2.0)["provenance"].get("price_impact_unit") == "percent_v2"
           and dict(filler("0.02", p4).get_fill("op-old")) == stored)
     print("FAILS: %d" % FAILS); return 1 if FAILS else 0
 

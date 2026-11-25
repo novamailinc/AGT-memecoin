@@ -776,21 +776,41 @@ check("S17c kind change on the SAME op id: the booked write-down (outcome %r) is
       % (_PAm.op_outcome(_opc), _n21, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
       _wdk_ok is True and _PAm.op_outcome(_opc) == "applied" and len(_gi2(mint)) == _n21 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
       and G._read()["bankroll"] == _br21 and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint])
-# S17d: an UNREADABLE account journal cannot prove a dropped op was not applied -> refused (NAMED FAULT INJECTION at paper_account._journal_read). Negative
-# control is S17b (readable and unbooked proceeds).
-mint = "BB22pump"; pid, entry, _ir = _refused_setup(mint)
-_opc = "grad:close:%s:%s" % (mint, pid)
-_CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
-_i2 = _CI.begin("grad", mint, pid, [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
-                                      {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}],
-                {"realized_usd": 1.0, "close_ts": 1795600780.0, "closed_reason": "crafted"}, supersedes=_ir)
-_point(mint, _i2); _n22 = len(_gi2(mint)); _rj = _PAm._journal_read
-with patch.object(_PAm, "_journal_read", lambda *a, **k: ([], "torn", None)):
+# S17d: an UNREADABLE account journal cannot prove a dropped op was not applied -> refused. NAMED FAULT INJECTION, SCOPED: only a call made DIRECTLY from
+# grad._finalize (the dropped-op guard site) sees the torn status; every other reader (buyback applied-add, snapshot) passes through unchanged, so the guard
+# under test is the one that fires. Reachability is asserted by a hit counter on that exact site, and a pass-through control with the SAME crafted state proceeds.
+import sys as _sys17
+def _scoped_jr(fault, hits):
+    _real = _PAm._journal_read
+    def _jr(*a, **k):
+        _f = _sys17._getframe(1)
+        if _f.f_code.co_name == "_finalize" and _f.f_code.co_filename.endswith("grad.py"):
+            hits.append(1)
+            if fault:
+                return ([], "torn", None)
+        return _real(*a, **k)
+    return _jr
+def _s17d_setup(mint):
+    pid, entry, _ir = _refused_setup(mint)
+    _opc = "grad:close:%s:%s" % (mint, pid)
+    _CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+    _i2 = _CI.begin("grad", mint, pid, [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+                                          {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}],
+                    {"realized_usd": 1.0, "close_ts": 1795600780.0, "closed_reason": "crafted"}, supersedes=_ir)
+    _point(mint, _i2)
+    return pid, entry, _i2
+mint = "BB22pump"; pid, entry, _i2 = _s17d_setup(mint); _n22 = len(_gi2(mint)); _h = []
+with patch.object(_PAm, "_journal_read", _scoped_jr(True, _h)):
     G.poll_exits(price_fn=prices([entry * 0.05]))
-check("S17d unreadable account journal: the dropped ':wd' op cannot be proven unapplied, so the change is refused AT THIS GUARD (pending why %r; no new intent %d -> %d, crafted intent %s, position open)"
-      % ((lane_pos(mint).get("settlement_pending") or {}).get("why"), _n22, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
-      len(_gi2(mint)) == _n22 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
+check("S17d unreadable account journal AT THE DROPPED-OP GUARD (guard site reached: %d hit(s) from grad._finalize): refused, pending why %r, no new intent %d -> %d, crafted intent %s, position open"
+      % (len(_h), (lane_pos(mint).get("settlement_pending") or {}).get("why"), _n22, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
+      len(_h) >= 1 and len(_gi2(mint)) == _n22 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
       and (lane_pos(mint).get("settlement_pending") or {}).get("why") == "close_intent_not_durable")
+mint = "BB23pump"; pid, entry, _i2 = _s17d_setup(mint); _n23 = len(_gi2(mint)); _h = []
+with patch.object(_PAm, "_journal_read", _scoped_jr(False, _h)):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S17d control: SAME crafted state, same scoped wrapper but NO fault (guard site reached: %d hit(s)): the change is NOT refused (intents %d -> %d)" % (len(_h), _n23, len(_gi2(mint))),
+      len(_h) >= 1 and len(_gi2(mint)) > _n23)
 
 def _to_successor(m):
     pid_, entry_, i0_ = _refused_setup(m)

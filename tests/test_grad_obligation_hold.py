@@ -24,6 +24,7 @@ TMPD = tempfile.mkdtemp(prefix="ci-grad-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
     prefix="ci-grad-home-")
 os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+_SUITE_HOME = os.environ["FOREX_AGENT_HOME"]  # the suite-owned mkdtemp home (custody anchor for the mirror reset)
 
 import daemon.launch_scanner.grad as G
 import daemon.launch_scanner.paper_account as PA
@@ -96,6 +97,22 @@ def _fresh(price=0.00007):
     if os.path.exists(G.LEDGER_PATH):
         os.remove(G.LEDGER_PATH)
         import shutil as _shl; _shl.rmtree(PA.ACCOUNT_DIR, ignore_errors=True)  # DISCLOSED TEST EDIT: reset the account with the lane ledger (see test_regime)
+        _mir = os.path.join(os.path.dirname(PA.ACCOUNT_DIR), "lane_registry.%s.mirror.jsonl" % os.path.basename(PA.ACCOUNT_DIR))  # DISCLOSED FIXTURE EDIT (v6): the PARENT-dir lane-registry mirror must be reset with the account dir, else the next entry is refused fail-closed ("lane registry lost, its mirror remains"); same derivation as paper_account.py
+        _sh = os.path.realpath(_SUITE_HOME)
+        if os.path.realpath(_mir).startswith(_sh + os.sep) and os.path.basename(_sh).startswith("ci-grad-home-"):  # custody: only a file INSIDE this suite's own mkdtemp home is ever removed
+            if os.path.exists(_mir): os.remove(_mir)
+        else:
+            raise RuntimeError("mirror path outside the suite-owned home, refusing to delete: %r" % (_mir,))
+        # DISCLOSED FIXTURE EDIT (v6): the grad intent JOURNAL is reset with the account/registry (same suite-owned-home custody; precedent: test_close_intents_grad line 347). A frozen intent left by an earlier section would otherwise block every later ENTRY lane-wide (seen in test_paper_account_grad's native log), and the registry reset above removes the "journal existed" evidence, so no intent-journal-lost blocker is created.
+        _jp = CI.journal_path("grad")
+        if os.path.realpath(_jp).startswith(_sh + os.sep) and os.path.basename(_jp) == "close_intents_grad.jsonl":
+            if os.path.exists(_jp): os.remove(_jp)
+        else:
+            raise RuntimeError("journal path outside the suite-owned home, refusing to delete: %r" % (_jp,))
+        # PREFLIGHT (v6b): after a consistent reset NO leftover evidence may remain (registry primary+mirror, grad journal, ledger .bak inside the removed account dir, account marker rows, registry blockers). A survivor is a labelled fixture ERROR here, not a later KeyError. Runs only after a reset, never during a deliberate frozen scenario.
+        _left = [p for p in PA._registry_paths() if os.path.exists(p)] + ([_jp] if os.path.exists(_jp) else []) + ([PA.ACCOUNT_DIR] if os.path.exists(PA.ACCOUNT_DIR) else [])
+        if _left or PA.unresolved_refusals() or PA._registry_blockers():
+            raise RuntimeError("fixture reset left evidence behind: %r markers=%r blockers=%r" % (_left, PA.unresolved_refusals(), PA._registry_blockers()))
     FAKE_KS.halted = set()
     FAKE_KS.recorded = []
     ps, m_veto, m_safety = _patch_all(price=price)

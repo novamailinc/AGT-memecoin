@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bb84 (= bb83 + explicit target-path reachability instrumentation and direct write-down rows) REAL-CALLER frozen-hold harness, MOMENTUM, SOURCE ONLY (never run). The refused write-down and the refused leg credit are produced by the REAL poll_exits against a real generation mismatch (parent wipes the account files so the lane position is bound to an old generation); NO hand-written freezes except the unit child, which uses real begin/freeze and is labelled. Position age is set by editing the SCRATCH lane ledger (labelled fixture). Mutant: a labelled model of the BB81 pre-check (exact-op only)."""
+"""bb85 (= bb84 + MINT2 positive control, frozen-reason assertion, fresh-process entry recovery rows) REAL-CALLER frozen-hold harness, MOMENTUM, SOURCE ONLY (never run). The refused write-down and the refused leg credit are produced by the REAL poll_exits against a real generation mismatch (parent wipes the account files so the lane position is bound to an old generation); NO hand-written freezes except the unit child, which uses real begin/freeze and is labelled. Position age is set by editing the SCRATCH lane ledger (labelled fixture). Mutant: a labelled model of the BB81 pre-check (exact-op only)."""
 if __name__ != "__main__":
     import pytest
     pytest.skip("script-style test", allow_module_level=True)
@@ -214,6 +214,23 @@ def child_unit3():
 if MODE == "open": child_open(); sys.exit(0)
 if MODE == "wdref": child_wdref(sys.argv[3] if len(sys.argv) > 3 else ""); sys.exit(0)
 if MODE == "legwd": child_legwd(sys.argv[3] if len(sys.argv) > 3 else ""); sys.exit(0)
+def child_posctl():
+    """POSITIVE CONTROL for the public-entry rows: same fixture, same generation (NO wipe, NO freeze): an entry of MINT2 is ACCEPTED, so a refusal elsewhere is caused by the frozen obligation and not by tape/cap/veto/cooldown."""
+    PA = fresh(); cash(PA); out = {}
+    e = _enter(MINT2); out["ok"] = bool(e[0]); out["reason"] = str(e[1])[:160]; out["s"] = _snap(PA)
+    print("RESULT " + _json.dumps(out, default=str), flush=True)
+def child_wdrestart():
+    """FRESH PROCESS after the real refused write-down: recovery, public entry, direct debit and a real poll."""
+    PA = fresh(); out = {"s0": _snap(PA)}
+    L._RECOVERY_DONE = False; L._ENTRY_BLOCKED = False
+    out["recovery_blocked"] = bool(L._recover_close_intents()); out["s1"] = _snap(PA)
+    e = _enter(MINT2); out["entry_other"] = [bool(e[0]), str(e[1])[:160]]
+    try: r = PA.try_debit(LANE_NAME, "DirectProbeMint", 1.0, 1000.0, "probe:direct:wdr"); out["direct"] = [bool(r[0]), str(r[1])[:240]]
+    except Exception as ex: out["direct"] = [False, "EXC %s" % type(ex).__name__]
+    L.poll_exits(price_fn=_pf0); out["s2"] = _snap(PA)
+    print("RESULT " + _json.dumps(out, default=str), flush=True)
+if MODE == "posctl": child_posctl(); sys.exit(0)
+if MODE == "wdrestart": child_wdrestart(); sys.exit(0)
 if MODE == "unit2": child_unit2(); sys.exit(0)
 if MODE == "unit3": child_unit3(); sys.exit(0)
 FAILS = []
@@ -242,8 +259,10 @@ def wipe(root):
     ad = _acct_dir(root)
     for n in ("ledger.json", "ledger.json.bak", "events.jsonl"):
         if os.path.exists(os.path.join(ad, n)): os.remove(os.path.join(ad, n))
-def run_child(mode, variant=""):
-    root = newroot("C"); do_open(root); wipe(root)
+LASTROOT = [None]
+def run_child(mode, variant="", wipe_first=True):
+    root = newroot("C"); do_open(root); LASTROOT[0] = root
+    if wipe_first: wipe(root)
     rc, out, err = spawn([mode, root] + ([variant] if variant else [])); r = res(out)
     if r is None: print("FAIL SETUP %s child (rc %s, %s)" % (mode, rc, err[-300:])); raise SystemExit(2)
     return r
@@ -253,7 +272,7 @@ def run_unit(mode):
     return r
 KEYS = ("credit", "debit", "intent_ops", "pending_unfrozen", "frozen_unresolved", "journal_sha", "n_lines", "pos_open")
 try:
-    w = run_child("wdref"); a0, a1, a2, a2b, a3 = w["s0"], w["s1"], w["s2"], w["s2b"], w["s3"]
+    w = run_child("wdref"); rootW = LASTROOT[0]; a0, a1, a2, a2b, a3 = w["s0"], w["s1"], w["s2"], w["s2b"], w["s3"]
     wdop = [o for o in a1["intent_ops"] if ":writedown:" in o]
     check("C1 REAL refused write-down: the real poll_exits time-stop write-down against a stale generation leaves ONE frozen write-down obligation (op id lane:writedown:mint:pos), the position open with no leg done, no credit or debit (%r)" % ({k: a1[k] for k in ("intent_ops", "frozen_unresolved", "pending_unfrozen", "pos_open", "legs_done", "credit", "debit")},), len(a1["intent_ops"]) == 1 and len(wdop) == 1 and a1["frozen_unresolved"] == 1 and a1["pending_unfrozen"] == 0 and a1["pos_open"] is True and a1["legs_done"] == {"a": False, "b": False, "c": False} and a1["credit"] == a0["credit"] and a1["debit"] == a0["debit"])
     check("C1b TARGET PATH REACHED: in the first real cycle the REAL write-down caller ran (_pa_write_down calls %r) behind a gate call classified as write-down that was allowed (gate log %r)" % (w["m1"]["wd_calls"], w["m1"]["gate"]), w["m1"]["wd_calls"] == 1 and any(x["wd"] and x["ret"] for x in w["m1"]["gate"]))
@@ -266,9 +285,15 @@ try:
     check("X1 REAL frozen leg credit (2x poll, stale generation): one frozen leg-a obligation, leg a open (%r)" % ({k: b1[k] for k in ("intent_ops", "frozen_unresolved", "pos_open", "legs_done")},), len(b1["intent_ops"]) == 1 and ":leg:a:" in b1["intent_ops"][0] and b1["frozen_unresolved"] == 1 and b1["pos_open"] is True and b1["legs_done"]["a"] is False)
     check("X2 CROSS-FAMILY: the later REAL write-down poll opens NO write-down intent and makes no account op while the leg-a credit is frozen (ops %r -> %r, credit %r -> %r, debit %r -> %r, why %r)" % (b1["intent_ops"], b2["intent_ops"], b1["credit"], b2["credit"], b1["debit"], b2["debit"], (b2.get("pending_exit") or {}).get("why")), b2["intent_ops"] == b1["intent_ops"] and b2["credit"] == b1["credit"] and b2["debit"] == b1["debit"] and b2["pos_open"] is True and b2["legs_done"] == b1["legs_done"])
     check("X3 CROSS-FAMILY: a real remaining close (spans leg a) is held too: returns 0.0, no new intent, journal unchanged (ret %r, lines %r -> %r)" % (g["ret_remaining"], b2["n_lines"], b3["n_lines"]), g["ret_remaining"] == 0.0 and b3["intent_ops"] == b1["intent_ops"] and b3["journal_sha"] == b2["journal_sha"] and b3["credit"] == b1["credit"])
+    pc = run_child("posctl", wipe_first=False)
+    check("P0 POSITIVE CONTROL (separate child, same fixture, no wipe, no freeze): an entry of MINT2 is ACCEPTED and opens a second position, so the C6/R5 refusals of MINT2 are caused by the frozen obligation (%r)" % ({k: pc[k] for k in ("ok", "reason")},), pc["ok"] is True and pc["s"]["n_positions"] == 2)
+    rc, out, err = spawn(["wdrestart", rootW]); wr = res(out)
+    if wr is None: print("FAIL SETUP wdrestart (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
+    r0, r1, r2 = wr["s0"], wr["s1"], wr["s2"]
+    check("R5 FRESH PROCESS after the real refused write-down: recovery reports entries blocked, a public MINT2 entry is refused for the frozen-obligation reason, the direct account debit is refused, and a real poll_exits adds no intent, journal line, account op or fill-journal change; the position stays open on its ORIGINAL generation (recovery %r, entry %r, direct %r, lines %r -> %r -> %r)" % (wr["recovery_blocked"], wr["entry_other"], wr["direct"], r0["n_lines"], r1["n_lines"], r2["n_lines"]), wr["recovery_blocked"] is True and wr["entry_other"][0] is False and "close-intent divergence frozen" in wr["entry_other"][1] and wr["direct"][0] is False and r2["intent_ops"] == a1["intent_ops"] and r2["journal_sha"] == r0["journal_sha"] and r2["credit"] == a1["credit"] and r2["debit"] == a1["debit"] and r2["fj_sha"] == a1["fj_sha"] and r2["pos_open"] is True and r2["n_positions"] == 1 and r2["pa_account_id"] == a0["pa_account_id"])
     FJK = ("fj_exists", "fj_sha", "fj_len", "fj_n")
     check("C5 MEASURED NO-SALE (write-down family): the real quote-sim FILL JOURNAL on disk is byte-identical across every real cycle and direct close call after the freeze (s1 %r, s2b %r, s3 %r; before the first cycle %r)" % ({k: a1[k] for k in FJK}, {k: a2b[k] for k in FJK}, {k: a3[k] for k in FJK}, {k: a0[k] for k in FJK}), all(a1[k] == a2[k] == a2b[k] == a3[k] for k in FJK))
-    check("C6 PUBLIC RE-ENTRY stays refused while the obligation is unresolved (this is NOT authorization of re-entry): the lane entry for the SAME mint and for another mint and a direct account debit are all refused, one position, debit count unchanged (%r)" % ({k: w[k] for k in ("entry_same_mint", "entry_other_mint", "direct")},), w["entry_same_mint"][0] is False and w["entry_other_mint"][0] is False and w["direct"][0] is False and w["s4"]["debit"] == a1["debit"] and w["s4"]["n_positions"] == 1 and w["s4"]["fj_sha"] == a1["fj_sha"])
+    check("C6 PUBLIC RE-ENTRY stays refused while the obligation is unresolved (this is NOT authorization of re-entry): the lane entry for ANOTHER mint is refused FOR THE FROZEN-OBLIGATION REASON (reason text must contain close-intent divergence frozen), a direct account debit is refused; the SAME-mint refusal is WEAK evidence (an open position of that mint already exists) and is only recorded; one position, debit count and fill journal unchanged (%r)" % ({k: w[k] for k in ("entry_same_mint", "entry_other_mint", "direct")},), "close-intent divergence frozen" in w["entry_other_mint"][1] and w["entry_same_mint"][0] is False and w["entry_other_mint"][0] is False and w["direct"][0] is False and w["s4"]["debit"] == a1["debit"] and w["s4"]["n_positions"] == 1 and w["s4"]["fj_sha"] == a1["fj_sha"])
     check("X4 MEASURED NO-SALE (cross-family): after the first real 2x sale of leg a, the fill journal is byte-identical through the later write-down poll and the real remaining close (after sale %r, after write-down poll %r, after remaining close %r)" % ({k: b1[k] for k in FJK}, {k: b2[k] for k in FJK}, {k: b3[k] for k in FJK}), all(b1[k] == b2[k] == b3[k] for k in FJK))
     check("X5 the first real 2x cycle DID write the fill journal (positive control: the journal fingerprint is capable of changing, so X4/C5 are not vacuous) (%r)" % ({k: b1[k] for k in FJK},), b1["fj_exists"] is True and b1["fj_len"] > 0 and (b1["fj_n"] or 0) >= 1)
     g1, g2, g2w = g["m1"], g["m2"], g["m2w"]

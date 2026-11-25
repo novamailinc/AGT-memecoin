@@ -127,7 +127,7 @@ def spawn(args):
     p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=30)
     return p.returncode, p.stdout, p.stderr
 for tag, point, mult in (("S1", "after_credit", "2.3"), ("S2", "pre_lane_marker", "2.3"), ("S3-control", "after_credit", "2.0")):
-    root = tempfile.mkdtemp(prefix="nonsimkill-%s-" % tag)
+    root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
     rc, out, err = spawn(["run", root, point])
     ec = [l for l in out.splitlines() if l.startswith("ENTRY")]
     check("%s: child KILLED by SIGKILL (rc %d, want -%d), kill point reached" % (tag, rc, _signal.SIGKILL), rc == -_signal.SIGKILL and "SURVIVED" not in out)

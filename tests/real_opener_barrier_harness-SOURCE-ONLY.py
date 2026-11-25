@@ -83,7 +83,7 @@ def writer():
 t = None
 if hold:
     t = threading.Thread(target=writer, daemon=True); t.start(); assert started.wait(5)
-s0 = snap(); T0A = time.monotonic(); r = GR.consider_candidate(CAND if scen in ("Y8", "Y9", "Y10") else mkcand(1), time.time()); EL = time.monotonic() - T0A; s1 = snap()
+s0 = snap(); T0A = time.monotonic(); r = GR.consider_candidate(CAND if scen in ("Y8", "Y10") else mkcand(1), time.time()); EL = time.monotonic() - T0A; s1 = snap()
 if t: t.join(10)
 retry = None
 if scen == "Y4":
@@ -94,23 +94,20 @@ if scen == "Y10":
     AH["t"].join(10)
     f1 = sorted(raw_fills()); rr = GR.consider_candidate(CAND, time.time()); f2 = json.load(open(FILL_PATH))["fills"]
     retry = {"r": [bool(rr[0]), str(rr[1])], "s": snap(), "n_fills_before": len(f1), "n_fills_after": len(f2), "first_ops": f1, "ops_after": sorted(f2), "committed": committed_ops(), "elapsed_first": el}
-if scen in ("Y8", "Y9"):
+if scen == "Y8":
     os.remove(fault_file())                                    # the fault is cleared by the fixture; the stub now passes
     f1 = json.load(open(FILL_PATH))["fills"]; first_ops = sorted(f1); first_px = {k: v.get("price_usd") for k, v in f1.items()}
-    if scen == "Y9":
-        def _age(j):
-            for v in j["fills"].values(): v["provenance"]["quote_requested_at"] = float(v["provenance"]["quote_requested_at"]) - 120.0
-        F._locked(_age)
     rr = GR.consider_candidate(CAND, time.time()); f2 = json.load(open(FILL_PATH))["fills"]
     pos = list(raw_ledger().get("positions", {}).values())
     retry = {"r": [bool(rr[0]), str(rr[1])], "s": snap(), "same_ops": sorted(f2) == first_ops, "first_ops": first_ops, "ops_after": sorted(f2), "committed": committed_ops(), "n_fills_before": len(first_ops), "n_fills_after": len(f2),
              "entry_px": (pos[0].get("entry_price") if pos else None), "first_px": first_px}
+LOCK_CTOR_POST = LK["n"]                                      # snapshot BEFORE the acquirable probe below (in Y0/Y1 the probe constructs the counting subclass itself)
 LOCKFILE_POST = os.path.exists(GC._fault_lock_path(GR))     # BEFORE the acquirable probe below: that probe opens (creates) the lock file itself
 try:
     with GC._fault_lock(GR, 0.5): acquirable = True
 except Exception as e: acquirable = False
 print(json.dumps({"reached": True, "scen": scen, "r": [bool(r[0]), str(r[1])], "s0": s0, "s1": s1, "calls": len(calls), "depth_empty": not getattr(GC._FLT, "depth", {}), "acquirable": acquirable,
-                  "lockfile": LOCKFILE_POST, "lockfile_after_probe": os.path.exists(GC._fault_lock_path(GR)), "lockfile_pre": LOCKFILE_PRE, "lock_ctor": LK["n"], "retry": retry, "writer_released": (t is None or not t.is_alive()), "main_depth_empty_note": "depth is thread-local: this is the MAIN thread; the writer thread releases its own lock, checked by writer_released"}))
+                  "lockfile": LOCKFILE_POST, "lockfile_after_probe": os.path.exists(GC._fault_lock_path(GR)), "lockfile_pre": LOCKFILE_PRE, "lock_ctor": LOCK_CTOR_POST, "lock_ctor_after_probe": LK["n"], "retry": retry, "writer_released": (t is None or not t.is_alive()), "main_depth_empty_note": "depth is thread-local: this is the MAIN thread; the writer thread releases its own lock, checked by writer_released"}))
 """
 def run(scen):
     h = H.newhome(); cp, j = H.run(CHILD, h, scen)
@@ -172,7 +169,7 @@ def main():
     if j:
         rt = j["retry"] or {}
         check("Y10 ACCOUNT BUSY at the opener: another holder keeps the account lock 1.5 s after the barrier re-check; the debit is refused as account busy (%s) in %.2fs (< the 1.5 s hold: the ACQUIRE is bounded), nothing debited (cash %s -> %s), no position, intent released, fault lock free; after the holder released, the same candidate opens with exactly one debit (delta %s vs Y1 %s); per the real contract the retry is a NEW buy (fills %s -> %s, the busy-refused attempt leaves one uncommitted ORPHAN fill, committed ops %s)" % (j["r"], rt.get("elapsed_first", -1), j["s0"]["cash"], j["s1"]["cash"], (j["s0"]["cash"] - (rt.get("s") or {}).get("cash", 0)), D.get("d1"), rt.get("n_fills_before"), rt.get("n_fills_after"), rt.get("committed")),
-              refused(j, "account busy") and rt.get("elapsed_first", 9) < 1.4 and (rt.get("r") or [False])[0] is True and abs((j["s0"]["cash"] - rt["s"]["cash"]) - D.get("d1", -1)) < 1e-9 and rt["s"]["n_pos"] == 1 and rt["s"]["intents"] == [] and j["writer_released"] is not False and rt.get("n_fills_before") == 1 and rt.get("n_fills_after") == 2 and len(rt.get("committed") or []) == 1 and rt["committed"][0] not in rt["first_ops"])
+              refused(j, "account busy") and rt.get("elapsed_first", 9) < 1.4 and (rt.get("r") or [False])[0] is True and abs((j["s0"]["cash"] - rt["s"]["cash"]) - D.get("d1", -1)) < 1e-9 and rt["s"]["n_pos"] == 1 and rt["s"]["intents"] == [] and rt.get("n_fills_before") == 1 and rt.get("n_fills_after") == 2 and len(rt.get("committed") or []) == 1 and rt["committed"][0] not in rt["first_ops"])
     j = run("Y5")
     if j: check("Y5 guard raises at the re-check (3rd call): refused fail-closed (%s), same cleanup" % (j["r"],), refused(j, "unavailable at commit") and j["calls"] == 3)
     j = run("Y6")

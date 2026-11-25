@@ -121,4 +121,5 @@ for modname in ("tranche", "tranche_protect"):
 check("F0c network tripwire never fired", NET == [])
 print("RESULT: %d failures" % len(FAILS))
 if FAILS: print("FAILS:", FAILS)
+sys.stdout.flush(); sys.stderr.flush()            # os._exit skips stdio flush: without this a piped run logs NO check lines (49de85d8 run: rc 0, empty log)
 os._exit(1 if FAILS else 0)

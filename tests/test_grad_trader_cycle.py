@@ -43,7 +43,7 @@ def scan_for(g, res=None, boom=False):
 os.environ.pop(GC.ENV_FLAG, None)
 g = fake(); res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g))
 check("G1 flag off: ONLY the legacy callable runs, result passed through, no journal", g.calls == ["LEGACY"] and res == {"opened": 9} and n == 7 and rec is None and not os.path.exists(g.LEDGER_PATH + ".cycle.json"))
-check("G2 flag off: entry_allowed is (True, None) and startup_report inactive", T.entry_allowed(g) == (True, None) and T.startup_report(g) == {"active": False})
+check("G2 flag off: entry_allowed is (True, None) and startup_report inactive", T.entry_allowed(g) == (True, None) and (lambda sr: sr.get("active") is False and sr.get("mode") == "off" and sr.get("detail") == "flag_off" and "fault_active" not in sr)(T.startup_report(g)))
 os.environ[GC.ENV_FLAG] = "1"
 g = fake(demo=False); res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g))
 check("G3 flag on but NON-DEMO engine: legacy only, nothing journaled", g.calls == ["LEGACY"] and rec is None and T.entry_allowed(g) == (True, None))

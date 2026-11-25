@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bb85 (= bb84 + MINT2 positive control, frozen-reason assertion, fresh-process entry recovery rows) REAL-CALLER frozen-hold harness, MOMENTUM, SOURCE ONLY (never run). The refused write-down and the refused leg credit are produced by the REAL poll_exits against a real generation mismatch (parent wipes the account files so the lane position is bound to an old generation); NO hand-written freezes except the unit child, which uses real begin/freeze and is labelled. Position age is set by editing the SCRATCH lane ledger (labelled fixture). Mutant: a labelled model of the BB81 pre-check (exact-op only)."""
+"""bb86 (= bb85 with the fill-journal fingerprint replaced by a counted modelled-fill call + lane ledger fields, S0 positive control, genuinely unreadable journal fixture) (bb85 = bb84 + MINT2 positive control, frozen-reason assertion, fresh-process entry recovery rows) REAL-CALLER frozen-hold harness, MOMENTUM, SOURCE ONLY (never run). The refused write-down and the refused leg credit are produced by the REAL poll_exits against a real generation mismatch (parent wipes the account files so the lane position is bound to an old generation); NO hand-written freezes except the unit child, which uses real begin/freeze and is labelled. Position age is set by editing the SCRATCH lane ledger (labelled fixture). Mutant: a labelled model of the BB81 pre-check (exact-op only)."""
 if __name__ != "__main__":
     import pytest
     pytest.skip("script-style test", allow_module_level=True)
@@ -119,14 +119,10 @@ def _snap(PA):
     d["wal_events"] = sorted(set(e.get("event") for e in evs))
     mp = os.path.join(_acct_dir(ROOTDIR), "unresolved_generation_refusals.jsonl")
     d["marker_records"] = len([1 for ln in open(mp) if ln.strip()]) if os.path.exists(mp) else 0
-    fp = os.path.join(os.environ.get("FOREX_AGENT_HOME", "."), "demo_fill_journal.json")   # the REAL quote-sim fill journal (demo_fill.py), read from disk
-    try: fb = open(fp, "rb").read()
-    except OSError: fb = None
-    d["fj_exists"] = fb is not None; d["fj_sha"] = hashlib.sha256(fb or b"").hexdigest()[:16]; d["fj_len"] = len(fb or b"")
-    try: _fj = _json.loads(fb) if fb else None
-    except ValueError: _fj = "unparsable"
-    d["fj_n"] = (len(_fj) if isinstance(_fj, (dict, list)) else (None if _fj is None else -1))
-    d["fj_keys"] = sorted(str(k) for k in _fj)[:12] if isinstance(_fj, dict) else None
+    try: _lg = _json.load(open(L.LEDGER_PATH))
+    except Exception: _lg = {}
+    d["lane_bankroll"] = _lg.get("bankroll"); d["lane_lens"] = {k: len(v) for k, v in sorted(_lg.items()) if isinstance(v, (list, dict))}
+    d["lane_pos_realized"] = ((_lg.get("positions") or {}).get(MINT) or {}).get("realized_usd")
     return d
 def _pf2(mult):
     def f(chain, mint, spot_index=None):
@@ -138,7 +134,7 @@ def _age():
     with L._ledger_lock():
         d = L._read(); d["positions"][MINT]["entry_ts"] = time.time() - 26 * 3600; L._write(d)
 def _pos(): return (L.open_positions() or {}).get(MINT) or {}
-GATE = []; WD = {"n": 0}
+GATE = []; WD = {"n": 0}; SALE = {"n": 0}
 def _instrument():
     """TARGET-PATH EVIDENCE: wrap the REAL _intent_gate (log key, whether the exit meta classifies as a write-down, and the real return) and count REAL _pa_write_down calls. The wrappers call the real functions unchanged."""
     og = L._intent_gate; ow = L._pa_write_down
@@ -147,8 +143,12 @@ def _instrument():
         GATE.append({"key": str(key), "wd": L._pkind(m.get("reason"), m.get("pkind")) == "write_down_zero", "ret": bool(r)}); return r
     def w(pos, reason):
         WD["n"] += 1; return ow(pos, reason)
+    oh = L._fills.honest_exit
+    def h(*a, **k):
+        SALE["n"] += 1; return oh(*a, **k)
+    L._fills.honest_exit = h   # the modelled-fill price function: the only sale-side computation of this (non-quote-sim) exit path; wrapper calls the real function
     L._intent_gate = g; L._pa_write_down = w
-def _mark(): return {"gate": [dict(x) for x in GATE], "wd_calls": WD["n"]}
+def _mark(): return {"gate": [dict(x) for x in GATE], "wd_calls": WD["n"], "sales": SALE["n"]}
 def _mutant_bb81():
     def f(pos, key):
         _all = CI.frozen_for_op(LANE_NAME, pos["mint"], pos.get("pa_pos_id"), "%s:%s:%s:%s" % (LANE_NAME, key if str(key).startswith("remaining:") else "leg:%s" % key, pos["mint"], pos.get("pa_pos_id")))
@@ -168,7 +168,7 @@ def child_wdref(variant=""):
     out["ret_remaining_px"] = L._close_remaining(pos, 0.002, "hard_stop_-50pct")
     out["ret_leg_a"] = L._close_leg(pos, "a", 0.002, "leg_a_2x")
     out["realized_unchanged"] = float(pos.get("realized_usd") or 0) == r0; out["legs_after"] = {k: bool((pos.get("legs") or {}).get(k, {}).get("done")) for k in ("a", "b", "c")}
-    out["s3"] = _snap(PA)
+    out["s3"] = _snap(PA); out["m3"] = _mark()
     try: e1 = _enter(MINT); out["entry_same_mint"] = [bool(e1[0]), str(e1[1])[:160]]
     except Exception as ex: out["entry_same_mint"] = [False, "EXC %s" % type(ex).__name__]
     try: e2 = _enter(MINT2); out["entry_other_mint"] = [bool(e2[0]), str(e2[1])[:160]]
@@ -201,8 +201,9 @@ def child_unit2():
     pw = dict(pos, _exit_meta={"reason": "time_stop_24h_unquotable", "pkind": None}); out["writedown_held"] = len(ids("b", pw)) == 1
     out["a_still_free_of_b_only"] = ids("b") == []
     jp = CI.journal_path(LANE_NAME); b4 = os.path.getsize(jp); L._frozen_overlap(pos, "a"); out["readonly"] = os.path.getsize(jp) == b4
-    with open(jp, "ab") as f: f.write(b"{garbage\n")
+    with open(jp, "ab") as f: f.write(b"{garbage\n" + b'{"ev":"probe"}\n')   # a corrupt line FOLLOWED by a valid line: genuinely unreadable (a corrupt LAST line alone is a tolerated torn tail)
     out["unreadable_none"] = L._frozen_overlap(pos, "a") is None
+    pos.pop("pending_exit", None); gr = L._intent_gate(pos, "b"); out["gate_unreadable"] = [bool(gr), (pos.get("pending_exit") or {}).get("why")]
     print("RESULT " + _json.dumps(out), flush=True)
 def child_unit3():
     """frozen REMAINING close of legs b,c holds legs b and c and any span, not leg a."""
@@ -214,6 +215,11 @@ def child_unit3():
 if MODE == "open": child_open(); sys.exit(0)
 if MODE == "wdref": child_wdref(sys.argv[3] if len(sys.argv) > 3 else ""); sys.exit(0)
 if MODE == "legwd": child_legwd(sys.argv[3] if len(sys.argv) > 3 else ""); sys.exit(0)
+def child_salectl():
+    """POSITIVE CONTROL for the sale-side measurement: same fixture, SAME generation (no wipe), a real 2x poll books leg a: the modelled-fill function is called, leg a is done, the lane position realized changes. Without this the 'no sale' rows could be vacuous."""
+    PA = fresh(); cash(PA); out = {}; _instrument(); out["s0"] = _snap(PA)
+    L.poll_exits(price_fn=_pf2(2.0)); out["s1"] = _snap(PA); out["m1"] = _mark()
+    print("RESULT " + _json.dumps(out, default=str), flush=True)
 def child_posctl():
     """POSITIVE CONTROL for the public-entry rows: same fixture, same generation (NO wipe, NO freeze): an entry of MINT2 is ACCEPTED, so a refusal elsewhere is caused by the frozen obligation and not by tape/cap/veto/cooldown."""
     PA = fresh(); cash(PA); out = {}
@@ -230,6 +236,7 @@ def child_wdrestart():
     L.poll_exits(price_fn=_pf0); out["s2"] = _snap(PA)
     print("RESULT " + _json.dumps(out, default=str), flush=True)
 if MODE == "posctl": child_posctl(); sys.exit(0)
+if MODE == "salectl": child_salectl(); sys.exit(0)
 if MODE == "wdrestart": child_wdrestart(); sys.exit(0)
 if MODE == "unit2": child_unit2(); sys.exit(0)
 if MODE == "unit3": child_unit3(); sys.exit(0)
@@ -290,18 +297,19 @@ try:
     rc, out, err = spawn(["wdrestart", rootW]); wr = res(out)
     if wr is None: print("FAIL SETUP wdrestart (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
     r0, r1, r2 = wr["s0"], wr["s1"], wr["s2"]
-    check("R5 FRESH PROCESS after the real refused write-down: recovery reports entries blocked, a public MINT2 entry is refused for the frozen-obligation reason, the direct account debit is refused, and a real poll_exits adds no intent, journal line, account op or fill-journal change; the position stays open on its ORIGINAL generation (recovery %r, entry %r, direct %r, lines %r -> %r -> %r)" % (wr["recovery_blocked"], wr["entry_other"], wr["direct"], r0["n_lines"], r1["n_lines"], r2["n_lines"]), wr["recovery_blocked"] is True and wr["entry_other"][0] is False and "close-intent divergence frozen" in wr["entry_other"][1] and wr["direct"][0] is False and r2["intent_ops"] == a1["intent_ops"] and r2["journal_sha"] == r0["journal_sha"] and r2["credit"] == a1["credit"] and r2["debit"] == a1["debit"] and r2["fj_sha"] == a1["fj_sha"] and r2["pos_open"] is True and r2["n_positions"] == 1 and r2["pa_account_id"] == a0["pa_account_id"])
-    FJK = ("fj_exists", "fj_sha", "fj_len", "fj_n")
-    check("C5 MEASURED NO-SALE (write-down family): the real quote-sim FILL JOURNAL on disk is byte-identical across every real cycle and direct close call after the freeze (s1 %r, s2b %r, s3 %r; before the first cycle %r)" % ({k: a1[k] for k in FJK}, {k: a2b[k] for k in FJK}, {k: a3[k] for k in FJK}, {k: a0[k] for k in FJK}), all(a1[k] == a2[k] == a2b[k] == a3[k] for k in FJK))
-    check("C6 PUBLIC RE-ENTRY stays refused while the obligation is unresolved (this is NOT authorization of re-entry): the lane entry for ANOTHER mint is refused FOR THE FROZEN-OBLIGATION REASON (reason text must contain close-intent divergence frozen), a direct account debit is refused; the SAME-mint refusal is WEAK evidence (an open position of that mint already exists) and is only recorded; one position, debit count and fill journal unchanged (%r)" % ({k: w[k] for k in ("entry_same_mint", "entry_other_mint", "direct")},), "close-intent divergence frozen" in w["entry_other_mint"][1] and w["entry_same_mint"][0] is False and w["entry_other_mint"][0] is False and w["direct"][0] is False and w["s4"]["debit"] == a1["debit"] and w["s4"]["n_positions"] == 1 and w["s4"]["fj_sha"] == a1["fj_sha"])
-    check("X4 MEASURED NO-SALE (cross-family): after the first real 2x sale of leg a, the fill journal is byte-identical through the later write-down poll and the real remaining close (after sale %r, after write-down poll %r, after remaining close %r)" % ({k: b1[k] for k in FJK}, {k: b2[k] for k in FJK}, {k: b3[k] for k in FJK}), all(b1[k] == b2[k] == b3[k] for k in FJK))
-    check("X5 the first real 2x cycle DID write the fill journal (positive control: the journal fingerprint is capable of changing, so X4/C5 are not vacuous) (%r)" % ({k: b1[k] for k in FJK},), b1["fj_exists"] is True and b1["fj_len"] > 0 and (b1["fj_n"] or 0) >= 1)
+    check("R5 FRESH PROCESS after the real refused write-down: recovery reports entries blocked, a public MINT2 entry is refused for the frozen-obligation reason, the direct account debit is refused, and a real poll_exits adds no intent, journal line, account op or fill-journal change; the position stays open on its ORIGINAL generation (recovery %r, entry %r, direct %r, lines %r -> %r -> %r)" % (wr["recovery_blocked"], wr["entry_other"], wr["direct"], r0["n_lines"], r1["n_lines"], r2["n_lines"]), wr["recovery_blocked"] is True and wr["entry_other"][0] is False and "close-intent divergence frozen" in wr["entry_other"][1] and wr["direct"][0] is False and r2["intent_ops"] == a1["intent_ops"] and r2["journal_sha"] == r0["journal_sha"] and r2["credit"] == a1["credit"] and r2["debit"] == a1["debit"] and r2["pos_open"] is True and r2["n_positions"] == 1 and r2["pa_account_id"] == a0["pa_account_id"])
+    sc = run_child("salectl", wipe_first=False)
+    check("S0 POSITIVE CONTROL for the sale-side measurement (separate child, same generation, no freeze): a real 2x poll calls the modelled-fill function (calls %r), books leg a (legs %r) and changes the lane position realized (%r -> %r), so the no-sale rows below can detect a sale" % (sc["m1"]["sales"], sc["s1"]["legs_done"], sc["s0"]["lane_pos_realized"], sc["s1"]["lane_pos_realized"]), sc["m1"]["sales"] >= 1 and sc["s1"]["legs_done"]["a"] is True and sc["s1"]["lane_pos_realized"] != sc["s0"]["lane_pos_realized"])
+    LK = ("lane_bankroll", "lane_lens", "lane_pos_realized")
+    check("C5 MEASURED NO-SALE (write-down family): after the freeze, every further real cycle and direct close call makes ZERO further modelled-fill calls (count after first cycle %r, after cycle 2 %r, after direct calls %r) and leaves lane bankroll, collection sizes and position realized unchanged (%r -> %r)" % (w["m1"]["sales"], w["m2"]["sales"], w["m3"]["sales"], {k: a1[k] for k in LK}, {k: a3[k] for k in LK}), w["m1"]["sales"] == w["m2"]["sales"] == w["m3"]["sales"] and all(a1[k] == a2[k] == a3[k] for k in LK))
+    check("C6 PUBLIC RE-ENTRY stays refused while the obligation is unresolved (this is NOT authorization of re-entry): the lane entry for ANOTHER mint is refused FOR THE FROZEN-OBLIGATION REASON (reason text must contain close-intent divergence frozen), a direct account debit is refused; the SAME-mint refusal is WEAK evidence (an open position of that mint already exists) and is only recorded; one position, debit count, lane bankroll and position realized unchanged (%r)" % ({k: w[k] for k in ("entry_same_mint", "entry_other_mint", "direct")},), "close-intent divergence frozen" in w["entry_other_mint"][1] and w["entry_same_mint"][0] is False and w["entry_other_mint"][0] is False and w["direct"][0] is False and w["s4"]["debit"] == a1["debit"] and w["s4"]["n_positions"] == 1 and w["s4"]["lane_bankroll"] == a1["lane_bankroll"] and w["s4"]["lane_pos_realized"] == a1["lane_pos_realized"])
+    check("X4 MEASURED NO-SALE (cross-family): after the first real 2x cycle, the later write-down poll, the direct write-down close and the remaining close make ZERO further modelled-fill calls (after first cycle %r, poll %r, direct write-down %r, remaining %r) and leave lane bankroll, collection sizes and position realized unchanged (%r -> %r)" % (g["m1"]["sales"], g["m2"]["sales"], g["m2w"]["sales"], g["m3"]["sales"], {k: b1[k] for k in LK}, {k: b3[k] for k in LK}), g["m1"]["sales"] >= 1 and g["m1"]["sales"] == g["m2"]["sales"] == g["m2w"]["sales"] == g["m3"]["sales"] and all(b1[k] == b2[k] == b3[k] for k in LK))
     g1, g2, g2w = g["m1"], g["m2"], g["m2w"]
     check("X2a REACHABILITY RECORD: the later write-down POLL may be intercepted by the journal resume of the already-sold leg a (so it may NOT reach the write-down path; X2b is the explicit target-path row); gate calls observed during that poll %r, _pa_write_down calls during it %r (safety condition: none)" % (g2["gate"][len(g1["gate"]):], g2["wd_calls"]), g2["wd_calls"] == 0)
-    check("X2b EXPLICIT TARGET PATH: a direct REAL _close_remaining write-down close on the position with the frozen leg-a obligation reaches a write-down-classified gate call that returns False, returns 0.0, never reaches _pa_write_down (calls %r), opens no intent (ops %r -> %r), no account op, fill journal unchanged (%r -> %r); new gate calls %r" % (g2w["wd_calls"], b2["intent_ops"], g["s2w"]["intent_ops"], b2["fj_sha"], g["s2w"]["fj_sha"], g2w["gate"][len(g2["gate"]):]), g["ret_wd"] == 0.0 and g2w["wd_calls"] == 0 and any(x["wd"] and not x["ret"] for x in g2w["gate"][len(g2["gate"]):]) and g["s2w"]["intent_ops"] == b1["intent_ops"] and g["s2w"]["credit"] == b1["credit"] and g["s2w"]["debit"] == b1["debit"] and g["s2w"]["fj_sha"] == b1["fj_sha"] and g["s2w"]["pos_open"] is True)
+    check("X2b EXPLICIT TARGET PATH: a direct REAL _close_remaining write-down close on the position with the frozen leg-a obligation reaches a write-down-classified gate call that returns False, returns 0.0, never reaches _pa_write_down (calls %r), opens no intent (ops %r -> %r), no account op, no further modelled-fill call (%r -> %r); new gate calls %r" % (g2w["wd_calls"], b2["intent_ops"], g["s2w"]["intent_ops"], g2["sales"], g2w["sales"], g2w["gate"][len(g2["gate"]):]), g["ret_wd"] == 0.0 and g2w["wd_calls"] == 0 and any(x["wd"] and not x["ret"] for x in g2w["gate"][len(g2["gate"]):]) and g["s2w"]["intent_ops"] == b1["intent_ops"] and g["s2w"]["credit"] == b1["credit"] and g["s2w"]["debit"] == b1["debit"] and g["s2w"]["pos_open"] is True and g2["sales"] == g2w["sales"])
     u = run_unit("unit2")
     check("U1 overlap rule on a real journal: frozen leg a holds leg a and any spanning close, NOT legs b/c, NOT a new generation of the same mint (%r)" % ({k: u[k] for k in ("clean_a", "a_held", "b_free", "remaining_held", "newgen_free")},), all(u[k] is True for k in ("clean_a", "a_held", "b_free", "remaining_held", "newgen_free")))
-    check("U2 a write-down close is held by any frozen intent of the position, the helper is read-only, and an unreadable journal returns None (%r)" % ({k: u[k] for k in ("writedown_held", "readonly", "unreadable_none")},), all(u[k] is True for k in ("writedown_held", "readonly", "unreadable_none")))
+    check("U2 a write-down close is held by any frozen intent of the position, the helper is read-only, a GENUINELY unreadable journal (corrupt line followed by a valid line) returns None, and the gate then falls to the storage handling: refused (False) with why close_intent_not_durable (%r)" % ({k: u[k] for k in ("writedown_held", "readonly", "unreadable_none", "gate_unreadable")},), all(u[k] is True for k in ("writedown_held", "readonly", "unreadable_none")) and u["gate_unreadable"] == [False, "close_intent_not_durable"])
     u3 = run_unit("unit3")
     check("U3 a frozen REMAINING close of legs b,c holds legs b and c and any span but not leg a (%r)" % (u3,), all(u3[k] is True for k in ("b_held", "c_held", "a_free", "span_held")))
     gm = run_child("legwd", "mutant"); m1, m2 = gm["s1"], gm["s2"]

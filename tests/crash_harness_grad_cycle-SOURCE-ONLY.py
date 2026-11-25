@@ -11,6 +11,11 @@ point inside _repair_log_tail, then triggers the repair through _record_fault; a
   O5 the ledger file and the cycle journal are byte-identical before and after (the repair never touches accounting state).
 Scenarios: S1 fragment SHORTER than the marker killed after marker/before truncate; S2 fragment LONGER than the marker, same kill point;
 S3 kill at the new seam after_preserve_before_marker (fragment preserved, marker not yet written); S0 control with no kill. NOT built yet: S4 partial-marker write (Python has no hook inside one write(); needs a synthesized torn state, which would NOT be a real mid-write kill).
+CLAIM LIMITS (read before citing any result): evidence class is an INSTRUMENTED ABRUPT PROCESS EXIT (os._exit at a test seam), not an arbitrary external SIGKILL.
+It covers the lock-FREE caller fault-log layer only (_record_fault -> _repair_log_tail with a bare fake grad); it does NOT exercise the cycle lock, a locked repair,
+or any accounting state (O5 only shows the ledger file bytes were untouched). NOT covered: a kill between the preserve write and its fsync (the torn-tails append
+is flushed/fsynced inside one with-block; there is no seam before the fsync), the partial-marker window (no hook inside one write(), only a synthesized state
+could stand in, which would not be a real mid-write exit), and torn-page/power-loss behavior.
 NOT covered (known gaps, to build next): the position-opening step, the accounting oracle (cash + marks conservation across a kill between the fill journal and
 the account credit), and the fault-WRITE-failure variant (the fault-file atomic write failing while the log append succeeds)."""
 import json, os, subprocess, sys, tempfile, hashlib
@@ -82,7 +87,7 @@ def scenario(name, frag, point, expect_kill):
     except Exception: j = {}; print(v.stdout, v.stderr)
     check("%s O1 fault active, never clean (%s)" % (name, j.get("why")), j.get("active") is True)
     check("%s O2 fragment preserved in torn-tails or still in the log" % name, j.get("torn_has_fragment") or j.get("frag_in_log"))
-    check("%s O3 complete lines parse and known_1 still open (%s)" % (name, j.get("open_ids")), j.get("complete_lines_parse") and (j.get("open_ids") is None or any(i.startswith("known_1") for i in j["open_ids"])))
+    check("%s O3 complete lines parse and known_1 still open (%s)" % (name, j.get("open_ids")), j.get("complete_lines_parse") and isinstance(j.get("open_ids"), list) and any(i.startswith("known_1") for i in j["open_ids"]))
     check("%s O4 later fault write ok and log append-safe" % name, j.get("later_write_ok") and j.get("log_append_safe"))
     check("%s O5 ledger untouched" % name, j.get("led_sha") == sha0)
 

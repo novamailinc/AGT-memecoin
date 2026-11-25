@@ -545,5 +545,61 @@ _amt = [o.get("amount") for e in _evs if e.get("ev") == "intent" for o in e.get(
 check("S12 old negative intent: FROZEN visibly (not applied), amount untouched %r, no cash move" % _amt,
       any(e.get("ev") == "frozen" for e in _evs) and not any(e.get("ev") in ("applied", "account_applied") for e in _evs) and _amt == [-0.286441] and abs(PA_cash() - _cash12) < 1e-12)
 
+def _jl(path):
+    import json as _j
+    try:
+        return [_j.loads(x) for x in open(path).read().splitlines() if x.strip()]
+    except Exception:
+        return []
+def _rec_exits(m):
+    import glob as _g
+    out = []
+    for p_ in _g.glob(os.path.join(os.environ["FOREX_AGENT_HOME"], "recorder", "events-*.jsonl")):
+        out += [e for e in _jl(p_) if e.get("kind") == "exit" and e.get("mint") == m]
+    return out
+def _verdict_closes(m):
+    p_ = os.path.join(os.path.dirname(os.path.abspath(G.LEDGER_PATH)), "verdict_ledger", "events.jsonl")
+    return [e for e in _jl(p_) if m in str(e)]
+
+# ---- S13: RESTART while a refused settle is pending (real recovery re-run): the pending position stays open and visible, the open intent
+# is re-driven against the account (refused again => FROZEN visibly by existing recover_lane, entries blocked), the old amount is never
+# rewritten, bankroll/recorder/verdict are NOT booked, nothing is resold ----
+mint = "BB13pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3); JUP.mult = 0.05
+br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint)); vc0 = len(_verdict_closes(mint))
+with patch.object(_PAm, "credit", _credit_refuse):
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    _iid13 = (lane_pos(mint).get("settlement_pending") or {}).get("intent_id")
+    G._RECOVERY_DONE = False
+    G._recover_close_intents()   # the restart path, account still refusing
+    for _ in range(2):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+lp = lane_pos(mint); _e13 = [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("intent_id") == _iid13]
+check("S13 pending refusal survives a restart: still OPEN, settlement_pending, no close record, bankroll not booked (%r -> %r), no recorder exit (%d) / verdict close (%d -> %d)"
+      % (br0, G._read()["bankroll"], len(_rec_exits(mint)) - ex0, vc0, len(_verdict_closes(mint))),
+      mint in G.open_positions() and bool(lp.get("settlement_pending")) and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+      and G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0 and len(_verdict_closes(mint)) == vc0)
+check("S13 restart re-drive of the refused op FROZE its intent visibly (frozen event present, never applied, amount untouched)",
+      any(e.get("ev") == "frozen" for e in _e13) and not any(e.get("ev") in ("applied", "account_applied") for e in _e13))
+JUP.mult = 1.0
+
+# ---- S10b: the close that finally settles books bankroll/recorder/verdict EXACTLY once ----
+mint = "BB14pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3); JUP.mult = 0.05
+br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint))
+with patch.object(_PAm, "credit", _credit_refuse):
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S10b during the refusal: no bankroll, recorder exit or verdict effect", G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+rec = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+check("S10b after the settle: bankroll advanced by realized EXACTLY once (%r -> %r, realized %r), ONE recorder exit (%d)" % (br0, G._read()["bankroll"], rec[0].get("realized_usd") if rec else None, len(_rec_exits(mint)) - ex0),
+      len(rec) == 1 and abs(G._read()["bankroll"] - (br0 + rec[0]["realized_usd"])) < 1e-6 and len(_rec_exits(mint)) - ex0 == 1)
+JUP.mult = 1.0
+
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

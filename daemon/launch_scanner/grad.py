@@ -3113,7 +3113,9 @@ def _finalize(d, mint, pos, closed_reason):
         # The executed sale stays durably recorded and NOTHING is credited or closed: the credit cannot be computed without the
         # account's own applied buyback stake (unknown is never zero).
         pos["settlement_pending"] = {"why": _bb_why, "closed_reason": closed_reason, "since": _prev_sp.get("since") or time.time(),
-                                     "last_try": time.time(), "tries": int(_prev_sp.get("tries") or 0) + 1}
+                                     "last_try": time.time(), "tries": int(_prev_sp.get("tries") or 0) + 1,
+                                     # a hold never loses the open close intent of an earlier refused settle
+                                     **{_k: _prev_sp[_k] for _k in ("intent_id", "plan_sig") if _prev_sp.get(_k)}}
         pos["pending_exit"] = {"leg": "settlement", "why": _bb_why, "ts": time.time()}
         logger.error("grad: %s SETTLEMENT PENDING (%s): economic exit done, buyback cost unreadable; position kept open, no cash booked", mint[:12], _bb_why)
         d["bankroll"] = round(float(d["bankroll"]) - realized, 6)   # undo this call's lane booking: nothing is closed
@@ -3190,9 +3192,17 @@ def _finalize(d, mint, pos, closed_reason):
         _iid = None
         _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
         if _ci is not None:
-            if _prev_sp.get("intent_id") and _prev_sp.get("plan_sig") == _plan_sig:
+            try:
+                _open_ids = {x.get("intent_id") for x in _ci.pending(LANE)}
+            except Exception:
+                _open_ids = set()
+            if _prev_sp.get("intent_id") in _open_ids and _prev_sp.get("plan_sig") == _plan_sig:
                 _iid = _prev_sp["intent_id"]   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
             else:
+                if _prev_sp.get("intent_id") in _open_ids:
+                    # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
+                    # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
+                    _ci.freeze(LANE, _prev_sp["intent_id"], "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160])
                 _iid = _ci.begin(LANE, mint, _pos_id, _plan,
                                  {"realized_usd": realized,
                                   "entry_notional_usd": entry_notional,

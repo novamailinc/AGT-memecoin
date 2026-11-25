@@ -2,7 +2,7 @@
 """ALL-LANE contract test for the SHARED recovery (close_intents.recover_lane) through each lane's REAL _recover_close_intents, in REAL separate processes
 sharing one scratch home (a "restart" is a new process). ENGINEERING TEST: the intent is journaled with close_intents.begin directly (labelled setup: there is no
 lane position, so the lane re-book is refused and recovery freezes it); no trading, no account op beyond the real lane recovery, no config or flag change.
-Lanes: ceo, watcher, momentum, grad (the mirror lane is covered by tests/test_close_intents_frozen_restart_mirror_gate.py under the bb55 pre-apply gate).
+Lanes: ceo, watcher, grad (the mirror and momentum lanes are covered by tests/test_close_intents_frozen_restart_{mirror,momentum}_gate.py under their pre-apply gates).
 Contract (existing safety contract: a frozen intent blocks the lane's entries):
   C  control: an empty journal does NOT block entries.
   A  freeze write FAILS (named injected fault, CI.freeze returns False in that process): the divergence is still a BLOCKER (entries blocked), the intent stays
@@ -20,7 +20,7 @@ sys.path.insert(0, ROOT)
 import tests._guard_fixture as G
 G.block_network()
 sys.path.insert(0, os.path.join(ROOT, "daemon", "launch_scanner"))
-LANES = ("ceo", "watcher_lane", "momentum_lane", "grad")   # mirror moved to tests/test_close_intents_frozen_restart_mirror_gate.py (bb55 gate)
+LANES = ("ceo", "watcher_lane", "grad")   # mirror and momentum_lane moved to tests/test_close_intents_frozen_restart_{mirror,momentum}_gate.py (bb55 / bb58 gates)
 
 def child(mode, root, modname, flag):
     os.environ["FOREX_AGENT_HOME"] = root; os.environ["PAPER_ACCOUNT_ENABLED"] = "1"; os.environ["PAPER_ACCOUNT_START"] = "10"

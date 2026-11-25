@@ -998,6 +998,72 @@ def _configured_stake():
     return None if v is None else float(v)
 
 
+def _ei():
+    """Entry-intent recovery module, or None when the separate default-off flag is not '1'. Flag on and the module cannot import: RAISE (callers refuse entries; exits never call this without a guard)."""
+    if os.environ.get("AGT_GRAD_ENTRY_INTENT_ENABLED") != "1":
+        return None
+    try:
+        from daemon.launch_scanner import grad_entry_intent as _m
+    except ImportError:
+        import grad_entry_intent as _m
+    return _m
+
+
+def _ei_recover():
+    """Classify/adopt surviving entry-intent records. CALLER HOLDS the lane ledger lock. Returns None (nothing blocks) or a reason that blocks ENTRIES only.
+    Never raises. Flag off: returns None without any I/O."""
+    try:
+        _m = _ei()
+    except Exception as _e:
+        return "entry-intent module unavailable (%r); entries blocked fail-closed" % (_e,)
+    if _m is None:
+        return None
+    try:
+        try:
+            from daemon.launch_scanner import entry_guard as _egr
+        except ImportError:
+            import entry_guard as _egr
+        _pa = _paper_account()
+
+        def _evidence(op_id):
+            if _pa is None:
+                return {"ok": False, "why": "paper account unavailable"}
+            return _m.account_evidence(_pa, op_id, _egr.ENTRY_ACCOUNT_WAIT_S)
+
+        def _adopt(rec, pid):
+            d = _read()
+            mint = rec["mint"]
+            if mint in d["positions"]:
+                raise RuntimeError("lane already holds the mint")
+            pos = json.loads(json.dumps(rec["pos"]))
+            pos["pa_pos_id"] = pid
+            d["bankroll"] = round(float(d["bankroll"]) - float(rec["stake"]), 6)
+            ed = d["entries_day"]
+            if ed.get("date") != _today():
+                ed = {"date": _today(), "count": 0}
+            ed["count"] = int(ed.get("count") or 0) + 1   # the original entry incremented this in the same write that never landed
+            d["entries_day"] = ed
+            d["positions"][mint] = pos
+            d["watchlist"].pop(mint, None)
+            _write(d)
+
+        def _drop(op_id, mint):
+            try:
+                _df = _demo_filler()
+                if _df is not None:
+                    _k = "%s|%s" % (LANE, mint)
+                    _df._locked(lambda j: j.setdefault("intents", {}).pop(_k, None) if (j.get("intents") or {}).get(_k) == op_id else None)
+            except Exception as _de:
+                logger.warning("%s: entry-intent drop_intent failed (%r)", LANE, _de)
+
+        _why, _acts = _m.recover_pass(LEDGER_PATH, LANE, _read, _adopt, _evidence, _drop)
+        for _op, _mt, _cl, _wh in _acts:
+            logger.warning("%s entry-intent op=%s mint=%s class=%s: %s", LANE, _op, _mt, _cl, _wh)
+        return _why
+    except Exception as _e:
+        return "entry-intent recovery failed (%r); entries blocked fail-closed" % (_e,)
+
+
 def consider_candidate(cand, now=None):
     """Decide one graduation candidate. Returns (opened, reason,
     final): final=True means never reconsider this mint (entered,
@@ -1294,6 +1360,9 @@ def _consider_candidate(cand, now):
     # Authoritative section: dedupe + caps + bankroll re-checked
     # under the same lock that debits cash and inserts the position.
     with _ledger_lock():
+        _eib = _ei_recover()
+        if _eib:
+            return _skip(mint, _eib, False)
         d = _read()
         if float(d["bankroll"]) < _stake:
             if d["state"] != "bankroll_exhausted":
@@ -1374,6 +1443,7 @@ def _consider_candidate(cand, now):
             if _age_why:
                 return _skip(mint, "risk: " + _age_why, False)
             _op = "%s:entry:%s:%d" % (LANE, mint, int(_born * 1000))
+            _ei_fill = None
             if _demo_mode():
                 # DEMO: fill = Jupiter-quote simulation, NEVER the model fill; no filler or a skip
                 # REFUSES the entry (no silent fallback to modelled P&L).
@@ -1396,6 +1466,7 @@ def _consider_candidate(cand, now):
                         logger.warning("%s: release_intent failed (%r); a retry may replay the original fill", LANE, _re)
                     return _skip(mint, "risk: " + _pq, False)
                 _qty = _fill["qty_tokens"]
+                _ei_fill = _fill
                 filled = _fill["price_usd"]
                 pos.update({"tokens": _qty, "entry_price": filled, "peak_price": filled,
                             "gas_in_usd": round(_fill["fee_usd"], 6),
@@ -1410,6 +1481,8 @@ def _consider_candidate(cand, now):
         # lane write, hold the cycle FAULT lock (order ledger -> fault, as the abort hook) and RE-CHECK the mandatory guard under it, so a fault is either recorded before this
         # re-check (entry refused, nothing debited) or only after the write. The wait is SHORT (entry_guard.ENTRY_FAULT_WAIT_S, held while the ledger lock is held, so it bounds
         # the delay an exit can see behind an entry); a timeout refuses the entry. Flag off: a no-op. Never taken by exits.
+        _ei_path = None
+        _eim = None
         _cbx = None
         try:
             _cbx = _eg.commit_barrier(type("_LedgerRef", (), {"LEDGER_PATH": LEDGER_PATH})(), _eg.ENTRY_FAULT_WAIT_S)
@@ -1437,6 +1510,17 @@ def _consider_candidate(cand, now):
                 # The account flock is shared by the whole roster and its plain acquire blocks without a bound; while we hold the lane ledger lock AND the fault lock, bound the ACQUIRE
                 # (AccountBusy is raised before the account critical section starts: nothing was written, so this is a clean transient refusal; the demo intent is released below).
                 # A fake account without the scope helper falls back to the plain call. The bound does not cover I/O inside the account critical section.
+                try:
+                    _eim = _ei() if (_demo_mode() and _ei_fill is not None) else None
+                    if _eim is not None:
+                        _ei_path = _eim.write_record(LEDGER_PATH, _eim.build_record(LANE, mint, _op, _stake, _qty, pos, _ei_fill,
+                                                     {"mint": mint, "pool": cand.get("pool_address"), "created_ts": cand.get("created_ts")}))
+                except Exception as _eie:
+                    try:
+                        _demo_filler().release_intent(LANE, mint)
+                    except Exception as _re:
+                        logger.warning("%s: release_intent failed (%r) after entry-intent record failure", LANE, _re)
+                    return _skip(mint, "entry intent record unavailable (%r); entry refused before any debit" % (_eie,), False)
                 try:
                     _bw = getattr(_pa, "bounded_lock_wait", None)
                     if _bw is not None:
@@ -1466,6 +1550,8 @@ def _consider_candidate(cand, now):
                 _write(d)
             finally:
                 _INFLIGHT_OPEN.discard(str(pos.get("pa_pos_id")))
+            if _ei_path is not None:
+                _eim.remove_record(_ei_path)   # AFTER the lane commit; idempotent, a failure is class A on the next pass
         finally:
             _cbx.__exit__(None, None, None)
         if _demo_mode():
@@ -3946,6 +4032,15 @@ def _validate_jup_observed(requested, raw):
 
 def _poll_exits(price_fn):
     _POLL_SEQ["n"] += 1
+    if os.environ.get("AGT_GRAD_ENTRY_INTENT_ENABLED") == "1":
+        # Entry-intent recovery (flag on only). Contained: ANY failure here is logged and the exit path below proceeds; this can only keep entries blocked.
+        try:
+            with _ledger_lock():
+                _eib = _ei_recover()
+            if _eib:
+                logger.warning("grad poll_exits: entry-intent state blocks entries: %s", _eib)
+        except Exception as _eie:
+            logger.warning("grad poll_exits: entry-intent recovery pass failed (%r); exits continue", _eie)
     # Phase 1: snapshot (locked read). Quotes happen outside the lock.
     with _ledger_lock():
         snapshot = {m: p for m, p in _read()["positions"].items()}

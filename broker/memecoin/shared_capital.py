@@ -138,7 +138,9 @@ def apply_exit(plan, account):
         raise CapitalConflict(error)
     if rec is None:
         ok,why = account.credit(plan['lane'],plan['mint'],plan['proceeds'],plan['op_id'],
-                                 pos_id=plan['pos_id'],qty=plan['qty'],fee=0.,price_kind=kind)
+                                 pos_id=plan['pos_id'],qty=plan['qty'],fee=0.,price_kind=kind,
+                                 expected_account_id=plan.get('expected_account_id'),
+                                 entry_op_id=plan.get('entry_op_id'))
         rec,error = account.operation_receipt(plan['op_id'])
         if error:
             raise CapitalConflict(error)

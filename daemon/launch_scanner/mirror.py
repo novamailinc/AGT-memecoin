@@ -381,6 +381,11 @@ _RECOVERY_DONE = False
 _ENTRY_BLOCKED = False
 
 
+def _block_entries():
+    global _ENTRY_BLOCKED
+    _ENTRY_BLOCKED = True
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process for every mirror
     lane before the first entry/close. A frozen intent (account and ledger
@@ -406,7 +411,8 @@ def _recover_close_intents():
                 ok, why = _pa.write_down(
                     lane, op.get("mint"), op.get("op_id"),
                     pos_id=op.get("pos_id"), qty=op.get("qty"),
-                    reason=op.get("reason"))
+                    reason=op.get("reason"),
+                    expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
             elif op.get("kind") != "credit":
                 return False, "recorded op kind %r is not supported, NOT applied" % (op.get("kind"),)
             else:
@@ -417,7 +423,8 @@ def _recover_close_intents():
                     lane, op.get("mint"), op.get("amount"),
                     op.get("op_id"), pos_id=op.get("pos_id"),
                     qty=op.get("qty"), fee=op.get("fee") or 0.0,
-                    price_kind=op.get("price_kind"))
+                    price_kind=op.get("price_kind"),
+                    expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
             if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
                     and not _pa.pos_ever_existed(
                         pos_id=op.get("pos_id"), lane=lane,
@@ -462,6 +469,14 @@ def _recover_close_intents():
             frozen = _gated
         else:
             frozen = list(_ci.recover_lane(lane, account_apply, lane_has_close, lane_apply) or []) + _gated
+        try:
+            _unb = [str(m) for m, p in ((_read().get("positions") or {}).items())
+                    if isinstance(p, dict) and p.get("lane", lane) == lane and p.get("pa_pos_id") and not p.get("pa_account_id")]
+        except Exception:
+            _unb = ["unreadable-lane-ledger"]
+        if _unb:
+            frozen = list(frozen) + ["unbound-position:" + m for m in _unb]
+            logger.error("mirror %s: open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no automatic rebinding)", lane, ",".join(_unb))
         if frozen:
             _ENTRY_BLOCKED = True
             logger.error("mirror %s: %d close intent(s) FROZEN - ledgers "
@@ -508,7 +523,8 @@ def _pa_apply(pos, suffix, kind_op, apply_fn):
         iid = _ci.begin(lane, mint, pid, [kind_op],
                         {"realized_usd": kind_op.get("amount") or 0.0,
                          "closed_reason": (pos.get("_exit_meta") or {}).get("reason") or suffix, "close_ts": time.time(),
-                         "leg_suffix": suffix})
+                         "leg_suffix": suffix},
+                        account_id=pos.get("pa_account_id"))
         _pend = (lane, iid, pid, mint, suffix)
     _ok, _why = apply_fn(_pa)
     if not _ok and _pa.op_outcome(kind_op["op_id"]) == "orphan" \
@@ -533,10 +549,12 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
     _pa_apply(pos, suffix,
               {"kind": "credit", "op_id": op, "mint": mint, "amount": gross,
                "qty": qty, "fee": fee, "price_kind": price_kind,
-               "pos_id": pid},
+               "pos_id": pid,
+               "expected_account_id": pos.get("pa_account_id"), "entry_op_id": pos.get("pa_entry_op")},
               lambda _pa: _pa.credit(lane, mint, gross, op, pos_id=pid,
                                      qty=qty, fee=fee,
-                                     price_kind=price_kind))
+                                     price_kind=price_kind,
+                                     expected_account_id=pos.get("pa_account_id"), entry_op_id=pos.get("pa_entry_op")))
 
 
 def _pa_write_down(pos, reason):
@@ -547,9 +565,11 @@ def _pa_write_down(pos, reason):
     op = "%s:writedown:%s:%s" % (lane, mint, pid)
     _pa_apply(pos, "writedown",
               {"kind": "write_down", "op_id": op, "mint": mint,
-               "pos_id": pid, "reason": reason},
+               "pos_id": pid, "reason": reason,
+               "expected_account_id": pos.get("pa_account_id"), "entry_op_id": pos.get("pa_entry_op")},
               lambda _pa: _pa.write_down(lane, mint, op, pos_id=pid,
-                                         reason=reason))
+                                         reason=reason,
+                                         expected_account_id=pos.get("pa_account_id"), entry_op_id=pos.get("pa_entry_op")))
 
 
 try:
@@ -1092,6 +1112,14 @@ def _mirror_card(chain, source, mint, symbol, score, tier,
                         logger.warning("mirror: release_intent failed (%r); a retry may replay the original (stale) fill", _re)
                 return False, "paper account: " + str(_why)
             pos["pa_pos_id"] = _pid
+            # GENERATION BINDING from the debit's own entry op under the account lock (see momentum_lane). None = unproven: stored UNBOUND, every
+            # settlement refused and frozen, entries blocked; never normalized, compensated or re-bought.
+            pos["pa_entry_op"] = _op
+            pos["pa_account_id"] = _pa.entry_binding(lane, mint, _op, _pid)
+            if not pos["pa_account_id"]:
+                pos["pa_binding_failed"] = True
+                _block_entries()
+                logger.error("mirror: entry %s debit %s succeeded but its account generation could NOT be proven: position stored UNBOUND, ENTRIES BLOCKED", mint, _pid)
         d["positions"][mint] = pos
         _write(d)
         if _intent_op:

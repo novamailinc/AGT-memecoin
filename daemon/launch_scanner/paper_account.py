@@ -1060,6 +1060,11 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         kind = ev.get("event")
         lane, mint = ev.get("lane"), ev.get("mint")
         op_id = ev.get("op_id")
+        if (kind in _MUTATION_EVENTS and isinstance(ev.get("account_id"), str) and isinstance(led.get("account_id"), str)
+                and ev.get("account_id") != led.get("account_id")):
+            # GENERATION SAFETY: a mutation journaled under another account generation must never be replayed into this ledger.
+            return led, ("replay divergence: %s %s journaled under account generation %s, ledger is %s"
+                         % (kind, op_id, str(ev.get("account_id"))[:8], str(led.get("account_id"))[:8]))
         if kind in _MUTATION_EVENTS and op_id and op_id in ops:
             # Caller op already applied: idempotent skip. The seq
             # still advances — the state includes this mutation.
@@ -1074,7 +1079,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                 if cur.get("pos_id", _pos_id(lane, mint, ev_seq)) == pid:
                     if op_id:
                         ops[op_id] = {"event": "debit", "pos_id": pid,
-                                      "lane": lane, "mint": mint,
+                                      "lane": lane, "mint": mint, "account_id": ev.get("account_id"),
                                       "stake": ev.get("stake"), "qty": ev.get("qty"),
                                       **({"instance": True} if ev.get("instance") is True else {})}
                     led["seq"] = ev_seq
@@ -1090,7 +1095,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                          pid, ev.get("ts"), instance=ev.get("instance") is True)
             if op_id:
                 ops[op_id] = {"event": "debit", "pos_id": pid,
-                              "lane": lane, "mint": mint,
+                              "lane": lane, "mint": mint, "account_id": ev.get("account_id"),
                               "stake": stake, "qty": ev.get("qty"),
                               **({"instance": True} if ev.get("instance") is True else {})}
             replayed += 1
@@ -1433,6 +1438,12 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
             degraded = ("journal seq violation %s -> %s; manual "
                         "WAL reconciliation required" % hole)
     if not os.path.exists(LEDGER_PATH):
+        if entries or jstatus is not None:
+            # GENERATION SAFETY: a missing ledger with ANY journal history is a lost/replaced book, never a first run. Creating a clean account on top
+            # of the old WAL would merge old-generation debits into a new account_id on the next load. Fail closed, write nothing, create nothing.
+            logger.error("paper_account: ledger missing with WAL present (%d records, status %s): NOT regenerating; manual reconciliation required",
+                         len(entries), jstatus)
+            return None, False, "ledger missing with WAL present (not regenerated)"
         led = _new_ledger()
         _journal({"event": "create", "start_balance":
                   led["start_balance"], "account_id": led["account_id"]})
@@ -1681,10 +1692,10 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
         led["ops"][op_id] = {"event": "debit", "lane": lane,
                              "mint": mint, "pos_id": pid,
-                             "stake": stake, "qty": qty,
+                             "stake": stake, "qty": qty, "account_id": led.get("account_id"),
                              **({"instance": True} if instance else {})}
         _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
-                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "op_id": op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "stake": stake, "qty": qty,
                   **({"instance": True} if instance else {}),
                   "cash_after": led["cash"],
@@ -2010,10 +2021,10 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
         _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
         led["ops"][entry_op_id] = {"event": "debit", "lane": lane,
                                    "mint": mint, "pos_id": pid,
-                                   "stake": stake, "qty": qty,
+                                   "stake": stake, "qty": qty, "account_id": led.get("account_id"),
                                    **({"instance": True} if instance else {})}
         _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
-                  "op_id": entry_op_id, "lane": lane, "mint": mint,
+                  "op_id": entry_op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "stake": stake, "qty": qty,
                   **({"instance": True} if instance else {}),
                   "cash_after": led["cash"],
@@ -2141,10 +2152,66 @@ def list_holds(prefix: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     return {k: v for k, v in holds.items() if k.startswith(prefix)}
 
 
+def _generation_refusal(led, expected, entry_op_id, lane, mint, pos_id):
+    """ATOMIC settlement-generation proof. The caller holds _lock() and has just run _load_locked(), so the ledger, the journal and the entry-op
+    evidence checked here are the SAME ones the mutation then applies to: there is no check-then-mutate window. Returns None when proven,
+    else a refusal reason. Every failure is a refusal (never an orphan or a convergence): unknown is not proof."""
+    ident = led.get("account_id")
+    if not isinstance(ident, str) or not ident:
+        return "ledger account generation unbound (legacy)"
+    if not isinstance(expected, str) or not expected:
+        return "caller bound no account generation"
+    if expected != ident:
+        return "account generation mismatch (bound %s, ledger %s)" % (expected[:8], ident[:8])
+    entries, jst, _t = _journal_read()
+    if jst is not None:
+        return "journal not clean (%s)" % jst
+    creates = [e for e in entries if e.get("event") == "create"]
+    if len(creates) != 1 or creates[0].get("account_id") != ident:
+        return "journal create identity mismatch (%d create events)" % len(creates)
+    if not isinstance(entry_op_id, str) or not entry_op_id:
+        return "caller bound no entry op"
+    op = (led.get("ops") or {}).get(entry_op_id)
+    if not (isinstance(op, dict) and op.get("event") == "debit" and op.get("lane") == lane and op.get("mint") == mint):
+        return "entry op %s not proven in the ledger" % entry_op_id
+    if pos_id and op.get("pos_id") != pos_id:
+        return "entry op pos_id %s differs from the settled pos_id %s" % (op.get("pos_id"), pos_id)
+    if op.get("account_id") != ident:
+        return "entry op carries no matching account generation"
+    debs = [e for e in entries if e.get("event") == "debit" and e.get("op_id") == entry_op_id]
+    if len(debs) != 1 or debs[0].get("pos_id") != op.get("pos_id") or debs[0].get("account_id") != ident:
+        return "journal does not hold exactly one matching debit for the entry op"
+    return None
+
+
+def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Optional[str]:
+    """The account generation a just-debited position belongs to, read back under the account lock and ONLY when the exact entry op, pos_id,
+    lane/mint, the clean journal and the single create identity all prove it (the same proof settlement uses). A regenerated or rolled-back
+    account cannot return a binding for an op it never held. None = unproven (the caller must treat the entry as an uncertain partial
+    execution, never as bound)."""
+    if not (isinstance(entry_op_id, str) and entry_op_id and isinstance(pos_id, str) and pos_id):
+        return None
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if led is None or not healthy or degraded:
+            return None
+        ident = led.get("account_id")
+        if _generation_refusal(led, ident, entry_op_id, lane, mint, pos_id) is not None:
+            return None
+        return ident
+
+
+def _refuse_generation(op_id, lane, mint, pos_id, reason):
+    _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason})
+    return False, "generation refused: %s (journaled, nothing applied)" % reason
+
+
 def credit(lane: str, mint: str, proceeds: float, op_id: str,
            ts: Optional[float] = None, pos_id: Optional[str] = None,
            qty: Optional[float] = None, fee: float = 0.0,
-           price_kind: Optional[str] = None
+           price_kind: Optional[str] = None,
+           expected_account_id: Optional[str] = None,
+           entry_op_id: Optional[str] = None
            ) -> Tuple[bool, str]:
     """Settle a sale of `qty` units of `mint` (None = ALL remaining
     units, i.e. a full close) for `proceeds` gross paper dollars
@@ -2203,6 +2270,9 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                       "reason": degraded})
             return False, ("account degraded: %s (journaled for "
                            "manual reconciliation)" % degraded)
+        _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+        if _grf is not None:
+            return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         rec, conflict = _op_lookup(led, op_id, "credit", lane, mint,
                                    {})
         if conflict:
@@ -2332,7 +2402,9 @@ def write_down(lane: str, mint: str, op_id: str,
                ts: Optional[float] = None,
                pos_id: Optional[str] = None,
                reason: Optional[str] = None,
-               qty: Optional[float] = None
+               qty: Optional[float] = None,
+               expected_account_id: Optional[str] = None,
+               entry_op_id: Optional[str] = None
                ) -> Tuple[bool, str]:
     """Write a position down to zero carrying value: units and their
     original cost move to the unresolved register as
@@ -2353,6 +2425,10 @@ def write_down(lane: str, mint: str, op_id: str,
         led, healthy, degraded = _load_locked()
         if led is None:
             return False, "ledger unreadable"
+        if degraded is None:
+            _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+            if _grf is not None:
+                return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         prior = led["ops"].get(op_id)
         if prior is not None:
             # Instance operations are exact. A different event or target can

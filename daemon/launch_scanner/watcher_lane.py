@@ -201,6 +201,11 @@ _RECOVERY_DONE = False
 _ENTRY_BLOCKED = False
 
 
+def _block_entries():
+    global _ENTRY_BLOCKED
+    _ENTRY_BLOCKED = True
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process, before
     this process's first entry/close. Account ops re-apply
@@ -223,13 +228,15 @@ def _recover_close_intents():
             ok, why = _pa.write_down(
                 LANE, op.get("mint"), op.get("op_id"),
                 pos_id=op.get("pos_id"), qty=op.get("qty"),
-                reason=op.get("reason") or "recovered")
+                reason=op.get("reason") or "recovered",
+                expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
         else:
             ok, why = _pa.credit(
                 LANE, op.get("mint"), op.get("amount"),
                 op.get("op_id"), pos_id=op.get("pos_id"),
                 qty=op.get("qty"), fee=op.get("fee") or 0.0,
-                price_kind=op.get("price_kind"))
+                price_kind=op.get("price_kind"),
+                expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
         if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
                 and not _pa.pos_ever_existed(
                     pos_id=op.get("pos_id"), lane=LANE,
@@ -271,6 +278,13 @@ def _recover_close_intents():
                 if not _fzok:
                     logger.error("watcher: freeze event for %s NOT written; entries stay blocked from the durable record alone", _iid)
             frozen = [str(i or "unreadable-pending") for i, _w in _un]
+    try:
+        _unb = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+    except Exception:
+        _unb = ["unreadable-lane-ledger"]
+    if _unb:
+        frozen = list(frozen) + ["unbound-position:" + m for m in _unb]
+        logger.error("watcher: open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no automatic rebinding)" % ",".join(_unb))
     if frozen:
         _ENTRY_BLOCKED = True
         logger.error("watcher: %d close intent(s) FROZEN - ledgers "
@@ -291,7 +305,8 @@ def _intent_open(lane_suffix, pos, ops, reason):
                     {"realized_usd": ops[0].get("amount") or 0.0,
                      "closed_reason": reason,
                      "close_ts": time.time(),
-                     "leg_suffix": lane_suffix})
+                     "leg_suffix": lane_suffix},
+                    account_id=pos.get("pa_account_id"))
     return (iid, pa_pos_id, mint, lane_suffix)
 
 
@@ -338,9 +353,12 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
                          [{"kind": "credit", "op_id": _op,
                            "mint": mint, "amount": gross, "qty": qty,
                            "fee": fee, "price_kind": price_kind,
-                           "pos_id": pa_pos_id}], (pos.get("_exit_meta") or {}).get("reason") or suffix)
+                           "pos_id": pa_pos_id,
+                           "expected_account_id": pos.get("pa_account_id"), "entry_op_id": pos.get("pa_entry_op")}],
+                         (pos.get("_exit_meta") or {}).get("reason") or suffix)
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
-                           qty=qty, fee=fee, price_kind=price_kind)
+                           qty=qty, fee=fee, price_kind=price_kind,
+                           expected_account_id=pos.get("pa_account_id"), entry_op_id=pos.get("pa_entry_op"))
     if not _ok and _pa.op_outcome(_op) == "orphan" \
             and not _pa.pos_ever_existed(pos_id=pa_pos_id,
                                          lane=LANE, mint=mint):
@@ -373,9 +391,11 @@ def _pa_write_down(pos, reason):
     _pend = _intent_open("writedown", pos,
                          [{"kind": "write_down", "op_id": _op,
                            "mint": mint, "pos_id": pa_pos_id,
-                           "reason": reason}], reason)
+                           "reason": reason,
+                           "expected_account_id": pos.get("pa_account_id"), "entry_op_id": pos.get("pa_entry_op")}], reason)
     _ok, _why = _pa.write_down(LANE, mint, _op, pos_id=pa_pos_id,
-                               reason=reason)
+                               reason=reason,
+                               expected_account_id=pos.get("pa_account_id"), entry_op_id=pos.get("pa_entry_op"))
     if not _ok and _pa.op_outcome(_op) == "orphan" \
             and not _pa.pos_ever_existed(pos_id=pa_pos_id,
                                          lane=LANE, mint=mint):
@@ -1336,6 +1356,14 @@ def _consider_fire(sig, now):
                         logger.warning("%s: release_intent failed (%r); a retry may replay the original (stale) fill", LANE, _re)
                 return _skip(mint, "paper account: " + _why, False)
             pos["pa_pos_id"] = _pid
+            # GENERATION BINDING from the debit's own entry op under the account lock. None = unproven: stored UNBOUND, settlements refused and
+            # frozen, entries blocked (no automatic rebinding, no compensation).
+            pos["pa_entry_op"] = _op
+            pos["pa_account_id"] = _pa.entry_binding(LANE, mint, _op, _pid)
+            if not pos["pa_account_id"]:
+                pos["pa_binding_failed"] = True
+                _block_entries()
+                logger.error("watcher: entry %s debit %s succeeded but its account generation could NOT be proven: position stored UNBOUND, ENTRIES BLOCKED" % (mint, _pid))
         d["bankroll"] = round(float(d["bankroll"]) - _N, 6)
         d["positions"][mint] = pos
         _write(d)

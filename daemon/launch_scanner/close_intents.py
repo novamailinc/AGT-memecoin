@@ -229,7 +229,8 @@ def _op_family(op_id) -> str:
 
 def begin(lane: str, mint: str, pos_id: Optional[str],
           settle_ops: List[Dict[str, Any]],
-          close_info: Dict[str, Any], stable_id: bool = False, supersedes: Optional[str] = None) -> str:
+          close_info: Dict[str, Any], stable_id: bool = False, supersedes: Optional[str] = None,
+          account_id: Optional[str] = None) -> str:
     """Open an intent. settle_ops is the ordered list of account
     operations this close performs, each {kind: credit|write_down,
     op_id, amount?, qty?, price_kind?, reason?}; close_info carries
@@ -256,6 +257,8 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     intent_id = "%s:%s" % (intent_id, uuid.uuid4().hex[:24])
     ev = {"ev": "intent", "intent_id": intent_id, "lane": lane, "mint": mint, "pos_id": pos_id,
           "settle_ops": settle_ops, "close_info": dict(close_info)}
+    if account_id is not None:
+        ev["account_id"] = account_id   # the ORIGINAL account generation the position was opened under (never re-read at settlement)
     if op_key is None:
         with _op_key_lock(lane):
             ents, st, _ = _read_consistent(journal_path(lane))

@@ -328,6 +328,11 @@ _RECOVERY_DONE = False
 _ENTRY_BLOCKED = False
 
 
+def _block_entries():
+    global _ENTRY_BLOCKED
+    _ENTRY_BLOCKED = True
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process, before
     this process's first new close. The account side re-applies
@@ -351,12 +356,14 @@ def _recover_close_intents():
             ok, why = _pa.write_down(
                 LANE, op.get("mint"), op.get("op_id"),
                 pos_id=op.get("pos_id"), qty=op.get("qty"),
-                reason=op.get("reason") or "recovered")
+                reason=op.get("reason") or "recovered",
+                expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
         else:
             ok, why = _pa.credit(
                 LANE, op.get("mint"), op.get("amount"),
                 op.get("op_id"), pos_id=op.get("pos_id"),
-                qty=op.get("qty"), price_kind=op.get("price_kind"))
+                qty=op.get("qty"), price_kind=op.get("price_kind"),
+                expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
         if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
                 and not _pa.pos_ever_existed(
                     pos_id=op.get("pos_id"), lane=LANE,
@@ -396,6 +403,13 @@ def _recover_close_intents():
 
     frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
                               lane_apply)
+    try:
+        _unb = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+    except Exception:
+        _unb = ["unreadable-lane-ledger"]
+    if _unb:
+        frozen = list(frozen or []) + ["unbound-position:" + m for m in _unb]
+        logger.error("grad: open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no automatic rebinding)", ",".join(_unb))
     if frozen:
         _ENTRY_BLOCKED = True
         logger.error("grad: %d close intent(s) FROZEN - ledgers "
@@ -1550,6 +1564,14 @@ def _consider_candidate(cand, now):
                 # Pin the open instance so the close can never settle
                 # a later reopen of the same mint.
                 pos["pa_pos_id"] = _pid
+                # GENERATION BINDING from the debit's own entry op under the account lock; None = unproven: stored UNBOUND, settlements refused/frozen,
+                # entries blocked (no automatic rebinding, no compensation).
+                pos["pa_entry_op"] = _op
+                pos["pa_account_id"] = _pa.entry_binding(LANE, mint, _op, _pid)
+                if not pos["pa_account_id"]:
+                    pos["pa_binding_failed"] = True
+                    _block_entries()
+                    logger.error("grad: entry %s debit %s succeeded but its account generation could NOT be proven: position stored UNBOUND, ENTRIES BLOCKED", mint, _pid)
                 _INFLIGHT_OPEN.add(str(_pid))   # account holds it, lane books do not yet: not "unknown" for the marks hook
             d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
             d["positions"][mint] = pos
@@ -2049,7 +2071,8 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
     # difference and the account then holds exactly the lane's unsold tokens. The lane tally stays in LANE units.
     _lane_qty = qty
     qty = (None if acct_qty is _QTY_NONE else (acct_qty if acct_qty is not None else _acct_qty(pos, leg_key, qty))) if qty is not None else qty
-    ok, why = _pa.credit(LANE, pos["mint"], gross, _op, pos_id=pos["pa_pos_id"], qty=qty, fee=fee, price_kind=kind)
+    ok, why = _pa.credit(LANE, pos["mint"], gross, _op, pos_id=pos["pa_pos_id"], qty=qty, fee=fee, price_kind=kind,
+                         expected_account_id=pos.get("pa_account_id"), entry_op_id=pos.get("pa_entry_op"))
     if not ok:
         # Same convergence rule as the final close: an orphan (the account never held these units, and never did
         # for this position) is a legitimate pre-account position, not a refusal: the leg proceeds and the
@@ -2081,9 +2104,11 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
                         if not _iid:
                             _iid = _ci.begin(LANE, pos["mint"], pos["pa_pos_id"],
                                              [{"kind": "credit", "op_id": _op, "mint": pos["mint"], "amount": gross,
-                                               "qty": qty, "price_kind": kind, "pos_id": pos["pa_pos_id"]}],
+                                               "qty": qty, "price_kind": kind, "pos_id": pos["pa_pos_id"],
+                                               "expected_account_id": pos.get("pa_account_id"), "entry_op_id": pos.get("pa_entry_op")}],
                                              {"realized_usd": round(gross - fee, 6), "close_ts": int(float(pos.get("entry_ts") or 0) * 1000) + ord(str(leg_key)[-1]),   # STABLE: a retry regenerates the same intent id
-                                              "closed_reason": "tranche_leg_" + str(leg_key)}, stable_id=True)
+                                              "closed_reason": "tranche_leg_" + str(leg_key)}, stable_id=True,
+                                             account_id=pos.get("pa_account_id"))
                         _st = _ci.intent_status(LANE, _iid)
                         if _st == "applied":
                             # an APPLIED intent is never frozen: that contradicts a divergence claim, so it is held visibly, not resolved
@@ -3198,6 +3223,10 @@ def _finalize(d, mint, pos, closed_reason):
                 _warn_throttled(("settle_pending", mint, _res), "grad: %s SETTLEMENT PENDING (%s): %s residue_qty=%s; position kept open, no cash booked (see recon_health)", mint[:12], closed_reason, _res, _resq)
                 _write(d)
                 return None
+        for _bo in _plan:
+            # GENERATION BINDING: a freshly built plan carries the position's ORIGINAL binding; a plan resumed from a recorded intent keeps its own.
+            _bo.setdefault("expected_account_id", pos.get("pa_account_id"))
+            _bo.setdefault("entry_op_id", pos.get("pa_entry_op"))
         _ci = _close_intents() if _plan else None
         _iid = None
         _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
@@ -3259,7 +3288,8 @@ def _finalize(d, mint, pos, closed_reason):
                                       "entry_notional_usd": entry_notional,
                                       "closed_reason": closed_reason,
                                       "close_ts": time.time()},
-                                     supersedes=(_prev_id if _prev_st in ("open", "frozen") else None))
+                                     supersedes=(_prev_id if _prev_st in ("open", "frozen") else None),
+                                     account_id=pos.get("pa_account_id"))
             except _ci.IntentNotDurable as _nd:
                 # FAIL CLOSED: no durable plan, so NO account op. Position stays open, visible, nothing resold, bankroll booking undone;
                 # an earlier open intent (if any) keeps its id/plan_sig so a later poll can still recover or reuse it.
@@ -3277,12 +3307,14 @@ def _finalize(d, mint, pos, closed_reason):
             if _sop["kind"] == "write_down":
                 _ok, _why = _pa.write_down(
                     LANE, mint, _sop["op_id"], pos_id=_pos_id,
-                    qty=_sop.get("qty"), reason=_sop.get("reason"))
+                    qty=_sop.get("qty"), reason=_sop.get("reason"),
+                    expected_account_id=_sop.get("expected_account_id"), entry_op_id=_sop.get("entry_op_id"))
             else:
                 _ok, _why = _pa.credit(
                     LANE, mint, _sop["amount"], _sop["op_id"],
                     pos_id=_pos_id, qty=_sop.get("qty"),
-                    price_kind=_sop.get("price_kind"))
+                    price_kind=_sop.get("price_kind"),
+                    expected_account_id=_sop.get("expected_account_id"), entry_op_id=_sop.get("entry_op_id"))
             if not _ok:
                 # Orphan tolerance needs POSITIVE evidence of a
                 # pre-account epoch: the account's journal shows

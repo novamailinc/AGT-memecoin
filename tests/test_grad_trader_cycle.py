@@ -213,5 +213,46 @@ check("G42 startup_report distinguishes flag_off, off_non_demo, on, refuse", sr_
 gsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "grad_trader_cycle.py")).read()
 i = gsrc.index("def entry_scan("); j2 = gsrc.index("# ---------------------------------------------------------- main loop")
 check("G43 static: entry_scan never uses scan_phase, the cycle lock or cycle.json; no post-scan flag in this source", all(x not in gsrc[i:j2] for x in ("scan_phase", "_cycle_lock_path", "_journal_path", "cycle.json")) and "POST_SCAN" not in gsrc)
+# ---- v3b: fault-state serialisation (UNEXECUTED) ----
+import threading as _th, time as _tm
+os.environ[GC.ENV_FLAG] = "1"
+# G44 contention: another open file description holds the fault lock -> _record_fault does NOT record, reports failure, nothing written (fail closed)
+g = fake(); _t0 = GC._FAULT_LOCK_TIMEOUT_S; GC._FAULT_LOCK_TIMEOUT_S = 0.2
+hl = open(GC._fault_lock_path(g), "a"); fcntl.flock(hl, fcntl.LOCK_EX | fcntl.LOCK_NB); o44 = {}
+try: w44 = GC._record_fault(g, o44, "x44")
+finally: fcntl.flock(hl, fcntl.LOCK_UN); hl.close(); GC._FAULT_LOCK_TIMEOUT_S = _t0
+check("G44 fault lock held elsewhere: _record_fault returns False, fault_lock_failure set, no fault file, in-process flag stays active", w44 is False and "fault_lock_failure" in o44 and not os.path.exists(GC._fault_path(g)) and GC.fault_active(g)[0] is True)
+# G45 reentrancy: nesting in one thread must not deadlock or release early
+g = fake(); _t0 = GC._FAULT_LOCK_TIMEOUT_S; GC._FAULT_LOCK_TIMEOUT_S = 0.5
+try:
+    with GC._fault_lock(g):
+        with GC._fault_lock(g): pass
+        h2 = open(GC._fault_lock_path(g), "a")
+        try: fcntl.flock(h2, fcntl.LOCK_EX | fcntl.LOCK_NB); still = False
+        except BlockingIOError: still = True
+        h2.close()
+    h3 = open(GC._fault_lock_path(g), "a"); fcntl.flock(h3, fcntl.LOCK_EX | fcntl.LOCK_NB); freed = True; h3.close()
+finally: GC._FAULT_LOCK_TIMEOUT_S = _t0
+check("G45 fault lock is reentrant per thread, still held after the inner release, free after the outer", still and freed)
+# G46 lost-update interleave, deterministic: writer A reads the fault record; while A is inside its critical section writer B starts. B must BLOCK until A
+# finishes, and the final record must carry BOTH reasons (without the lock B would run inside A and one would be lost).
+g = fake(); GC._record_fault(g, {}, "seed46"); _rf = GC._read_fault; _state = {"in_a": False}; _bt = {}
+def _slow_read(grad):
+    r = _rf(grad)
+    if not _state["in_a"]:
+        _state["in_a"] = True
+        tb = _th.Thread(target=lambda: _bt.setdefault("ok", GC._record_fault(g, {}, "B46"))); tb.start(); _tm.sleep(0.3); _bt["alive_midway"] = tb.is_alive(); _bt["t"] = tb
+    return r
+GC._read_fault = _slow_read
+try: GC._record_fault(g, {}, "A46")
+finally: GC._read_fault = _rf
+_bt["t"].join(10); fr = GC._read_fault(g); rs = [e.get("reason") for e in fr.get("reasons", [])]
+check("G46 two fault writers: B blocks while A is mid-write and BOTH reasons survive (%s)" % rs, _bt.get("alive_midway") is True and "A46" in rs and "B46" in rs and "seed46" in rs)
+# G47 clear_fault's commit block takes the fault lock (static, as the commit is disabled): the commit section and the lock are on the same line
+gsrc2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "grad_cycle.py")).read()
+check("G47 static: clear_fault commit takes lock() then _fault_lock; a fault-lock timeout returns blocked", "with lock(), _fault_lock(grad):" in gsrc2 and "fault_lock_unavailable" in gsrc2)
+# G48 static lock order: nothing inside the fault-locked writers takes the cycle or ledger lock
+i2 = gsrc2.index("def _record_fault_locked("); j3 = gsrc2.index("def _atomic(")
+check("G48 static: _record_fault_locked body takes no ledger/cycle lock and calls no snapshot/recon_health", all(x not in gsrc2[i2:j3] for x in ("lock()", "_cycle_lock_path", "recon_health", "snapshot(")))
 print("FAILS: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

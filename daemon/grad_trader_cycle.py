@@ -16,7 +16,7 @@ and the hook's durable fault both happen-before any later entry commit, and an e
 fsynced append-only fault log through grad_cycle._record_fault, so the fault survives process death. commit_refusal refuses on (a) an active or unreadable
 fault, (b) an in-memory abort count above the acknowledged baseline, (c) a hook that failed to record. Residual gaps, stated: an abort in ANOTHER process
 is invisible here; a kill between the count and the end of the hook (inside the lock, a short window) leaves only the ledger-level heal; _record_fault is not
-internally thread-safe, so the hook serialises with a module lock but the main cycle's own _record_fault calls do not take it.
+internally thread-safe, (v3b) every fault writer, including main-cycle calls, now serialises on grad_cycle's cross-thread/cross-process fault lock (leaf lock; a timeout means NOT recorded, fail closed).
 """
 import logging
 import os
@@ -30,7 +30,6 @@ _EMPTY_SCAN = {"stream": 0, "opened": 0, "select_rejected": 0, "select_reasons":
 _ENGINES = {}          # lane -> engine, filled by register()
 _BASELINE = {}         # lane -> acknowledged abort count
 _HOOK_FAILED = {}      # lane -> True when the abort hook could not record a fault
-_FAULT_LOCK = threading.Lock()
 
 
 def _gc():
@@ -80,8 +79,7 @@ def _make_abort_hook(engine):
 
     def _hook(mint, err):
         try:
-            with _FAULT_LOCK:
-                ok = _gc()._record_fault(engine, {}, "poll_abort_live", mint=mint, error=err)
+            ok = _gc()._record_fault(engine, {}, "poll_abort_live", mint=mint, error=err)      # serialised inside grad_cycle by the fault lock
             if not ok:
                 _HOOK_FAILED[lane] = True
         except Exception:
@@ -186,12 +184,10 @@ def _entry_check_locked(engine):
     if j is None:
         return True, None
     if j.get("unreadable"):
-        with _FAULT_LOCK:
-            gc._record_fault(engine, {}, "entry_scan_journal_unreadable", detail=str(j.get("unreadable"))[:120])
+        gc._record_fault(engine, {}, "entry_scan_journal_unreadable", detail=str(j.get("unreadable"))[:120])
         return False, "entry_scan_journal_unreadable"
     if j.get("status") == "running":
-        with _FAULT_LOCK:
-            gc._record_fault(engine, {}, "interrupted_entry_scan", prior_boot=j.get("boot_id"), same_boot=(j.get("boot_id") == gc._BOOT["id"]))
+        gc._record_fault(engine, {}, "interrupted_entry_scan", prior_boot=j.get("boot_id"), same_boot=(j.get("boot_id") == gc._BOOT["id"]))
         try:
             gc._atomic(jp, dict(j, status="interrupted_recorded"))      # the fault is durable; do not record it twice
         except Exception:

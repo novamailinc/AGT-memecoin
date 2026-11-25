@@ -21,6 +21,7 @@ entries; exits still run. No threads or processes are started. A fresh process i
 import json
 import logging
 import os
+import threading
 import time
 
 logger = logging.getLogger("forex_agent.daemon.grad_cycle")
@@ -205,7 +206,70 @@ def fault_active(grad):
     return True, "fault_file_never_written"
 
 
+_FAULT_LOCK_TIMEOUT_S = 5.0
+_FLT = threading.local()
+
+
+class FaultLockTimeout(OSError):
+    pass
+
+
+def _fault_lock_path(grad):
+    return grad.LEDGER_PATH + ".cycle-fault.lock"
+
+
+class _fault_lock:
+    """Cross-thread AND cross-process serialisation of every fault-state writer (fault file, fault log, clear log, fault-file removal, torn-tail repair,
+    _MEM). A flock on its own file (separate open file description per acquisition, so threads of one process also exclude each other), REENTRANT per
+    thread via a depth counter. LOCK ORDER: this is a LEAF lock. Callers may hold the cycle lock and/or the ledger lock when they take it (cycle -> ledger
+    -> fault, and the poll-abort hook runs ledger -> fault); nothing that holds it may take the cycle or ledger lock (the held sections do bare file I/O
+    only). Acquisition is bounded (non-blocking retries up to _FAULT_LOCK_TIMEOUT_S) so a stuck holder cannot hang a thread that holds the ledger lock; a
+    timeout raises FaultLockTimeout and the caller treats the fault as NOT recorded (fail closed). The kernel frees it on process death."""
+    def __init__(self, grad):
+        self.path = _fault_lock_path(grad); self.fh = None
+
+    def __enter__(self):
+        import fcntl  # noqa: PLC0415
+        depth = getattr(_FLT, "depth", None)
+        if depth is None:
+            depth = _FLT.depth = {}
+        if depth.get(self.path, 0) > 0:
+            depth[self.path] += 1; return self
+        fh = open(self.path, "a")
+        end = time.time() + float(_FAULT_LOCK_TIMEOUT_S)
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); break
+            except BlockingIOError:
+                if time.time() >= end:
+                    fh.close(); raise FaultLockTimeout("fault lock busy")
+                time.sleep(0.01)
+        self.fh = fh; depth[self.path] = 1
+        return self
+
+    def __exit__(self, *a):
+        depth = _FLT.depth
+        depth[self.path] -= 1
+        if depth[self.path] == 0:
+            del depth[self.path]
+            try: self.fh.close()
+            except Exception: pass
+        return False
+
+
 def _record_fault(grad, out, reason, **detail):
+    """Serialised wrapper (see _fault_lock). A lock timeout/IO failure means the fault is NOT durable: in-process flag set, returns False."""
+    try:
+        with _fault_lock(grad):
+            return _record_fault_locked(grad, out, reason, **detail)
+    except OSError as e:
+        out["fault_lock_failure"] = repr(e)[:200]
+        _MEM[grad.LEDGER_PATH] = dict(_MEM.get(grad.LEDGER_PATH) or {}, since=(_MEM.get(grad.LEDGER_PATH) or {}).get("since", time.time()),
+                                      fault_id=(_MEM.get(grad.LEDGER_PATH) or {}).get("fault_id") or "lockfail", file_written=False)
+        return False
+
+
+def _record_fault_locked(grad, out, reason, **detail):
     """Make the fault durable. The FIRST record keeps its identity (fault_id) and age (since): later reasons are APPENDED to `reasons`, never
     replacing the original. When the file write fails the in-process flag stays AND the prior cycle journal is left untouched."""
     now = out.get("ts") if out.get("ts") is not None else time.time()
@@ -471,7 +535,7 @@ def clear_fault(grad, account=None, operator_note=""):
     except Exception as e:
         return False, dict(ev, blocked=["cycle_lock_unavailable:%r" % (e,)])
     try:
-      with lock():     # commit step: bare reads only, after re-checking no cycle runs and the full state is unchanged
+      with lock(), _fault_lock(grad):     # commit step (fault lock = leaf, taken last): bare reads only, after re-checking no cycle runs and the full state is unchanged
         j2 = _read_journal(grad)
         if j2 and (j2.get("unreadable") or j2.get("status") == "running"):
             return False, dict(ev, blocked=["cycle_running_at_commit"])
@@ -488,6 +552,8 @@ def clear_fault(grad, account=None, operator_note=""):
             if f is not None: os.remove(_fault_path(grad))
         except Exception as e:
             return False, dict(ev, blocked=["fault_file_not_removed:%r" % (e,)])
+    except FaultLockTimeout as e:
+        return False, dict(ev, blocked=["fault_lock_unavailable:%r" % (e,)])
     finally:
         try: _cl.close()
         except Exception: pass

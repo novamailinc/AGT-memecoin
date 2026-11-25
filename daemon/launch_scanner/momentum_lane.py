@@ -1645,8 +1645,8 @@ def _pending_unusable(lane):
 # No compensation, no liquidation, no ledger rewrite, no legacy migration and no economic policy is chosen here.
 _GATE_STATS = {"ok": 0, "freeze": 0, "hold": 0}
 _GATE_LEG = ("leg:a", "leg:b", "leg:c")
-_OP_KEYS = {"credit": {"kind", "op_id", "mint", "amount", "qty", "fee", "price_kind", "pos_id"},   # exactly what _pa_settle records
-            "write_down": {"kind", "op_id", "mint", "pos_id", "reason"}}                          # exactly what _pa_write_down records (no qty/amount/fee)
+_OP_KEYS = {"credit": {"kind", "op_id", "mint", "amount", "qty", "fee", "price_kind", "pos_id", "expected_account_id", "entry_op_id"},   # exactly what _pa_settle records (generation binding fields included)
+            "write_down": {"kind", "op_id", "mint", "pos_id", "reason", "expected_account_id", "entry_op_id"}}                          # exactly what _pa_write_down records (no qty/amount/fee)
 
 
 def _read_status():

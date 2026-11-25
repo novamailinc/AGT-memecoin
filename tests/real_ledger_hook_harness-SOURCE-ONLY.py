@@ -93,6 +93,9 @@ PRE2 = BOOT + r"""
 os.environ["AGT_GRAD_CYCLE_ENABLED"] = "1"
 for _k in ("AGT_GRAD_CYCLE_LANES",): os.environ.pop(_k, None)
 from daemon import grad_cycle as GC, grad_trader_cycle as T
+def _reach(tag):
+    # POSITIVE reached-target evidence: written and fsynced by the child immediately before its deliberate exit, so an unrelated rc=1 cannot pass
+    fh = open(os.path.join(home, "reached." + tag), "w"); fh.write(tag); fh.flush(); os.fsync(fh.fileno()); fh.close()
 def mkcand(n):
     return {"mint": "GradMint%dpump" % n, "symbol": "TK%d" % n, "name": "TK%d / SOL" % n, "chain": "solana", "dex": "pumpswap", "created_ts": time.time() - 60.0,
             "pool_address": "POOL%d" % n, "reserve_usd": 6000.0, "fdv_usd": 69000.0, "price_usd": 0.00007, "source": "gecko-new-pool"}
@@ -141,14 +144,14 @@ poll_abort(); os._exit(0)
 
 CHILD_W1 = PRE2 + r"""
 r1 = open_first(); T.register(GR); force_abort(); save_baseline()
-def die_in_restore(d, m, p, e): os._exit(1)            # ABRUPT exit inside the restore I/O: after the write-ahead marker, before the abort is counted
+def die_in_restore(d, m, p, e): _reach("W1_in_restore"); os._exit(1)            # ABRUPT exit inside the restore I/O: after the write-ahead marker, before the abort is counted
 GR._persist_poll_failure = die_in_restore
 poll_abort(); os._exit(0)
 """
 CHILD_W2 = PRE2 + r"""
 r1 = open_first(); T.register(GR); force_abort(); save_baseline()
 if sys.argv[2] == "mutant": GR._FAILURE_BEGIN_HOOK = None      # sensitivity control: no write-ahead marker
-def die_before_write(mint, err): os._exit(1)           # the K1 kill point: between the count and the fault write
+def die_before_write(mint, err): _reach("W2_before_fault_write_" + sys.argv[2]); os._exit(1)           # the K1 kill point: between the count and the fault write
 GR._ABORT_HOOK = die_before_write
 poll_abort(); os._exit(0)
 """
@@ -157,7 +160,7 @@ r1 = open_first(); T.register(GR); force_abort(); save_baseline()
 GC._record_fault = lambda *a, **k: False               # the abort hook cannot make the fault durable (failed hook)
 poll_abort()
 print(json.dumps({"refusal_inproc": T.commit_refusal(GR.LANE), "hook_failed": dict(T._HOOK_FAILED), "marker": os.path.exists(GR.LEDGER_PATH + ".poll-inflight.json")}), flush=True)
-os._exit(1)
+_reach("W3_after_abort_failed_hook"); os._exit(1)
 """
 CHILD_W4 = PRE2 + r"""
 r1 = open_first(); T.register(GR)
@@ -176,6 +179,17 @@ try: cl = GR.poll_exits(price_fn=gpf(3.0))
 finally: FakeJup.mult = 1.0
 s1 = state()
 print(json.dumps({"refusal": refusal, "closes_or_progress": [s1["fills"] - s0["fills"], s1["credits"] - s0["credits"]], "ncl": len(cl or []), "aborts": GR._POLL_ABORTS["count"]}))
+"""
+
+CHILD_W6 = PRE2 + r"""
+r1 = open_first(); T.register(GR)
+def _boom(*a, **k): raise RuntimeError("forced close_leg failure")
+GR._close_leg = _boom
+GC.mark_inflight = lambda *a, **k: None                 # the write-ahead marker cannot be written (BEGIN failure)
+GR._persist_poll_failure = lambda d, m, p, e: True      # the restore itself succeeds: no abort, no fault
+poll_abort()
+sr = T.startup_report(GR)
+print(json.dumps({"marker": os.path.exists(GR.LEDGER_PATH + ".poll-inflight.json"), "aborts": GR._POLL_ABORTS["count"], "refusal": T.commit_refusal(GR.LANE), "begin_failed": sr.get("begin_failed"), "fault": bool(GC._read_fault(GR))}))
 """
 VERIFY = PRE2 + r"""
 _raw_sha = _sha()        # raw ledger digest BEFORE any snapshot/heal or register in this fresh process
@@ -304,28 +318,34 @@ T.register(GR); ck = T._entry_check(GR); ran, why, _r = T.entry_scan(GR, lambda:
 print(json.dumps({"check": list(ck), "fault_active": bool(GC.fault_active(GR)[0]), "entry_ok": ran, "why": why}))
 """
 
+def _reached(h, tag): return os.path.exists(os.path.join(h, "reached." + tag))
 def s_W():
-    h = newhome(); cp, j = run(CHILD_W1, h); check("W1 child exited abruptly inside the restore (rc=%s, expected 1)" % cp.returncode, cp.returncode == 1)
+    h = newhome(); cp, j = run(CHILD_W1, h); check("W1 child exited abruptly INSIDE the restore: rc=%s (expected 1) AND reached-target sentinel present=%s" % (cp.returncode, _reached(h, "W1_in_restore")), cp.returncode == 1 and _reached(h, "W1_in_restore"))
     cv, v = run(VERIFY, h)
     check("W1 fresh process: write-ahead marker alone makes fault_active (%s), entries refused, scan_gate refuses, conservation vs baseline holds" % (v and v["why"],),
           bool(v) and v["why"] == "poll_failure_inflight" and v["fault_active"] and bool(v["refusal"]) and v["scan_gate"][0] is False and same_as_base(v))
-    h = newhome(); cp, j = run(CHILD_W2, h, "real"); check("W2 (K1 kill point) child exited abruptly (rc=%s, expected 1)" % cp.returncode, cp.returncode == 1)
+    h = newhome(); cp, j = run(CHILD_W2, h, "real"); check("W2 (K1 kill point) child: rc=%s (expected 1) AND reached-target sentinel present=%s" % (cp.returncode, _reached(h, "W2_before_fault_write_real")), cp.returncode == 1 and _reached(h, "W2_before_fault_write_real"))
     cv, v = run(VERIFY, h)
     check("W2 K1 GAP CLOSED: kill between count and fault write now leaves the durable in-flight marker, fresh process refuses entries (fault_file=%s why=%s refusal=%s)" % (v and v["fault_file"], v and v["why"], v and v["refusal"]),
           bool(v) and (not v["fault_file"]) and v["why"] == "poll_failure_inflight" and bool(v["refusal"]) and same_as_base(v))
     h = newhome(); cp, j = run(CHILD_W2, h, "mutant"); cv, v = run(VERIFY, h)
+    check("W2m child: rc=%s (expected 1) AND reached-target sentinel present=%s AND verify ran" % (cp.returncode, _reached(h, "W2_before_fault_write_mutant")), cp.returncode == 1 and _reached(h, "W2_before_fault_write_mutant") and cv.returncode == 0 and v is not None)
     check("W2m MUTANT (BEGIN hook removed): the K1 gap reappears (no fault file, no refusal): sensitivity control", bool(v) and (not v["fault_file"]) and v["refusal"] is None and v["fault_active"] is False)
     h = newhome(); cp, j = run(CHILD_W3, h)
-    check("W3 failed hook: in-process refusal AND marker kept (%s)" % j, bool(j) and bool(j["refusal_inproc"]) and j["marker"] is True)
+    check("W3 child: rc=%s (expected 1), reached-target sentinel present=%s; failed hook: in-process refusal AND marker kept (%s)" % (cp.returncode, _reached(h, "W3_after_abort_failed_hook"), j), cp.returncode == 1 and _reached(h, "W3_after_abort_failed_hook") and bool(j) and bool(j["refusal_inproc"]) and j["marker"] is True)
     cv, v = run(VERIFY, h)
     check("W3 failed hook, FRESH process after restart: still refuses via the marker (%s)" % (v and v["why"],), bool(v) and v["why"] == "poll_failure_inflight" and bool(v["refusal"]))
     h = newhome(); cp, j = run(CHILD_W4, h)
-    check("W4 recovered failure: marker removed, no abort, no fault, entries NOT refused (%s)" % j, bool(j) and j["marker"] is False and j["aborts"] == 0 and j["refusal"] is None and j["fault"] is False)
+    check("W4 child rc=%s (expected 0); recovered failure: marker removed, no abort, no fault, entries NOT refused (%s)" % (cp.returncode, j), cp.returncode == 0 and bool(j) and j["marker"] is False and j["aborts"] == 0 and j["refusal"] is None and j["fault"] is False)
     h = newhome(); cp, j = run(CHILD_W5, h)
     check("W5 marker present: entries refused BUT the risk-reducing exit poll still runs and sells (fills/credits delta %s, closes %s, aborts %s, refusal %s)" % (j and j["closes_or_progress"], j and j["ncl"], j and j["aborts"], j and j["refusal"]),
-          bool(j) and bool(j["refusal"]) and j["aborts"] == 0 and (j["closes_or_progress"][0] > 0 or j["ncl"] > 0))
+          cp.returncode == 0 and bool(j) and bool(j["refusal"]) and j["aborts"] == 0 and (j["closes_or_progress"][0] > 0 or j["ncl"] > 0))
+def _w6():
+    h = newhome(); cp, j = run(CHILD_W6, h)
+    check("W6 BEGIN failure is VISIBLE: child rc=%s (expected 0); no marker, no abort, but commit_refusal refuses (%s) and startup_report shows begin_failed (%s)" % (cp.returncode, j and j["refusal"], j and j["begin_failed"]),
+          cp.returncode == 0 and bool(j) and j["marker"] is False and j["aborts"] == 0 and bool(j["refusal"]) and "marker could not be written" in j["refusal"] and j["begin_failed"] is True)
 def main():
-    for f in (s_K0, s_K1, s_K2, lambda: s_K3("real"), lambda: s_K3("mutant"), s_K4, s_W):
+    for f in (s_K0, s_K1, s_K2, lambda: s_K3("real"), lambda: s_K3("mutant"), s_K4, s_W, _w6):
         if FAILS or _STOP["why"]:
             print("EARLY STOP (fails=%d, stop=%s)" % (len(FAILS), _STOP["why"])); break
         f()

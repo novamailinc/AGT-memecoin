@@ -60,5 +60,21 @@ os.environ.pop(GC.ENV_FLAG)
 g2 = fake(); T.register(g2)
 check("I17 flag off: register installs no BEGIN/END hooks and nothing is written", getattr(g2, "_FAILURE_BEGIN_HOOK", None) is None and T.commit_refusal(g2.LANE) is None)
 os.environ[GC.ENV_FLAG] = "1"
-# clear_fault marker handling (evidence key, no_fault bypass, removal after the clear record) is WRITTEN but has NO test here: clear_fault needs a full ledger/account fixture and its commit is disabled.
+g = fake(); T.register(g); realm = GC.mark_inflight; GC.mark_inflight = lambda *a, **k: None
+try: tk = g._FAILURE_BEGIN_HOOK("m", "e")
+finally: GC.mark_inflight = realm
+sr = T.startup_report(g)
+check("I18 BEGIN failure (marker not written): returns None, per-lane flag set, commit_refusal refuses with the marker message, startup_report shows begin_failed", tk is None and T._BEGIN_FAILED.get(g.LANE) is True and "marker could not be written" in (T.commit_refusal(g.LANE) or "") and sr.get("begin_failed") is True)
+T.register(g)
+check("I19 a restart (register) clears the begin-failed flag; startup_report shows the marker state field", T._BEGIN_FAILED.get(g.LANE) is None and "inflight_marker" in T.startup_report(g))
+g = fake(); t = GC.mark_inflight(g, "m", "e"); gathered = json.load(open(GC._inflight_path(g)))
+check("I20 _marker_unchanged: same marker True; absent-vs-absent True", GC._marker_unchanged(g, gathered) is True and GC._marker_unchanged(fake(), None) is True)
+t2 = GC.mark_inflight(g, "m2", "e2")
+check("I21 _marker_unchanged: a marker REPLACED after gathering is False (stale-gather race: it must not be removed by clear)", GC._marker_unchanged(g, gathered) is False)
+g = fake(); t = GC.mark_inflight(g, "m", "e")
+check("I22 _marker_unchanged: gathered None but marker now present is False; gathered present but marker gone is False", GC._marker_unchanged(g, None) is False and (lambda g3: GC._marker_unchanged(g3, gathered))(fake()) is False)
+open(GC._inflight_path(g), "w").write("{x")
+check("I23 _marker_unchanged: unreadable marker is False", GC._marker_unchanged(g, gathered) is False)
+# clear_fault marker handling (evidence key, no_fault bypass, removal after the clear record, and the call of _marker_unchanged at commit) is WRITTEN but NOT end-to-end tested: clear_fault needs a full ledger/account fixture and its commit is disabled; only the _marker_unchanged helper is unit-tested.
+# (evidence key, no_fault bypass, removal after the clear record) is WRITTEN but has NO test here: clear_fault needs a full ledger/account fixture and its commit is disabled.
 print("FAILS: %d" % FAILS); sys.exit(1 if FAILS else 0)

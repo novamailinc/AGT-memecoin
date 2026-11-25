@@ -516,6 +516,17 @@ class EventNormalizer(object):
             event.event_type = other.event_type
             event.note_provenance("event_type", provider)
 
+        # Execution outcome: a later observation that says the transaction
+        # FAILED on chain, against a record that holds a decoded non-failed
+        # event, is a disagreement (never silently resolved, never borrowed
+        # as verified by the earlier observation). Unknown stays neutral.
+        if other.event_type == EVENT_TYPE_TRANSACTION_FAILED \
+                and event.event_type not in (
+                    EVENT_TYPE_UNKNOWN, EVENT_TYPE_TRANSACTION_FAILED):
+            event.add_disagreement("execution_status", {
+                provider: "failed", "existing": "executed"})
+            self.stats["conflicts"] += 1
+
         # Program identity: unknown never overwrites known; two known
         # programs that disagree are a recorded disagreement, never a
         # silent pick.
@@ -585,8 +596,7 @@ class EventNormalizer(object):
         elif event.disagreements:
             event.verification_status = VERIFICATION_CONFLICTING
             event.processing_status = PROCESSING_HELD
-        elif any(o.get("decoder_validation") == "verified"
-                 for o in event.observations) \
+        elif event.has_confirmed_verified_observation() \
                 and event.lifecycle_status in CONFIRMED_LIFECYCLES:
             event.verification_status = VERIFICATION_VERIFIED
             event.processing_status = PROCESSING_STORED

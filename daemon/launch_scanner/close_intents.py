@@ -221,6 +221,12 @@ class IntentNotDurable(RuntimeError):
     plan: recovery can only converge an intent that exists on disk."""
 
 
+def _op_family(op_id) -> str:
+    """Base operation id: grad's ":wd" write-down companion belongs to its close op."""
+    o = str(op_id)
+    return o[:-3] if o.endswith(":wd") else o
+
+
 def begin(lane: str, mint: str, pos_id: Optional[str],
           settle_ops: List[Dict[str, Any]],
           close_info: Dict[str, Any], stable_id: bool = False, supersedes: Optional[str] = None) -> str:
@@ -266,16 +272,22 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
 
             def _same_op(e0):
                 return _same_pos(e0) and sorted(str(o.get("op_id")) for o in e0.get("settle_ops") or []) == _ids
+            _fam = {_op_family(o.get("op_id")) for o in settle_ops}
+
+            def _overlaps(e0):
+                # independent per-leg operations of ONE position (distinct op ids) never block each other; a re-plan of the same close shares the base op
+                # id (grad's ":wd" write-down belongs to the base op), so overlapping operations are exclusive
+                return _same_pos(e0) and bool(_fam & {_op_family(o.get("op_id")) for o in e0.get("settle_ops") or []})
             _succ = {}   # superseded intent id -> ids of intents recorded as its successors (journal ancestry)
             for e in ents:
                 if e.get("ev") == "intent" and e.get("supersedes"):
                     _succ.setdefault(e["supersedes"], []).append(e.get("intent_id"))
-            _pend_pos = [i0 for i0, s0 in _stt.items() if _same_pos(s0["intent"]) and not s0["applied"] and s0["frozen"] is None]
+            _pend_pos = [i0 for i0, s0 in _stt.items() if _overlaps(s0["intent"]) and not s0["applied"] and s0["frozen"] is None]
             _pend = [i0 for i0 in _pend_pos if _same_op(_stt[i0]["intent"])]
             if len(_pend_pos) != len(_pend):
                 # POSITION-WIDE exclusivity: one position never carries two pending intents (a different op set on a pending position is refused,
                 # with or without supersedes); the pending one must be finalized or frozen first
-                raise IntentNotDurable("position %s/%s already has pending intent(s) %s with a DIFFERENT op set: refusing a second pending intent"
+                raise IntentNotDurable("position %s/%s already has pending intent(s) %s with an OVERLAPPING different op set: refusing a second pending intent"
                                        % (mint, pos_id, ",".join(sorted(set(_pend_pos) - set(_pend)))))
             if _pend:
                 # same logical operation still pending (crash before its terminal event): RESUME it, never open a second intent. The caller's
@@ -288,14 +300,14 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
                 if json.dumps(e0.get("settle_ops"), sort_keys=True) != json.dumps(settle_ops, sort_keys=True):
                     raise IntentNotDurable("operation %s already pending with a DIFFERENT plan" % iid0)
                 return iid0
-            # frozen-unsuperseded exclusivity is position-wide too: a frozen intent of this position (any op set) blocks a new one unless named
-            _frozen_open = [i0 for i0, s0 in _stt.items() if _same_pos(s0["intent"]) and not s0["applied"] and s0["frozen"] is not None and i0 not in _succ]
+            # frozen-unsuperseded exclusivity covers OVERLAPPING operations of the position: a frozen intent blocks a new overlapping one unless named
+            _frozen_open = [i0 for i0, s0 in _stt.items() if _overlaps(s0["intent"]) and not s0["applied"] and s0["frozen"] is not None and i0 not in _succ]
             if supersedes:
                 # explicit supersede: must name an EXISTING, FROZEN, UNAPPLIED intent of this very position that has no successor yet (an applied or
                 # already-replaced chain is never re-opened, nothing foreign is accepted), validated even when no frozen intent of this op set exists
                 s_ = _stt.get(supersedes)
-                if not (s_ and _same_pos(s_["intent"]) and s_["frozen"] is not None and not s_["applied"] and supersedes not in _succ):
-                    raise IntentNotDurable("supersedes=%s is not a frozen, unapplied, not-yet-replaced intent of this position: refusing" % supersedes)
+                if not (s_ and _overlaps(s_["intent"]) and s_["frozen"] is not None and not s_["applied"] and supersedes not in _succ):
+                    raise IntentNotDurable("supersedes=%s is not a frozen, unapplied, not-yet-replaced intent of this operation: refusing" % supersedes)
             if _frozen_open and set(_frozen_open) != {supersedes}:
                 raise IntentNotDurable("operation already has FROZEN intent(s) %s: a frozen intent never revives; a new intent needs an explicit supersedes=<that id>"
                                        % ",".join(sorted(_frozen_open)))
@@ -379,11 +391,18 @@ def chain_tip(lane: str, intent_id: str) -> Tuple[Optional[str], Optional[str], 
         if e.get("ev") == "intent" and e.get("supersedes"):
             succ.setdefault(e["supersedes"], []).append(e.get("intent_id"))
     cur, seen = intent_id, set()
+    _root = (stt.get(intent_id) or {}).get("intent") or None
+    if _root is None and intent_id in succ:
+        raise IntentNotDurable("supersede chain starts at UNKNOWN intent %s (successors recorded for an absent parent): refusing" % intent_id)
     while cur in succ:
         if len(succ[cur]) != 1 or cur in seen:
             raise IntentNotDurable("ambiguous supersede chain at %s: %r" % (cur, succ[cur]))
         seen.add(cur)
-        cur = succ[cur][0]
+        nxt = succ[cur][0]
+        _ne = (stt.get(nxt) or {}).get("intent")
+        if _root is not None and (_ne is None or _ne.get("mint") != _root.get("mint") or _ne.get("pos_id") != _root.get("pos_id")):
+            raise IntentNotDurable("supersede chain leaves the position at %s -> %s: refusing" % (cur, nxt))
+        cur = nxt
     s_ = stt.get(cur)
     if not s_ or s_["intent"] is None:
         return cur, None, None

@@ -48,16 +48,19 @@ check("the SAME supersedes while the successor is pending RESUMES it (same id %s
 # DISTINCT operations (other pos / other op ids) in the same second get distinct ids; the frozen original is not in the way of them
 c = ci.begin("grad", "MINT1", "grad/MINT1#2", OPS, dict(INFO))
 _OTHER = [{"kind": "credit", "op_id": "op-other", "amount": 1.0}]
+_OVER = [{"kind": "credit", "op_id": "op-1", "amount": 1.0}, {"kind": "write_down", "op_id": "op-1:wd", "reason": "r"}]   # shares the base op op-1 (a grad re-plan)
 def _ngrad(): return len([e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent"])
 _n0 = _ngrad()
-check("POSITION-WIDE exclusivity: a DIFFERENT op set on a position that already has a pending intent is refused, plain or with supersedes, nothing appended (%d -> %d)" % (_n0, _ngrad()),
-      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO), supersedes=a))
+check("OVERLAPPING exclusivity: a different op set that shares the base op (a re-plan) on a position with a pending intent is refused, plain or with supersedes, nothing appended (%d -> %d)" % (_n0, _ngrad()),
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OVER, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OVER, dict(INFO), supersedes=a))
       and _ngrad() == _n0)
+d1 = ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO))
+check("a NON-overlapping independent operation on the same position is allowed while another is pending (%s, %d intents)" % (d1, _ngrad()), bool(d1) and d1 != b and _ngrad() == _n0 + 1)
 c2 = ci.begin("grad", "MINT1", "grad/MINT1#3", _OTHER, dict(INFO))
 check("distinct POSITIONS in the same second are distinct from each other and from both earlier intents (%s, %s)" % (c, c2), len({a, b, c, c2}) == 4)
 ci.freeze("grad", b, "second freeze")
-check("position-wide FROZEN exclusivity: with b frozen (unsuperseded) a different op set on the same position is refused unless it names b",
-      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO), supersedes=a)))
+check("overlapping FROZEN exclusivity: with b frozen (unsuperseded) an overlapping different op set is refused unless it names b",
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OVER, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OVER, dict(INFO), supersedes=a)))
 check("after a SECOND freeze the same operation again needs an explicit supersede naming the LATEST frozen intent (plain refused, supersedes=a refused, supersedes=b ok)",
       _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=a))
       and bool(ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=b)))
@@ -104,8 +107,27 @@ check("RE-supersede of the ancestor after its successor APPLIED is refused (no s
       _raises(lambda: ci.begin("lanev4", "MV", "pv", OPS, dict(INFO), supersedes=_ra)) and _nint("lanev4") == 2)
 check("stable_id together with supersedes is an explicit refusal (never a silent drop), nothing appended",
       _raises(lambda: ci.begin("lanev5", "MV", "pv", OPS, dict(INFO), stable_id=True, supersedes="x")) and _nint("lanev5") == 0)
-check("supersedes of a frozen intent with a CHANGED op set (same position) is allowed and recorded (changed settle plan)",
-      bool(ci.begin("lanev3", "MV", "pv-other", [{"kind": "credit", "op_id": "op-changed", "amount": 2.0}], dict(INFO), supersedes=_fo)) and _nint("lanev3") == 2)
+check("supersedes of a frozen intent by an OVERLAPPING changed op set (re-plan sharing the base op) is allowed and recorded",
+      bool(ci.begin("lanev3", "MV", "pv-other", _OVER, dict(INFO), supersedes=_fo)) and _nint("lanev3") == 2)
+_fo2 = ci.begin("lanev6", "MV", "pv", OPS, dict(INFO)); ci.freeze("lanev6", _fo2, "r")
+check("supersedes of a frozen intent by a NON-overlapping op set is refused (a different operation is not its replacement), nothing appended",
+      _raises(lambda: ci.begin("lanev6", "MV", "pv", _OTHER, dict(INFO), supersedes=_fo2)) and _nint("lanev6") == 1)
+
+# ---- per-leg independence (N5): ops of one position with distinct op ids do not block each other; overlapping ones do ----
+LA = [{"kind": "credit", "op_id": "pos#1:leg:a", "amount": 1.0}]; LB = [{"kind": "credit", "op_id": "pos#1:leg:b", "amount": 1.0}]
+LD = [{"kind": "credit", "op_id": "pos#1:leg:d", "amount": 1.0}]
+LAW = [{"kind": "credit", "op_id": "pos#1:leg:a", "amount": 1.0}, {"kind": "write_down", "op_id": "pos#1:leg:a:wd", "reason": "r"}]
+n5a = ci.begin("lanen5", "MN", "pos#1", LA, dict(INFO)); n5b = ci.begin("lanen5", "MN", "pos#1", LB, dict(INFO))
+check("leg A pending, leg B allowed on the same position (distinct intents %s / %s, 2 intents)" % (n5a, n5b), n5a != n5b and _nint("lanen5") == 2)
+check("plain retry of leg B resumes it (same id); an overlapping re-plan of leg A while A is pending is refused", ci.begin("lanen5", "MN", "pos#1", LB, dict(INFO)) == n5b
+      and _raises(lambda: ci.begin("lanen5", "MN", "pos#1", LAW, dict(INFO))) and _nint("lanen5") == 2)
+ci.freeze("lanen5", n5a, "r")
+n5d = ci.begin("lanen5", "MN", "pos#1", LD, dict(INFO))
+check("leg A frozen: leg D (non-overlapping) is allowed (%s); the PLAIN retry of leg A is refused; leg B still resumes" % n5d,
+      bool(n5d) and _raises(lambda: ci.begin("lanen5", "MN", "pos#1", LA, dict(INFO))) and ci.begin("lanen5", "MN", "pos#1", LB, dict(INFO)) == n5b and _nint("lanen5") == 3)
+n5a2 = ci.begin("lanen5", "MN", "pos#1", LAW, dict(INFO), supersedes=n5a)
+check("leg A's frozen intent is replaced by the overlapping re-plan only through supersedes (%s, parent recorded), then a SECOND overlapping re-plan while it is pending is refused" % n5a2,
+      [e for e in ci._read(ci.journal_path("lanen5"))[0] if e.get("intent_id") == n5a2][0].get("supersedes") == n5a and _raises(lambda: ci.begin("lanen5", "MN", "pos#1", LA, dict(INFO))))
 
 # ---- chain_tip: follow the journal's supersede chain (N3 support) ----
 _t1 = ci.begin("lanect", "MT", "pt", OPS, dict(INFO)); ci.freeze("lanect", _t1, "r")
@@ -121,6 +143,21 @@ with open(ci.journal_path("lanect"), "a") as _fh: _fh.write(_json.dumps(_ev_amb)
 check("an AMBIGUOUS chain (two successors recorded for one parent) raises IntentNotDurable (never a guess)", _raises(lambda: ci.chain_tip("lanect", _t1)))
 open(ci.journal_path("lanecu"), "w").write("{not json}\n{also not json}\n")
 check("chain_tip on an unreadable journal raises IntentNotDurable (never an empty fallback)", _raises(lambda: ci.chain_tip("lanecu", "x")))
+def _raw(lane, ev):
+    with open(ci.journal_path(lane), "a") as fh: fh.write(_json.dumps(ev) + "\n")
+def _iev(lane, iid, pos, sup=None):
+    e = {"ev": "intent", "intent_id": iid, "lane": lane, "mint": "MX", "pos_id": pos, "settle_ops": OPS, "close_info": {}, "ts": 1.0}
+    if sup: e["supersedes"] = sup
+    return e
+_raw("lanecy", _iev("lanecy", "lanecy:A", "p", "lanecy:B")); _raw("lanecy", _iev("lanecy", "lanecy:B", "p", "lanecy:A"))
+check("chain_tip NEGATIVE CONTROL: a CYCLE (A supersedes B, B supersedes A) raises", _raises(lambda: ci.chain_tip("lanecy", "lanecy:A")))
+_raw("lanexp", _iev("lanexp", "lanexp:X", "p1")); _raw("lanexp", _iev("lanexp", "lanexp:Y", "p2", "lanexp:X"))
+check("chain_tip NEGATIVE CONTROL: a successor on ANOTHER position (cross-position chain) raises", _raises(lambda: ci.chain_tip("lanexp", "lanexp:X")))
+_raw("laneun", _iev("laneun", "laneun:Z", "p", "laneun:GHOST"))
+check("chain_tip NEGATIVE CONTROL: successors recorded for an UNKNOWN (absent) parent raise; the successor itself is a valid root", _raises(lambda: ci.chain_tip("laneun", "laneun:GHOST")) and ci.chain_tip("laneun", "laneun:Z")[:2] == ("laneun:Z", "open"))
+_raw("lanedb", _iev("lanedb", "lanedb:P", "p")); _raw("lanedb", _iev("lanedb", "lanedb:Q1", "p", "lanedb:P")); _raw("lanedb", _iev("lanedb", "lanedb:Q2", "p", "lanedb:P"))
+check("chain_tip NEGATIVE CONTROL: a DOUBLE successor of one parent raises; and begin(supersedes=<that parent>) refuses without appending",
+      _raises(lambda: ci.chain_tip("lanedb", "lanedb:P")) and _raises(lambda: ci.begin("lanedb", "MX", "p", OPS, dict(INFO), supersedes="lanedb:P")) and _nint("lanedb") == 3)
 
 # ---- recover_lane on a supersede chain, with canned callbacks (journal logic only; the callbacks are interface stubs, no account) ----
 _ca = ci.begin("lanerc", "MR", "pr", OPS, dict(INFO)); ci.freeze("lanerc", _ca, "account re-apply refused: earlier")

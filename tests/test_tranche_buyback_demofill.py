@@ -763,6 +763,35 @@ for _ in range(3):
 check("S17b control: the account accepts, the close books once and the successor is applied", len([c for c in (G._read().get("closes") or []) if c.get("mint") == mint]) == 1 and mint not in G.open_positions()
       and _CI.intent_status("grad", _g18[2]["intent_id"]) == "applied")
 
+# S17c: SAME op id, DIFFERENT kind (the crafted old intent holds a booked WRITE-DOWN under the close op id; the new plan is a credit under the same id) -> refused
+mint = "BB21pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted write-down intent")
+_i2 = _CI.begin("grad", mint, pid, [{"kind": "write_down", "op_id": _opc, "mint": mint, "pos_id": pid, "reason": "crafted"}],
+                {"realized_usd": 0.0, "close_ts": 1795600779.0, "closed_reason": "crafted"}, supersedes=_ir)
+_wdk_ok, _ = _PAm.write_down("grad", mint, _opc, pos_id=pid, qty=None, reason="crafted booked write-down under the close op id")
+_point(mint, _i2); _n21 = len(_gi2(mint)); _br21 = G._read()["bankroll"]
+G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S17c kind change on the SAME op id: the booked write-down (outcome %r) is not silently re-booked as a credit: refused, no new intent (%d -> %d), crafted intent open (%s), nothing booked"
+      % (_PAm.op_outcome(_opc), _n21, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
+      _wdk_ok is True and _PAm.op_outcome(_opc) == "applied" and len(_gi2(mint)) == _n21 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
+      and G._read()["bankroll"] == _br21 and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint])
+# S17d: an UNREADABLE account journal cannot prove a dropped op was not applied -> refused (NAMED FAULT INJECTION at paper_account._journal_read). Negative
+# control is S17b (readable and unbooked proceeds).
+mint = "BB22pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+_i2 = _CI.begin("grad", mint, pid, [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+                                      {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}],
+                {"realized_usd": 1.0, "close_ts": 1795600780.0, "closed_reason": "crafted"}, supersedes=_ir)
+_point(mint, _i2); _n22 = len(_gi2(mint)); _rj = _PAm._journal_read
+with patch.object(_PAm, "_journal_read", lambda *a, **k: ([], "torn", None)):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S17d unreadable account journal: the dropped ':wd' op cannot be proven unapplied, so the change is refused AT THIS GUARD (pending why %r; no new intent %d -> %d, crafted intent %s, position open)"
+      % ((lane_pos(mint).get("settlement_pending") or {}).get("why"), _n22, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
+      len(_gi2(mint)) == _n22 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
+      and (lane_pos(mint).get("settlement_pending") or {}).get("why") == "close_intent_not_durable")
+
 def _to_successor(m):
     pid_, entry_, i0_ = _refused_setup(m)
     _d = G._read(); _d["positions"][m]["settlement_pending"]["plan_sig"] = "INJECTED-previous-plan-signature"; G._write(_d)
@@ -783,22 +812,33 @@ for _ in range(3):
     G.poll_exits(price_fn=prices([entry * 0.05]))
 check("S18a the account accepts: one close, B applied, I0 frozen", len([c for c in (G._read().get("closes") or []) if c.get("mint") == mint]) == 1 and _CI.intent_status("grad", _b) == "applied" and _CI.intent_status("grad", _i0) == "frozen")
 
-# S18b: B was driven to APPLIED in the journal (account credit booked, both markers) but the LANE write was lost, and the position still names I0
+# S18b: B was driven to APPLIED in the journal (real account credit booked, both markers) but the LANE write was lost, the position still names I0, AND the
+# retry sees a DIFFERENT quote and a different current lane figure. The reconcile must come from B's DURABLE record (settle ops and close_info), never from the
+# current re-price. NAMED INJECTIONS: stored pointer; a different quote (JUP.mult and the poll price); the lane's current realized changed (what a re-price does).
 mint = "BB20pump"; pid, entry, _i0, _b, _g = _to_successor(mint)
-_bop = [o for o in _g[1]["settle_ops"] if o.get("kind") == "credit"][0]
+_bop = [o for o in _g[1]["settle_ops"] if o.get("kind") == "credit"][0]; _rec_real = float(_g[1]["close_info"]["realized_usd"])
+_cash_pre = PA_cash()
 _ok20, _w20 = _real_credit("grad", mint, _bop["amount"], _bop["op_id"], pos_id=pid, qty=_bop.get("qty"), price_kind=_bop.get("price_kind"))   # INJECTION: real account op booked
 _m1 = _CI.mark_account_applied("grad", _b); _m2 = _CI.mark_lane_applied("grad", _b)
 _cash20 = PA_cash(); _br20 = G._read()["bankroll"]
-check("S18b setup: B credit booked in the account (%r), journal says B applied (%r), the lane still holds the position open" % (_ok20, _CI.intent_status("grad", _b)),
-      _ok20 is True and _m1 and _m2 and _CI.intent_status("grad", _b) == "applied" and mint in G.open_positions())
+check("S18b setup: B credit booked in the account (%r, cash delta %.6f vs recorded amount %.6f), journal says B applied (%r), the lane still holds the position open"
+      % (_ok20, _cash20 - _cash_pre, float(_bop["amount"]), _CI.intent_status("grad", _b)),
+      _ok20 is True and _m1 and _m2 and _CI.intent_status("grad", _b) == "applied" and mint in G.open_positions() and abs((_cash20 - _cash_pre) - float(_bop["amount"])) < 1e-6)
 _point(mint, _i0, sig=(lane_pos(mint).get("settlement_pending") or {}).get("plan_sig"))
+_d20 = G._read(); _d20["positions"][mint]["realized_usd"] = round(float(_d20["positions"][mint]["realized_usd"]) + 0.5, 6); G._write(_d20)
+JUP.mult = 0.03
+_cur_real = float(lane_pos(mint)["realized_usd"])
+check("S18b sensitivity: the CURRENT lane realized (%.6f) differs from B's recorded close_info realized (%.6f), the quote differs (JUP.mult 0.03 vs 0.05)" % (_cur_real, _rec_real), abs(_cur_real - _rec_real) > 0.4)
 for _ in range(3):
-    G.poll_exits(price_fn=prices([entry * 0.05]))
+    G.poll_exits(price_fn=prices([entry * 0.03]))
 _rec20 = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
-check("S18b follows the chain to the APPLIED tip and reconciles: no new intent (%d), ONE close, flat, bankroll once (%r -> %r), the credit not booked a second time (cash %r vs %r)"
-      % (len(_gi2(mint)), _br20, G._read()["bankroll"], PA_cash(), _cash20),
-      len(_gi2(mint)) == 2 and len(_rec20) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (_br20 + _rec20[0]["realized_usd"])) < 1e-6
-      and abs(PA_cash() - _cash20) < 1e-9 and acct_lot_qty(pid) < 1e-6)
+check("S18b reconcile from the DURABLE tip record: no 3rd intent (%d), exactly ONE close, flat, close realized %r == B recorded %r, bankroll +recorded once (%r -> %r)"
+      % (len(_gi2(mint)), _rec20[0].get("realized_usd") if _rec20 else None, _rec_real, _br20, G._read()["bankroll"]),
+      len(_gi2(mint)) == 2 and len(_rec20) == 1 and mint not in G.open_positions() and abs(_rec20[0]["realized_usd"] - _rec_real) < 1e-9
+      and abs(G._read()["bankroll"] - (_br20 + _rec_real)) < 1e-6 and acct_lot_qty(pid) < 1e-6)
+check("S18b the account credit is NOT booked a second time and equals the recorded amount (cash %r vs %r after the injected credit, delta %.6f vs %.6f), no hold loop (no pending, no settlement_pending)"
+      % (PA_cash(), _cash20, _cash20 - _cash_pre, float(_bop["amount"])),
+      abs(PA_cash() - _cash20) < 1e-9 and abs((_cash20 - _cash_pre) - float(_bop["amount"])) < 1e-6 and not lane_pos(mint) and _CI.intent_status("grad", _b) == "applied")
 JUP.mult = 1.0
 
 # ---- S15: REAL DemoFiller sale idempotency and the execute-before-save window (real filler, real sim executor, FakeJup quotes = canned quote fixture, engineering only) ----

@@ -3215,9 +3215,23 @@ def _finalize(d, mint, pos, closed_reason):
                 else:
                     _prev_st = None
                 if _chain_moved and _prev_st == "applied":
-                    # the successor chain already durably APPLIED this settle (the lane state write was lost): reconcile onto the tip; the account ops
-                    # below are idempotent by op id and the lane booking then completes exactly once
+                    # the successor chain already durably APPLIED this settle (the lane state write was lost): reconcile onto the tip FROM ITS DURABLE
+                    # RECORD, never from the current re-price: the recorded settle ops are replayed (idempotent by op id) and the lane books the RECORDED
+                    # realized, entry notional and reason (bankroll corrected from this call's figure to the recorded one), so lane and account agree exactly
                     _iid = _prev_id
+                    _tci = dict(_prev_ev.get("close_info") or {})
+                    _plan = [dict(_o) for _o in (_prev_ev.get("settle_ops") or [])]
+                    _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
+                    if _tci.get("realized_usd") is None:
+                        raise _ci.IntentNotDurable("applied tip %s has no recorded realized_usd: cannot reconcile" % _iid)
+                    _rec_realized = round(float(_tci["realized_usd"]), 6)
+                    d["bankroll"] = round(float(d["bankroll"]) - realized + _rec_realized, 6)
+                    realized = _rec_realized
+                    if _tci.get("entry_notional_usd") is not None:
+                        entry_notional = float(_tci["entry_notional_usd"])
+                    if _tci.get("closed_reason"):
+                        closed_reason = str(_tci["closed_reason"])
+                    pnl = round(realized - entry_notional, 4)
                 elif _prev_st == "open" and ((not _chain_moved and _prev_sp.get("plan_sig") == _plan_sig)
                                              or (_chain_moved and json.dumps(_prev_ev.get("settle_ops"), sort_keys=True) == json.dumps(_plan, sort_keys=True))):
                     _iid = _prev_id   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)

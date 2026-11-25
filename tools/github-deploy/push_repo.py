@@ -179,9 +179,27 @@ UNQUALIFIED_PREFIXES = ("tools/phone-test/",)
 ALLOW_UNQUALIFIED_ENV = "AGT_ALLOW_UNQUALIFIED_PHONE_BUNDLE"
 
 
+def _norm_dest(path: str):
+    """Normalize a repo path/destination: backslashes -> '/', collapse '//' and '.', resolve '..' (a path that escapes or climbs is returned as
+    None = refuse), strip leading '/', casefold. Returns the normalized string ('' for the repo root) or None when unresolvable."""
+    import posixpath
+    p = str(path).replace("\\", "/")
+    parts = [x for x in p.split("/") if x not in ("", ".")]
+    if ".." in parts:
+        return None
+    return posixpath.normpath("/".join(parts)).casefold() if parts else ""
+
+
 def _is_unqualified(path: str) -> bool:
-    p = path.strip("/") + "/"
-    return any(p.startswith(x) or (x.rstrip("/") + "/") == p for x in UNQUALIFIED_PREFIXES)
+    n = _norm_dest(path)
+    if n is None:
+        return True            # unresolvable path: treat as unqualified (refuse / preserve)
+    return any(n == x.rstrip("/") or n.startswith(x) for x in UNQUALIFIED_PREFIXES)
+
+
+def _is_ancestor_of_unqualified(path: str) -> bool:
+    n = _norm_dest(path)
+    return n is not None and any(x.rstrip("/").startswith(n + "/") or n == "" for x in UNQUALIFIED_PREFIXES) and not _is_unqualified(path)
 
 
 def guard_extras(extras, environ):
@@ -189,7 +207,13 @@ def guard_extras(extras, environ):
     if environ.get(ALLOW_UNQUALIFIED_ENV) == "1":
         return None
     for spec in extras:
-        dest = spec.partition(":")[2]
+        src, _, dest = spec.partition(":")
+        if _norm_dest(dest) is None:
+            return "refusing --extra %r: destination cannot be normalized (contains '..')" % spec
+        if _is_ancestor_of_unqualified(dest) and os.path.isdir(src):
+            for _dp, _dn, _fn in os.walk(src):
+                if any(d.casefold() == "phone-test" for d in _dn):
+                    return "refusing --extra %r: destination is a parent of tools/phone-test and the source contains a phone-test directory" % spec
         if dest and _is_unqualified(dest):
             return ("refusing --extra %r: %s is an unqualified frozen live-wallet bundle; set %s=1 only after it is qualified"
                     % (spec, dest, ALLOW_UNQUALIFIED_ENV))

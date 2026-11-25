@@ -48,15 +48,30 @@ def main():
     for imp, want in (("5.0", "price_impact_out_of_documented_range"), ("1.5", "price_impact_out_of_documented_range"), ("-0.01", "price_impact_negative_unsupported"), ("zz", "price_impact_unknown")):
         reason, det = skip_reason(filler(imp, os.path.join(d, "jx%s.json" % imp)), "op-x")
         check("quote %r refused as %s with raw value in detail" % (imp, want), reason == want and (det or {}).get("price_impact_raw") == imp[:64], (reason, det))
-    # old journal replay: a pre-fix record (ratio stored under price_impact_pct, no stamp, no raw) is returned UNCHANGED and never stamped
-    old = {"status": "filled", "side": "buy", "mint": MINT, "price_impact_pct": 0.004, "qty_tokens": 99.0, "price_usd": 1.0, "fee_usd": 0.0, "total_debit_usd": 1.0}
-    p4 = os.path.join(d, "old.json"); json.dump({"fills": {"op-old": old}, "attempts": []}, open(p4, "w"))
-    before = open(p4).read()
-    r4 = filler("0.02", p4).buy("op-old", MINT, 1.0, 2.0)
-    check("old record replayed via buy(): returned as stored, no stamp, no raw", r4.get("price_impact_unit") is None and r4.get("price_impact_raw") is None and r4.get("price_impact_pct") == 0.004, r4)
-    check("old record not rewritten on disk by replay", open(p4).read() == before)
-    check("a NEW fill beside it is stamped while the old one stays unstamped", filler("0.02", p4).buy("op-new", MINT, 1.0, 2.0).get("price_impact_unit") == "percent_v2"
-          and json.load(open(p4))["fills"]["op-old"].get("price_impact_unit") is None)
+    # percent-form 0.4 is now read as 40%: refused at cap 2.0 (the unit regression this change closes), buy and sell
+    reason, det = skip_reason(filler("0.4", os.path.join(d, "j40.json")), "op-40")
+    check("quote ratio 0.4 (=40%) refused price_impact_over_cap at cap 2.0 (buy)", reason == "price_impact_over_cap", reason)
+    fs = filler("0.0201", os.path.join(d, "jsell.json"))
+    try:
+        fs.sell("op-sell-over", MINT, 100.0, 2.0); sreason = None
+    except DF.DemoSkip as e:
+        sreason = e.reason
+    check("sell: ratio 0.0201 over cap 2.0 refused price_impact_over_cap, no fill journaled", sreason == "price_impact_over_cap" and fs.get_fill("op-sell-over") is None, sreason)
+    # old-record replay: the OLD record is produced by the REAL writer (DemoFiller._save) from a real fill with the new keys removed and the
+    # pre-fix semantics (ratio under price_impact_pct), then replayed by a fresh DemoFiller on the same journal. We compare the actual returned fill.
+    p4 = os.path.join(d, "old.json")
+    fo = filler("0.02", p4)
+    real = dict(fo.buy("op-seed", MINT, 1.0, 2.0))
+    old = {k: v for k, v in real.items() if k not in ("price_impact_unit", "price_impact_raw")}
+    old["price_impact_pct"] = 0.02          # pre-fix stored the ratio under the _pct name
+    fo._save("op-old", old)
+    stored = dict(filler("0.02", p4).get_fill("op-old"))
+    r4 = dict(filler("0.02", p4).buy("op-old", MINT, 1.0, 2.0))
+    check("old record: replay returns the stored fill exactly (no executor call, nothing recomputed)", r4 == stored, {k: (r4.get(k), stored.get(k)) for k in set(r4) | set(stored) if r4.get(k) != stored.get(k)})
+    check("old record: carries NO unit stamp and NO raw value after replay", r4.get("price_impact_unit") is None and r4.get("price_impact_raw") is None and "price_impact_unit" not in r4)
+    check("old record: stored pct still the old ratio value, never multiplied", r4.get("price_impact_pct") == 0.02)
+    check("a NEW fill on the same journal is stamped while the old one stays unstamped", filler("0.02", p4).buy("op-new", MINT, 1.0, 2.0).get("price_impact_unit") == "percent_v2"
+          and dict(filler("0.02", p4).get_fill("op-old")) == stored)
     print("FAILS: %d" % FAILS); return 1 if FAILS else 0
 
 if __name__ == "__main__":

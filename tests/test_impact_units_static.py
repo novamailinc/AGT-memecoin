@@ -1,4 +1,4 @@
-"""Static (AST only, imports no project code) checks for the impact-unit change. SOURCE ONLY, WRITTEN NOT RUN. run: python3 tests/test_impact_units_static.py"""
+"""Static (AST only, imports no project code) checks for the impact-unit change. HEURISTIC name/shape checks, NOT execution proof (mainnet stays disabled and unexecuted). SOURCE ONLY, WRITTEN NOT RUN. run: python3 tests/test_impact_units_static.py"""
 import ast, os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAILS = 0

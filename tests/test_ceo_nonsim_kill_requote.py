@@ -94,47 +94,72 @@ def child_run(point):
         CI.mark_account_applied = lambda lane, iid: _die()
     elif point == "pre_lane_marker":
         CI.mark_lane_applied = lambda lane, iid: _die()
+    elif point == "before_credit":
+        PA.credit = lambda *a, **k: _die()   # labelled injection: the close intent is durable (begin returned), the account credit never happens
     C.poll_exits(price_fn=pf_mult(KILL_MULT))
     print("CHILD SURVIVED point=%s (kill point not reached)" % point, flush=True); sys.exit(7)
 
+HITS = {"n": 0}
+LOGS = []
+import logging as _logging
+class _H(_logging.Handler):
+    def emit(self, rec):
+        try: LOGS.append(rec.getMessage())
+        except Exception: pass
 def _inject(kind):
     """Labelled NAMED fault injection in THIS recovery process only (scratch root; no repo state, config or flag changes)."""
     real = C._recorded_credit_op
-    if kind in ("qty_mismatch", "amount_nan", "fee_negative", "amount_missing"):
+    if kind in ("qty_mismatch", "qty_near", "amount_nan", "fee_negative", "amount_missing", "price_kind_missing", "reason_missing"):
         def wrap(pos, suffix):
             op = real(pos, suffix)
             if op is None: return None
+            HITS["n"] += 1   # the mutation REACHED the guard input
             op = dict(op)
             if kind == "qty_mismatch": op["qty"] = float(op["qty"]) * 1.5
+            elif kind == "qty_near": op["qty"] = float(op["qty"]) * (1 + 1e-10)
             elif kind == "amount_nan": op["amount"] = float("nan")
             elif kind == "fee_negative": op["fee"] = -1.0
-            else: op.pop("amount", None)
+            elif kind == "amount_missing": op.pop("amount", None)
+            elif kind == "price_kind_missing": op["price_kind"] = None
+            else: op["_close_info"] = {}
             return op
         C._recorded_credit_op = wrap
-    elif kind == "foreign_position":
-        C._recorded_credit_op = lambda pos, suffix: None   # the pending intent belongs to another position instance: no recorded op matches this one
+    elif kind == "foreign_pos_id":
+        d = C._read(); d["positions"][MINT]["pa_pos_id"] = "foreign-pos-id-xyz"; C._write(d)   # the OPEN position is now a different instance than the pending intent's
     elif kind == "journal_corrupt":
         jp = CI.journal_path("ceo"); lines = open(jp).read().split("\n")
         lines.insert(1, "{garbage-not-json"); open(jp, "w").write("\n".join(lines))
 
-def child_recover(mult, inject=None):
+def child_recover(mult, inject=None, try_entry=None):
     PA = fresh()
+    _logging.getLogger().addHandler(_H()); _logging.getLogger().setLevel(_logging.WARNING)
     if inject: _inject(inject)
     ents0, st0, _t = CI._read(CI.journal_path("ceo"))
     intents0 = [e for e in ents0 if e.get("ev") == "intent"]
     op0 = ((intents0[0].get("settle_ops") or [{}])[0]) if intents0 else {}
     pre = {"pre_cash": cash(PA), "pre_status": st0, "pre_ev": [e.get("ev") for e in ents0 if e.get("intent_id")],
-           "op_amount": op0.get("amount"), "op_fee": op0.get("fee"), "op_id": op0.get("op_id"), "op_qty": op0.get("qty")}
+           "op_amount": op0.get("amount"), "op_fee": op0.get("fee"), "op_id": op0.get("op_id"), "op_qty": op0.get("qty"),
+           "op_reason": ((intents0[0].get("close_info") or {}).get("closed_reason") if intents0 else None)}
     print("PRE " + _json.dumps(pre), flush=True)
+    if inject == "different_trigger":
+        _orig = C._close_leg   # labelled: the retry fires under a DIFFERENT trigger reason than the recorded one
+        C._close_leg = lambda pos, k, px, reason, pkind=None: _orig(pos, k, px, "operator_probe_other_trigger", pkind)
     for _ in range(3):
         C.poll_exits(price_fn=pf_mult(float(mult)))
     pos = (C.open_positions() or {}).get(MINT) or {}
     ents, st, _ = CI._read(CI.journal_path("ceo"))
+    guard = [m for m in LOGS if "unusable for the retry" in m]
+    et = None
+    if try_entry:
+        et = repr(C.consider_card(csig("CeoMint2")))[:300]
     res = {"cash": cash(PA), "a_done": bool(pos.get("legs", {}).get("a", {}).get("done")), "a_realized": pos.get("legs", {}).get("a", {}).get("realized_usd"),
            "a_exit_price": pos.get("legs", {}).get("a", {}).get("exit_price"), "entry_price": pos.get("entry_price"),
+           "a_reason": pos.get("legs", {}).get("a", {}).get("exit_reason"),
            "pending": len(CI.pending("ceo")), "journal_status": st, "ev": [e.get("ev") for e in ents if e.get("intent_id")],
            "n_intents": len([e for e in ents if e.get("ev") == "intent"]), "pend_why": (pos.get("pending_exit") or {}).get("why"),
-           "n_pos": len(C.open_positions() or {})}
+           "n_pos": len(C.open_positions() or {}), "hits": HITS["n"], "guard_logs": len(guard),
+           "frozen_open": len(CI.frozen_open("ceo")), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
+           "n_pos_all": len(C.open_positions() or {})}
     print("RESULT " + _json.dumps(res), flush=True)
 
 def child_recover_kill(mult):
@@ -146,7 +171,7 @@ def child_recover_kill(mult):
 
 if MODE == "run": child_run(sys.argv[3]); sys.exit(0)
 if MODE == "recover_kill": child_recover_kill(sys.argv[3]); sys.exit(0)
-if MODE == "recover": child_recover(sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None); sys.exit(0)
+if MODE == "recover": child_recover(sys.argv[3], (sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != "-" else None), (sys.argv[5] if len(sys.argv) > 5 else None)); sys.exit(0)
 
 # ---- parent
 FAILS = []
@@ -157,12 +182,14 @@ def spawn(args):
     p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=30)
     return p.returncode, p.stdout, p.stderr
 FOUR = ["intent", "account_applied", "lane_applied", "applied"]
-def recover(root, mult, inject=None):
-    rc, out, err = spawn(["recover", root, str(mult)] + ([inject] if inject else []))
+HAS_HELPER = None
+def recover(root, mult, inject=None, try_entry=False):
+    rc, out, err = spawn(["recover", root, str(mult), inject or "-"] + (["try"] if try_entry else []))
     rl = [l for l in out.splitlines() if l.startswith("RESULT ")]; pl = [l for l in out.splitlines() if l.startswith("PRE ")]
     return rc, err, (_json.loads(pl[0][4:]) if pl else None), (_json.loads(rl[0][7:]) if rl else None)
 SCEN = (("S1", "after_credit", "2.0", "2.3", "leg", False), ("S2", "pre_lane_marker", "2.0", "2.3", "leg", False), ("S3-control", "after_credit", "2.0", "2.0", "leg", False),
-        ("S4-remaining", "after_credit", "0.45", "0.4", "remaining", False), ("S6-second-restart-lane-marker-kill", "after_credit", "2.0", "2.3", "leg", True))
+        ("S4-remaining", "after_credit", "0.45", "0.4", "remaining", False), ("S6-second-restart-lane-marker-kill", "after_credit", "2.0", "2.3", "leg", True),
+        ("S7-kill-after-begin-BEFORE-credit", "before_credit", "2.0", "2.3", "leg", False))
 for tag, point, kmult, mult, kind, kill2 in SCEN:
     root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
     rc, out, err = spawn(["run", root, point, kmult])
@@ -177,17 +204,21 @@ for tag, point, kmult, mult, kind, kill2 in SCEN:
     check("%s: recovery process exited 0 with PRE and RESULT (rc %d, stderr tail %r)" % (tag, rc2, err2[-160:]), rc2 == 0 and pre is not None and r is not None and "Traceback" not in err2)
     if pre is None or r is None: continue
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
-    want_ev = ["intent"] if (point == "after_credit" and not kill2) else None
-    check("%s: durable state before the final recovery: journal status %r (want None), lifecycle %r%s, credit already in the account (cash %.6f > entry %.6f), recorded op %r amount %r fee %r qty %r"
-          % (tag, pre["pre_status"], pre["pre_ev"], (" (want %r)" % want_ev) if want_ev else " (starts with intent)", pre["pre_cash"], entry_cash, pre["op_id"], pre["op_amount"], pre["op_fee"], pre.get("op_qty")),
-          pre["pre_status"] is None and (pre["pre_ev"] == want_ev if want_ev else pre["pre_ev"][:1] == ["intent"]) and _cents(pre["pre_cash"]) > _cents(entry_cash)
-          and pre["op_amount"] is not None and str(pre["op_id"]).startswith("ceo:%s:" % ("leg:a" if kind == "leg" else "remaining")))
+    credited = point != "before_credit"
+    want_ev = ["intent"] if (point in ("after_credit", "before_credit") and not kill2) else None
+    check("%s: durable state before the final recovery: journal status %r (want None), lifecycle %r%s, cash %.6f %s entry %.6f, recorded op %r amount %r fee %r qty %r reason %r"
+          % (tag, pre["pre_status"], pre["pre_ev"], (" (want %r)" % want_ev) if want_ev else " (starts with intent)", pre["pre_cash"], ">" if credited else "==", entry_cash,
+             pre["op_id"], pre["op_amount"], pre["op_fee"], pre.get("op_qty"), pre.get("op_reason")),
+          pre["pre_status"] is None and (pre["pre_ev"] == want_ev if want_ev else pre["pre_ev"][:1] == ["intent"])
+          and ((_cents(pre["pre_cash"]) > _cents(entry_cash)) if credited else (_cents(pre["pre_cash"]) == _cents(entry_cash)))
+          and pre["op_amount"] is not None and str(pre["op_id"]).startswith("ceo:%s:" % ("leg:a" if kind == "leg" else "remaining"))
+          and bool(pre.get("op_reason")) and pre.get("op_reason") != ("leg:a" if kind == "leg" else None) and not str(pre.get("op_reason")).startswith(("leg:", "remaining:")))
     rec_net = round(float(pre["op_amount"]) - float(pre["op_fee"] or 0.0), 6)
     if kind == "leg":
         check("%s: retry at %sx: leg a done %r, pending_exit %r (no hold loop)" % (tag, mult, r["a_done"], r["pend_why"]), r["a_done"] is True and not r["pend_why"])
-        check("%s: credit booked ONCE at the RECORDED amounts: cash delta since entry %.6f == recorded net %.6f, lane leg realized %r == recorded net (retry exit price %r vs entry %r)"
-              % (tag, r["cash"] - entry_cash, rec_net, r["a_realized"], r["a_exit_price"], r["entry_price"]),
-              _cents(r["cash"] - entry_cash) == _cents(rec_net) and r["a_realized"] is not None and abs(float(r["a_realized"]) - rec_net) < 1e-6)
+        check("%s: credit booked ONCE at the RECORDED amounts: cash delta since entry %.6f == recorded net %.6f, lane leg realized %r == recorded net, leg exit_reason %r == recorded close reason %r"
+              % (tag, r["cash"] - entry_cash, rec_net, r["a_realized"], r["a_reason"], pre.get("op_reason")),
+              _cents(r["cash"] - entry_cash) == _cents(rec_net) and r["a_realized"] is not None and abs(float(r["a_realized"]) - rec_net) < 1e-6 and r["a_reason"] == pre.get("op_reason"))
         done_ok = r["a_done"] is True
     else:
         check("%s: retry at %sx: the remaining close finished, position closed (n_pos %d), pending_exit %r (no hold loop)" % (tag, mult, r["n_pos"], r["pend_why"]), r["n_pos"] == 0 and not r["pend_why"])
@@ -200,22 +231,57 @@ for tag, point, kmult, mult, kind, kill2 in SCEN:
     same = r3 is not None and all(r3[k] == r[k] for k in ("cash", "a_done", "a_realized", "ev", "pending", "n_pos", "n_intents", "journal_status"))
     check("%s: a SECOND fresh restart changes nothing (rc %d; cash %r -> %r, lifecycle %r -> %r) and the exit is complete (%r)"
           % (tag, rc3, r["cash"], (r3 or {}).get("cash"), r["ev"], (r3 or {}).get("ev"), done_ok), rc3 == 0 and same and done_ok)
-# ---- fail-closed named injections: after a real SIGKILL-after-credit, the recovery must refuse visibly, never double-credit, never presume
-for tag, inj in (("F1-qty-mismatch", "qty_mismatch"), ("F2-amount-nan", "amount_nan"), ("F3-fee-negative", "fee_negative"), ("F4-amount-missing", "amount_missing"),
-                 ("F5-foreign-position", "foreign_position"), ("F6-journal-corrupt", "journal_corrupt")):
+
+# ---- fail-closed named injections (real SIGKILL-after-credit setup, then a recovery process with a labelled injection in that process only).
+# They need the recorded-op helper: on a source without it (old code) they are SKIPPED and printed as SKIP, never counted as PASS.
+HAS_HELPER = hasattr(C, "_recorded_credit_op")
+FZ = (("F1-qty-mismatch", "qty_mismatch"), ("F2-amount-nan", "amount_nan"), ("F3-fee-negative", "fee_negative"), ("F4-amount-missing", "amount_missing"),
+      ("F5-qty-near-tolerance-1e-10", "qty_near"), ("F6-price-kind-missing", "price_kind_missing"), ("F7-close-reason-missing", "reason_missing"))
+for tag, inj in (FZ if HAS_HELPER else ()):
     root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
     rc, out, err = spawn(["run", root, "after_credit", "2.0"])
     check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
-    rc2, err2, pre, r = recover(root, "2.3", inj)
+    rc2, err2, pre, r = recover(root, "2.3", inj, True)
     check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
     if r is None or pre is None: continue
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
-    check("%s: NO second credit (cash %.6f == pre-recovery cash %.6f), leg a NOT marked done (%r), position still open (n_pos %d)" % (tag, r["cash"], pre["pre_cash"], r["a_done"], r["n_pos"]),
+    check("%s: the mutation REACHED the guard (hits %d >= 1) and the guard logged its refusal (guard_logs %d >= 1, once per refusal)" % (tag, r["hits"], r["guard_logs"]), r["hits"] >= 1 and r["guard_logs"] >= 1)
+    check("%s: NO second credit (cash %.6f == pre-recovery cash %.6f), leg a NOT done (%r), position still open (n_pos %d)" % (tag, r["cash"], pre["pre_cash"], r["a_done"], r["n_pos"]),
           _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos"] == 1)
-    if inj != "journal_corrupt":
-        check("%s: refusal is VISIBLE: pending_exit set (%r), 1 pending intent, still exactly 1 intent, lifecycle %r" % (tag, r["pend_why"], r["pending"], r["ev"]),
-              bool(r["pend_why"]) and r["pending"] == 1 and r["n_intents"] == 1 and "lane_applied" not in r["ev"])
-    else:
-        check("%s: journal reported corrupt (status %r), no lane_applied/applied written (%r), no new intent (%d)" % (tag, r["journal_status"], r["ev"], r["n_intents"]),
-              r["journal_status"] is not None and "lane_applied" not in r["ev"] and "applied" not in r["ev"] and r["n_intents"] <= 1)
+    check("%s: the intent is FROZEN (lifecycle %r, frozen_open %d, pending %d), still exactly 1 intent, entries BLOCKED (in-process flag %r; entry attempt %r)"
+          % (tag, r["ev"], r["frozen_open"], r["pending"], r["entry_blocked"], r["entry_try"]),
+          "frozen" in r["ev"] and r["frozen_open"] == 1 and r["pending"] == 0 and r["n_intents"] == 1 and "lane_applied" not in r["ev"]
+          and r["entry_blocked"] is True and "blocked" in str(r["entry_try"]) and r["n_pos_all"] == 1)
+    rc3, err3, pre3, r3 = recover(root, "2.3", None, True)
+    check("%s: after a FRESH restart (no injection) the frozen intent still BLOCKS entries and nothing is credited or closed (rc %d; frozen_open %r, blocked %r, entry %r, cash %r)"
+          % (tag, rc3, (r3 or {}).get("frozen_open"), (r3 or {}).get("entry_blocked"), (r3 or {}).get("entry_try"), (r3 or {}).get("cash")),
+          rc3 == 0 and r3 is not None and r3["frozen_open"] == 1 and r3["entry_blocked"] is True and "blocked" in str(r3["entry_try"])
+          and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False and r3["n_pos_all"] == 1)
+
+if HAS_HELPER:
+    # different trigger: recorded close reason wins over the retry's new trigger reason
+    tag = "F8-different-trigger-keeps-recorded-reason"
+    root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+    rc, out, err = spawn(["run", root, "after_credit", "2.0"])
+    check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+    rc2, err2, pre, r = recover(root, "2.3", "different_trigger")
+    check("%s: recovery exited 0 and leg a done" % tag, rc2 == 0 and r is not None and r["a_done"] is True)
+    if r is not None and pre is not None:
+        print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+        check("%s: leg exit_reason %r is the RECORDED close reason %r, not the new trigger 'operator_probe_other_trigger'" % (tag, r["a_reason"], pre.get("op_reason")),
+              r["a_reason"] == pre.get("op_reason") and r["a_reason"] != "operator_probe_other_trigger")
+
+# journal corrupt mid-file: sentinel/entry block + hold classification read in the child
+tag = "F9-journal-corrupt"
+root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+rc, out, err = spawn(["run", root, "after_credit", "2.0"])
+check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+rc2, err2, pre, r = recover(root, "2.3", "journal_corrupt", True)
+check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+if r is not None and pre is not None:
+    print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+    check("%s: NO second credit (cash %.6f vs pre %.6f), leg a NOT done (%r), position open (n_pos %d), no lane_applied/applied written (%r)" % (tag, r["cash"], pre["pre_cash"], r["a_done"], r["n_pos"], r["ev"]),
+          _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos"] == 1 and "lane_applied" not in r["ev"] and "applied" not in r["ev"])
+    check("%s: journal reported corrupt (status %r), entries BLOCKED (flag %r, entry attempt %r), exit held visibly (pending_exit %r)" % (tag, r["journal_status"], r["entry_blocked"], r["entry_try"], r["pend_why"]),
+          r["journal_status"] is not None and r["entry_blocked"] is True and "blocked" in str(r["entry_try"]) and bool(r["pend_why"]) and r["n_pos_all"] == 1)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

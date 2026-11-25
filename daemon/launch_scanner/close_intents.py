@@ -457,6 +457,18 @@ def freeze(lane: str, intent_id: str, why: str) -> bool:
                                              "why": why}))
 
 
+def frozen_open(lane: str) -> List[str]:
+    """Ids of FROZEN, unapplied intents with no recorded successor (a frozen intent is terminal until an operator supersedes it): they keep a lane's
+    entries blocked ACROSS process restarts. A corrupt journal returns [] here (recover_lane's own corrupt-journal sentinel blocks it)."""
+    entries, status, _ = _read(journal_path(lane))
+    if status == "torn":
+        return []
+    stt = _state(entries)
+    succ = {e.get("supersedes") for e in entries if e.get("ev") == "intent" and e.get("supersedes")}
+    return [iid for iid, st in stt.items()
+            if st["intent"] is not None and not st["applied"] and st["frozen"] is not None and iid not in succ]
+
+
 def pending(lane: str) -> List[Dict[str, Any]]:
     """Intents with no terminal applied/frozen, for inspection and
     tests."""

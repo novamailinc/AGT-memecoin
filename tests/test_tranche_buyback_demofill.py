@@ -805,5 +805,51 @@ try: _F.buy("grad:entry:S15bw:1", "S15bw", 10.0, 2.0); _r = False
 except RuntimeError: _r = True
 check("S15m BUY claim not writable: raises, executor never reached (%d -> %d)" % (_n0, len(JUP.calls)), _r and len(JUP.calls) == _n0)
 
+# n. the mint guard blocks on an UNKNOWN record too (not only inflight), and the unknown record keeps the sale's intent
+setup(); _F = FILLER[0]; _F._inject_outage = "settled"
+try: _F.sell("grad:exit:S15ug:a", "S15ug", 100.0, 2.0, meta={"reason": "hard_stop_-50pct", "pkind": "x", "key": "a"})
+except DF.DemoSkip: pass
+_ug = _F.get_fill("grad:exit:S15ug:a") or {}; _n4 = len(JUP.calls)
+try: _F.sell("grad:exit:S15ug:remaining:abc", "S15ug", 300.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+try: _F.buy("grad:entry:S15ug:1", "S15ug", 10.0, 2.0); _wb = None
+except DF.DemoSkip as e: _wb = e.reason
+check("S15n leg a UNKNOWN: a remainder under another op id is refused (%r), a buyback entry is refused (%r), NO executor call (%d -> %d), unknown record keeps intent reason (%r)"
+      % (_w, _wb, _n4, len(JUP.calls), (_ug.get("intent") or {}).get("reason")),
+      _ug.get("status") == "unknown" and _w == "unresolved_unknown" and _wb == "unresolved_unknown" and len(JUP.calls) == _n4
+      and (_ug.get("intent") or {}).get("reason") == "hard_stop_-50pct")
+# o. a landed-failed tx: the attempt AND its fee are durable BEFORE the claim is cleared; if recording raises, the claim stays
+def _txfail_filler():
+    setup(); _F = FILLER[0]; _booked = []
+    _F._fee_sink = lambda usd, fid: (_booked.append((round(usd, 6), fid)) or (True, ""))
+    _orig = _F._executor
+    class _Ex:
+        def __init__(s, ex): s.ex = ex
+        def execute_swap(s, *a, **k): raise BrokerError(BROKER_UNAVAILABLE, "x", detail={"reason": "tx_failed", "fee_lamports": 5000, "signature": "sigfail"})
+    _F._executor = lambda *a, **k: _Ex(_orig(*a, **k))
+    return _F, _booked
+_F, _booked = _txfail_filler()
+try: _F.sell("grad:exit:S15tf:a", "S15tf", 100.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+with open(_F._jpath()) as _fh: _j = json.load(_fh)
+check("S15o tx_failed: fee booked once (%r), attempt journaled (%d) with fee_op_id, then the claim is cleared (%r)" % (_booked, len(_j["attempts"]), _F.get_fill("grad:exit:S15tf:a")),
+      _w == "tx_failed" and len(_booked) == 1 and _booked[0][1] == "feeloss:grad:exit:S15tf:a:0" and len(_j["attempts"]) == 1
+      and _j["attempts"][0]["detail"].get("fee_op_id") == "feeloss:grad:exit:S15tf:a:0" and _F.get_fill("grad:exit:S15tf:a") is None)
+_F, _booked = _txfail_filler()
+def _bad_ra2(*a, **k): raise RuntimeError("INJECTED: attempt journal not writable")
+_F._record_attempt = _bad_ra2
+try: _F.sell("grad:exit:S15tf2:a", "S15tf2", 100.0, 2.0)
+except RuntimeError: pass
+check("S15o' tx_failed whose attempt/fee record cannot be written: claim STAYS inflight (%r), nothing booked (%r): the fee evidence is not lost by an early clear"
+      % ((_F.get_fill("grad:exit:S15tf2:a") or {}).get("status"), _booked), (_F.get_fill("grad:exit:S15tf2:a") or {}).get("status") == "inflight" and not _booked)
+# p. resolve_inflight is disabled: no caller string clears an inflight claim
+setup(); _F = FILLER[0]; _F._save = _bad
+try: _F.sell("grad:exit:S15rs:a", "S15rs", 100.0, 2.0)
+except RuntimeError: pass
+try: _F.resolve_inflight("grad:exit:S15rs:a", "not_executed", "operator says so", "op"); _w = None
+except DF.DemoSkip as e: _w = e.reason
+check("S15p resolve_inflight refuses (%r) and the claim remains (%r)" % (_w, (_F.get_fill("grad:exit:S15rs:a") or {}).get("status")),
+      _w == "resolution_disabled" and (_F.get_fill("grad:exit:S15rs:a") or {}).get("status") == "inflight")
+
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

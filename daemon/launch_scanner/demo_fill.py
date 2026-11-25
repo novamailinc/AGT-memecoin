@@ -255,9 +255,12 @@ class DemoFiller:
             j["attempts"].append({"op_id": op_id, "side": side, "mint": mint,
                                   "reason": reason, "detail": detail, "ts": self._now()})
             if reason == "confirm_timeout":
+                _prev = j["fills"].get(op_id) or {}
                 j["fills"][op_id] = {"status": "unknown", "op_id": op_id, "side": side, "mint": mint,
                                      "signature": (detail or {}).get("signature"),
                                      "ctx": (detail or {}).get("_ctx"), "detail": detail}
+                if _prev.get("intent"):
+                    j["fills"][op_id]["intent"] = dict(_prev["intent"])   # what the sale was for survives claim -> unknown
         self._locked(f)
 
     # ---- inputs, validated BEFORE any quote --------------------------

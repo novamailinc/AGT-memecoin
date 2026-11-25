@@ -8,7 +8,7 @@ close_intents.mark_account_applied (labelled injection point, real process death
 Scenarios per lane: S1 after_credit, retry 2.3x (the case under test); S3 CONTROL: after_credit, retry 2.0x (same price: proves harness and kill are real).
 Contract: leg a done; the account credit booked ONCE (cash unchanged by the recovery); the lane leg realized equals the RECORDED net (recorded amount - fee), not a
 new quote; lifecycle exactly [intent, account_applied, lane_applied, applied]; nothing pending; no hold.
-EXPECTED on source without the recorded-op settle for these lanes: S1 RED by assertion (lane realized at the new quote), S3 GREEN. Not yet run.
+EXPECTED on source without the recorded-op settle for these lanes: S1 RED by assertion (lane realized at the new quote), S3 GREEN. Not yet run. Uses the REAL killswitch module redirected to a scratch state dir (no stub).
 Run: python3 -B tests/test_other_lanes_nonsim_kill_requote.py"""
 if __name__ != "__main__":
     import pytest
@@ -77,8 +77,6 @@ def fresh(start="10"):
     L.quote_price = G.stamped_quote(L, lambda chain, mint, spot_index=None: 0.001)
     L._safety = _Safe()
     if hasattr(L, "_veto"): L._veto = _Veto()
-    if hasattr(L, "_ks"): L._ks = type("KS", (), {"is_halted": lambda s, l: False, "gate": lambda s, l: True, "record_trade": lambda s, l, p, ts=None: None,
-                                                  "check_lane": lambda s, l: {"lane": l}})()
     L._ENTRY_BLOCKED = False; L._RECOVERY_DONE = False
     return PA
 def cash(PA): return PA.snapshot()["cash"]
@@ -88,7 +86,9 @@ def pf_mult(m):
         return float(pos.get("entry_price") or 0) * m
     return pf
 def _cents(x): return int(round(float(x) * 100))
-def _die(): os.kill(os.getpid(), _signal.SIGKILL)
+def _die():
+    print("KILLHIT lane=%s at mark_account_applied" % LANE_ARG, flush=True)   # hit counter: the lane reached the injected point
+    os.kill(os.getpid(), _signal.SIGKILL)
 
 def child_run(mult):
     PA = fresh(); r = _enter()
@@ -131,7 +131,7 @@ for lane in LANES:
         root = _tf.mkdtemp(prefix="otherlane-%s-" % tag)
         rc, out, err = spawn(["run", root, lane, "2.0"])
         check("%s: child KILLED by SIGKILL (rc %d, want -9), entry opened non-sim (%s)" % (tag, rc, [l for l in out.splitlines() if l.startswith("ENTRY")]),
-              rc == -_signal.SIGKILL and "SURVIVED" not in out and "ok=True" in out and "nonsim=True" in out and "pa_pos_id=True" in out)
+              rc == -_signal.SIGKILL and "SURVIVED" not in out and "KILLHIT lane=%s" % lane in out and "ok=True" in out and "nonsim=True" in out and "pa_pos_id=True" in out)
         rc2, out2, err2 = spawn(["recover", root, lane, retry])
         pl = [l for l in out2.splitlines() if l.startswith("PRE ")]; rl = [l for l in out2.splitlines() if l.startswith("RESULT ")]
         pre = _json.loads(pl[0][4:]) if pl else None; r = _json.loads(rl[0][7:]) if rl else None
@@ -139,9 +139,11 @@ for lane in LANES:
         if pre is None or r is None:
             continue
         print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+        _el = [l for l in out.splitlines() if l.startswith("ENTRY")]
+        entry_cash = float(_el[0].split("cash=")[1].split()[0]) if _el else 1e18
         rec_net = round(float(pre["op_amount"]) - float(pre["op_fee"] or 0.0), 6)
-        check("%s: durable state before recovery: ONE pending intent recorded (n %d, ev %r, recorded net %r)" % (tag, pre["n_pre"], pre["pre_ev"], rec_net),
-              pre["n_pre"] == 1 and pre["pre_ev"][:2] == ["intent", "account_applied"] and rec_net > 0)
+        check("%s: durable state before recovery: ONE intent, account_applied NOT yet marked (killed inside it), credit already in cash (%r > entry cash %r) (n %d, ev %r, recorded net %r)" % (tag, pre["pre_cash"], entry_cash, pre["n_pre"], pre["pre_ev"], rec_net),
+              pre["n_pre"] == 1 and pre["pre_ev"] == ["intent"] and rec_net > 0 and pre["pre_cash"] > entry_cash + 1e-9)
         check("%s: retry: leg a done %r, no hold (pending_exit %r), nothing pending (%r)" % (tag, r["a_done"], r["pend_why"], r["pending"]), r["a_done"] is True and r["pend_why"] is None and r["pending"] == 0)
         check("%s: credit booked ONCE (cash %r vs before recovery %r) and the lane leg realized %r equals the RECORDED net %r (not a new quote)" % (tag, r["cash"], pre["pre_cash"], r["a_realized"], rec_net),
               _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_realized"] is not None and abs(float(r["a_realized"]) - rec_net) < 1e-6)

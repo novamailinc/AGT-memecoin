@@ -306,12 +306,19 @@ out2 = run_bb(mint, entry * 1.3)
 check("S1 replay: a second cycle does nothing (no buyback, no quote, no cash move)", out2 == [] and len(JUP.calls) == nq and abs(PA_cash() - c1) < 1e-12)
 # lifecycle: sell the remaining legs (legs b and c include their buyback share) until closed
 JUP.mult = 0.05
+_pre_keys = set(FILLER[0]._locked(lambda j: list(j["fills"].keys()))); c_mid = PA_cash()
 for _ in range(8):
     G.poll_exits(price_fn=prices([entry * 0.05]))
 closed = "BB1pump" not in G.open_positions()
 rec = (G._read().get("closes") or [])[-1] if (G._read().get("closes") or []) else {}
 sells = FILLER[0]._locked(lambda j: [v for k, v in j["fills"].items() if v.get("side") == "sell" and v.get("status") == "filled" and (":%s:" % mint) in k])
-check("S1 lifecycle: position fully closed through the quote sim (%d sells)" % len(sells), closed and len(sells) >= 3)
+# PLAN-AWARE lifecycle (replaces the unsupported ">=3 sells" count: the persisted journal shows legs b and c are sold in ONE remaining-fill):
+_closes1 = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+_new = FILLER[0]._locked(lambda j: {k: v for k, v in j["fills"].items() if k not in _pre_keys and v.get("side") == "sell" and v.get("status") == "filled" and (":%s:" % mint) in k})
+check("S1 lifecycle: position closed EXACTLY ONCE (%d close records) and gone from open positions" % len(_closes1), closed and len(_closes1) == 1)
+check("S1 lifecycle: no duplicate sell fill (distinct fill ops %d, sell qty rows %d)" % (len(sells), len(sells)), len({(round(float(x["qty_tokens"]), 9), x.get("price_usd")) for x in sells}) == len(sells) and len(sells) >= 2)
+check("S1 lifecycle: POSITIVE actual remaining credit: the final sell(s) net %.7f > 0 and the account cash rose by it (%.7f), within the 6 dp cash contract" % (sum(v["net_proceeds_usd"] for v in _new.values()), PA_cash() - c_mid),
+      bool(_new) and sum(v["net_proceeds_usd"] for v in _new.values()) > 0 and abs((PA_cash() - c_mid) - sum(v["net_proceeds_usd"] for v in _new.values())) < CASH_TOL)
 check("S1 lifecycle: no stuck state (no pending_exit / settlement_pending on the close record)", closed and not rec.get("pending_exit") and not rec.get("settlement_pending"))
 _sold_qty = sum(float(s_["qty_tokens"]) for s_ in sells)
 check("S1 lifecycle: units sold == original + bought (%.6f vs %.6f)" % (_sold_qty, tokens0 + f["qty_tokens"]), abs(_sold_qty - (tokens0 + f["qty_tokens"])) < 1e-6)

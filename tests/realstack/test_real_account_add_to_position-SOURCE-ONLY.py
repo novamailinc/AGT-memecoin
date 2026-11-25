@@ -40,7 +40,11 @@ def main():
     check("add: lot qty +40 and basis +1.0 on the SAME lot", near(p1["qty"] - p0["qty"], 40.0, 1e-9) and near(p1["basis"] - p0["basis"], 1.0, 1e-9) and p1["pos_id"] == pid, repr((p0["qty"], p1["qty"], p0["basis"], p1["basis"])))
     check("add: spendable cash fell by exactly the cost (no double use)", near(c0 - float(s1["cash_spendable"]), 1.0), "%.6f -> %.6f" % (c0, float(s1["cash_spendable"])))
     check("money conservation: cost_exposure +cost exactly, book_value unchanged", near(float(s1["cost_exposure"]) - ex0, 1.0) and near(float(s1["book_value"]), bv0), "dexp=%.6f dbook=%.6f" % (float(s1["cost_exposure"]) - ex0, float(s1["book_value"]) - bv0))
-    check("lot entry_qty/entry_cost rose by qty/cost", near(float(p1.get("entry_qty", -1)) - float(p0.get("entry_qty", -2)), 40.0, 1e-9) and near(float(p1.get("entry_cost", -1)) - float(p0.get("entry_cost", -2)), 1.0, 1e-9), repr((p0.get("entry_qty"), p1.get("entry_qty"), p0.get("entry_cost"), p1.get("entry_cost"))))
+    # entry_qty/entry_cost are NOT in the snapshot() view (rev3 defect); read the real persisted ledger lot instead.
+    def stored(pa_):
+        d = json.load(open(pa_.LEDGER_PATH)); return d["lanes"][L]["open"][M]
+    st1 = stored(pa)
+    check("lot entry_qty/entry_cost (PERSISTED ledger lot) equal seed 100/2.0 plus the add 40/1.0", near(st1.get("entry_qty", -1), 140.0, 1e-9) and near(st1.get("entry_cost", -1), 3.0, 1e-9), repr({k: st1.get(k) for k in ("pos_id", "qty", "basis", "entry_qty", "entry_cost")}))
     ok2, why2 = pa.add_to_position(L, M, pid, 1.0, 40.0, "t:add1", ts=2.0, marks=mk(pa))
     check("idempotent retry (same op_id, same params): ok and NOT re-applied", ok2 is True and "retry" in why2 and near(lot(pa, L, M)["qty"], p1["qty"], 1e-12), repr((ok2, why2)))
     ok3, why3 = pa.add_to_position(L, M, pid, 1.5, 40.0, "t:add1", marks=mk(pa))
@@ -127,7 +131,7 @@ def main():
         ra = pa7.applied_add("d:addok")
         check("corrupt ledger: applied_add of the REAL earlier record is None while unreadable, or the exact record if the journal rebuilt it (never a different value)",
               ra is None or (near(ra["qty"], 40.0, 1e-12) and near(ra["stake"], 1.0, 1e-12) and ra["pos_id"] == pid7), repr(ra))
-        say("INFO", "corrupt ledger: applied_add state = %s" % ("None (unknown, not proof of absence)" if ra is None else "record rebuilt from journal"))
+        say("INFO", "corrupt ledger: applied_add state = %s" % ("None (unknown, not proof of absence)" if ra is None else "record present after recovery (shadow-copy restore per paper_account log, or journal replay; this check does not distinguish)"))
     except Exception as e:
         check("corrupt ledger: applied_add does not raise", False, "RAISED %r (finding)" % (e,))
     # replay divergence: journaled debit_add for a lot that does not exist

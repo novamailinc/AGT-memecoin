@@ -273,6 +273,29 @@ def frozen_for_op(lane: str, mint: str, pos_id: Optional[str], op_id: str):
     return sorted(out)
 
 
+def frozen_for_position(lane: str, mint: str, pos_id: Optional[str]):
+    """READ-ONLY (never appends). -> [(intent_id, why, [op_id, ...])] of EVERY frozen, unapplied, not-superseded intent of THIS position (same lane, mint and
+    position instance), whatever its operation family. [] when none. None when the journal is not cleanly readable. A close that spans the whole position
+    (a remaining-legs close or a zero-price write-down) uses this to see an unresolved obligation of ANY family; nothing is superseded or judged here."""
+    path = journal_path(lane)
+    if not os.path.exists(path):
+        return []
+    ents, st, _t = _read_consistent(path)
+    if st not in (None, "torn_tail"):
+        return None
+    stt = _state(ents)
+    sup = {e.get("supersedes") for e in ents if e.get("ev") == "intent" and e.get("supersedes")}
+    out = []
+    for i, s0 in stt.items():
+        e0 = s0["intent"]
+        if e0 is None or s0["applied"] or s0["frozen"] is None or i in sup:
+            continue
+        if e0.get("mint") != mint or e0.get("pos_id") != pos_id or e0.get("lane", lane) != lane:
+            continue
+        out.append((i, str(s0["frozen"])[:200], sorted(str(o.get("op_id")) for o in e0.get("settle_ops") or [] if isinstance(o, dict))))
+    return sorted(out)
+
+
 class IntentNotDurable(RuntimeError):
     """The intent (or a freeze) could not be written to the journal. The caller MUST NOT apply the account side without a durable
     plan: recovery can only converge an intent that exists on disk."""

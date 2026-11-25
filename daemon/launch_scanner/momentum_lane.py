@@ -390,6 +390,34 @@ def _intent_open(lane_suffix, pos, ops, reason):
     return (iid, pa_pos_id, mint, lane_suffix)
 
 
+def _op_suffix(op_id, mint, pa_pos_id):
+    """suffix of a momentum op id lane:<suffix>:mint:pos (the suffix itself may contain ':', e.g. leg:a); None when it does not have that shape."""
+    _pre = "%s:" % LANE; _post = ":%s:%s" % (mint, pa_pos_id); o = str(op_id)
+    return o[len(_pre):-len(_post)] if o.startswith(_pre) and o.endswith(_post) and len(o) > len(_pre) + len(_post) else None
+
+
+def _frozen_overlap(pos, key):
+    """[(intent_id, why)] of the frozen unapplied intents of this position that overlap the close `key` (see _intent_gate), [] when none, None when the
+    journal is unreadable. An op id of an unknown shape is treated as overlapping (never judged harmless)."""
+    _ci = _close_intents()
+    _all = _ci.frozen_for_position(LANE, pos["mint"], pos.get("pa_pos_id"))
+    if _all is None:
+        return None
+    _k = str(key)
+    _meta = pos.get("_exit_meta") or {}
+    _wd = _pkind(_meta.get("reason"), _meta.get("pkind")) == "write_down_zero" if _meta.get("reason") or _meta.get("pkind") else False
+    _span = _k.startswith("remaining") or _wd
+    out = []
+    for _iid, _why, _ops in _all:
+        if _span:
+            out.append((_iid, _why)); continue
+        for _o in _ops:
+            _s = _op_suffix(_o, pos["mint"], pos.get("pa_pos_id"))
+            if _s is None or _s == "leg:%s" % _k or _s == "writedown" or (_s.startswith("remaining:") and _k in _s[len("remaining:"):]):
+                out.append((_iid, _why)); break
+    return out
+
+
 def _intent_gate(pos, key):
     """FAIL CLOSED before anything is sold or booked: when the shared account is on for this position and the close-intent journal cannot be
     written, the leg/close is NOT executed (no sale, no lane close/bankroll/verdict, no account op). The position shows pending_exit
@@ -399,18 +427,13 @@ def _intent_gate(pos, key):
     _ci = _close_intents()
     if _ci is None:
         return True
-    # A FROZEN, unapplied intent for THIS operation (e.g. a generation refusal) is a different, known state from a storage failure: hold it under its own
-    # truthful reason and WITHOUT probing (the probe appends a journal line every cycle). Nothing is superseded, retried, rebound or credited here.
+    # A FROZEN, unapplied intent that overlaps THIS close (e.g. a generation refusal) is a different, known state from a storage failure: hold it under its
+    # own truthful reason and WITHOUT probing (the probe appends a journal line every cycle). Nothing is superseded, retried, rebound or credited here.
+    # Overlap rule (read-only, one read of the journal): a LEG close is held by a frozen intent of the same leg, of a remaining-legs close that contains that
+    # leg, or of a write-down; a REMAINING-legs close or a zero-price WRITE-DOWN spans the position, so any frozen unapplied intent of the position holds it.
+    # Independent legs never hold each other. Unreadable journal: fall through to the storage handling below.
     try:
-        _suffix = key if str(key).startswith("remaining:") else "leg:%s" % key
-        _fz = _ci.frozen_for_op(LANE, pos["mint"], pos.get("pa_pos_id"), "%s:%s:%s:%s" % (LANE, _suffix, pos["mint"], pos.get("pa_pos_id")))
-        # the zero-price write-down is a POSITION-WIDE operation (op id lane:writedown:mint:pos): a frozen unapplied write-down intent holds every close
-        # of that position the same way (a new close would otherwise probe the journal and then collide with the frozen write-down in begin()). Read-only.
-        _fw = _ci.frozen_for_op(LANE, pos["mint"], pos.get("pa_pos_id"), "%s:writedown:%s:%s" % (LANE, pos["mint"], pos.get("pa_pos_id")))
-        if _fz is None or _fw is None:
-            _fz = None
-        else:
-            _fz = list(_fz) + list(_fw)
+        _fz = _frozen_overlap(pos, key)
     except Exception:
         _fz = None
     if _fz:

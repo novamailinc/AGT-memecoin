@@ -358,6 +358,20 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
 
     mint_auth = info.get("mintAuthority")
     freeze_auth = info.get("freezeAuthority")
+    # Typed authority status (additive). jsonParsed returns the key
+    # with null when the authority is revoked; an ABSENT key or a
+    # non-string value is unavailable, never revoked.
+    def _auth_status(key):
+        if key not in info:
+            return "unavailable"
+        v = info.get(key)
+        if v is None:
+            return "revoked"
+        if isinstance(v, str) and v:
+            return "set"
+        return "unavailable"
+    mint_auth_status = _auth_status("mintAuthority")
+    freeze_auth_status = _auth_status("freezeAuthority")
     curve_pda = _pump_curve_pda(mint)
     if mint_auth:
         if curve_pda and str(mint_auth) == curve_pda:
@@ -385,6 +399,8 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
             flags.append(msg)
 
     ext_names: List[str] = []
+    # Typed per-entry parse status (additive): name + one of parsed/malformed/unparsed/unrecognized. No raw data.
+    ext_entries: List[Dict[str, Any]] = []
     transfer_fee_detail: Dict[str, Any] = {}
     extensions = info.get("extensions")
     if extensions is None:
@@ -398,18 +414,23 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
                 if not isinstance(ext, dict):
                     _ext_flag("Token-2022 extension entry unreadable "
                               "(unverified — review)")
+                    ext_entries.append({"name": None, "status": "malformed"})
                     continue
                 name = ext.get("extension")
                 if not isinstance(name, str) or not name:
                     _ext_flag("Token-2022 extension entry unreadable "
                               "(unverified — review)")
+                    ext_entries.append({"name": None, "status": "malformed"})
                     continue
+                _state_bad = False
                 state = ext.get("state")
                 if not isinstance(state, dict):
                     _ext_flag("Token-2022 extension entry unreadable "
                               "(unverified — review)")
+                    _state_bad = True
                     state = {}
                 ext_names.append(name)
+                _st = "malformed" if _state_bad else "parsed"
                 if name == "permanentDelegate":
                     fails.append(
                         "Token-2022 permanent delegate can seize/burn "
@@ -486,6 +507,18 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
                         _ext_flag("Token-2022 transfer fee is "
                                   "authority-mutable (can be raised "
                                   "later)")
+                    # Typed status (additive): key absent or an odd type is
+                    # unavailable, never "revoked"; only an explicit null is.
+                    if "transferFeeConfigAuthority" not in state:
+                        _fee_auth_status = "unavailable"
+                    elif auth is None:
+                        _fee_auth_status = "revoked"
+                    elif isinstance(auth, str) and auth.strip():
+                        _fee_auth_status = "set"
+                    else:
+                        _fee_auth_status = "unavailable"
+                    transfer_fee_detail["config_authority_status"] = \
+                        _fee_auth_status
                 elif name == "mintCloseAuthority":
                     if state.get("mintCloseAuthority"):
                         flags.append(
@@ -531,13 +564,43 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
                     _ext_flag(
                         "Token-2022 extension the RPC decoder itself "
                         "could not parse (unverified — review)")
+                    _st = "unparsed"
                 elif name not in _KNOWN_SAFE_EXTENSIONS:
                     _ext_flag("Token-2022 extension %r unrecognized "
                               "(unverified — review)" % name)
+                    _st = "unrecognized"
+                ext_entries.append({"name": name, "status": _st})
             except Exception:
                 _ext_flag("Token-2022 extension entry unreadable "
                           "(unverified — review)")
+                ext_entries.append({"name": None, "status": "malformed"})
                 continue
+
+    # Typed extension-scan completeness (additive). "complete" only when no entry or list was unreadable; a
+    # positive "no transfer fee" claim downstream needs it. This is a fact about the parse, not a policy.
+    # Typed completeness (replaces substring matching on flag text): the extension list is absent or a list, every
+    # entry parsed, the entry count equals the list length, and no extension name repeats.
+    _owner_raw = value.get("owner") if isinstance(value.get("owner"), str) and value.get("owner") else None
+    _ext_key = "absent" if extensions is None else ("list" if isinstance(extensions, list) else "malformed")
+    _enames = [e.get("name") for e in ext_entries if e.get("name")]
+    _scan_complete = (_ext_key != "malformed"
+                      and len(ext_entries) == (len(extensions) if _ext_key == "list" else 0)
+                      and all(e.get("status") == "parsed" for e in ext_entries)
+                      and len(set(_enames)) == len(_enames))
+    _kind = ("spl" if _owner_raw == str(TOKEN_PROGRAM) else
+             "token2022" if _owner_raw == str(TOKEN2022_PROGRAM) else "other")
+    # Emitter-side proof only decides whether the epoch read is skipped; decide() re-derives it independently.
+    _proves_no_fee = (_scan_complete and "transferFeeConfig" not in ext_names
+                      and ((_kind == "spl" and _ext_key == "absent") or (_kind == "token2022" and _ext_key == "list")))
+    _n_fee_ext = ext_names.count("transferFeeConfig")
+    if _n_fee_ext > 1:
+        # Duplicate transferFeeConfig entries: the per-entry update above is last-wins, which could erase an
+        # authority or schedule seen in an earlier entry. Replace with an explicit ambiguous state (fail closed).
+        # Any authority-mutable flag already added by an earlier entry stays in flags.
+        transfer_fee_detail = {"status": "ambiguous_duplicate", "config_authority_status": "ambiguous",
+                               "entry_count": _n_fee_ext}
+        _ext_flag("Token-2022 duplicate transferFeeConfig entries (ambiguous - review)")
+        _scan_complete = False
 
     # 2) Largest token accounts + their owners.
     res = _rpc("getTokenLargestAccounts", [mint], per_call)
@@ -558,6 +621,16 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
             o = (p.get("info") or {}).get("owner")
             owners[i] = str(o) if o else None
 
+    # Epoch evidence for transfer-fee selection (additive). A failed read leaves epoch_info None; nothing here
+    # guesses an epoch. fetched_at is the LOCAL read time, not an upstream observation time.
+    epoch_info = None
+    if not _proves_no_fee:
+        _ep_res = _rpc("getEpochInfo", [], per_call)
+        if isinstance(_ep_res, dict):
+            _ep = _ep_res.get("epoch")
+            if isinstance(_ep, int) and not isinstance(_ep, bool) and _ep >= 0:
+                epoch_info = {"epoch": _ep, "fetched_at": time.time()}
+
     # Venue accounts to exclude from user concentration: the pump
     # curve's own token account.
     venue_accts = set()
@@ -568,6 +641,10 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
 
     user_pcts: List[float] = []
     program_pct = 0.0
+    # Raw facts for the typed holders evidence (additive). owner_kind is a FACT about the account, not a policy:
+    # "program" = the pump curve's own token account, "pda" = owner is off the ed25519 curve, "wallet" = anything else.
+    # No program/venue classification beyond that is made here; an unknown owner is emitted as None.
+    holder_rows: List[Dict[str, Any]] = []
     for i, a in enumerate(accounts):
         # RAW amounts on both sides: mint info's `supply` is raw, and
         # uiAmount (decimal-adjusted) against it understates every
@@ -581,14 +658,17 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
         owner = owners[i]
         if addr in venue_accts:
             program_pct += pct
+            holder_rows.append({"amount": amt, "owner_kind": "program", "owner": owner or addr})
             continue
         if owner is not None:
             try:
                 if not _is_on_curve(_b58decode(owner)):
                     program_pct += pct  # PDA-owned: pool/escrow vault
+                    holder_rows.append({"amount": amt, "owner_kind": "pda", "owner": owner})
                     continue
             except Exception:
                 pass  # unparseable owner -> count as user (safer)
+        holder_rows.append({"amount": amt, "owner_kind": "wallet", "owner": owner})
         user_pcts.append(pct)
     user_pcts.sort(reverse=True)
 
@@ -620,13 +700,23 @@ def _check_inner(mint: str, timeout: float) -> Dict[str, Any]:
         "topHolders": [{"pct": round(p, 2)} for p in user_pcts],
         "instant": {
             "token2022_extensions": ext_names,
+            "token_program_id": _owner_raw,
+            "extensions_parse": {"token_program_id": _owner_raw, "token_program_kind": _kind,
+                                 "extensions_key": _ext_key, "entry_count": len(ext_entries),
+                                 "entries": ext_entries, "complete": _scan_complete},
             "transfer_fee": transfer_fee_detail or None,
             "mint_authority": (str(mint_auth) if mint_auth else None),
             "freeze_authority": (str(freeze_auth)
                                  if freeze_auth else None),
+            "mint_authority_status": mint_auth_status,
+            "freeze_authority_status": freeze_auth_status,
+            "as_of": time.time(),
             "top1_user_pct": round(top1, 2),
             "top10_user_pct": round(top10, 2),
             "program_held_pct": round(program_pct, 2),
+            "holder_rows": holder_rows,
+            "supply_raw": supply,
+            "epoch_info": epoch_info,
         },
     }
 

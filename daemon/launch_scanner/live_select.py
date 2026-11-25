@@ -515,7 +515,7 @@ def stamp_entry_execution(engine, mint, details):
 
 # -- engine factory -----------------------------------------------------
 
-def _install_mandatory_gates(eng):
+def _install_mandatory_gates(eng, safety_policy=None):
     """Keep the engine's real safety and veto, refuse the raw no-gate stubs, and make the veto fail CLOSED: grad._veto_ok
     treats an engine exception as "no evidence" and passes, which is acceptable for paper research but not for a lane that
     spends real money (directive section 25: never open positions when critical intelligence is unreliable)."""
@@ -535,7 +535,68 @@ def _install_mandatory_gates(eng):
 
     eng._veto_ok = _veto_fail_closed
 
-def make_live_engine(home, executor):
+    # Typed live safety policy (core.live_safety_policy): the engine's report must also satisfy an explicit allowlist of
+    # flags and Token-2022 extensions. NO DEFAULT ACCEPTANCE: safety_policy=None means accepted_flag_prefixes=() and
+    # verified_extensions=(), so any flag, any extension, and any report without extension evidence is refused. The owner
+    # decides what is acceptable by supplying {"accepted_flag_prefixes": [...], "verified_extensions": [...]}.
+    from core.live_safety_policy import live_safety_decision as _lsd
+    pol = safety_policy if isinstance(safety_policy, dict) else {}
+    prefixes = tuple(pol.get("accepted_flag_prefixes") or ())
+    exts = tuple(pol.get("verified_extensions") or ())
+    require_ev = pol.get("require_extension_evidence", True) is not False
+
+    def _authority_typed_ok(rep):
+        # Typed authority status emitted at the source (instant_safety). Missing, malformed or anything other than
+        # "revoked" refuses. No owner exception exists for this check. Reports from other sources without the typed
+        # fields (for example a RugCheck-path report) therefore refuse. "as_of" in the block is the LOCAL check time,
+        # not an upstream observation time.
+        inst = rep.get("instant") if isinstance(rep, dict) else None
+        if not isinstance(inst, dict):
+            return False, "authority status unavailable (no instant block)"
+        for k in ("mint_authority_status", "freeze_authority_status"):
+            if inst.get(k) != "revoked":
+                return False, "%s is %r, not revoked" % (k, inst.get(k))
+        return True, ""
+
+    _REQUIRED_READS = ("getAccountInfo", "getTokenLargestAccounts", "getMultipleAccounts")
+
+    def _evidence_ok(rep):
+        # Acquisition provenance. Each trace entry is ONE final routine read; failed provider attempts that preceded a
+        # usable result live inside entry["attempts"] and are NOT required to be ok. A report is refused unless it carries
+        # a non-empty evidence list covering the three reads a verdict needs, and every entry is kind "ok" with
+        # decision_usable exactly True. Degraded or fallback alone is not a refusal here.
+        ev = rep.get("acquisition_evidence") if isinstance(rep, dict) else None
+        if not isinstance(ev, list) or not ev:
+            return False, "acquisition evidence missing"
+        seen = set()
+        for e in ev:
+            if not isinstance(e, dict):
+                return False, "acquisition evidence malformed"
+            if e.get("kind") != "ok" or e.get("decision_usable") is not True:
+                return False, "acquisition evidence entry not usable (%s)" % str(e.get("method"))[:40]
+            m = e.get("method")
+            if isinstance(m, str):
+                seen.add(m)
+        missing = [m for m in _REQUIRED_READS if m not in seen]
+        if missing:
+            return False, "acquisition evidence lacks required read: %s" % missing[0]
+        return True, ""
+
+    def _safety_strict(mint):
+        res = _lsd(lambda: base_safety(mint), prefixes, exts, require_ev)
+        if not (isinstance(res, tuple) and len(res) == 4) or res[0] is not True:
+            return res
+        ok, why = _authority_typed_ok(res[2])
+        if not ok:
+            return False, "live lane: " + why, res[2], False
+        ok, why = _evidence_ok(res[2])
+        if not ok:
+            return False, "live lane: " + why, res[2], False
+        return res
+
+    eng._safety_ok = _safety_strict
+
+def make_live_engine(home, executor, safety_policy=None):
     """Load grad.py as a fresh, isolated module and override its
     lane policy for the LIVE lane: live ledger/limits/
     preregistration, no safety gate / no veto (paper select's
@@ -574,7 +635,7 @@ def make_live_engine(home, executor):
     # _safety_ok (RugCheck / on-chain fallback; unknown is not a pass) and _veto_ok. The raw no-gate stubs belong to the
     # experimental research lanes only and are refused here. NOTE: this makes the live lane NOT equivalent to paper
     # grad_select, so paper results must not be read as live evidence.
-    _install_mandatory_gates(eng)
+    _install_mandatory_gates(eng, safety_policy)
     eng._preregistration = _preregistration
     fills = LiveFills(executor, fail_streak)
     eng._fills = fills

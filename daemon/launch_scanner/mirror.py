@@ -559,6 +559,34 @@ def _recover_close_intents():
     return _ENTRY_BLOCKED
 
 
+def _op_suffix(lane, op_id, mint, pa_pos_id):
+    """suffix of an op id lane:<suffix>:mint:pos (the suffix itself may contain ':', e.g. leg:a); None when it does not have that shape."""
+    _pre = "%s:" % lane; _post = ":%s:%s" % (mint, pa_pos_id); o = str(op_id)
+    return o[len(_pre):-len(_post)] if o.startswith(_pre) and o.endswith(_post) and len(o) > len(_pre) + len(_post) else None
+
+
+def _frozen_overlap(pos, key):
+    """[(intent_id, why)] of the frozen unapplied intents of this position that overlap the close `key` (see _intent_gate), [] when none, None when the
+    journal is unreadable. An op id of an unknown shape is treated as overlapping (never judged harmless)."""
+    _ci = _close_intents()
+    _all = _ci.frozen_for_position(pos["lane"], pos["mint"], pos.get("pa_pos_id"))
+    if _all is None:
+        return None
+    _k = str(key)
+    _meta = pos.get("_exit_meta") or {}
+    _wd = _pkind(_meta.get("reason"), _meta.get("pkind")) == "write_down_zero" if _meta.get("reason") or _meta.get("pkind") else False
+    _span = _k.startswith("remaining") or _wd
+    out = []
+    for _iid, _why, _ops in _all:
+        if _span:
+            out.append((_iid, _why)); continue
+        for _o in _ops:
+            _s = _op_suffix(pos["lane"], _o, pos["mint"], pos.get("pa_pos_id"))
+            if _s is None or _s == "leg:%s" % _k or _s == "writedown" or (_s.startswith("remaining:") and _k in _s[len("remaining:"):]):
+                out.append((_iid, _why)); break
+    return out
+
+
 def _intent_gate(pos, key):
     """FAIL CLOSED before anything is sold or booked: when the shared account is on for this position and the close-intent journal cannot be
     written, the leg/close is NOT executed (no sale, no lane close/bankroll/verdict, no account op). The position shows pending_exit
@@ -568,6 +596,17 @@ def _intent_gate(pos, key):
     _ci = _close_intents()
     if _ci is None:
         return True
+    # A FROZEN, unapplied intent that overlaps THIS close is a different, known state from a storage failure: hold it under its own truthful reason and
+    # WITHOUT probing. Nothing is superseded, retried, rebound or credited here. Same overlap rule as the other lanes (leg held by same-leg / containing
+    # remaining / write-down intents; remaining or write-down spans the position); the lane is pos["lane"] (mirror is multi-lane). Unreadable: fall through.
+    try:
+        _fz = _frozen_overlap(pos, key)
+    except Exception:
+        _fz = None
+    if _fz:
+        logger.error("mirror: exit %s of %s HELD: frozen unapplied close intent %s (%s); no probe, no supersede, no account op", key, pos.get("mint"), _fz[0][0], _fz[0][1])
+        _hold_not_durable(pos, key, why="frozen_intent_unresolved", detail={"frozen_intents": [{"intent_id": i, "why": w} for i, w in _fz]})
+        return False
     try:
         _ok = _ci.journal_writable(pos["lane"])
     except Exception:
@@ -1803,13 +1842,18 @@ def _hold_not_durable(pos, key, why="close_intent_not_durable", detail=None):
         # resolved: by an operator reconciling the sale record against the fill journal; observed records are never rewritten to clear it.
         _pe["qualification_excluded"] = True
         _pe["resolution"] = "operator: reconcile the sale record against the fill journal; observed evidence is not rewritten to clear this hold"
+    if why == "frozen_intent_unresolved":
+        _pe["qualification_excluded"] = True
+        _pe["resolution"] = ("operator: a FROZEN close intent (see detail) is unresolved, usually a refused account generation; storage is not the cause. "
+                             "No automatic retry, supersession, rebinding or credit is performed; the frozen evidence is not rewritten to clear this hold")
     pos["pending_exit"] = _pe
     _h = pos.setdefault("exit_hold_history", [])   # append-only provenance, carried into the close record
     _h.append({"ts": _pe["ts"], "key": key, "why": why, "reason": _rs, "tries": _tries, "risk_exit_blocked": _pe["risk_exit_blocked"],
                "qualification_excluded": bool(_pe.get("qualification_excluded"))})
     del _h[:-50]
     if _pe["risk_exit_blocked"]:
-        logger.error("RISK EXIT BLOCKED by close-intent storage failure: %s %s reason=%s tries=%d operator_attention=%s",
+        logger.error("RISK EXIT BLOCKED (%s): %s %s reason=%s tries=%d operator_attention=%s",
+                     "frozen close intent, not a storage failure" if why == "frozen_intent_unresolved" else "close-intent storage failure",
                      pos.get("mint"), key, _rs, _tries, _pe["operator_attention"])
 
 
@@ -1888,7 +1932,7 @@ def _resume_pending_exit(pos):
     else:
         _close_leg(pos, _key, float(_rec.get("price_usd") or 0.0), _reason, _pk)
     _pe2 = pos.get("pending_exit")
-    if isinstance(_pe2, dict) and _pe2.get("why") == "close_intent_not_durable":
+    if isinstance(_pe2, dict) and _pe2.get("why") in ("close_intent_not_durable", "frozen_intent_unresolved"):
         return "held"
     if all((v or {}).get("done") for v in pos["legs"].values()):
         return "closed:%s" % _reason

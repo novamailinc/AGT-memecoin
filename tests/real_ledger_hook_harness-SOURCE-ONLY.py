@@ -156,7 +156,7 @@ CHILD_W3 = PRE2 + r"""
 r1 = open_first(); T.register(GR); force_abort(); save_baseline()
 GC._record_fault = lambda *a, **k: False               # the abort hook cannot make the fault durable (failed hook)
 poll_abort()
-print(json.dumps({"refusal_inproc": T.commit_refusal(GR.LANE), "hook_failed": dict(T._HOOK_FAILED), "marker": os.path.exists(GR.LEDGER_PATH + ".poll-inflight.json")}))
+print(json.dumps({"refusal_inproc": T.commit_refusal(GR.LANE), "hook_failed": dict(T._HOOK_FAILED), "marker": os.path.exists(GR.LEDGER_PATH + ".poll-inflight.json")}), flush=True)
 os._exit(1)
 """
 CHILD_W4 = PRE2 + r"""

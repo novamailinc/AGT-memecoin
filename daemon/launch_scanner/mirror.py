@@ -1396,6 +1396,14 @@ def _gate_intent(lane, it, d, status):
         _extra = sorted(set(_op) - _OP_KEYS[_k])
         if _extra:
             _probs.append("op[%d] carries fields %r the %s writer never records" % (_i, _extra, _k))
+        if (("expected_account_id" in _op) or ("entry_op_id" in _op)) and not (_op.get("expected_account_id") is None and _op.get("entry_op_id") is None and _int.get("account_id") is None):   # all-None on an unbound intent = recorded UNBOUND (the account refuses it visibly)
+            # GENERATION-BINDING fields: both must be present, non-empty strings, and the account generation must equal the one recorded on the INTENT itself
+            # (stamped at begin from the position's original binding). A foreign or mismatched binding is never trusted, never applied.
+            _bx = _op.get("expected_account_id"); _be = _op.get("entry_op_id")
+            if not (isinstance(_bx, str) and _bx and isinstance(_be, str) and _be):
+                _probs.append("op[%d] generation-binding fields must be BOTH non-empty strings (got %r/%r)" % (_i, _bx, _be))
+            elif _int.get("account_id") != _bx:
+                _probs.append("op[%d] binding generation %r differs from the intent's recorded account generation %r" % (_i, _bx, _int.get("account_id")))
         if _op.get("mint") != mint or _op.get("pos_id") != pid:
             _probs.append("op[%d] mint/pos_id %r/%r differ from the intent %r/%r" % (_i, _op.get("mint"), _op.get("pos_id"), mint, pid))
         if _k == "credit":

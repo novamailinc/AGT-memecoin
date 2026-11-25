@@ -252,7 +252,28 @@ check("G46 two fault writers: B blocks while A is mid-write and BOTH reasons sur
 gsrc2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "grad_cycle.py")).read()
 check("G47 static: clear_fault commit takes lock() then _fault_lock; a fault-lock timeout returns blocked", "with lock(), _fault_lock(grad):" in gsrc2 and "fault_lock_unavailable" in gsrc2)
 # G48 static lock order: nothing inside the fault-locked writers takes the cycle or ledger lock
-i2 = gsrc2.index("def _record_fault_locked("); j3 = gsrc2.index("def _atomic(")
-check("G48 static: _record_fault_locked body takes no ledger/cycle lock and calls no snapshot/recon_health", all(x not in gsrc2[i2:j3] for x in ("lock()", "_cycle_lock_path", "recon_health", "snapshot(")))
+def _body(src, name):
+    i = src.index("def " + name + "("); m = re.search(r"\n(def |class |_[A-Z_]+ = )", src[i + 5:]); return src[i:(i + 5 + m.start()) if m else len(src)]
+_locked_bodies = [_body(gsrc2, "_record_fault_locked"), _body(gsrc2, "_repair_log_tail_locked")]
+check("G48 static (non-vacuous): both locked bodies are non-empty and take no ledger/cycle lock, no snapshot/recon_health", all(len(bd) > 400 for bd in _locked_bodies) and all(x not in bd for bd in _locked_bodies for x in ("lock()", "_cycle_lock_path", "recon_health", "snapshot(", "_ledger_lock")))
+# G49 repair vs concurrent append, deterministic: a torn tail log; the repair is paused at its crash seam (_REPAIR_HOOK) with the fault lock held; a second
+# writer must BLOCK until the repair finishes; the final log must be line-clean, hold the marker, and carry the appended entry exactly once.
+g = fake(); lp = GC._fault_log_path(g); open(lp, "w").write(json.dumps({"fault_id": "f49", "since": 1.0, "entry": {"reason": "seed"}}) + "\n" + '{"fault_id": "torn')
+_oh = GC._REPAIR_HOOK; _ct = {}
+def _pause(point):
+    if point == "after_marker_before_truncate" and "t" not in _ct:
+        _ct["t"] = _th.Thread(target=lambda: _ct.setdefault("ok", GC._record_fault(g, {}, "C49"))); _ct["t"].start(); _tm.sleep(0.3); _ct["alive"] = _ct["t"].is_alive()
+GC._REPAIR_HOOK = _pause
+try: rr = GC._repair_log_tail(g)
+finally: GC._REPAIR_HOOK = _oh
+_ct["t"].join(10); lines = open(lp).read().split("\n"); okj = True
+for ln in lines[:-1]:
+    try: json.loads(ln)
+    except Exception: okj = False
+check("G49 repair vs concurrent append: appender blocks during the repair, log ends clean, marker present, appended entry exactly once (%d lines)" % (len(lines) - 1),
+      rr is True and _ct.get("alive") is True and okj and lines[-1] == "" and open(lp).read().count("C49") == 1 and "fault_log_torn_tail_repaired" in open(lp).read())
+# G50 static: every call of the repair goes through the serialising wrapper; the unlocked body is called only from the wrapper
+callers = [m.start() for m in re.finditer(r"_repair_log_tail_locked\(", gsrc2)]
+check("G50 static: _repair_log_tail_locked is called only inside the _repair_log_tail wrapper (plus its own def)", len(callers) == 2 and gsrc2.index("def _repair_log_tail(") < callers[0] < gsrc2.index("def _repair_log_tail_locked("))
 print("FAILS: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

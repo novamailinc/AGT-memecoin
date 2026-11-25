@@ -127,7 +127,18 @@ def _REPAIR_HOOK(point):
 
 
 def _repair_log_tail(grad):
-    """Called before every fault-log append (the caller holds the cycle lock). A log not ending in a newline would make the next append
+    """Serialised wrapper: EVERY caller (the append path in _record_fault_locked, which already holds the fault lock, and _run_cycle_inner's eager
+    repair, which does not) goes through the fault lock, so a repair can never interleave with an append. A lock timeout/IO failure = not repaired = False."""
+    try:
+        with _fault_lock(grad):
+            return _repair_log_tail_locked(grad)
+    except OSError:
+        return False
+
+
+def _repair_log_tail_locked(grad):
+    """Body of the repair; the CALLER MUST HOLD the fault lock (the cycle lock is neither required nor sufficient: the poll-abort hook and the entry
+    thread append without it). A log not ending in a newline would make the next append
     concatenate onto the torn fragment and poison the whole log forever. The fragment is PRESERVED in <log>.torn-tails.jsonl, the log is
     truncated back to its last newline, and a MARKER fault with its own fault_id is appended: the unknown fault stays ACTIVE until a clear record
     names it. Returns True when the log is append-safe."""
@@ -224,7 +235,9 @@ class _fault_lock:
     thread via a depth counter. LOCK ORDER: this is a LEAF lock. Callers may hold the cycle lock and/or the ledger lock when they take it (cycle -> ledger
     -> fault, and the poll-abort hook runs ledger -> fault); nothing that holds it may take the cycle or ledger lock (the held sections do bare file I/O
     only). Acquisition is bounded (non-blocking retries up to _FAULT_LOCK_TIMEOUT_S) so a stuck holder cannot hang a thread that holds the ledger lock; a
-    timeout raises FaultLockTimeout and the caller treats the fault as NOT recorded (fail closed). The kernel frees it on process death."""
+    timeout raises FaultLockTimeout and the caller treats the fault as NOT recorded (fail closed). The 5 s figure is a RETRY POLICY for the lock attempt
+    only: open(), flock and the file I/O done while holding it have no bound, so it does not bound exit latency. The kernel frees the flock on process death.
+    The fault lock does NOT order a writer against the cycle or ledger locks beyond the leaf rule above; same-thread reentrancy is by the depth map only."""
     def __init__(self, grad):
         self.path = _fault_lock_path(grad); self.fh = None
 
@@ -236,12 +249,12 @@ class _fault_lock:
         if depth.get(self.path, 0) > 0:
             depth[self.path] += 1; return self
         fh = open(self.path, "a")
-        end = time.time() + float(_FAULT_LOCK_TIMEOUT_S)
+        end = time.monotonic() + float(_FAULT_LOCK_TIMEOUT_S)      # monotonic: a wall-clock step cannot shorten or stretch the retry window
         while True:
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); break
             except BlockingIOError:
-                if time.time() >= end:
+                if time.monotonic() >= end:
                     fh.close(); raise FaultLockTimeout("fault lock busy")
                 time.sleep(0.01)
         self.fh = fh; depth[self.path] = 1

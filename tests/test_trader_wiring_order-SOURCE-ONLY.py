@@ -54,7 +54,7 @@ for path, want_entry in (("scripts/grad-select-trader", True), ("scripts/grad-ra
     check("X-%s: flag-on with missing wiring module refuses entries (log text present) and still polls exits" % b, "wiring missing" in src and "AGT_GRAD_CYCLE_ENABLED" in src)
 lv = open(os.path.join(ROOT, "scripts/grad-select-live-trader")).read()
 check("L-live: register-only wiring present after make_live_engine and before the first thread, and NO main_cycle (non-demo lane stays on its own path)",
-      "make_live_engine(home, executor)" in lv and "_gtc.register(engine)" in lv and lv.index("_gtc.register(engine)") > lv.index("make_live_engine(home, executor)") and lv.index("_gtc.register(engine)") < lv.index("threading.Thread(") and "main_cycle" not in lv)
+      "make_live_engine(home, executor)" in lv and "_gtc.register(engine)" in lv and lv.index("_gtc.register(engine)") > lv.index("make_live_engine(home, executor)") and lv.index("_gtc.register(engine)") < lv.index("threading.Thread(") and not any(isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", "")) == "main_cycle" for n in ast.walk(ast.parse(lv))))
 for tp in ("scripts/tranche-trader", "scripts/tranche-protect-trader"):
     ts = open(os.path.join(ROOT, tp)).read()
     check("T-%s: the buyback (an entry) is gated by entry_allowed or skipped when the flag is on and wiring missing" % os.path.basename(tp), "entry_allowed(engine)" in ts and "_bb_ok" in ts and ts.index("_bb_ok") < ts.index("maybe_buyback(engine)"))

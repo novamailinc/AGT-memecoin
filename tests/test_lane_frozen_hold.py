@@ -117,6 +117,7 @@ def _fault_core(mutant=""):
     a finally. Failures are OBSERVED as real OSError(EFBIG) captured from the production code's own logged exc_info and by an in-window write probe."""
     import resource, errno, logging
     PA = fresh(); cash(PA)
+    if mutant == "nohelper": CI.frozen_for_op = lambda *a, **k: None   # MUTANT: the old behavior (no frozen-op pre-check: the storage probe runs every cycle and the hold is labelled storage failure)
     if mutant == "nofreeze": CI.freeze = lambda *a, **k: True   # MUTANT: the old behavior, a freeze that claims success and writes nothing
     # the real account load creates the NEW generation (the parent removed the old account files)
     ad = _acct_dir(ROOTDIR); out = {"euid": os.geteuid()}
@@ -179,8 +180,10 @@ def _snap(PA):
     ents = [_json.loads(x) for x in raw.decode("utf-8", "replace").splitlines() if x.strip().startswith("{")]
     d["intent_ops"] = sorted(set(op.get("op_id") for e in ents if e.get("ev") == "intent" for op in (e.get("settle_ops") or []) if isinstance(op, dict)))
     d["n_intent_events"] = len([e for e in ents if e.get("ev") == "intent"])
+    d["n_probe"] = len([e for e in ents if e.get("ev") == "probe"]); d["n_lines"] = len(ents)
+    d["pending_exit"] = {k: pos.get(k) for k in ("pending_exit",)}["pending_exit"] if d["pos_open"] else None
     d["ev_kinds"] = sorted(set(e.get("ev") for e in ents))
-    d["pending_unfrozen"] = len(CI.pending(LANE_NAME)); d["frozen_unresolved"] = len(CI.frozen_unresolved(jp)[0])
+    d["pending_unfrozen"] = len(CI.pending(LANE_NAME)); d["frozen_ids"] = CI.frozen_unresolved(jp)[0]; d["frozen_unresolved"] = len(d["frozen_ids"])
     evs = _jl(ROOTDIR)[0]
     d["credit"] = len([e for e in evs if e.get("event") == "credit"]); d["debit"] = len([e for e in evs if e.get("event") == "debit"])
     d["wal_events"] = sorted(set(e.get("event") for e in evs))
@@ -199,6 +202,10 @@ def child_fault2(mutant=""):
     try: L.poll_exits(price_fn=_pf2(2.0)); out["c2_exc"] = None
     except Exception as e: out["c2_exc"] = type(e).__name__
     s2 = _snap(PA); out["s2"] = s2
+    for _i in range(3):
+        try: L.poll_exits(price_fn=_pf2(2.0))
+        except Exception as e: out["c2_exc"] = type(e).__name__
+    out["s2b"] = _snap(PA)
     out["entry_blocked_flag"] = bool(getattr(L, "_ENTRY_BLOCKED", False))
     try: e = _enter(MINT2); out["c2_entry_ok"] = bool(e[0]); out["c2_entry_reason"] = str(e[1])[:160]
     except Exception as ex: out["c2_entry_ok"] = False; out["c2_entry_reason"] = "EXC %s" % type(ex).__name__
@@ -220,6 +227,23 @@ def child_restart2():
     out["s3"] = _snap(PA)
     print("RESULT " + _json.dumps(out, default=str), flush=True)
 
+def child_unit():
+    """Deterministic unit coverage of the read-only helper on a REAL journal written by close_intents.begin/freeze (scratch home)."""
+    ln = "momentum"; pid = "momentum/M1#1"; out = {}
+    def op(k): return "momentum:leg:%s:M1:%s" % (k, pid)
+    def ops(k): return [{"kind": "credit", "op_id": op(k), "amount": 1.0, "qty": 1.0}]
+    i1 = CI.begin(ln, "M1", pid, ops("a"), {"close_ts": time.time(), "leg_suffix": "leg:a"}); CI.freeze(ln, i1, "gen refused")
+    out["a_frozen"] = [x[0] for x in (CI.frozen_for_op(ln, "M1", pid, op("a")) or [])] == [i1]
+    out["b_independent"] = CI.frozen_for_op(ln, "M1", pid, op("b")) == []
+    out["other_pos"] = CI.frozen_for_op(ln, "M1", "momentum/M1#2", op("a")) == [] and CI.frozen_for_op(ln, "M2", pid, op("a")) == []
+    jp = CI.journal_path(ln); before = os.path.getsize(jp); CI.frozen_for_op(ln, "M1", pid, op("a")); out["readonly"] = os.path.getsize(jp) == before
+    i2 = CI.begin(ln, "M1", pid, ops("a"), {"close_ts": time.time(), "leg_suffix": "leg:a"}, supersedes=i1)
+    out["superseded_then_pending"] = CI.frozen_for_op(ln, "M1", pid, op("a")) == []
+    CI.freeze(ln, i2, "again"); out["new_frozen"] = [x[0] for x in (CI.frozen_for_op(ln, "M1", pid, op("a")) or [])] == [i2]
+    with open(jp, "ab") as f: f.write(b"{garbage\n" + b'{"ev":"probe"}\n')
+    out["unreadable_is_none"] = CI.frozen_for_op(ln, "M1", pid, op("a")) is None
+    print("RESULT " + _json.dumps(out), flush=True)
+if MODE == "unit": child_unit(); sys.exit(0)
 if MODE == "open": child_open(); sys.exit(0)
 if MODE == "probe": child_probe(sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""); sys.exit(0)
 if MODE == "fault2": child_fault2(sys.argv[3] if len(sys.argv) > 3 else ""); sys.exit(0)
@@ -269,17 +293,29 @@ try:
     check("F1 after the faulted settle the lane position is OPEN, bound to its original generation, with no leg done (%r)" % ({k: s1[k] for k in ("pos_open", "legs_done", "pa_pos_id", "n_positions")},), s1["pos_open"] is True and s1["legs_done"] == {"a": False, "b": False, "c": False} and s1["n_positions"] == 1)
     check("F2 exactly one obligation exists: one distinct credit op id across the journal, it is FROZEN and unapplied, none pending-unfrozen (%r)" % ({k: s1[k] for k in ("intent_ops", "frozen_unresolved", "pending_unfrozen")},), len(s1["intent_ops"]) == 1 and s1["frozen_unresolved"] == 1 and s1["pending_unfrozen"] == 0)
     check("F3 SECOND CYCLE (same process, storage restored): no account credit or debit, position still open and unchanged, same single obligation, nothing pending-unfrozen (%r)" % ({k: s2[k] for k in ("credit", "debit", "pos_open", "legs_done", "intent_ops", "frozen_unresolved", "pending_unfrozen")},), s2["credit"] == 0 and s2["debit"] == 0 and s2["pos_open"] is True and s2["legs_done"] == s1["legs_done"] and s2["intent_ops"] == s1["intent_ops"] and s2["pending_unfrozen"] == 0 and s2["frozen_unresolved"] >= 1 and s2["pa_account_id"] == s1["pa_account_id"] and s2["tokens"] == s1["tokens"])
-    check("F4 second cycle with storage restored: the refusal is now DURABLY recorded in the account marker (observation, hypothesis; marker_records %r -> %r)" % (s1["marker_records"], s2["marker_records"]), s2["marker_records"] >= 1)
+    pe = s2.get("pending_exit") or {}
+    check("F4 SAFE HOLD (replaces the false marker expectation): the second cycle made NO credit attempt, so the marker count is unchanged (%r -> %r), nothing credited, the position carries a pending_exit hold" % (s1["marker_records"], s2["marker_records"]), s2["marker_records"] == s1["marker_records"] and s2["credit"] == 0 and bool(pe))
+    check("H1 the hold names the REAL cause: why=frozen_intent_unresolved (not close_intent_not_durable), detail lists the frozen intent id, the resolution text does not send the operator to the fill journal (%r)" % ({k: pe.get(k) for k in ("why", "tries", "operator_attention", "resolution")},), pe.get("why") == "frozen_intent_unresolved" and [i.get("intent_id") for i in (pe.get("detail") or {}).get("frozen_intents", [])] == s1["frozen_ids"] and len(s1["frozen_ids"]) == 1 and "fill journal" not in str(pe.get("resolution")) and pe.get("qualification_excluded") is True)
+    sb = f["s2b"]
+    check("P1 BOUNDED JOURNAL: three further held cycles add NO journal line at all (lines %r -> %r, probes %r -> %r, sha %r -> %r)" % (s2["n_lines"], sb["n_lines"], s2["n_probe"], sb["n_probe"], s2["journal_sha"], sb["journal_sha"]), sb["n_lines"] == s2["n_lines"] and sb["n_probe"] == s2["n_probe"] and sb["journal_sha"] == s2["journal_sha"] and sb["credit"] == 0 and sb["intent_ops"] == s1["intent_ops"])
     check("F5 no second buy: the public lane entry after the faulted cycles is refused and the lane holds one position, account has the original debit count (%r)" % ({k: f.get(k) for k in ("c2_entry_ok", "c2_entry_reason")}, ), f["c2_entry_ok"] is False and s3["n_positions"] == 1 and s3["debit"] == s1["debit"])
     rc, out, err = spawn(["restart2", rootF]); r = res(out)
     if r is None: print("FAIL SETUP restart2 (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
     q0, q1, q2, q3 = r["s0"], r["s1"], r["s2"], r["s3"]
     check("R1 FRESH process: lane recovery is blocked and applies nothing: the journal bytes are identical before and after recovery, no credit, no account_applied event (%r)" % ({k: q1[k] for k in ("journal_sha", "credit")}, q0["journal_sha"]), r["recovery_blocked"] is True and q1["journal_sha"] == q0["journal_sha"] and q1["credit"] == 0 and "account_applied" not in q1["ev_kinds"])
-    check("R2 FRESH process poll_exits cycle: no credit, no debit, position unchanged and still bound to the ORIGINAL generation, no new obligation (%r)" % ({k: q2[k] for k in ("credit", "debit", "pos_open", "pa_account_id", "intent_ops", "pending_unfrozen")},), q2["credit"] == 0 and q2["debit"] == 0 and q2["pos_open"] is True and q2["pa_account_id"] == s1["pa_account_id"] and q2["intent_ops"] == s1["intent_ops"] and q2["pending_unfrozen"] == 0)
+    check("R2 FRESH process poll_exits cycle: no credit, no debit, position unchanged and still bound to the ORIGINAL generation, no new obligation and no journal line added (%r)" % ({k: q2[k] for k in ("credit", "debit", "pos_open", "pa_account_id", "intent_ops", "pending_unfrozen", "journal_sha")},), q2["credit"] == 0 and q2["debit"] == 0 and q2["pos_open"] is True and q2["pa_account_id"] == s1["pa_account_id"] and q2["intent_ops"] == s1["intent_ops"] and q2["pending_unfrozen"] == 0 and q2["journal_sha"] == q1["journal_sha"])
     check("R3 NO REBINDING: the lane position keeps the old generation id while the account ledger holds a different one (%r vs %r)" % (q3["pa_account_id"], r["ledger_account_id"]), q3["pa_account_id"] == s1["pa_account_id"] and bool(r["ledger_account_id"]) and r["ledger_account_id"] != q3["pa_account_id"])
     check("R4 FRESH process: public debit and public lane entry still refused, still no second position (%r)" % ({k: r[k] for k in ("direct_ok", "direct_why", "entry_ok")},), r["direct_ok"] is False and NEED in r["direct_why"] and r["entry_ok"] is False and q3["n_positions"] == 1 and q3["debit"] == s1["debit"])
+    rc, out, err = spawn(["unit", newroot("U")]); u = res(out)
+    if u is None: print("FAIL SETUP unit (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
+    check("U1 frozen_for_op returns the frozen unapplied intent of that exact operation and is read-only (journal size unchanged) (%r)" % ({k: u[k] for k in ("a_frozen", "readonly")},), u["a_frozen"] is True and u["readonly"] is True)
+    check("U2 per-leg independence is preserved: a frozen leg a does not hold leg b, another position or another mint (%r)" % ({k: u[k] for k in ("b_independent", "other_pos")},), u["b_independent"] is True and u["other_pos"] is True)
+    check("U3 an explicitly SUPERSEDED intent no longer holds, a newly frozen successor does, and an unreadable journal returns None (never judged from unreadable evidence) (%r)" % ({k: u[k] for k in ("superseded_then_pending", "new_frozen", "unreadable_is_none")},), u["superseded_then_pending"] is True and u["new_frozen"] is True and u["unreadable_is_none"] is True)
     rootM, m = run_fault("nofreeze")
-    check("M MUTANT (freeze claims success and writes nothing, the old behavior): the same scenario leaves NO frozen obligation, so F2 would fail (%r)" % ({k: m["s1"][k] for k in ("frozen_unresolved", "intent_ops", "pending_unfrozen")},), m["s1"]["frozen_unresolved"] == 0)
+    check("M MUTANT (freeze claims success and writes nothing): the same scenario leaves NO frozen obligation, so F2 would fail (%r)" % ({k: m["s1"][k] for k in ("frozen_unresolved", "intent_ops", "pending_unfrozen")},), m["s1"]["frozen_unresolved"] == 0)
+    rootN, n = run_fault("nohelper")
+    npe = n["s2"].get("pending_exit") or {}
+    check("M2 MUTANT OF THE FIX (old behavior: no frozen-op pre-check): the probe journal GROWS each held cycle (probes %r -> %r) and the hold is mislabelled %r, so H1 and P1 would fail" % (n["s2"]["n_probe"], n["s2b"]["n_probe"], npe.get("why")), n["s2b"]["n_probe"] > n["s2"]["n_probe"] and npe.get("why") == "close_intent_not_durable")
 except _TO as e:
     print("FAIL BUDGET %s" % e); FAILS.append("budget")
 except SystemExit:

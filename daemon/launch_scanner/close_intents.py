@@ -248,6 +248,31 @@ def frozen_unresolved(path: str):
     return sorted(i for i, s0 in stt.items() if s0["intent"] is not None and s0["frozen"] is not None and not s0["applied"] and i not in sup), st
 
 
+def frozen_for_op(lane: str, mint: str, pos_id: Optional[str], op_id: str):
+    """READ-ONLY (never appends, so repeated held cycles add nothing to the journal). -> [(intent_id, why)] of the FROZEN, unapplied, not-superseded intents of THIS
+    position whose settle ops overlap the operation family of `op_id` (the same overlap rule begin() applies: independent per-leg operations never match each
+    other). [] when none. None when the journal is not cleanly readable (the caller keeps its own storage handling; nothing is judged from unreadable evidence)."""
+    path = journal_path(lane)
+    if not os.path.exists(path):
+        return []
+    ents, st, _t = _read_consistent(path)
+    if st not in (None, "torn_tail"):
+        return None
+    fam = _op_family(op_id)
+    stt = _state(ents)
+    sup = {e.get("supersedes") for e in ents if e.get("ev") == "intent" and e.get("supersedes")}
+    out = []
+    for i, s0 in stt.items():
+        e0 = s0["intent"]
+        if e0 is None or s0["applied"] or s0["frozen"] is None or i in sup:
+            continue
+        if e0.get("mint") != mint or e0.get("pos_id") != pos_id or e0.get("lane", lane) != lane:
+            continue
+        if fam in {_op_family(o.get("op_id")) for o in e0.get("settle_ops") or [] if isinstance(o, dict)}:
+            out.append((i, str(s0["frozen"])[:200]))
+    return sorted(out)
+
+
 class IntentNotDurable(RuntimeError):
     """The intent (or a freeze) could not be written to the journal. The caller MUST NOT apply the account side without a durable
     plan: recovery can only converge an intent that exists on disk."""

@@ -96,6 +96,8 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
             return self.fills[op_id]
         def get_fill(self, op_id):
             return self.fills.get(op_id)
+        def fills_by_prefix(self, prefix, suffix=""):
+            return {k: dict(v) for k, v in self.fills.items() if k.startswith(prefix) and k.endswith(suffix)}
     ff = _FakeFiller(); spy2 = _SpyAccount(); spy2.max_price_impact_pct = lambda: 50.0
     pos2 = mkpos("FR" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":
@@ -196,11 +198,72 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
     # an UNREADABLE fill journal fails closed: held, no sale
     class _BadJournal(_FakeFiller):
         def get_fill(self, op_id): raise OSError("INJECTED: fill journal unreadable")
+        def fills_by_prefix(self, prefix, suffix=""): raise OSError("INJECTED: fill journal unreadable")
     ffu = _BadJournal(); posu = mkpos("FJ" + modname[:3], lm)
     with patch.object(M, "_paper_account", lambda: spyr), patch.object(M, "_demo_filler", lambda: ffu):
         _ru = M._resume_pending_exit(posu)
     check("%s unreadable fill journal: resume holds (%r, why %r), no sale (%d)" % (modname, _ru, (posu.get("pending_exit") or {}).get("why"), len(ffu.calls)),
           _ru == "held" and posu["pending_exit"]["why"] == "unresolved_fill_journal" and not ffu.calls)
+
+    # ---- v11/v12: prefix enumeration, overlap, drift, unknown, legacy quarantine, hold history, trail classification
+    def _filled(reason="leg_a_2x"):
+        return {"status": "filled", "price_usd": 0.001, "gross_usd": 0.1, "fee_usd": 0.001, "execution_source": "canned_fixture", "signature": "s",
+                "provenance": {}, "intent": {"reason": reason}}
+    def _resume_with(pos, fills):
+        ffx = _FakeFiller(); ffx.fills.update(fills); spx = _SpyAccount(); spx.max_price_impact_pct = lambda: 50.0
+        with patch.object(M, "_paper_account", lambda: spx), patch.object(M, "_demo_filler", lambda: ffx), patch.object(M, "_exit_fee_venue", lambda p: None):
+            return M._resume_pending_exit(pos), ffx, spx
+    # OVERLAP: a filled leg-a record AND a filled remaining record, both unbooked: never first-match, held
+    po = mkpos("FO" + modname[:3], lm)
+    _r, _f, _s = _resume_with(po, {M._exit_op(po, "a"): _filled(), M._exit_op(po, "remaining:abc"): _filled("hard_stop_-50pct")})
+    check("%s overlap (two unbooked filled records): held %r why %r, nothing credited (%d), no sale (%d)" % (modname, _r, (po.get("pending_exit") or {}).get("why"), len(_s.credits), len(_f.calls)),
+          _r == "held" and po["pending_exit"]["why"] == "unresolved_exit_overlap" and not _s.credits and not _f.calls)
+    # KEY DRIFT: a filled remainder for legs ab while only c ... legs now differ (a already done): held, not adopted
+    pd = mkpos("FD" + modname[:3], lm); pd["legs"]["a"]["done"] = True
+    _r, _f, _s = _resume_with(pd, {M._exit_op(pd, "remaining:abc"): _filled("hard_stop_-50pct")})
+    check("%s key drift (filled remaining:abc but leg a is already booked): held %r why %r, no credit" % (modname, _r, (pd.get("pending_exit") or {}).get("why")),
+          _r == "held" and pd["pending_exit"]["why"] == "unresolved_key_drift" and not _s.credits)
+    # UNKNOWN record: held, never sold
+    pu = mkpos("FK" + modname[:3], lm)
+    _r, _f, _s = _resume_with(pu, {M._exit_op(pu, "a"): {"status": "unknown"}})
+    check("%s unknown record: held %r why %r, no sale" % (modname, _r, (pu.get("pending_exit") or {}).get("why")),
+          _r == "held" and pu["pending_exit"]["why"] == "unresolved_unknown" and not _f.calls)
+    # SENSITIVITY control: exactly one unbooked filled record is settled once
+    p1 = mkpos("F1" + modname[:3], lm)
+    _r, _f, _s = _resume_with(p1, {M._exit_op(p1, "a"): _filled()})
+    check("%s control: a single unbooked filled record settles (%r, credits %d)" % (modname, _r, len(_s.credits)), _r == "resumed" and len(_s.credits) == 1)
+    # LEGACY (suffix-less) exit record: quarantined, never adopted, never read as absence
+    pl = mkpos("FL" + modname[:3], lm); pl["entry_ts"] = 1000.0
+    _leg_id = M._exit_op(pl, "a")[:-len(":%s" % pl["pa_pos_id"])]
+    _r, _f, _s = _resume_with(pl, {_leg_id: _filled()})
+    check("%s legacy suffix-less filled record with no ts: held %r why %r, not adopted (credits %d), no sale (%d)" % (modname, _r, (pl.get("pending_exit") or {}).get("why"), len(_s.credits), len(_f.calls)),
+          _r == "held" and pl["pending_exit"]["why"] == "unresolved_legacy_exit_key" and not _s.credits and not _f.calls)
+    pl2 = mkpos("FM2" + modname[:3], lm); pl2["entry_ts"] = 1000.0
+    _old = _filled(); _old["ts"] = 10.0
+    _r, _f, _s = _resume_with(pl2, {M._exit_op(pl2, "a")[:-len(":%s" % pl2["pa_pos_id"])]: _old})
+    check("%s control: a legacy record provably OLDER than the entry is ignored (%r)" % (modname, _r), _r is None)
+    # HOLD HISTORY reaches the close record with qualification_excluded
+    ph = mkpos("FH" + modname[:3], lm)
+    ph["symbol"] = "T"; ph["source"] = "t"; ph["entry_ts"] = 1.0; ph["entry_price"] = 0.001; ph["entry_features"] = {}
+    _f0 = _FakeFiller(); _s0 = _SpyAccount(); _s0.max_price_impact_pct = lambda: 50.0
+    with patch.object(M, "_paper_account", lambda: _s0), patch.object(M, "_demo_filler", lambda: _f0), patch.object(M, "_exit_fee_venue", lambda p: None), \
+         patch.object(CI, "_append", _no_write):
+        M._close_leg(ph, "a", 0.001, "hard_stop_-50pct")
+    check("%s hold history recorded (%r)" % (modname, [h.get("why") for h in ph.get("exit_hold_history", [])]), ph.get("exit_hold_history") and ph["exit_hold_history"][-1]["qualification_excluded"] is True)
+    for _k in ph["legs"]: ph["legs"][_k]["done"] = True; ph["legs"][_k]["exit_price"] = 0.001; ph["legs"][_k]["exit_ts"] = 2.0
+    dh = {"positions": {ph["mint"]: ph}, "closes": [], "bankroll": 10.0, "state": "running"}
+    with patch.object(M, "_write", lambda dd: True), patch.object(M, "_recover_close_intents", lambda: None):
+        try:
+            rech = M._finalize(dh, ph["mint"], ph, "ladder_complete")
+        except Exception as _e:
+            rech = {"EXC": repr(_e)}
+    check("%s close record carries exit_hold_history and qualification_excluded (%r)" % (modname, (rech or {}).get("qualification_excluded") if isinstance(rech, dict) else rech),
+          isinstance(rech, dict) and rech.get("qualification_excluded") is True and rech.get("exit_hold_history"))
+    # TRAIL classification: a held trail exit is a RISK exit
+    pt = mkpos("FT" + modname[:3], lm)
+    with patch.object(M, "_paper_account", lambda: _s0), patch.object(M, "_demo_filler", lambda: _f0), patch.object(CI, "_append", _no_write):
+        M._close_leg(pt, "a", 0.001, "trail_stop_-30pct")
+    check("%s held trail exit is risk_exit_blocked (%r)" % (modname, (pt.get("pending_exit") or {}).get("risk_exit_blocked")), (pt.get("pending_exit") or {}).get("risk_exit_blocked") is True)
     # an exception that is NOT IntentNotDurable still propagates (the rollback is narrow, never a blanket catch)
     pos3 = mkpos("FX" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":

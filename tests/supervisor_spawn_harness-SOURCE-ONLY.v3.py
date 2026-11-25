@@ -78,6 +78,58 @@ def sv5b():
         left = V2.reap_owned(h, sp)
         if left: print("INFO SV5b last-resort cleanup killed exact owned pids %s" % (left,))
 
+
+# ---------------- harness-local private mount namespace + fresh /proc, with a FAIL-CLOSED identity self-test ----------------
+# Why (reviewer source trace): the wrapper creates a PID namespace (unshare -rnpf) but does not mount a /proc for it, so in-namespace kill()/getpid() use inner ids while /proc/<number> shows OUTER ids;
+# live-process probes by number are therefore unreliable (sl11 SV5). Fix, local to THIS harness process only: unshare(CLONE_NEWNS) (a private copy of the mount table owned by the wrapper's user namespace),
+# make every mount in that copy private (so nothing propagates to the shared mounts), verify no shared/master propagation tag remains, then mount a fresh proc on /proc (nosuid,nodev,noexec) in that private copy.
+# The wrapper, its mounts and every other process are unchanged; the private mount namespace vanishes when this process exits. No scenario runs and nothing is signalled unless the identity self-test passes.
+import ctypes
+CLONE_NEWNS = 0x00020000; MS_REC = 0x4000; MS_PRIVATE = 1 << 18; MS_NOSUID = 2; MS_NODEV = 4; MS_NOEXEC = 8
+def private_proc():
+    """-> (ok, [messages]). Never signals anything. Must be called while single-threaded, before any scenario."""
+    msgs = []; libc = ctypes.CDLL(None, use_errno=True)
+    def err(w): return "%s failed: errno %d (%s)" % (w, ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    try:
+        pre_ns = os.readlink("/proc/self/ns/pid"); pre_self = os.readlink("/proc/self"); pre_mnt = os.readlink("/proc/self/ns/mnt")
+    except Exception as e: return False, ["cannot read the pre-mount proc facts: %r" % (e,)]
+    msgs.append("INFO PROC BEFORE (diagnostic, expected mismatch per the reviewer trace): pid ns %s, mount ns %s, os.getpid() %d, readlink(/proc/self) %s -> %s" % (pre_ns, pre_mnt, os.getpid(), pre_self, "SAME" if pre_self == str(os.getpid()) else "DIFFERENT (inner and outer pid views differ)"))
+    if libc.unshare(CLONE_NEWNS) != 0: return False, msgs + ["FAIL " + err("unshare(CLONE_NEWNS)")]
+    mnt_after = os.readlink("/proc/self/ns/mnt")
+    if mnt_after == pre_mnt: return False, msgs + ["FAIL mount namespace did not change after unshare (%s)" % mnt_after]
+    if libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None) != 0: return False, msgs + ["FAIL " + err("mount --make-rprivate /")]
+    tagged = [l.split(" - ")[0][:120] for l in open("/proc/self/mountinfo").read().splitlines() if (" shared:" in l.split(" - ")[0] or " master:" in l.split(" - ")[0])]
+    if tagged: return False, msgs + ["FAIL propagation tags remain after make-rprivate (%d mounts), refusing to mount: %s" % (len(tagged), tagged[:3])]
+    if libc.mount(b"proc", b"/proc", b"proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, None) != 0: return False, msgs + ["FAIL " + err("mount -t proc proc /proc")]
+    msgs.append("INFO PRIVATE MOUNT NS %s (was %s): every mount private (0 shared/master tags), fresh proc mounted nosuid,nodev,noexec" % (mnt_after, pre_mnt))
+    # identity self-test
+    me = os.getpid(); fails = []
+    try:
+        post_ns = os.readlink("/proc/self/ns/pid"); sl = os.readlink("/proc/self"); st = open("/proc/self/stat").read(); stpid = int(st.split(" ", 1)[0])
+    except Exception as e: return False, msgs + ["FAIL cannot read fresh proc: %r" % (e,)]
+    if post_ns != pre_ns: fails.append("pid namespace link changed (%s != %s)" % (post_ns, pre_ns))
+    if sl != str(me): fails.append("readlink(/proc/self) %s != os.getpid() %d" % (sl, me))
+    if stpid != me: fails.append("/proc/self/stat pid %d != os.getpid() %d" % (stpid, me))
+    mk = "idtest-" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+    code = "import os,sys,time\nprint(os.getpid(),flush=True)\ntime.sleep(30)\n"
+    ch = subprocess.Popen([sys.executable, "-B", "-c", code, mk], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        import select
+        rr = select.select([ch.stdout], [], [], 8.0)[0]; said = int(ch.stdout.readline()) if rr else None
+        cmd = open("/proc/%d/cmdline" % ch.pid, "rb").read().replace(b"\0", b" ").decode("utf8", "replace")
+        cst = open("/proc/%d/stat" % ch.pid).read(); cppid = int(cst[cst.rindex(")") + 2:].split()[1])
+        if said != ch.pid: fails.append("child reported its own pid %s != Popen pid %d" % (said, ch.pid))
+        if mk not in cmd: fails.append("/proc/%d/cmdline lacks the unique marker (%r)" % (ch.pid, cmd[:80]))
+        if cppid != me: fails.append("/proc/%d/stat ppid %d != my pid %d" % (ch.pid, cppid, me))
+        msgs.append("INFO IDENTITY SELF-TEST facts: self pid %d, /proc/self -> %s, child Popen pid %d reported %s, cmdline carries marker %s, child ppid %d" % (me, sl, ch.pid, said, mk in cmd, cppid))
+    except Exception as e: fails.append("self-test child probe raised %r" % (e,))
+    finally:
+        try: ch.kill(); ch.wait(timeout=5)      # own Popen object only, never a number read from /proc
+        except Exception as e: fails.append("could not kill/reap the self-test child: %r" % (e,))
+    if ch.poll() is not None and os.path.exists("/proc/%d" % ch.pid): fails.append("reaped self-test child pid %d is still listed in /proc" % ch.pid)
+    if fails: return False, msgs + ["FAIL IDENTITY SELF-TEST: " + "; ".join(fails)]
+    return True, msgs + ["PASS IDENTITY SELF-TEST: private mount ns, fresh proc, pid views agree (self, stat, child pid, cmdline, ppid, reaped child absent)"]
+
 # ---------------- G1 ----------------
 def build_shim_g1():
     head = V2.SHIM_HEAD; old = "if _cfgs:\n"
@@ -112,7 +164,7 @@ def g1():
         try: return [json.loads(l) for l in open(os.path.join(h, "sv3.inc")).read().splitlines() if l.strip()]
         except Exception: return []
     try:
-        while time.time() - t0 < 40.0 and p.poll() is None:
+        while time.time() - t0 < min(40.0, max(1.0, B.left() - 5.0)) and p.poll() is None:
             try:
                 st = json.load(open(statep)); d = st["daemons"]["grad-trader"]; cur = (d["state"], d["pid"], d["restarts"], d["last_exit"], d["owned"])
                 if cur != last: log.append([round(time.time() - t0, 3)] + list(cur)); last = cur
@@ -194,7 +246,7 @@ def cred_env(home, extra=None, base=True):
     return e
 
 def run_cred(env, args=("--preflight",)):
-    r = subprocess.run([sys.executable, "-B", os.path.join(B.REPO, "deploy", "agt", "credentials.py")] + list(args), cwd=B.REPO, env=env, capture_output=True, text=True, timeout=20)
+    r = subprocess.run([sys.executable, "-B", os.path.join(B.REPO, "deploy", "agt", "credentials.py")] + list(args), cwd=B.REPO, env=env, capture_output=True, text=True, timeout=max(1.0, min(20.0, B.left())))
     return r.returncode, r.stdout + r.stderr
 
 def tree(h):
@@ -252,7 +304,7 @@ def c2():
     h = B.newhome(); home = os.path.join(h, "home", ".forex-agent"); os.makedirs(home)
     env = cred_env(home, {n: fx() for n in REQ}); env.update({"HOME": os.path.join(h, "home"), "AGT_PY": sys.executable, "GIT_CONFIG_NOSYSTEM": "1"})
     pre = tree(h)
-    r = subprocess.run(["bash", os.path.join(B.REPO, "deploy", "agt", "start.sh"), "--preflight-only"], cwd=h, env=env, capture_output=True, text=True, timeout=40)
+    r = subprocess.run(["bash", os.path.join(B.REPO, "deploy", "agt", "start.sh"), "--preflight-only"], cwd=h, env=env, capture_output=True, text=True, timeout=max(1.0, min(40.0, B.left())))
     out = r.stdout + r.stderr; new = tree(h) - pre
     head = subprocess.run(["git", "-C", B.REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     try: ver = json.load(open(os.path.join(home, "agt_version.json")))
@@ -262,7 +314,16 @@ def c2():
     check("C8 start.sh --preflight-only (explicit env): credential step reached and OK (%s); the version file names the repo HEAD (%s == %s); everything written is inside the scratch dir; no fixture value echoed (%s)" % (reached, ver.get("commit"), head, any(v in out for v in env.values() if v.startswith("fx-"))),
           reached and ver.get("commit") == head and not any(v in out for v in env.values() if v.startswith("fx-")))
 
+BUDGET_S = 100.0      # internal bounded maximum (outer wrapper limit stays 120 s)
 def main():
+    B.DEADLINE = time.time() + BUDGET_S; t_start = time.time()
+    ok, msgs = private_proc()
+    for m in msgs:
+        if m.startswith("PASS "): check(m[5:], True)
+        elif m.startswith("FAIL "): check(m[5:], False)
+        else: print(m)
+    if not ok:
+        print("ABORT before any scenario or signal: the identity self-test did not pass (fail-closed); FAILS: %d" % len(FAILS)); return 1
     try:
         for n, f in (("SV5b", sv5b), ("C1-C7", c1), ("C8", c2), ("G1", g1)): B.scen(n, f)
     finally: B.reap_all()
@@ -270,6 +331,6 @@ def main():
     check("all harness-spawned children reaped (still alive: %s)" % (alive,), not alive)
     check("no bytecode written under the repo (scripts/__pycache__ exists: %s, tests/__pycache__ exists: %s, deploy/agt/__pycache__ exists: %s)" % tuple(os.path.exists(os.path.join(B.REPO, d, "__pycache__")) for d in ("scripts", "tests", os.path.join("deploy", "agt"))),
           not any(os.path.exists(os.path.join(B.REPO, d, "__pycache__")) for d in ("scripts", "tests", os.path.join("deploy", "agt"))))
-    print("elapsed %.1fs of 90s budget; FAILS: %d" % (90.0 - B.left(), len(FAILS))); return 1 if FAILS else 0
+    print("elapsed %.1fs of %.0fs internal budget (outer wrapper limit 120s); FAILS: %d" % (time.time() - t_start, BUDGET_S, len(FAILS))); return 1 if FAILS else 0
 if __name__ == "__main__":
     sys.exit(main())

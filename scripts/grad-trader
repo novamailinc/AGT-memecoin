@@ -58,6 +58,12 @@ def main():
         logger.warning("grad module missing: %s", _IMPORT_ERROR)
         return 1
     state = _grad.ensure_ledger()
+    try:      # cycle-hook registration only, before the loop; fail-soft; no-op unless AGT_GRAD_CYCLE_ENABLED=1
+        from daemon import grad_trader_cycle as _gtc
+        _gtc.register(_grad)
+        logger.warning("grad cycle hooks: %s", _gtc.startup_report(_grad))
+    except Exception as e:
+        logger.warning("grad cycle hooks not registered: %r", e)
     # Materialize the killswitch lane entry (not halted) so the lane
     # is visible in killswitch status from day one.
     try:

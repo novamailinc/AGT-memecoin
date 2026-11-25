@@ -63,6 +63,12 @@ except Exception:
     except Exception:
         _recorder = None
 
+# Cycle-hook registration only (write-ahead marker, abort hook, entry refusal). Fail-soft import; the raw lane has no cycle journal or entry-scan wiring here.
+try:
+    from daemon import grad_trader_cycle as _gtc
+except Exception:
+    _gtc = None
+
 POLL_SECS = 5
 GT_BACKFILL_EVERY_S = 60
 GT_BACKFILL_PAGES = 5
@@ -79,6 +85,10 @@ def main():
         return 1
     engine = _raw.make_engine()
     state = engine.ensure_ledger()
+    # BEFORE any thread (feed, armed watcher, exit poller, entry loop) can call poll_exits; no ledger I/O. No-op unless AGT_GRAD_CYCLE_ENABLED=1.
+    if _gtc is not None:
+        _gtc.register(engine)
+        logger.warning("grad-raw cycle hooks: %s", _gtc.startup_report(engine))
     # Materialize the killswitch lane entry (not halted) so the lane
     # is visible in killswitch status from day one.
     try:

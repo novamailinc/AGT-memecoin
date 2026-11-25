@@ -96,6 +96,10 @@ def main():
         return 1
     engine = _sel.make_engine()
     state = engine.ensure_ledger()
+    # Register the abort hooks and the abort baseline BEFORE any thread (heartbeat, feed, armed watcher, exit poller, entry loop) can call poll_exits: an
+    # abort before registration would be unhooked (no write-ahead marker, no durable fault) and would be folded into the baseline. register does no ledger I/O.
+    if _gtc is not None:
+        _gtc.register(engine)
     # Materialize the killswitch lane entry (not halted) so the
     # lane is visible in killswitch status from day one.
     try:
@@ -227,7 +231,6 @@ def main():
                    float(state.get("bankroll") or 0), state.get("state"),
                    _sel.VERDICT_SAMPLE_CLOSES)
     if _gtc is not None:
-        _gtc.register(engine)
         logger.warning("grad-select cycle wiring: %s",
                        _gtc.startup_report(engine))
     last_gt = 0.0

@@ -1217,6 +1217,8 @@ def _pending_unusable(lane):
 # No compensation, no liquidation, no ledger rewrite, no legacy migration and no economic policy is chosen here.
 _GATE_STATS = {"ok": 0, "freeze": 0, "hold": 0}
 _GATE_LEG = ("leg:a", "leg:b", "leg:c")
+_OP_KEYS = {"credit": {"kind", "op_id", "mint", "amount", "qty", "fee", "price_kind", "pos_id"},   # exactly what _pa_settle records
+            "write_down": {"kind", "op_id", "mint", "pos_id", "reason"}}                          # exactly what _pa_write_down records (no qty/amount/fee)
 
 
 def _read_status():
@@ -1248,18 +1250,24 @@ def _expected_op_id(lane, kind, suffix, mint, pid):
 
 
 def _identify_instance(d, lane, mint, pid):
-    """PURE instance evidence from an ok ledger dict: 'open_same' (open position of this lane/mint with exactly this pa_pos_id), 'closed_same' (a lane close
-    record carrying exactly this pa_pos_id and mint; a full close proves the instance, whichever leg op is outstanding), else None. Never matches on a
-    missing id. The close list is capped (MAX_CLOSES): absence of a close record is not proof the instance never existed, it only means THIS lane cannot identify it."""
+    """PURE instance evidence from an ok ledger dict: 'open_same' (open position with exactly this mint, pa_pos_id and an EXPLICIT lane equal to this lane),
+    'closed_same' (close record with exactly this pa_pos_id, mint and explicit lane), 'legacy_lane_missing' (id and mint match but the record has no lane field:
+    unjudgeable, a HOLD, never a match), else None. Never matches on a missing id. LIMITS (not proof): the closes list is capped (MAX_CLOSES), so None means
+    'THIS lane cannot identify it', not 'never existed'; a real empty ledger with a pending journal is weak evidence of absence for the same reason."""
     if not (isinstance(mint, str) and mint and isinstance(pid, str) and pid):
         return None
+    _legacy = False
     _p = (d.get("positions") or {}).get(mint)
-    if isinstance(_p, dict) and _p.get("pa_pos_id") == pid and _p.get("lane", lane) == lane:
-        return "open_same"
+    if isinstance(_p, dict) and _p.get("pa_pos_id") == pid:
+        if _p.get("lane") == lane:
+            return "open_same"
+        _legacy = _legacy or ("lane" not in _p)
     for _r in (d.get("closes") or []):
-        if isinstance(_r, dict) and _r.get("pa_pos_id") == pid and _r.get("mint") == mint and _r.get("lane", lane) == lane:
-            return "closed_same"
-    return None
+        if isinstance(_r, dict) and _r.get("pa_pos_id") == pid and _r.get("mint") == mint:
+            if _r.get("lane") == lane:
+                return "closed_same"
+            _legacy = _legacy or ("lane" not in _r)
+    return "legacy_lane_missing" if _legacy else None
 
 
 def _outcome_diag(op_ids):
@@ -1292,7 +1300,7 @@ def _gate_intent(lane, it, d, status):
     if not (isinstance(_ops, list) and _ops):
         return "freeze", "settle_ops missing or empty", {}
     _suffix = (_int.get("close_info") or {}).get("leg_suffix") if isinstance(_int.get("close_info"), dict) else None
-    _seen = set(); _probs = []
+    _seen = set(); _probs = []; _legacy = []
     for _i, _op in enumerate(_ops):
         if not isinstance(_op, dict):
             _probs.append("op[%d] is not a record" % _i); continue
@@ -1305,6 +1313,9 @@ def _gate_intent(lane, it, d, status):
         if _op.get("op_id") in _seen:
             _probs.append("op[%d] duplicate op_id" % _i)
         _seen.add(_op.get("op_id"))
+        _extra = sorted(set(_op) - _OP_KEYS[_k])
+        if _extra:
+            _probs.append("op[%d] carries fields %r the %s writer never records" % (_i, _extra, _k))
         if _op.get("mint") != mint or _op.get("pos_id") != pid:
             _probs.append("op[%d] mint/pos_id %r/%r differ from the intent %r/%r" % (_i, _op.get("mint"), _op.get("pos_id"), mint, pid))
         if _k == "credit":
@@ -1313,15 +1324,21 @@ def _gate_intent(lane, it, d, status):
                 _probs.append("op[%d] %s" % (_i, _w))
         elif _k == "write_down":
             if not (isinstance(_op.get("reason"), str) and _op.get("reason").strip()):
-                _probs.append("op[%d] write_down has no recorded reason" % _i)
+                _legacy.append("op[%d] write_down has no recorded reason (legacy/missing field: held, no reason is invented)" % _i)
     _ids = [o.get("op_id") for o in _ops if isinstance(o, dict) and isinstance(o.get("op_id"), str)]
     _diag = _outcome_diag(_ids)
     _dtxt = ", ".join("%s=%s" % (k, v) for k, v in sorted(_diag.items())) or "no op ids"
     if _probs:
         return "freeze", "invalid recorded intent, NOTHING of it applied: %s [account evidence: %s]" % ("; ".join(_probs), _dtxt), _diag
+    if _legacy:
+        return "hold", "legacy/missing-field record, NOTHING applied, nothing appended: %s [account evidence: %s]" % ("; ".join(_legacy), _dtxt), _diag
     if status != "ok":
         return "hold", "lane ledger %s: position instance cannot be judged (a missing/unreadable ledger is NOT an empty ledger) [account evidence: %s]" % (status, _dtxt), _diag
     _inst = _identify_instance(d, lane, mint, pid)
+    if _inst == "legacy_lane_missing":
+        return "hold", "position/close record matches id and mint but has no lane field (legacy): cannot be judged, nothing applied [account evidence: %s]" % _dtxt, _diag
+    if _inst is None and not ((d.get("positions") or {}) or (d.get("closes") or [])):
+        return "hold", "lane ledger has NO positions and NO closes while an intent is pending: weak evidence of absence (lost/reset ledger is indistinguishable from a real close), nothing applied, nothing appended [account evidence: %s]" % _dtxt, _diag
     if _inst is None:
         return "freeze", "lane cannot identify this position instance %s (absent or another instance): NOT applied by this gate [account evidence: %s]" % (pid, _dtxt), _diag
     if it.get("account_applied") and any(v == "unknown" for v in _diag.values()):

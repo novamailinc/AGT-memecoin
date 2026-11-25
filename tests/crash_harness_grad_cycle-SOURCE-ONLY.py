@@ -27,7 +27,7 @@ def check(name, ok):
     if not ok: FAILS.append(name)
 
 PRE = r'''
-import os, sys, json, types, time
+import os, sys, json, types, time, hashlib
 sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
 import tests._guard_fixture as _g; _g.block_network()   # BEFORE any repo import
 from daemon import grad_cycle as GC

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bb60 v2 = bb44 durable_defect with ONLY the log TEXT predicate made lane-aware (watcher wording unchanged; momentum accepts the bb58 gate rejection text). All behavior assertions unchanged. Pin of the bb44 file (de486b29) preserved; that file has NO accepted run. ADDITION (bb44, separately reviewable; bb43 pins unchanged): DURABLE-DEFECT restart case for the WATCHER and MOMENTUM lanes. A labelled SETUP injection in the killed child records a real durable defect in the close intent (price_kind missing / half qty / close reason missing) and the child then SIGKILLs itself after the account credit. A FRESH recovery process with NO injection must recognise the defect from the DURABLE journal + ledger alone (_pending_unusable), freeze, block entries, credit nothing, and keep blocking after another restart; with the freeze write failing it must still block from durable data. Without the recorded-op helper the cases print SKIP (never PASS).\nPrevious header: EXTENSION (bb43, fix coverage): scenarios for the recorded-op settle in the WATCHER and MOMENTUM lanes. Leg a (as test_other_lanes_nonsim_kill_requote), REMAINING close (hard stop, ONE combined exit, op remaining:abc), and named FAIL-CLOSED injections into the recorded op (qty mismatch, price_kind missing, amount nan, freeze write failing), each with entries blocked, no second credit, restart persistence. Injections need the recorded-op helper: on a source without it they print SKIP and are never counted as PASS.
+"""bb60 v2 = bb44 durable_defect with ONLY the log TEXT predicate made lane-aware (watcher wording unchanged; momentum requires the bb58 gate rejection text carrying the INJECTED defect reason in the same log record). All behavior assertions unchanged. Pin of the bb44 file (de486b29) preserved; that file has NO accepted run. ADDITION (bb44, separately reviewable; bb43 pins unchanged): DURABLE-DEFECT restart case for the WATCHER and MOMENTUM lanes. A labelled SETUP injection in the killed child records a real durable defect in the close intent (price_kind missing / half qty / close reason missing) and the child then SIGKILLs itself after the account credit. A FRESH recovery process with NO injection must recognise the defect from the DURABLE journal + ledger alone (_pending_unusable), freeze, block entries, credit nothing, and keep blocking after another restart; with the freeze write failing it must still block from durable data. Without the recorded-op helper the cases print SKIP (never PASS).\nPrevious header: EXTENSION (bb43, fix coverage): scenarios for the recorded-op settle in the WATCHER and MOMENTUM lanes. Leg a (as test_other_lanes_nonsim_kill_requote), REMAINING close (hard stop, ONE combined exit, op remaining:abc), and named FAIL-CLOSED injections into the recorded op (qty mismatch, price_kind missing, amount nan, freeze write failing), each with entries blocked, no second credit, restart persistence. Injections need the recorded-op helper: on a source without it they print SKIP and are never counted as PASS.
 REAL PROCESS-KILL test, NON-DEMO (modelled-fill) exit for the WATCHER and MOMENTUM lanes: SIGKILL after the account credit, then a FRESH process retries at a
 DIFFERENT price. Same structure as tests/test_ceo_nonsim_kill_requote.py (which covers the ceo lane and its fix).
 ENGINEERING TEST of the REAL lane module, REAL shared paper account and REAL close-intent journal in a scratch root, canned price feed (not real-provider
@@ -43,8 +43,11 @@ from daemon.launch_scanner import signal_bus as BUS
 import daemon.launch_scanner.close_intents as CI
 LANES = ("watcher", "momentum")
 
-def _startup_text(m):   # bb60 (log-text correction ONLY): the watcher keeps its ORIGINAL wording; the momentum lane (bb58 gate) recognises the same durable defect at startup with the gate rejection text
-    return "has an unusable recorded op" in m or (LANE_ARG == "momentum" and "momentum" in m and "rejected by the gate" in m)
+_DEFECT_REASON = {"nopk": "price_kind not recorded", "qtyhalf": "recorded qty", "noreason": "close reason not recorded"}   # exact reason fragments the momentum gate puts in its rejection text (momentum_lane._op_defects)
+def _startup_text(m):   # bb60 (log-text correction ONLY): the watcher keeps its ORIGINAL wording; for momentum the SAME log record must be the gate rejection AND carry the reason of the INJECTED defect (env OLTEST_DEFECT, set by the parent for the child), so attribution is kept
+    if "has an unusable recorded op" in m: return True
+    _r = _DEFECT_REASON.get(os.environ.get("OLTEST_DEFECT", ""))
+    return bool(LANE_ARG == "momentum" and _r and "momentum" in m and "rejected by the gate" in m and _r in m)
 if LANE_ARG:
     from daemon.launch_scanner import watcher_lane as _W, momentum_lane as _M
     L = {"watcher": _W, "momentum": _M}[LANE_ARG]
@@ -197,6 +200,7 @@ for lane in LANES:
         if not _has_helper(lane):
             print("SKIP %s: recorded-op helper absent in this source (NOT a pass)" % tag); continue
         root = _tf.mkdtemp(prefix="otherlane-dd-%s-" % tag)
+        os.environ["OLTEST_DEFECT"] = defect
         entry_cash = killed(root, lane, "2.0", tag, defect)
         rc2, err2, pre, r = recover(root, lane, "2.3", None, True)
         check("%s: recovery (NO injection) exited 0, no crash trace (rc %d, stderr tail %r)" % (tag, rc2, err2[-160:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
@@ -214,6 +218,7 @@ for lane in LANES:
     if not _has_helper(lane):
         print("SKIP %s: recorded-op helper absent (NOT a pass)" % tag); continue
     root = _tf.mkdtemp(prefix="otherlane-dd-%s-" % tag)
+    os.environ["OLTEST_DEFECT"] = "nopk"
     entry_cash = killed(root, lane, "2.0", tag, "nopk")
     rc2, err2, pre, r = recover(root, lane, "2.3", "freeze_false", True)
     check("%s: recovery exited 0, no crash trace (rc %d)" % (tag, rc2), rc2 == 0 and "Traceback" not in err2 and r is not None)

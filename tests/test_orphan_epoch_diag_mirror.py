@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""DIAGNOSTIC (bb61, NOT RUN until cleared): what does account EPOCH evidence actually prove for a REAL-SHAPE pending close intent? Lanes: MOMENTUM and MIRROR.
-Purpose: distinguish safe no-op convergence of a never-debited orphan from hiding an account LOSS or duplicating accounting, WITHOUT choosing an owner economic contract.
-Real parts: real lane entry (real paper_account.try_debit mints the real 'lane/mint#seq' pos_id), real close-intent writer (CI.begin through poll_exits), real separate-process SIGKILL right before PA.credit,
-real recovery (entry-first: _enter triggers _recover_close_intents -> gate -> recover_lane -> real PA.credit / op_outcome / pos_ever_existed). Canned feed = engineering fixture.
-LABELLED INJECTIONS (scratch root only, files of the paper account): none | wipe_all (ledger, .bak, journal removed = a brand-new account epoch) | journal_loss | ledger_loss | torn_mid (one corrupt record
-mid-file) | stale_ledger (pre-entry ledger restored over ledger and .bak, journal intact) | journal_prefix (journal cut to the clean prefix BEFORE the debit, ledger intact). No production file is touched.
-ASSERTIONS are only: setup/instrument facts, the healthy control (E0 converges once), and the no-duplicate-accounting invariant (at most one credit event for the op; no cash gained twice). The
-convergence/freeze/hold CLASS of every loss scenario is printed as an OBSERVATION (OBS lines), NOT asserted: no owner contract is selected here. Hand predictions are UNVERIFIED.
+"""DIAGNOSTIC (bb62, NOT RUN until cleared): what does account EPOCH evidence actually prove for a REAL-SHAPE pending close intent? Lane: MIRROR only (the sibling file covers the other lane).
+Purpose: observe whether a clean-looking account that lost the target debit can make recovery converge an intent as an 'orphan' with no credit (hiding loss) or misattribute a credit, WITHOUT choosing an owner economic contract.
+REAL parts: real lane entry (real PA.try_debit mints the real 'lane/mint#seq' pos_id), real close-intent writer (CI.begin via poll_exits), real separate-process SIGKILL right before PA.credit for the TARGET mint only,
+real recovery (L._recover_close_intents directly: gate -> recover_lane -> real PA.credit/op_outcome/pos_ever_existed). Canned feed = engineering fixture.
+RECOVERY-ONLY observation: the recovery pass is observed and reconciled BEFORE any fresh entry; the entry-first attempt is a separate later step whose cash is never used for the accounting reconciliation.
+LABELLED INJECTIONS (scratch root, paper-account files only, verified by file hashes before recovery): none | wipe_all (ledger, ledger.bak, journal removed: a new account generation) | journal_loss | ledger_loss (ledger AND bak removed) |
+torn_mid | stale_ledger (pre-target ledger over ledger and bak) | trail_cut (target is the LAST debit; journal cut at the clean line boundary before the target debit, ledger kept: ledger AHEAD of journal) |
+midchain (target is the FIRST debit; only the target debit line removed, a later debit stays) | pair_rollback (pre-target ledger AND pre-target journal restored together, bak too: a consistent clean older pair) |
+reuse (wipe_all, then a real PA.try_debit for the same lane and mint with the same stake/qty to observe whether the fresh account REUSES the old pos_id: possible misattribution).
+NO production or earlier test file is edited. There is NO positive safe-pre-epoch control here (no never-debited orphan case): that original purpose stays separate coverage, and no timestamp/seq/account_id is promoted to proof (account_id and seq are printed as candidate evidence only).
+ASSERTED: setup/instrument facts, injection-did-what-its-label-says, E0 control, and the accounting-reconciliation invariant (credit events for the op <=1; no new debit in recovery; cash delta == sum of net of the credit events journaled DURING recovery; the lane close count changes by <=1). The CLASS of every loss scenario is an OBSERVATION, not asserted.
+HYPOTHESES (UNVERIFIED, hand, not conclusions): E0 CREDITED_ONCE; E1 wipe_all and E8 pair_rollback and E6 trail_cut-with-consistent-ledger: orphan no-op candidate; E2/E3/E4/E5/E7: no orphan convergence (degraded/unknown/hold/freeze); E9 reuse: credit applies to the new position if ids collide.
 Run: python3 -B tests/test_orphan_epoch_diag_mirror.py"""
 if __name__ != "__main__":
     import pytest
@@ -15,8 +19,9 @@ import sys, os
 MODE = sys.argv[1] if len(sys.argv) > 1 else "parent"
 import tempfile as _tf
 ROOTDIR = sys.argv[2] if MODE != "parent" else _tf.mkdtemp(prefix="orphandiag-parent-unused-")
-LANE_ARG = sys.argv[3] if MODE != "parent" else None
+LANE_ARG = "mirror"
 import logging as _logging, importlib, json as _json, signal as _signal, subprocess, time, hashlib, shutil
+T0 = time.time(); BUDGET_S = 100.0
 if MODE != "parent": os.environ["FOREX_AGENT_HOME"] = os.path.join(ROOTDIR, "home")   # child processes: scratch account home BEFORE any lane import reads it
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
@@ -37,13 +42,9 @@ for _nm in dir(_MX):
             return _init
         _o.__init__ = _mk()
 import daemon.launch_scanner.close_intents as CI
-if LANE_ARG:
-    if LANE_ARG == "momentum":
-        from daemon.launch_scanner import momentum_lane as L
-        LANE_NAME = L.LANE; assert LANE_NAME == "momentum", LANE_NAME
-    else:
-        from daemon.launch_scanner import mirror as L
-        LANE_NAME = "degen_mirror"
+if True:
+    from daemon.launch_scanner import mirror as L
+    LANE_NAME = L.LANE_BY_CHAIN["solana"]   # actual final lane name from the module (pos["lane"] for solana)
 class _Safe:
     def check_token(self, chain, mint, timeout=10): return {"passed": True, "score": 80, "flags": [], "fails": [], "unknown": False}
 class _Veto:
@@ -53,12 +54,8 @@ def _tape():
     n = time.time()
     return {"fetched_at": n, "received_at": n, "dex": "pump", "usd_liquidity": 100000.0, "usd_market_cap": 500000.0, "chg_m5": 10.0, "buys_m5": 100, "sells_m5": 40,
             "vol_m5": 9000.0, "buys_h1": 400, "sells_h1": 150, "price_usd": 0.001, "pair_created_ms": (time.time() - 3600) * 1000, "tape_source": "dexscreener"}
-MINT = "EpochDiagMint1"
+MINT = "EpochDiagMint1"; MINT2 = "EpochDiagMint2"
 def _enter(MINT=MINT):
-    if LANE_ARG == "momentum":
-        d = {"pool_address": "PoolOther", "mint": MINT, "symbol": "RUN", "name": "RUN", "chain": "solana", "source": "gecko-trending", "lane": "lowcap", "url": "",
-             "chg_24h_pct": 55.0, "chg_1h_pct": 8.0, "vol_24h_usd": 250000.0, "liq_usd": 100000.0, "usd_market_cap": 500000.0}
-        return L.consider_candidate(d, time.time())
     return L.mirror_card(chain="solana", source="test", mint=MINT, symbol="TKN", score=70.0, tier="pick", mcap=500_000.0, liquidity=50_000.0)
 def fresh(start="10"):
     h = os.path.join(ROOTDIR, "home"); os.makedirs(h, exist_ok=True); os.environ["FOREX_AGENT_HOME"] = h
@@ -69,71 +66,79 @@ def fresh(start="10"):
     PA = importlib.reload(PA); G.install(PA)
     led = os.path.join(ROOTDIR, "led"); os.makedirs(led, exist_ok=True)
     L.LEDGER_PATH = os.path.join(led, LANE_ARG + ".json")
-    if LANE_ARG == "momentum":
-        L.ensure_ledger(); L.quote_price = G.stamped_quote(L, lambda chain, mint, spot_index=None: 0.001)
-    else:
-        L._LOCK_PATH = os.path.join(led, LANE_ARG + ".lock"); L.quote_price = G.stamped_const(L, 0.01); L.RUNNER_CONFIRM_GAP_S = 0.0
+    L._LOCK_PATH = os.path.join(led, LANE_ARG + ".lock"); L.quote_price = G.stamped_const(L, 0.01); L.RUNNER_CONFIRM_GAP_S = 0.0
     L._fresh_tape = lambda chain, mint: _tape()
     L._safety = _Safe()
     if hasattr(L, "_veto"): L._veto = _Veto()
     L._ENTRY_BLOCKED = False; L._RECOVERY_DONE = False
     return PA
 def cash(PA): return PA.snapshot()["cash"]
-def pf_mult(m):
-    def pf(chain, mint, spot_index=None):
-        pos = (L.open_positions() or {}).get(mint) or {}
-        return float(pos.get("entry_price") or 0) * m
-    return pf
-def _cents(x): return int(round(float(x) * 100))
 def _die():
-    print("KILLHIT lane=%s at PA.credit" % LANE_ARG, flush=True)
+    print("KILLHIT lane=%s at PA.credit target" % LANE_ARG, flush=True)
     os.kill(os.getpid(), _signal.SIGKILL)
-def raw_state(root, lane_name):
-    """READ-ONLY raw file evidence (no account API call): account files, journal events, lane ledger, close-intent journal."""
-    ad = os.path.join(root, "home", "paper_account"); out = {}
-    def sha(p):
-        try:
-            with open(p, "rb") as f: return hashlib.sha256(f.read()).hexdigest()[:16]
-        except OSError: return None
-    out["files"] = {n: sha(os.path.join(ad, n)) for n in ("ledger.json", "ledger.json.bak", "events.jsonl")}
-    evs = []; bad = 0
+def _jl(root):
+    """raw journal lines of the scratch account: (events, bad_count, exists)"""
+    p = os.path.join(root, "home", "paper_account", "events.jsonl"); evs = []; bad = 0
     try:
-        with open(os.path.join(ad, "events.jsonl"), "rb") as f:
+        with open(p, "rb") as f:
             for raw in f:
                 s = raw.decode("utf-8", "replace").strip()
                 if not s: continue
                 try: evs.append(_json.loads(s))
                 except ValueError: bad += 1
-    except OSError: pass
-    out["journal_lines"] = len(evs); out["journal_bad"] = bad
+    except OSError: return [], 0, False
+    return evs, bad, True
+def _sha(p):
+    try:
+        with open(p, "rb") as f: return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError: return None
+def raw_state(root, lane_name):
+    """READ-ONLY raw file evidence (no account API call)."""
+    os.environ["FOREX_AGENT_HOME"] = os.path.join(root, "home")   # read-only evidence of THIS scratch root (the close-intent journal path follows this env)
+    ad = os.path.join(root, "home", "paper_account"); out = {}
+    out["files"] = {n: _sha(os.path.join(ad, n)) for n in ("ledger.json", "ledger.json.bak", "events.jsonl")}
+    evs, bad, ex = _jl(root)
+    out["journal_lines"] = len(evs); out["journal_bad"] = bad; out["journal_exists"] = ex
     out["journal_kinds"] = [e.get("event") for e in evs]
     out["debit_pos_ids"] = [e.get("pos_id") for e in evs if e.get("event") == "debit"]
+    out["create_account_ids"] = [e.get("account_id") for e in evs if e.get("event") == "create"]
+    out["seqs"] = [e.get("event_id") for e in evs if e.get("event_id")]
     try:
         with open(os.path.join(ad, "ledger.json")) as f: led = _json.load(f)
-        out["ledger"] = {"seq": led.get("seq"), "cash": led.get("cash"), "cash_spendable": led.get("cash_spendable"),
+        out["ledger"] = {"account_id": led.get("account_id"), "seq": led.get("seq"), "cash": led.get("cash"), "cash_spendable": led.get("cash_spendable"),
                          "open_keys": sorted(k for ln in (led.get("lanes") or {}).values() for k in ((ln or {}).get("open") or {}))}
     except Exception as e: out["ledger"] = "unreadable:%s" % type(e).__name__
     try:
         with open(os.path.join(root, "led", LANE_ARG + ".json")) as f: ld = _json.load(f)
-        out["lane_ledger"] = {"positions": sorted((ld.get("positions") or {}).keys()), "closes": len(ld.get("closes") or []), "bankroll": ld.get("bankroll")}
+        out["lane_ledger"] = {"positions": sorted((ld.get("positions") or {}).keys()), "closes": len(ld.get("closes") or []), "bankroll": ld.get("bankroll"),
+                              "pos_ids": {m: p.get("pa_pos_id") for m, p in (ld.get("positions") or {}).items()}}
     except Exception as e: out["lane_ledger"] = "unreadable:%s" % type(e).__name__
     try:
         ents, st, _t = CI._read(CI.journal_path(lane_name))
         out["intent_events"] = [e.get("ev") for e in ents]; out["intent_status"] = st
     except Exception as e: out["intent_events"] = "unreadable:%s" % type(e).__name__
     return out
-def child_run(mult):
+def child_run(mult, order):
+    """order=after: target entered first, second entered after it (midchain shape). order=before: second entered first, target LAST (trailing shape)."""
     PA = fresh(); cash(PA)
-    _ad = os.path.join(ROOTDIR, "home", "paper_account")
-    shutil.copy(os.path.join(_ad, "ledger.json"), os.path.join(ROOTDIR, "ledger.pre-entry.json"))   # scratch copies for the stale_ledger / pair_rollback injections
-    if os.path.exists(os.path.join(_ad, "events.jsonl")): shutil.copy(os.path.join(_ad, "events.jsonl"), os.path.join(ROOTDIR, "events.pre-entry.jsonl"))
-    r = _enter(); pos = (L.open_positions() or {}).get(MINT) or {}
-    if not (r[0] and pos.get("pa_pos_id")):
-        print("ENTRY-REFUSED lane=%s ok=%s reason=%r" % (LANE_ARG, bool(r[0]), r[1]), flush=True); sys.exit(5)
-    print("ENTRY lane=%s ok=%s cash=%.6f nonsim=%s pa_pos_id=%s" % (LANE_ARG, bool(r[0]), cash(PA), (pos.get("execution") or {}).get("source") != "jupiter_quote_sim", pos.get("pa_pos_id")), flush=True)
-    r2 = _enter("EpochDiagMint2"); p2 = (L.open_positions() or {}).get("EpochDiagMint2") or {}   # a SECOND real entry so a later account event follows the first debit (midchain scenario)
-    if not (r2[0] and p2.get("pa_pos_id")): print("ENTRY-REFUSED second %r" % (r2[1],), flush=True); sys.exit(5)
-    print("ENTRY2 cash=%.6f" % cash(PA), flush=True)
+    ad = os.path.join(ROOTDIR, "home", "paper_account")
+    def _snap_pre_target():
+        shutil.copy(os.path.join(ad, "ledger.json"), os.path.join(ROOTDIR, "ledger.pre-target.json"))
+        if os.path.exists(os.path.join(ad, "events.jsonl")): shutil.copy(os.path.join(ad, "events.jsonl"), os.path.join(ROOTDIR, "events.pre-target.jsonl"))
+    def _ent(m):
+        r = _enter(m); p = (L.open_positions() or {}).get(m) or {}
+        if not (r[0] and p.get("pa_pos_id")):
+            print("ENTRY-REFUSED lane=%s mint=%s ok=%s reason=%r" % (LANE_ARG, m, bool(r[0]), r[1]), flush=True); sys.exit(5)
+        return p
+    if order == "before":
+        _ent(MINT2); print("ENTRY2 cash=%.6f" % cash(PA), flush=True)
+        _snap_pre_target(); pos = _ent(MINT)
+    else:
+        _snap_pre_target(); pos = _ent(MINT)
+    print("ENTRY lane=%s mint=%s nonsim=%s pa_pos_id=%s" % (LANE_ARG, MINT, (pos.get("execution") or {}).get("source") != "jupiter_quote_sim", pos.get("pa_pos_id")), flush=True)
+    if order != "before":
+        _ent(MINT2); print("ENTRY2 cash=%.6f" % cash(PA), flush=True)
+    print("ENTRYCASH %.6f" % cash(PA), flush=True)
     _real = PA.credit
     def _kc(*a, **k):
         if a[1] == MINT: _die()
@@ -149,7 +154,7 @@ class _H(_logging.Handler):
     def emit(self, rec):
         try: LOGS.append(rec.getMessage())
         except Exception: pass
-def child_recover(entry_cash):
+def child_recover(entry_cash, reuse_stake, reuse_qty):
     pre = raw_state(ROOTDIR, LANE_NAME)
     ents0, st0, _t = CI._read(CI.journal_path(LANE_NAME))
     its = [e for e in ents0 if e.get("ev") == "intent"]
@@ -157,48 +162,76 @@ def child_recover(entry_cash):
     op_id = op.get("op_id"); pid = its[0].get("pos_id") if its else None
     PA = fresh()
     _logging.getLogger().addHandler(_H()); _logging.getLogger().setLevel(_logging.INFO)
-    cnt = {"poll_exits": 0}; _pe = L.poll_exits
+    reuse = None
+    if reuse_stake > 0:   # LABELLED injection (reuse): a REAL account debit after the epoch loss, same lane/mint/stake/qty
+        _ok, _why, _p2 = PA.try_debit(LANE_NAME, MINT, reuse_stake, reuse_qty, "epochdiag-reuse-op")
+        reuse = {"ok": bool(_ok), "why": str(_why)[:120], "new_pos_id": _p2, "same_as_intent_pos_id": _p2 == pid}
+    pre2 = raw_state(ROOTDIR, LANE_NAME)   # state just before recovery (after any labelled reuse debit, after the account loaded)
+    jn0 = pre2["journal_lines"]
+    cnt = {"poll_exits": 0, "credit_calls": 0}; _pe = L.poll_exits
     def _pe2(*a, **k):
         cnt["poll_exits"] += 1; return _pe(*a, **k)
     L.poll_exits = _pe2
-    credit_calls = {"n": 0}; _cr = PA.credit
+    _cr = PA.credit
     def _crc(*a, **k):
-        credit_calls["n"] += 1; return _cr(*a, **k)
+        cnt["credit_calls"] += 1; return _cr(*a, **k)
     PA.credit = _crc
-    e = _enter("EpochDiagNew")
-    post = raw_state(ROOTDIR, LANE_NAME)
+    cash_before = cash(PA)
+    L._RECOVERY_DONE = False
+    blocked = L._recover_close_intents()
+    cash_after = cash(PA)
+    post = raw_state(ROOTDIR, LANE_NAME)          # RECOVERY-ONLY state: no fresh entry has happened
+    evs, _b, _e = _jl(ROOTDIR)
+    new_evs = evs[jn0:] if len(evs) >= jn0 else []
     gs = getattr(L, "_GATE_STATS", None)
     ents, st, _ = CI._read(CI.journal_path(LANE_NAME))
     succ = {x.get("supersedes") for x in ents if x.get("ev") == "intent" and x.get("supersedes")}
     fro = len([i for i, x in CI._state(ents).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in succ])
-    res = {"op_id": op_id, "pos_id": pid, "outcome": PA.op_outcome(op_id) if op_id else None,
-           "pos_ever_existed": PA.pos_ever_existed(pos_id=pid, lane=LANE_NAME, mint=MINT), "credit_calls": credit_calls["n"],
-           "credit_events": len([x for x in PA._journal_read()[0] if x.get("op_id") == op_id and x.get("event") == "credit"]),
-           "orphan_events": [x.get("event") + ("/reason" if x.get("reason") else "") for x in PA._journal_read()[0] if x.get("op_id") == op_id and "orphan" in str(x.get("event"))],
-           "degraded_events": [str(x.get("event")) for x in PA._journal_read()[0] if x.get("op_id") == op_id and "degraded" in str(x.get("event"))],
+    res = {"op_id": op_id, "pos_id": pid, "blocked_returned": blocked, "outcome": PA.op_outcome(op_id) if op_id else None,
+           "pos_ever_existed": PA.pos_ever_existed(pos_id=pid, lane=LANE_NAME, mint=MINT), "credit_calls": cnt["credit_calls"], "cnt": cnt,
+           "new_event_kinds": [str(x.get("event")) + ("/reason" if x.get("reason") else "") for x in new_evs],
+           "new_credit_events_for_op": len([x for x in new_evs if x.get("op_id") == op_id and x.get("event") == "credit"]),
+           "new_debit_events": len([x for x in new_evs if x.get("event") == "debit"]),
+           "new_credit_net_sum": round(sum(float(x.get("net") or 0.0) for x in new_evs if x.get("event") == "credit"), 6),
+           "all_credit_events_for_op": len([x for x in evs if x.get("op_id") == op_id and x.get("event") == "credit"]),
+           "orphan_events": [str(x.get("event")) + ("/reason" if x.get("reason") else "") for x in evs if x.get("op_id") == op_id and "orphan" in str(x.get("event"))],
+           "degraded_events": [str(x.get("event")) for x in evs if x.get("op_id") == op_id and "degraded" in str(x.get("event"))],
            "journal_status": PA._journal_read()[1], "intent_status": st, "pending": len(CI.pending(LANE_NAME)), "frozen_open": fro,
-           "intent_applied": any(x.get("ev") == "applied" for x in ents), "entry_blocked": bool(L._ENTRY_BLOCKED), "entry_opened": bool(e[0]), "entry_try": repr(e)[:200],
-           "cash": cash(PA), "entry_cash": entry_cash, "cnt": cnt, "gate_stats": dict(gs) if isinstance(gs, dict) else None,
+           "intent_applied": any(x.get("ev") == "applied" for x in ents), "entry_blocked": bool(L._ENTRY_BLOCKED),
+           "cash_before_recovery": cash_before, "cash_after_recovery": cash_after, "entry_cash": entry_cash, "reuse": reuse,
+           "gate_stats": dict(gs) if isinstance(gs, dict) else None,
            "gate_logs": {k: len([m for m in LOGS if "GATE verdict=%s" % k in m]) for k in ("ok", "freeze", "hold")},
-           "recover_logs": [m[:240] for m in LOGS if "orphan" in m.lower() or "FROZEN" in m or "rejected by the gate" in m or "account re-apply" in m][:6]}
+           "recover_logs": [m[:240] for m in LOGS if "orphan" in m.lower() or "FROZEN" in m or "rejected by the gate" in m or "account re-apply" in m][:6],
+           "lane_closes_delta": (post["lane_ledger"]["closes"] - pre2["lane_ledger"]["closes"]) if isinstance(post["lane_ledger"], dict) and isinstance(pre2["lane_ledger"], dict) else None}
     print("PRE " + _json.dumps(pre, default=str), flush=True)
+    print("PRE2 " + _json.dumps(pre2, default=str), flush=True)
     print("POST " + _json.dumps(post, default=str), flush=True)
     print("RESULT " + _json.dumps(res, default=str), flush=True)
-if MODE == "run": child_run(sys.argv[4]); sys.exit(0)
-if MODE == "recover": child_recover(float(sys.argv[4])); sys.exit(0)
+    # SEPARATE LATER STEP (cash here is NOT used for any reconciliation): a fresh entry attempt shows whether entries are blocked
+    e = _enter("EpochDiagNew")
+    print("ENTRYTRY " + _json.dumps({"opened": bool(e[0]), "entry_blocked": bool(L._ENTRY_BLOCKED), "try": repr(e)[:200]}, default=str), flush=True)
+if MODE == "lane": print("LANE=%s" % LANE_NAME); sys.exit(0)
+if MODE == "run": child_run(sys.argv[4], sys.argv[3]); sys.exit(0)
+if MODE == "recover": child_recover(float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])); sys.exit(0)
 
 FAILS = []
 def check(n, c):
     print(("PASS " if c else "FAIL ") + n, flush=True)
     if not c: FAILS.append(n)
+class _TO(Exception): pass
 def spawn(args):
-    p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=90, env=dict(os.environ))
+    left = BUDGET_S - (time.time() - T0)
+    if left < 8: raise _TO("budget exhausted (%.0fs of %.0fs used)" % (time.time() - T0, BUDGET_S))
+    try:
+        p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=min(25.0, left), env=dict(os.environ))
+    except subprocess.TimeoutExpired:
+        raise _TO("spawn timeout %r" % (args[:2],))
     return p.returncode, p.stdout, p.stderr
 def inject(root, mode):
     """LABELLED injection on the SCRATCH paper account files only."""
     ad = os.path.join(root, "home", "paper_account"); lj = os.path.join(ad, "ledger.json"); jj = os.path.join(ad, "events.jsonl")
     if mode == "none": return
-    if mode == "wipe_all":
+    if mode in ("wipe_all", "reuse"):
         for n in ("ledger.json", "ledger.json.bak", "events.jsonl"):
             if os.path.exists(os.path.join(ad, n)): os.remove(os.path.join(ad, n))
     elif mode == "journal_loss": os.remove(jj)
@@ -208,69 +241,105 @@ def inject(root, mode):
         lines = open(jj).read().splitlines(keepends=True)
         with open(jj, "w") as f: f.writelines(lines[:-1] + ["{torn record\n"] + lines[-1:])
     elif mode == "stale_ledger":
-        for n in ("ledger.json", "ledger.json.bak"): shutil.copy(os.path.join(root, "ledger.pre-entry.json"), os.path.join(ad, n))
-    elif mode == "midchain":   # remove ONLY the debit record of the first position; the later debit and any later records stay (a seq hole in the middle of the chain)
-        lines = open(jj).read().splitlines(keepends=True); k = min(i for i, l in enumerate(lines) if '"event": "debit"' in l)
-        with open(jj, "w") as f: f.writelines(lines[:k] + lines[k + 1:])
-    elif mode == "pair_rollback":   # BOTH ledger and journal restored to their pre-entry copies (a consistent clean older pair)
-        for n in ("ledger.json", "ledger.json.bak"): shutil.copy(os.path.join(root, "ledger.pre-entry.json"), os.path.join(ad, n))
-        pj = os.path.join(root, "events.pre-entry.jsonl")
-        if os.path.exists(pj): shutil.copy(pj, jj)
-        else: os.remove(jj)
-    elif mode == "journal_prefix":
-        lines = open(jj).read().splitlines(keepends=True); k = max(i for i, l in enumerate(lines) if '"event": "debit"' in l)
+        for n in ("ledger.json", "ledger.json.bak"): shutil.copy(os.path.join(root, "ledger.pre-target.json"), os.path.join(ad, n))
+    elif mode == "trail_cut":   # target is the LAST debit (order=before): cut at the clean line boundary just before the TARGET debit, ledger kept
+        lines = open(jj).read().splitlines(keepends=True); k = [i for i, l in enumerate(lines) if '"event": "debit"' in l and MINT + '#' in l.replace(MINT2, "")][0]
         with open(jj, "w") as f: f.writelines(lines[:k])
+    elif mode == "midchain":    # target is the FIRST debit (order=after): ONLY the target debit line removed; the later debit stays
+        lines = open(jj).read().splitlines(keepends=True); k = [i for i, l in enumerate(lines) if '"event": "debit"' in l and (MINT + "#") in l][0]
+        with open(jj, "w") as f: f.writelines(lines[:k] + lines[k + 1:])
+    elif mode == "pair_rollback":   # pre-target ledger, bak AND journal restored together (a consistent clean older pair)
+        for n in ("ledger.json", "ledger.json.bak"): shutil.copy(os.path.join(root, "ledger.pre-target.json"), os.path.join(ad, n))
+        pj = os.path.join(root, "events.pre-target.jsonl")
+        if os.path.exists(pj): shutil.copy(pj, jj)
+        elif os.path.exists(jj): os.remove(jj)
+def verify_injection(root, mode, pre_raw):
+    """The label must match the files BEFORE recovery runs (hashes/existence, no account API)."""
+    ad = os.path.join(root, "home", "paper_account"); post = raw_state(root, "x"); f = post["files"]; pf = pre_raw["files"]
+    pre_t = _sha(os.path.join(root, "ledger.pre-target.json")); pre_j = _sha(os.path.join(root, "events.pre-target.jsonl"))
+    if mode == "none": return f == pf
+    if mode in ("wipe_all", "reuse"): return all(v is None for v in f.values())
+    if mode == "journal_loss": return f["events.jsonl"] is None and f["ledger.json"] == pf["ledger.json"] and f["ledger.json.bak"] == pf["ledger.json.bak"]
+    if mode == "ledger_loss": return f["ledger.json"] is None and f["ledger.json.bak"] is None and f["events.jsonl"] == pf["events.jsonl"]
+    if mode == "torn_mid": return post["journal_bad"] == 1 and f["ledger.json"] == pf["ledger.json"] and post["journal_lines"] == pre_raw["journal_lines"]
+    if mode == "stale_ledger": return f["ledger.json"] == pre_t and f["ledger.json.bak"] == pre_t and f["events.jsonl"] == pf["events.jsonl"] and pre_t != pf["ledger.json"]
+    if mode == "trail_cut": return post["journal_lines"] < pre_raw["journal_lines"] and f["ledger.json"] == pf["ledger.json"] and post["journal_bad"] == 0
+    if mode == "midchain": return post["journal_lines"] == pre_raw["journal_lines"] - 1 and f["ledger.json"] == pf["ledger.json"] and post["journal_bad"] == 0
+    if mode == "pair_rollback": return f["ledger.json"] == pre_t and f["ledger.json.bak"] == pre_t and f["events.jsonl"] == pre_j
+    return False
 def classify(r):
-    if r["credit_events"] == 1: return "CREDITED_ONCE"
-    if r["intent_applied"] and r["credit_events"] == 0 and r["outcome"] == "orphan": return "CONVERGED_ORPHAN_NOOP_(no credit)"
+    if r["new_credit_events_for_op"] == 1: return "CREDITED_ONCE"
+    if r["intent_applied"] and r["new_credit_events_for_op"] == 0 and r["outcome"] == "orphan": return "CONVERGED_ORPHAN_NOOP_(no credit)"
     if r["frozen_open"] >= 1: return "FROZEN"
     if r["pending"] >= 1: return "HOLD_PENDING"
     return "OTHER"
-SC = ("E0-CONTROL-healthy-no-injection", "E1-wipe_all-new-account-epoch", "E2-journal_loss-ledger-kept", "E3-ledger_loss-journal-kept", "E4-torn_mid-journal",
-      "E5-stale_ledger-restore-journal-intact", "E6-journal_prefix-cut-before-debit-ledger-kept", "E7-midchain-first-debit-record-removed", "E8-pair_rollback-clean-older-ledger-and-journal")
-for lane in ("mirror",):
-    for tag0 in SC:
-        mode = tag0.split("-", 1)[1].split("-")[0] if not tag0.startswith("E0") else "none"
-        tag = "%s-%s" % (tag0, lane)
-        root = _tf.mkdtemp(prefix="orphandiag-%s-" % tag)
-        rc, out, err = spawn(["run", root, lane, "2.0"])
-        _el = [l for l in out.splitlines() if l.startswith("ENTRY ")]
-        ok_e = bool(_el) and "ok=True" in _el[0] and "nonsim=True" in _el[0] and "pa_pos_id=" + (lane if lane == "momentum" else "degen_mirror") + "/" in _el[0] and "Traceback" not in err
-        check("%s: SETUP real entry opened with a real account pos_id (%s rc %d stderr %r)" % (tag, _el[:1], rc, err[-120:]), ok_e)
-        check("%s: child KILLED by SIGKILL right before PA.credit (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "KILLHIT" in out and "SURVIVED" not in out)
-        if not ok_e: continue
-        _e2 = [l for l in out.splitlines() if l.startswith("ENTRY2 ")]
-        check("%s: SETUP second real entry present (%s)" % (tag, _e2[:1]), bool(_e2))
-        if not _e2: continue
-        entry_cash = float(_e2[0].split("cash=")[1].split()[0])   # cash after BOTH entries, no credit applied yet
-        os.environ["FOREX_AGENT_HOME"] = os.path.join(root, "home")
-        lname = "momentum" if lane == "momentum" else "degen_mirror"
-        before = None
-        # raw evidence BEFORE the injection (parent reads files only): the account journal holds the debit for the real pos_id
-        ad = os.path.join(root, "home", "paper_account")
-        try: jk = [_json.loads(x).get("event") for x in open(os.path.join(ad, "events.jsonl")) if x.strip()]
-        except OSError: jk = []
-        pid = _el[0].split("pa_pos_id=")[1].split()[0]
-        check("%s: BEFORE injection: the account journal holds the debit (kinds %r), the lane position is real (pos_id %s)" % (tag, jk, pid), "debit" in jk and pid.startswith(lname + "/" + MINT + "#"))
+SC = (("E0-CONTROL-healthy-no-injection", "none", "after"), ("E1-wipe_all-new-account-generation", "wipe_all", "after"), ("E2-journal_loss-ledger-kept", "journal_loss", "after"),
+      ("E3-ledger_loss-ledger-and-bak-removed-journal-kept", "ledger_loss", "after"), ("E4-torn_mid-journal", "torn_mid", "after"), ("E5-stale_ledger-restore-journal-intact", "stale_ledger", "after"),
+      ("E6-trail_cut-target-is-last-debit-cut-before-it-ledger-kept", "trail_cut", "before"), ("E7-midchain-target-debit-record-removed-later-debit-stays", "midchain", "after"),
+      ("E8-pair_rollback-consistent-older-ledger-bak-and-journal", "pair_rollback", "before"), ("E9-reuse-wipe_all-then-real-debit-same-lane-mint", "reuse", "after"))
+try:
+    rc0, out0, err0 = spawn(["lane", ROOTDIR])
+    lname = out0.strip().split("LANE=")[-1] if "LANE=" in out0 else ""
+    check("SETUP actual final lane name derived from the module: %r (stderr %r)" % (lname, err0[-80:]), bool(lname) and rc0 == 0 and lname == "degen_mirror")
+except _TO as ex:
+    check("SETUP lane derivation: %s" % ex, False); lname = ""
+for tag, mode, order in (SC if lname else ()):
+    tag = "%s-%s" % (tag, LANE_ARG)
+    try:
+        root = _tf.mkdtemp(prefix="orphandiag-%s-" % tag[:40])
+        rc, out, err = spawn(["run", root, order, "2.0"])
+        _el = [l for l in out.splitlines() if l.startswith("ENTRY ")]; _e2 = [l for l in out.splitlines() if l.startswith("ENTRY2 ")]; _ec = [l for l in out.splitlines() if l.startswith("ENTRYCASH ")]
+        ok_e = bool(_el) and bool(_e2) and bool(_ec) and "nonsim=True" in _el[0] and ("pa_pos_id=%s/%s#" % (lname, MINT)) in _el[0] and "Traceback" not in err
+        check("%s: SETUP both real entries opened, target pos_id real (%s | %s rc %d stderr %r)" % (tag, _el[:1], _e2[:1], rc, err[-120:]), ok_e)
+        check("%s: child KILLED by SIGKILL right before PA.credit of the TARGET (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "KILLHIT" in out and "SURVIVED" not in out)
+        if not (ok_e and rc == -_signal.SIGKILL): continue
+        entry_cash = float(_ec[0].split()[1]); pid = _el[0].split("pa_pos_id=")[1].split()[0]
+        before = raw_state(root, lname)   # pid-specific proof of a complete, clean setup BEFORE the injection (raw files; no account API)
+        evs, bad, _ex = _jl(root)
+        tdeb = [e for e in evs if e.get("event") == "debit" and e.get("pos_id") == pid]
+        led = before["ledger"] if isinstance(before["ledger"], dict) else {}
+        cr = [e for e in evs if e.get("event") == "create"]
+        proof = (len(tdeb) == 1 and bad == 0 and len(cr) == 1 and cr[0].get("account_id") == led.get("account_id") and pid in before["debit_pos_ids"] and
+                 isinstance(before["lane_ledger"], dict) and before["lane_ledger"]["pos_ids"].get(MINT) == pid and before["intent_events"] and before["intent_events"][0] == "intent" and before["intent_status"] is None
+                 and any(("%s#" % MINT2) in str(p) for p in before["debit_pos_ids"]))
+        check("%s: BEFORE injection pid-specific proof: exactly one debit for %s, journal clean, one create event whose account_id equals the ledger's, lane position pos_id equals it, intent journaled, second debit present (debits %r, account_id %s)" % (tag, pid, before["debit_pos_ids"], str(led.get("account_id"))[:8]), proof)
+        if not proof: continue
         inject(root, mode)
-        rc2, out2, err2 = spawn(["recover", root, lane, "%.6f" % entry_cash])
-        pl = [l for l in out2.splitlines() if l.startswith("PRE ")]; ql = [l for l in out2.splitlines() if l.startswith("POST ")]; rl = [l for l in out2.splitlines() if l.startswith("RESULT ")]
-        check("%s: recovery process exited 0, no crash trace (rc %d, stderr tail %r)" % (tag, rc2, err2[-160:]), rc2 == 0 and pl and ql and rl and "Traceback" not in err2)
-        if not (pl and ql and rl): continue
-        pre = _json.loads(pl[0][4:]); post = _json.loads(ql[0][5:]); r = _json.loads(rl[0][7:])
-        print("  RAW-PRE  %s %s" % (tag, _json.dumps(pre, default=str)), flush=True)
-        print("  RAW-POST %s %s" % (tag, _json.dumps(post, default=str)), flush=True)
-        print("  RAW-RESULT %s %s" % (tag, _json.dumps(r, default=str)), flush=True)
-        check("%s: INSTRUMENT zero polls in the recovery process (%d)" % (tag, r["cnt"]["poll_exits"]), r["cnt"]["poll_exits"] == 0)
-        check("%s: INVARIANT no duplicate accounting: at most one credit event for the op (%d) and PA.credit calls recorded (%d)" % (tag, r["credit_events"], r["credit_calls"]), r["credit_events"] <= 1)
-        cl = classify(r)
-        print("OBS %s: CLASS=%s outcome=%s pos_ever_existed=%s intent_applied=%s frozen_open=%d pending=%d entry_blocked=%s credit_calls=%d orphan_events=%s degraded_events=%s journal_status=%s" % (
-            tag, cl, r["outcome"], r["pos_ever_existed"], r["intent_applied"], r["frozen_open"], r["pending"], r["entry_blocked"], r["credit_calls"], r["orphan_events"], r["degraded_events"], r["journal_status"]), flush=True)
-        print("OBS %s: LOSS-HIDING-CANDIDATE=%s (the intent is terminal with no credit although the account journal held the debit BEFORE the injection)" % (tag, "YES" if (cl.startswith("CONVERGED_ORPHAN") and "debit" in jk) else "no"), flush=True)
-        print("OBS %s: cash entry=%.6f post-recovery=%.6f; account debit pos_ids before=%r after=%r; lane ledger before=%r after=%r" % (tag, entry_cash, r["cash"], pre["debit_pos_ids"], post["debit_pos_ids"], pre["lane_ledger"], post["lane_ledger"]), flush=True)
-        for m in r["recover_logs"]: print("OBS %s: LOG %s" % (tag, m), flush=True)
-        if mode == "none":
-            check("%s: CONTROL converges: the real credit applied exactly once, intent terminal, entries not blocked, new entry admitted (class %s)" % (tag, cl),
-                  cl == "CREDITED_ONCE" and r["intent_applied"] and r["frozen_open"] == 0 and not r["entry_blocked"] and r["entry_opened"] and r["cash"] > entry_cash)
+        check("%s: INJECTION-VERIFIED the files match the label %r before recovery (%r)" % (tag, mode, {k: v for k, v in raw_state(root, lname)["files"].items()}), verify_injection(root, mode, before))
+        stake = float(tdeb[0].get("stake") or 0.0) if mode == "reuse" else 0.0; qty = float(tdeb[0].get("qty") or 0.0) if mode == "reuse" else 0.0
+        rc2, out2, err2 = spawn(["recover", root, "%.6f" % entry_cash, "%.6f" % stake, "%.6f" % qty])
+    except _TO as ex:
+        check("%s: BOUNDED run: %s" % (tag, ex), False); continue
+    g = lambda p: [l for l in out2.splitlines() if l.startswith(p)]
+    pl, p2l, ql, rl, el = g("PRE "), g("PRE2 "), g("POST "), g("RESULT "), g("ENTRYTRY ")
+    check("%s: recovery process exited 0, no crash trace (rc %d, stderr tail %r)" % (tag, rc2, err2[-160:]), rc2 == 0 and pl and p2l and ql and rl and el and "Traceback" not in err2)
+    if not (pl and p2l and ql and rl): continue
+    pre = _json.loads(pl[0][4:]); pre2 = _json.loads(p2l[0][5:]); post = _json.loads(ql[0][5:]); r = _json.loads(rl[0][7:])
+    print("  RAW-BEFORE-INJECTION %s %s" % (tag, _json.dumps(before, default=str)), flush=True)
+    print("  RAW-PRE %s %s" % (tag, _json.dumps(pre, default=str)), flush=True)
+    print("  RAW-PRE2 %s %s" % (tag, _json.dumps(pre2, default=str)), flush=True)
+    print("  RAW-POST %s %s" % (tag, _json.dumps(post, default=str)), flush=True)
+    print("  RAW-RESULT %s %s" % (tag, _json.dumps(r, default=str)), flush=True)
+    print("  RAW-ENTRYTRY %s %s" % (tag, el[0][9:] if el else None), flush=True)
+    check("%s: INSTRUMENT zero polls in the recovery process (%d) and the gate/recovery path was reached (gate stats %r)" % (tag, r["cnt"]["poll_exits"], r["gate_stats"]), r["cnt"]["poll_exits"] == 0 and r["gate_stats"] is not None and sum(r["gate_stats"].values()) >= 1)
+    delta = round(float(r["cash_after_recovery"]) - float(r["cash_before_recovery"]), 6)
+    check("%s: INVARIANT accounting reconciliation: new credit events for the op <=1 (%d), all <=1 (%d), no new debit in recovery (%d), cash delta %.6f == net sum of credit events journaled during recovery %.6f, lane close delta %r <=1" % (
+          tag, r["new_credit_events_for_op"], r["all_credit_events_for_op"], r["new_debit_events"], delta, r["new_credit_net_sum"], r["lane_closes_delta"]),
+          r["new_credit_events_for_op"] <= 1 and r["all_credit_events_for_op"] <= 1 and r["new_debit_events"] == 0 and abs(delta - r["new_credit_net_sum"]) < 1e-6 and r["lane_closes_delta"] is not None and r["lane_closes_delta"] <= 1)
+    cl = classify(r)
+    gen_b = (before["ledger"] or {}).get("account_id") if isinstance(before["ledger"], dict) else None
+    gen_a = (post["ledger"] or {}).get("account_id") if isinstance(post["ledger"], dict) else None
+    print("OBS %s: CLASS=%s blocked_returned=%s outcome=%s pos_ever_existed=%s intent_applied=%s frozen_open=%d pending=%d entry_blocked=%s credit_calls=%d new_event_kinds=%s orphan_events=%s degraded_events=%s journal_status=%s" % (
+        tag, cl, r["blocked_returned"], r["outcome"], r["pos_ever_existed"], r["intent_applied"], r["frozen_open"], r["pending"], r["entry_blocked"], r["credit_calls"], r["new_event_kinds"], r["orphan_events"], r["degraded_events"], r["journal_status"]), flush=True)
+    print("OBS %s: DEBIT-WAS-PRESENT-BEFORE-INJECTION=yes (proven above); LOSS-HIDING-CANDIDATE=%s (intent terminal with no credit and outcome orphan)" % (tag, "YES" if cl.startswith("CONVERGED_ORPHAN") else "no"), flush=True)
+    print("OBS %s: CANDIDATE-EVIDENCE ONLY (not proof): account_id before=%s after=%s changed=%s; ledger seq before=%s after=%s; pos_id of intent=%s reuse=%s" % (
+        tag, str(gen_b)[:8], str(gen_a)[:8], gen_b != gen_a, (before["ledger"] or {}).get("seq") if isinstance(before["ledger"], dict) else None, (post["ledger"] or {}).get("seq") if isinstance(post["ledger"], dict) else None, pid, r["reuse"]), flush=True)
+    print("OBS %s: cash entry=%.6f before-recovery=%.6f after-recovery=%.6f; lane ledger before=%r after=%r" % (tag, entry_cash, r["cash_before_recovery"], r["cash_after_recovery"], pre2["lane_ledger"], post["lane_ledger"]), flush=True)
+    for m in r["recover_logs"]: print("OBS %s: LOG %s" % (tag, m), flush=True)
+    if mode == "none":
+        check("%s: CONTROL converges: the real credit applied exactly once, intent terminal, no freeze, entries not blocked, cash up by the credit (class %s)" % (tag, cl),
+              cl == "CREDITED_ONCE" and r["intent_applied"] and r["frozen_open"] == 0 and not r["entry_blocked"] and delta > 0)
+print("OBS no positive safe-pre-epoch (never-debited) control exists in this diagnostic; the original orphan purpose stays separate coverage. Elapsed %.1fs of the %.0fs budget." % (time.time() - T0, BUDGET_S))
+check("COMPLETE: all %d scenarios reached their end-of-scenario within the budget" % len(SC), lname != "" and (time.time() - T0) < BUDGET_S + 5)
 print("FAILS: %d" % len(FAILS))
 sys.exit(1 if FAILS else 0)

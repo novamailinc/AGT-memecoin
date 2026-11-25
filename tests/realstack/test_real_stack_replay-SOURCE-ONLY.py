@@ -200,6 +200,8 @@ def main():
         say("INFO", "I4 state: lane position present=%s pending_exit=%r legs_done=%r closes %d->%d ; account open lots for mint=%d qty=%s ; unrecorded=%d"
             % (pos4 is not None, (pos4 or {}).get("pending_exit"), {k: v.get("done") for k, v in ((pos4 or {}).get("legs") or {}).items()},
                closes_before, len(closes4), len(accopen), [x["qty"] for x in accopen], len(unrecorded)))
+        say("INFO", "I4 COVERAGE: seeded position has no execution.source, so grad._is_sim(pos)=%r and exits take the MODEL-fill path with the engine's own quote; "
+            "the jupiter_quote_sim exit path (demo filler: Jupiter price + on-chain decimals + quote client) is NOT covered by this capture." % (eng._is_sim(pos4) if pos4 else "n/a",))
         try:
             say("INFO", "I4 context: _demo_mode()=%r (exits needing the demo filler/Jupiter raise on unrecorded hosts; never stubbed)" % (eng._demo_mode(),))
         except Exception as e:

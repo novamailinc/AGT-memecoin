@@ -57,9 +57,11 @@ def load_capture(path):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: CAPTURE.jsonl"); return 4
-    hdr, table = load_capture(sys.argv[1])
+    if len(sys.argv) > 2:
+        print("usage: [CAPTURE.jsonl]"); return 4
+    cap = sys.argv[1] if len(sys.argv) == 2 else os.path.join(ROOT, "tests", "realstack", "data", "capture-20261125T064432Z.jsonl")
+    say("INFO", "capture file %s sha256=%s" % (cap, hashlib.sha256(open(cap, "rb").read()).hexdigest()))
+    hdr, table = load_capture(cap)
     say("INFO", "provenance: head=%s providers=%s requests=%d t0_utc=%.0f data=REAL-CAPTURED-REPLAY coverage=%s first-body-per-URL"
         % (hdr["repo_head"], ",".join(hdr["providers"]), hdr["n_requests"], hdr["t0_utc"], hdr.get("coverage")))
     T0 = float(hdr["t0_utc"]); wall0 = time.time(); _real_time = time.time

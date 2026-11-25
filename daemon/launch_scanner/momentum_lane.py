@@ -1795,6 +1795,21 @@ def _resume_pending_exit(pos):
         _recs = _df.fills_by_prefix(_pre, _suf)
     except Exception:
         return _hold("*", "unresolved_fill_journal", "fill_journal_unreadable")   # unknown evidence is never read as "no fill"
+    # LEGACY-KEY QUARANTINE: exit ids written before the generation suffix carry no instance id ("<lane>:exit:<mint>:<key>"). Their generation cannot be
+    # proven, so a legacy record that is not provably OLDER than this position's entry is never adopted and never read as "absent": the position is held.
+    try:
+        _legacy = {k: v for k, v in _df.fills_by_prefix(_pre).items() if not k.endswith(_suf) and k[len(_pre):] in
+                   ("a", "b", "c") + tuple("remaining:" + c for c in ("a", "b", "c", "ab", "ac", "bc", "abc"))}
+    except Exception:
+        return _hold("*", "unresolved_fill_journal", "fill_journal_unreadable")
+    for _lk, _lr in sorted(_legacy.items()):
+        _lts = (_lr or {}).get("ts")
+        try:
+            _older = _lts is not None and float(_lts) < float(pos.get("entry_ts") or 0)
+        except Exception:
+            _older = False
+        if not _older:
+            return _hold(_lk[len(_pre):], "unresolved_legacy_exit_key", ((_lr or {}).get("intent") or {}).get("reason"))
     _cand = []
     for _op, _rec in sorted(_recs.items()):
         _key = _op[len(_pre):-len(_suf)]

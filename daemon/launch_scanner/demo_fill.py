@@ -364,21 +364,10 @@ class DemoFiller:
         return self._locked(lambda j: {k: dict(v) for k, v in j["fills"].items() if k.startswith(prefix) and k.endswith(suffix)})
 
     def resolve_inflight(self, op_id, outcome, evidence, operator):
-        """OPERATOR resolution of an unresolved inflight claim. Append-only: the observed claim is copied into j["resolutions"] with the operator,
-        evidence and time BEFORE it is removed; nothing observed is rewritten. Only outcome "not_executed" is supported (the claim is cleared so the op
-        may execute); "executed" needs the real fill and is NOT automated (it must be adopted through reconcile with a signature). Requires non-empty
-        evidence and operator and an existing inflight claim; returns the resolution record."""
-        if outcome != "not_executed" or not str(evidence or "").strip() or not str(operator or "").strip():
-            raise DemoSkip("resolution_refused", {"op_id": op_id, "why": "only outcome not_executed with evidence and operator is supported"})
-        def f(j):
-            cur = j["fills"].get(op_id)
-            if not cur or cur.get("status") != "inflight":
-                raise DemoSkip("resolution_refused", {"op_id": op_id, "why": "no inflight claim"})
-            rec = {"op_id": op_id, "claim": dict(cur), "outcome": outcome, "evidence": str(evidence), "operator": str(operator), "ts": self._now()}
-            j.setdefault("resolutions", []).append(rec)
-            del j["fills"][op_id]
-            return rec
-        return self._locked(f)
+        """DISABLED. Clearing an unresolved inflight claim needs VERIFIED evidence (an on-chain/receipt proof that the swap never landed) and an
+        authority route; neither exists in this codebase, and a caller-supplied string is not evidence. It refuses unconditionally, so no caller can
+        bypass the claim. The held state stays until a real reconcile (with a signature) settles it."""
+        raise DemoSkip("resolution_disabled", {"op_id": op_id, "why": "no verified-evidence/authority route exists; external resolution is disabled"})
 
     def _clear_inflight(self, op_id):
         def f(j):

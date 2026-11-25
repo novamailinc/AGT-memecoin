@@ -322,5 +322,21 @@ PA._MARKER_FAILED[0] = False   # emulate a restart: only the journal remains
 okV3, whyV3, _x = PA.try_debit(LANE, "MINTV3", 1.0, 100.0, "gb:entry:V3", marks=_mk())
 check("V3 after a simulated restart the block is re-derived from the journal (%s)" % whyV3, (not okV3) and "could not be recorded" in whyV3)
 
+# ---- W: the marker also stops add_to_position exposure increases and NEW hold_stake reservations; an earlier hold can still be released
+_use(os.path.join(_home, "W"))
+r = _need("debit W", PA.try_debit(LANE, "MINTW", 1.0, 100.0, "gb:entry:W", marks=_mk()))
+pidW = r[2]
+_need("hold W0 before any refusal", PA.hold_stake(LANE, 1.0, "gb:hold:W0", marks=_mk()))
+PA.credit(LANE, "MINTW", 1.1, "gb:exit:W", pos_id=pidW, qty=100.0, expected_account_id="some-other-generation", entry_op_id="gb:entry:W")
+check("W0 marker present", len(PA.unresolved_refusals() or []) == 1)
+okA, whyA = PA.add_to_position(LANE, "MINTW", pidW, 1.0, 100.0, "gb:add:W", marks=_mk())
+check("W1 add_to_position (exposure increase) is refused while the marker exists (%s)" % whyA, (not okA) and "exposure increase blocked" in whyA)
+okH, whyH = PA.hold_stake(LANE, 1.0, "gb:hold:W1", marks=_mk())
+check("W2 a NEW hold_stake reservation is refused while the marker exists (%s)" % whyH, (not okH) and "reservation blocked" in whyH)
+okH0, whyH0 = PA.hold_stake(LANE, 1.0, "gb:hold:W0", marks=_mk())
+check("W3 an identical retry of the EARLIER hold is still answered from the recorded op (%s)" % whyH0, okH0 is True)
+okR, whyR2 = PA.release_hold("gb:hold:W0", "test release")
+check("W4 releasing an earlier hold is NOT blocked (non-mutating toward exposure) (%s)" % (whyR2,), okR is True)
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

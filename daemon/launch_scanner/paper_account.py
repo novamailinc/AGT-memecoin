@@ -1753,6 +1753,9 @@ def add_to_position(lane: str, mint: str, pos_id: str, stake: float, qty: float,
             return False, "account ledger unreadable (fail-closed)"
         if degraded:
             return False, "account degraded: %s" % degraded
+        _ub = _entries_blocked_by_refusal()
+        if _ub and led.get("ops", {}).get(op_id) is None:
+            return False, "account exposure increase blocked: %s" % _ub
         prior = led.get("ops", {}).get(op_id)
         if prior is not None:
             _exp = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": pos_id}
@@ -1862,6 +1865,9 @@ def hold_stake(lane: str, amount: float, op_id: str,
             return False, "account ledger unreadable (fail-closed)"
         if degraded:
             return False, "account degraded: %s" % degraded
+        _ub = _entries_blocked_by_refusal()
+        if _ub and led.get("ops", {}).get(op_id) is None:
+            return False, "account reservation blocked: %s" % _ub
         prior = led.get("ops", {}).get(op_id)
         if prior is not None:
             _ps = prior.get("stake")

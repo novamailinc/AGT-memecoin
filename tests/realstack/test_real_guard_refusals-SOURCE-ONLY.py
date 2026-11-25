@@ -106,8 +106,8 @@ def main():
     refused = eg.mandatory_entry_refusal(eng.LANE)
     check("C8b entries now refused (gates off)", bool(refused))
     ok2, why2 = pa.credit(eng.LANE, "RSGUARDMINTpump", 2.5, "rs:op:close", pos_id=pid, qty=1000.0, fee=0.0,
-                          price_kind=getattr(getattr(pa, "PRICE_KIND", None), "UNKNOWN", None))
-    say("INFO", "C8c credit while entries refused -> %r (price_kind arg depends on module API)" % ((ok2, why2),))
+                          price_kind="current_price_simulated_fill")
+    say("INFO", "C8c credit while entries refused -> %r (price_kind=current_price_simulated_fill = the spendable kind in paper_account._SPENDABLE_KINDS)" % ((ok2, why2),))
     check("C8c credit path not blocked by the entry refusal", ok2 is True, repr((ok2, why2)))
     # C9 killswitch: lane halted -> gate false and buyback returns [] (NOT a guard control; exits before the guard)
     home, T, eng, pa, eg = env()

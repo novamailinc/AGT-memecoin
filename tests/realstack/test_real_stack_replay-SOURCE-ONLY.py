@@ -121,11 +121,12 @@ def main():
     check("post_quote stale (now=base+100) -> refused", bool(r) and "exceeds" in r, repr(r))
 
     # ---- (2) buyback accounting on a FIXTURE-SEEDED position, real quote path (captured bodies), real account.
-    # PREDECLARED rule R1 (lane-follow; derived from entry_guard comment "a buyback buys tokens: it is an entry" and
-    # unrouted_opener_refusal "every entry reserves through paper_account"; NOT yet confirmed by main/owner):
-    #   I1 account position qty after == before + (lane tokens after - lane tokens before)
-    #   I2 documented tranche.py rule: cash is NOT debited at buyback (settles at finalize); account cash unchanged. (tranche.py header, "Bookkeeping note")
-    # exit 1 here means a product finding UNDER R1 (not a harness gap), provided the preconditions below pass.
+    # PREDECLARED CORRECTNESS RULES (shared capital; a header comment about temporary overstatement is NOT a correctness rule):
+    #   I1 inventory: account position qty after buyback == lane unsold tokens (account qty before + lane tokens bought).
+    #   I2 no double use: the buyback cost must leave the account's SPENDABLE cash (cash_spendable after <= before - cost), because the
+    #      cost was already credited to shared cash by the leg-A credit and is otherwise spendable by any lane a second time.
+    #   I3 conservation: account book_value (cash + cost_exposure) after == before (money moved from cash into the position, nothing created).
+    # A violation exits 1 as a product finding; the legacy tranche.py "overstates cash until close" note is descriptive, not asserted as pass.
     home, S, T, pa, eg = fresh_env()
     eng = T.make_engine(); eng.ensure_ledger()
     px = eng.quote_price("solana", mint)
@@ -138,7 +139,8 @@ def main():
     check("precondition: real try_debit seeds the shared-account position", ok is True, repr((ok, why)))
     legqty = T.LEG_A_FRAC * tokens
     gross = round(legqty * px * 1.5, 6)
-    okc, whyc = pa.credit(eng.LANE, mint, gross, "rs:seed:legA", pos_id=pid, qty=legqty, fee=0.0)
+    okc, whyc = pa.credit(eng.LANE, mint, gross, "rs:seed:legA", pos_id=pid, qty=legqty, fee=0.0,
+                          price_kind="current_price_simulated_fill")   # the spendable kind a real sim leg credits with
     check("precondition: real credit of leg A", okc is True, repr((okc, whyc)))
     d = eng._read()
     d["positions"][mint] = {"mint": mint, "symbol": "RS", "chain": "solana", "lane": eng.LANE, "status": "open",
@@ -153,17 +155,20 @@ def main():
     say("INFO", "FIXTURE-SEEDED state: leg A done, peak=2x quote, entry=0.9x quote (not market-observed); everything else real")
     def acct_qty():
         sn = pa.snapshot()
-        return sum(float(x["qty"]) for l in sn["lanes"].values() for x in l["positions"] if x["mint"] == mint), float(sn["cash"])
-    q0, c0 = acct_qty(); t0 = float(eng._read()["positions"][mint]["tokens"])
+        return (sum(float(x["qty"]) for l in sn["lanes"].values() for x in l["positions"] if x["mint"] == mint),
+                float(sn.get("cash_spendable", sn["cash"])), float(sn["book_value"]))
+    q0, c0, bv0 = acct_qty(); cost0 = None; t0 = float(eng._read()["positions"][mint]["tokens"])
     T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
     check("precondition: real maybe_buyback executed (so the invariants below are measured, not skipped)", len(done) == 1, repr(done))
     if len(done) == 1:
-        q1, c1 = acct_qty(); t1 = float(eng._read()["positions"][mint]["tokens"])
-        say("INFO", "lane tokens %.6f -> %.6f ; account qty %.6f -> %.6f ; account cash %.6f -> %.6f" % (t0, t1, q0, q1, c0, c1))
-        check("I1 (R1) account qty follows lane tokens by the bought amount", abs((q1 - q0) - (t1 - t0)) <= 1e-6 * max(1.0, t1),
+        q1, c1, bv1 = acct_qty(); t1 = float(eng._read()["positions"][mint]["tokens"]); cost = float(done[0]["cost"])
+        say("INFO", "lane tokens %.6f -> %.6f ; account qty %.6f -> %.6f ; spendable cash %.6f -> %.6f ; book_value %.6f -> %.6f ; buyback cost %.6f"
+            % (t0, t1, q0, q1, c0, c1, bv0, bv1, cost))
+        check("I1 inventory: account qty follows lane tokens by the bought amount", abs((q1 - q0) - (t1 - t0)) <= 1e-6 * max(1.0, t1),
               "d_account=%.6f d_lane=%.6f" % (q1 - q0, t1 - t0))
-        check("I2 (tranche.py documented rule) account cash unchanged at buyback", abs(c1 - c0) <= 1e-9, "dcash=%.9f" % (c1 - c0))
+        check("I2 no double use: spendable cash fell by the buyback cost", c1 <= c0 - cost + 1e-6, "dspendable=%.6f cost=%.6f" % (c1 - c0, cost))
+        check("I3 conservation: account book_value unchanged", abs(bv1 - bv0) <= 1e-6, "dbook=%.6f" % (bv1 - bv0))
     say("INFO", "unrecorded-request count (raised/None, never faked)=%d hosts=%s" % (len(unrecorded), sorted(set(unrecorded))))
     say("INFO", "limits = TEST-ENGINEERING fixture (not policy); replay clock = capture t0 + elapsed; ledger timestamps carry replay time")
     print("SUMMARY PASS=%d FAIL=%d INFO=%d" % (RES["PASS"], RES["FAIL"], RES["INFO"]))

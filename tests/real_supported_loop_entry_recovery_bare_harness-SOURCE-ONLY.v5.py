@@ -321,13 +321,15 @@ def t2(lab, cyc):
 # Each variant plants ONE extra file next to the genuine killed-entry record, after the SIGKILL and before the restart. The planted contents are NOT invented class-E semantics: R1 is non-JSON bytes (unreadable record);
 # R2 is a byte copy of the genuine record with ONE numeric field changed and the checksum left stale (validate() -> checksum mismatch, the same path as a torn or altered record). S1 (same flags, no plant) is the control.
 # Fail-closed here blocks ENTRIES only: the adopted position must still be managed (risk-reducing exits are not frozen).
-PLANT_NAME = "f" * 40 + ".json"
+PLANT_NAME = "0" * 40 + ".json"   # sorts BEFORE any sha256-hex genuine name (not "0"*40 itself, collision asserted below), so recover_pass meets the block first and must keep going to adopt the genuine record
 def plant_phase(h, lab, variant, t):
     d = os.path.join(h, "grad_ledger.json.entry-intents")
     before = sorted(os.listdir(d)) if os.path.isdir(d) else None
     genuine = (t or {}).get("rec_files")
     check("%s PLANT SITE (derived path %s): the entry-intent directory exists and lists exactly the genuine record(s) the kill child reported at its seam (listing %s == seam rec_files %s, 1 file)" % (lab, os.path.basename(d), before, genuine), before is not None and before == genuine and len(before) == 1)
     if not before or len(before) != 1: raise B.Stop("plant site not as derived")
+    check("%s PLANT ORDER (sensitivity): planted name %s sorts strictly BEFORE the genuine record name %s (sorted listing order is the scan order) and is not equal to it" % (lab, PLANT_NAME[:8] + "..", before[0][:8] + ".."), PLANT_NAME < before[0])
+    if not PLANT_NAME < before[0]: raise B.Stop("plant name does not sort before the genuine record (collision or odd name)")
     gp = os.path.join(d, before[0]); raw = open(gp, "rb").read()
     if variant == "garbage": payload = b"\x00not json at all{{{"
     else:

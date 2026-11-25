@@ -6,7 +6,7 @@ L4 account ledger+WAL+registry deleted but a bound lane position remains = block
 L6 corrupt registry blocks; L7 lane ledger lost while the account holds lots blocks at account level; L8 position bound to the wrong entry op blocks; L9 an orphan account lot
 (no lane position) blocks the lane restart; L10 the real close_intents.begin registers its journal and its later loss blocks at account level; L11 generation mismatch blocks
 at ACCOUNT level (a lane that never called its own check); L12 FRESH PROCESS: account admission refuses on persisted evidence alone, and a fresh process on matching state
-admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses; L19 register-after-primary-loss refuses and the mirror keeps both lanes; L20 torn registry tail tolerated and repaired.
+admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses; L19 register-after-primary-loss refuses and the mirror keeps both lanes; L20 torn registry tail tolerated and repaired; L21 a torn intent-journal tail is never read as clean.
 NOT proven: lane runtime wiring (needs lane harnesses), whole-filesystem loss (no inside witness exists), journal rotation, grad closed-position witness, sim idempotency."""
 import ast, json, os, subprocess, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -235,6 +235,14 @@ check("L20a torn final line: admission stays open on the complete records (%r)" 
 LANE3 = LANE + "_three"
 check("L20b a new registration after a torn tail succeeds", PA.register_lane(LANE3, LP, None) is True)
 check("L20c the registry parses cleanly afterwards (torn line terminated, no glue)", PA._registry_read(PA._registry_paths()[0])[1] == "ok" and PA._registry_read(PA._registry_paths()[1])[1] in ("ok", "torn_tail"))
+
+# L21 a torn (unterminated) last intent-journal record is never read as clean; a complete journal stays clean
+d, LP, pid, ID, op = good("L21")
+if os.path.exists(CI.journal_path(LANE)): os.unlink(CI.journal_path(LANE))
+iid = CI.begin(LANE, "M", pid, [{"kind": "credit", "op_id": "lc:exit:L21", "amount": 1.0, "qty": 100.0, "price_kind": "mark"}],
+               {"realized_usd": 0.0, "entry_notional_usd": 1.0, "closed_reason": "t", "close_ts": int(time.time())}, account_id=ID)
+open(CI.journal_path(LANE), "a").write('{"ev": "frozen", "intent_id": "' + iid[:12])
+check("L21 a partial (torn) freeze record blocks account admission, not clean (%r)" % blocked(), blocked() is not None and "unterminated last record" in blocked())
 # L15 static wiring
 here = os.path.join(ROOT, "daemon", "launch_scanner")
 st = {n: open(os.path.join(here, n + ".py")).read() for n in ("momentum_lane", "ceo", "watcher_lane", "grad", "mirror", "close_intents")}

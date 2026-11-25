@@ -2557,7 +2557,11 @@ def _registry_blockers():
                 except ImportError:
                     import close_intents as _ci
                 _fz, _jst = _ci.frozen_unresolved(st["intent_path"])
-                if _jst not in (None, "torn_tail", "missing"):
+                if _jst == "torn_tail":
+                    # cannot tell an in-flight append from a crash that tore a freeze/intent record: never read as clean (transient while a writer is mid-append;
+                    # the lane's recover_lane/append truncates a provable torn tail)
+                    out.append("lane %s: intent journal has an unterminated last record (in-flight append or torn freeze/intent; not judged clean)" % ln)
+                elif _jst not in (None, "missing"):
                     out.append("lane %s: intent journal unreadable (%s)" % (ln, _jst))
                 elif _fz:
                     out.append("lane %s: frozen unapplied intent(s) %s (unresolved economic obligation)" % (ln, ",".join(_fz[:3])))

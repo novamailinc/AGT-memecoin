@@ -290,6 +290,40 @@ check("frozen: entry refused while divergence is frozen",
 _unpatch(ps)
 G._ENTRY_BLOCKED = False   # section isolation
 
+# ---- grad divergence site: freeze-success vs begin-failure (v7+ handler), real account + real journal ----
+from unittest.mock import patch as _patch
+_real_app = CI._append
+def _fail_intent(path, event): return False if event.get("ev") == "intent" else _real_app(path, event)
+ps, _mv, _ms = _fresh()
+opened, _w, _f = G.consider_candidate(_cand(mint="GHOSTB1pump"))
+check("fixture: divergence-site entry opened", opened)
+with PA._lock():
+    led, healthy, _deg = PA._load_locked()
+    led["lanes"]["grad"]["open"].pop("GHOSTB1pump", None)
+    PA._save_locked(led)
+def _leg_a(mint, mult=1.5):
+    with G._ledger_lock():
+        d = G._read(); pos = d["positions"][mint]
+        G._close_leg(pos, "a", pos["entry_price"] * mult, "test"); G._write(d)
+    return G._read()["positions"][mint]
+G._ENTRY_BLOCKED = False
+with _patch.object(CI, "_append", _fail_intent):
+    _pb = _leg_a("GHOSTB1pump")
+_evb = [e for e in _events() if e.get("intent_id", "").startswith("grad:GHOSTB1pump")]
+check("divergence + intent begin FAILS: no intent journaled (%r), hold why %r (journal failure, not divergence), leg a not done %r, entries blocked in-process %r"
+      % ([e["ev"] for e in _evb], (_pb.get("pending_exit") or {}).get("why"), not _pb["legs"]["a"]["done"], G._ENTRY_BLOCKED),
+      not _evb and (_pb.get("pending_exit") or {}).get("why") == "tranche_credit_refused" and _pb["legs"]["a"]["done"] is False and G._ENTRY_BLOCKED is True)
+_pb = _leg_a("GHOSTB1pump")
+_evb = [e for e in _events() if e.get("intent_id", "").startswith("grad:GHOSTB1pump")]
+check("storage back: the retry journals ONE intent and FREEZES it (%r), hold why %r, account side never applied"
+      % ([e["ev"] for e in _evb], (_pb.get("pending_exit") or {}).get("why")),
+      [e["ev"] for e in _evb] == ["intent", "frozen"] and (_pb.get("pending_exit") or {}).get("why") == "tranche_credit_divergence")
+_pb = _leg_a("GHOSTB1pump")
+_evb2 = [e for e in _events() if e.get("intent_id", "").startswith("grad:GHOSTB1pump")]
+check("a further poll does not open a second intent or re-freeze (%r)" % ([e["ev"] for e in _evb2],), [e["ev"] for e in _evb2] == ["intent", "frozen"])
+_unpatch(ps)
+G._ENTRY_BLOCKED = False
+
 # ---- recovery runs BEFORE a post-restart entry ---------------------
 # Simulate a kill after account_applied but before the lane write:
 # _finalize with a FAILING _write (the kill lands at the persist).

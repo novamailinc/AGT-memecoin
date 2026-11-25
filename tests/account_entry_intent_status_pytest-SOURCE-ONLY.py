@@ -73,9 +73,11 @@ class TestAccountEntryIntentStatus:
 
     def test_unreadable_directory_is_unknown(self, account, monkeypatch, tmp_path):
         monkeypatch.setenv('FOREX_AGENT_HOME', str(tmp_path / 'home')); os.makedirs(str(tmp_path / 'home'))
-        d = gei.records_dir(gei.default_ledger_path()); os.makedirs(d); os.chmod(d, 0)
-        try:
-            body = _run(monkeypatch, tmp_path)
-        finally:
-            os.chmod(d, 0o700)
+        d = gei.records_dir(gei.default_ledger_path()); os.makedirs(d)
+        real = os.listdir
+        def deny(path=".", *a, **k):
+            if str(path) == d: raise PermissionError("simulated unreadable entry-intent directory")
+            return real(path, *a, **k)
+        monkeypatch.setattr(gei.os, 'listdir', deny)
+        body = _run(monkeypatch, tmp_path)
         assert 'UNKNOWN' in body and 'not reported as clear' in body

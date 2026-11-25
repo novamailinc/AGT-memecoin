@@ -34,9 +34,14 @@ open(os.path.join(d, "bad.json"), "w").write("{nope"); s3 = M.status_readonly(L)
 check("status: unparseable record is pending-invalid, never clear", s3["state"] == "pending" and any(r["file"] == "bad.json" and r["valid"] is False for r in s3["records"]))
 L2 = home(); os.makedirs(M.records_dir(L2)); s4 = M.status_readonly(L2)
 check("status: present and empty directory is clear", s4["state"] == "clear")
-L3 = home(); os.makedirs(M.records_dir(L3)); os.chmod(M.records_dir(L3), 0)
+L3 = home(); os.makedirs(M.records_dir(L3))
+_real_ld = os.listdir
+def _deny(path=".", *a, **k):
+    if str(path) == M.records_dir(L3): raise PermissionError("simulated unreadable entry-intent directory")
+    return _real_ld(path, *a, **k)
+M.os.listdir = _deny
 try: s5 = M.status_readonly(L3)
-finally: os.chmod(M.records_dir(L3), 0o700)
+finally: M.os.listdir = _real_ld
 check("status: unreadable directory is UNKNOWN, not clear", s5["state"] == "unknown" and "unreadable" in (s5["why"] or ""))
 check("status: unreadable ledger parent is UNKNOWN", M.status_readonly("/nonexistent-root-xyz/sub/grad_ledger.json")["state"] == "unknown")
 lines = M.format_status_lines(s1, False)

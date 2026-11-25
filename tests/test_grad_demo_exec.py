@@ -205,7 +205,7 @@ class FakeJup:
         # buy: price 0.00001 SOL/token (dec 6): tokens = amount_lamports/1e9/1e-5 ; sell mirrors with self.mult
         if inp == SOLM: o = int(amount / 1e9 / 0.00001 * 1e6 * self.bmult)
         else: o = int(amount / 1e6 * 0.00001 * self.mult * 1e9)
-        return {"outAmount": str(o), "priceImpactPct": 0.4, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
+        return {"outAmount": str(o), "priceImpactPct": 0.004, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
 
 JUP = FakeJup()
 def new_filler():

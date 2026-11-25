@@ -67,7 +67,7 @@ class FakeJup:
         self.calls += 1; time.sleep(FakeJup.delay)
         if inp == SOLM: o = int(amount / 1e9 / 0.00001 * 1e6)
         else: o = int(amount / 1e6 * 0.00001 * 1e9 * FakeJup.mult)
-        return {"outAmount": str(o), "priceImpactPct": 0.4, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
+        return {"outAmount": str(o), "priceImpactPct": 0.004, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
 JUP = FakeJup()
 
 class KS:

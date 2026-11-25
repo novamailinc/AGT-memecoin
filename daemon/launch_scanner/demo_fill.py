@@ -478,6 +478,7 @@ class DemoFiller:
             "in_amount": int(res["in_amount"]), "out_amount": int(res["out_amount"]),
             "quote_out_amount": res.get("quote_out_amount"), "decimals": dec,
             "price_impact_pct": res.get("price_impact_pct"),
+            "price_impact_unit": res.get("price_impact_unit"),
             "route": _route_labels(q.get("quote")),
             "quote_requested_at": q.get("requested_at"), "quote_received_at": q.get("received_at"),
             "slippage_bps": q.get("slippage_bps"),

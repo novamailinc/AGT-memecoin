@@ -421,8 +421,11 @@ def execution_quality(trades, attempts):
            if _num(t.get("deterioration_detected_ts")) and t["deterioration_detected_ts"] >= t["entry_ts"]]
     return {
         "entry_slippage_bps_mean": mean(ent), "exit_slippage_bps_mean": mean(ext),
-        "price_impact_pct_mean": mean([t["price_impact_pct"] for t in trades]),
-        "price_impact_pct_max": max(t["price_impact_pct"] for t in trades),
+        # Unit versioning: only records stamped price_impact_unit == "percent_v2" hold true percent. Older records (no stamp)
+        # stored the Jupiter RATIO under the _pct name and are excluded from the mean/max (counted, never reinterpreted).
+        "price_impact_pct_mean": mean([t["price_impact_pct"] for t in trades if t.get("price_impact_unit") == "percent_v2"]),
+        "price_impact_pct_max": max([t["price_impact_pct"] for t in trades if t.get("price_impact_unit") == "percent_v2"], default=None),
+        "price_impact_legacy_unit_trades": sum(1 for t in trades if t.get("price_impact_unit") != "percent_v2"),
         "failed_execution_rate": (sum(1 for a in attempts if not a["ok"]) / len(attempts)) if attempts else None,
         "exit_completion_rate": (sum(1 for a in xa if a["ok"]) / len(xa)) if xa else None,
         "entry_attempts": len(ea), "exit_attempts": len(xa),

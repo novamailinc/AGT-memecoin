@@ -35,7 +35,7 @@ class FakeJupiter:
         return self._quote
 
 
-def good_quote(impact="0.50", out="2000000"):
+def good_quote(impact="0.005", out="2000000"):
     return {"outAmount": out, "priceImpactPct": impact}
 
 
@@ -47,8 +47,8 @@ def make(quote=None, http_status=None, seed=7, **kw):
 
 
 def test_skip_parity_no_route():
-    for quote, status in ((None, 400), ({"priceImpactPct": "0.1"}, None),
-                          ({"outAmount": "abc", "priceImpactPct": "0.1"},
+    for quote, status in ((None, 400), ({"priceImpactPct": "0.001"}, None),
+                          ({"outAmount": "abc", "priceImpactPct": "0.001"},
                            None)):
         try:
             make(quote, status).execute_swap(SOL, TOK, 10**7)
@@ -62,7 +62,7 @@ def test_skip_parity_price_impact():
     for quote, reason in (({"outAmount": "100"}, "price_impact_unknown"),
                           ({"outAmount": "100", "priceImpactPct": "zz"},
                            "price_impact_unknown"),
-                          (good_quote(impact="3.5"),
+                          (good_quote(impact="0.035"),
                            "price_impact_over_cap")):
         try:
             make(quote).execute_swap(SOL, TOK, 10**7)

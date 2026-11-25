@@ -47,7 +47,7 @@ class FakeJup:
     def get_quote(self, inp, out, amount, slippage_bps=100):
         if inp == SOLM: o = int(amount / 1e9 / 0.00001 * 1e6)
         else: o = int(amount / 1e6 * 0.00001 * 1e9 * FakeJup.mult)
-        return {"outAmount": str(o), "priceImpactPct": 0.4, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
+        return {"outAmount": str(o), "priceImpactPct": 0.004, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
 JUP = FakeJup()
 os.makedirs(os.path.join(home, "j"), exist_ok=True); os.makedirs(os.path.join(home, "led"), exist_ok=True)
 FILL_PATH = os.path.join(home, "j", "j.json")

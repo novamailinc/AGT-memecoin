@@ -52,7 +52,7 @@ from typing import Any, Callable, Dict, List, Optional
 from broker import BROKER_UNAVAILABLE, BrokerError
 
 from .fee_policy import PriorityFeePolicy
-from .jupiter import JupiterClient
+from .jupiter import JupiterClient, quote_price_impact_pct
 from .mainnet_executor import (
     DEFAULT_PRIORITY_FEE_LAMPORTS,
     PRIORITY_FEE_MAX_FRAC_OF_STAKE,
@@ -309,21 +309,9 @@ class SimulationExecutor:
                 BROKER_UNAVAILABLE,
                 "jupiter quote outAmount unparseable — no trade",
                 detail={"reason": "no_route"})
-        impact_raw = quote.get("priceImpactPct")
-        if impact_raw is None:
-            raise BrokerError(
-                BROKER_UNAVAILABLE,
-                "jupiter quote has no priceImpactPct — refusing to "
-                "trade blind",
-                detail={"reason": "price_impact_unknown"})
-        try:
-            impact = float(impact_raw)
-        except (TypeError, ValueError):
-            raise BrokerError(
-                BROKER_UNAVAILABLE,
-                "jupiter quote priceImpactPct unparseable — "
-                "refusing to trade blind",
-                detail={"reason": "price_impact_unknown"})
+        # Jupiter documents quote priceImpactPct as a DECIMAL RATIO in [0, 1] (0.01 = 1%), not a percentage; the cap
+        # is in PERCENT. quote_price_impact_pct converts (x100) and refuses missing / non-finite / negative / >1 values.
+        impact = quote_price_impact_pct(quote)
         if impact > float(price_impact_cap_pct):
             raise BrokerError(
                 BROKER_UNAVAILABLE,
@@ -528,6 +516,8 @@ class SimulationExecutor:
             "priority_fee_lamports": fee_paid,
             "base_fee_lamports": BASE_FEE_LAMPORTS,
             "price_impact_pct": impact,
+            "price_impact_ratio": impact / 100.0,
+            "price_impact_unit": "percent_v2",
             "quote_out_amount": out_expected,
             "latency_move_pct": move * 100.0,
             "latency_seconds": self._latency,

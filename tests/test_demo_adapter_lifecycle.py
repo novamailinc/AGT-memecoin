@@ -79,7 +79,7 @@ def test_demo_buy_measured_fill_with_fee():
     with tempfile.TemporaryDirectory() as tmp:
         # 0.05 SOL buy; quote returns 49_000 tokens (base units at 6 dec)
         ad, ex = _adapter(tmp, FakeJupiter(
-            [{"outAmount": "49000000000", "priceImpactPct": "0.40"}]))
+            [{"outAmount": "49000000000", "priceImpactPct": "0.004"}]))
         res = ad.submit_order(_req("BUY", 0.05))
         assert res.raw["mode"] == "demo"
         assert res.raw["tokens"] == 49_000.0
@@ -97,7 +97,7 @@ def test_demo_buy_measured_fill_with_fee():
 def test_demo_skip_leaves_state_untouched():
     with tempfile.TemporaryDirectory() as tmp:
         ad, ex = _adapter(tmp, FakeJupiter(
-            [{"outAmount": "49000000000", "priceImpactPct": "9.90"}]))
+            [{"outAmount": "49000000000", "priceImpactPct": "0.099"}]))
         before = ad._balance_sol
         try:
             ad.submit_order(_req("BUY", 0.05))
@@ -111,7 +111,7 @@ def test_demo_skip_leaves_state_untouched():
 def test_demo_idempotent_replay_executes_once():
     with tempfile.TemporaryDirectory() as tmp:
         jup = FakeJupiter(
-            [{"outAmount": "49000000000", "priceImpactPct": "0.40"}])
+            [{"outAmount": "49000000000", "priceImpactPct": "0.004"}])
         ad, ex = _adapter(tmp, jup)
         r1 = ad.submit_order(_req("BUY", 0.05, key="k-1"))
         r2 = ad.submit_order(_req("BUY", 0.05, key="k-1"))
@@ -123,7 +123,7 @@ def test_demo_idempotent_replay_executes_once():
 def test_demo_unknown_timeout_then_retry():
     with tempfile.TemporaryDirectory() as tmp:
         jup = FakeJupiter(
-            [{"outAmount": "49000000000", "priceImpactPct": "0.40"}])
+            [{"outAmount": "49000000000", "priceImpactPct": "0.004"}])
         ad, ex = _adapter(tmp, jup)
         before = ad._balance_sol
         ex.inject_confirm_outage()
@@ -142,8 +142,8 @@ def test_demo_unknown_timeout_then_retry():
 def test_demo_sell_fifo_net_of_fee():
     with tempfile.TemporaryDirectory() as tmp:
         jup = FakeJupiter([
-            {"outAmount": "49000000000", "priceImpactPct": "0.40"},
-            {"outAmount": "24500000", "priceImpactPct": "0.30"},
+            {"outAmount": "49000000000", "priceImpactPct": "0.004"},
+            {"outAmount": "24500000", "priceImpactPct": "0.003"},
         ])
         ad, ex = _adapter(tmp, jup)
         buy = ad.submit_order(_req("BUY", 0.05))

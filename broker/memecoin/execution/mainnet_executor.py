@@ -67,7 +67,7 @@ from broker.memecoin.execution import rpc as rpc_mod
 from broker.memecoin.execution import signer as signer_mod
 from broker.memecoin.execution import tx_templates as tx_templates_mod
 from broker.memecoin.execution.jito import DEFAULT_TIP_LAMPORTS
-from broker.memecoin.execution.jupiter import JupiterClient
+from broker.memecoin.execution.jupiter import JupiterClient, quote_price_impact_pct
 from broker.memecoin.wallet import WalletKeyProvider
 from daemon import solana_ids as _solana_ids
 from core.qualification_admission import admit as _admit
@@ -477,21 +477,9 @@ class MainnetExecutor:
                 BROKER_UNAVAILABLE,
                 "jupiter quote outAmount unparseable — no trade",
                 detail={"reason": "no_route"})
-        impact_raw = quote.get("priceImpactPct")
-        if impact_raw is None:
-            raise BrokerError(
-                BROKER_UNAVAILABLE,
-                "jupiter quote has no priceImpactPct — refusing to "
-                "trade blind",
-                detail={"reason": "price_impact_unknown"})
-        try:
-            impact = float(impact_raw)
-        except (TypeError, ValueError):
-            raise BrokerError(
-                BROKER_UNAVAILABLE,
-                "jupiter quote priceImpactPct unparseable — "
-                "refusing to trade blind",
-                detail={"reason": "price_impact_unknown"})
+        # Jupiter documents quote priceImpactPct as a DECIMAL RATIO in [0, 1] (0.01 = 1%), not a percentage; the cap
+        # is in PERCENT. quote_price_impact_pct converts (x100) and refuses missing / non-finite / negative / >1 values.
+        impact = quote_price_impact_pct(quote)
         if impact > float(price_impact_cap_pct):
             raise BrokerError(
                 BROKER_UNAVAILABLE,
@@ -648,6 +636,8 @@ class MainnetExecutor:
                 "out_before": out_before, "out_after": out_before,
                 "priority_fee_lamports": fee,
                 "price_impact_pct": impact,
+                "price_impact_ratio": impact / 100.0,
+                "price_impact_unit": "percent_v2",
                 "quote_out_amount": out_expected,
                 "compute_units": sized_cu["compute_units"],
                 "compute_units_source": sized_cu["source"],
@@ -728,6 +718,8 @@ class MainnetExecutor:
             "out_before": out_before, "out_after": out_after,
             "priority_fee_lamports": fee_paid,
             "price_impact_pct": impact,
+            "price_impact_ratio": impact / 100.0,
+            "price_impact_unit": "percent_v2",
             "quote_out_amount": out_expected,
             "compute_units": sized_cu["compute_units"],
             "compute_units_source": sized_cu["source"],

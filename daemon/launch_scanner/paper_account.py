@@ -104,6 +104,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -686,16 +687,51 @@ def _valid_amount(v: Any) -> bool:
             and math.isfinite(v))
 
 
+class AccountBusy(OSError):
+    """Raised ONLY by _lock() while acquiring, and ONLY inside a bounded_lock_wait() scope, when the account flock was not obtained within the bound.
+    The critical section has not started, so nothing was written."""
+
+
+_WAIT = threading.local()
+
+
+@contextlib.contextmanager
+def bounded_lock_wait(wait_s):
+    """Scope (per thread) in which _lock() acquires with a NON-BLOCKING monotonic retry up to wait_s seconds and raises AccountBusy on timeout, instead of
+    blocking forever. Default (outside any scope) is the original unbounded blocking acquire, so exits, credits, reconcile and every other caller are
+    unchanged. The bound covers the ACQUIRE only: I/O inside the critical section is not bounded. Used by the entry debit commit (see grad.consider_candidate)."""
+    prev = getattr(_WAIT, "s", None)
+    _WAIT.s = float(wait_s)
+    try:
+        yield
+    finally:
+        _WAIT.s = prev
+
+
 @contextlib.contextmanager
 def _lock():
     """Exclusive inter-process lock for the account ledger. Same
     pattern as the live10 mirror / killswitch locks: two processes
     can exist after a watchdog restart, and the fd is released
-    automatically if the holder dies."""
+    automatically if the holder dies. Outside bounded_lock_wait()
+    the acquire blocks (unchanged); inside it, it retries
+    non-blocking and raises AccountBusy at the bound."""
     os.makedirs(ACCOUNT_DIR, exist_ok=True)
     fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _w = getattr(_WAIT, "s", None)
+        if _w is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            _end = time.monotonic() + _w
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= _end:
+                        raise AccountBusy("account lock busy after %.2fs" % _w)
+                    time.sleep(0.01)
         yield
     finally:
         try:

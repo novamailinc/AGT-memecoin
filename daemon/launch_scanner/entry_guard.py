@@ -66,6 +66,7 @@ def mandatory_entry_refusal(lane):
     return None
 
 
+ENTRY_ACCOUNT_WAIT_S = 0.5   # bound on the ACCOUNT flock ACQUIRE inside the entry commit barrier (paper_account.bounded_lock_wait); I/O inside the account critical section is not bounded
 ENTRY_FAULT_WAIT_S = 0.5   # entry commits hold the LANE LEDGER LOCK while waiting: keep the wait short; a timeout REFUSES the entry (fail closed) instead of delaying exits behind it
 
 

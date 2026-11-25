@@ -1434,8 +1434,20 @@ def _consider_candidate(cand, now):
                         logger.warning("%s: release_intent failed (%r) after commit-time refusal", LANE, _re)
                 return _skip(mint, _why2, False)
             if _pa is not None:
-                _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
-                                                _op, durable_refusal=_demo_mode())
+                # The account flock is shared by the whole roster and its plain acquire blocks without a bound; while we hold the lane ledger lock AND the fault lock, bound the ACQUIRE
+                # (AccountBusy is raised before the account critical section starts: nothing was written, so this is a clean transient refusal; the demo intent is released below).
+                # A fake account without the scope helper falls back to the plain call. The bound does not cover I/O inside the account critical section.
+                try:
+                    _bw = getattr(_pa, "bounded_lock_wait", None)
+                    if _bw is not None:
+                        with _bw(_eg.ENTRY_ACCOUNT_WAIT_S):
+                            _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
+                                                            _op, durable_refusal=_demo_mode())
+                    else:
+                        _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
+                                                        _op, durable_refusal=_demo_mode())
+                except getattr(_pa, "AccountBusy", ()) as _ab:
+                    _ok, _why, _pid = False, "account busy (%s): entry refused, nothing written" % (_ab,), None
                 if not _ok:
                     if _demo_mode():
                         try:

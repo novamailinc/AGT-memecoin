@@ -14,7 +14,7 @@ only the demo selection is called. Importing daemon.telegram.commands reads no t
 `import grad_entry_intent` (when the package import fails) could shadow the module by sys.path order; this file imports the package module and asserts the handler resolved to the SAME module object. Caveat only, no change.
 Cases (each asserts specific values): H1 clear adds no entry-intent line, keeps the existing account lines, creates nothing; H2 pending leftover with the flag off: unresolved wording, 12-char display hint present and the
 full 13-char mint absent, recorded state shown flag-off, read-only (directory bytes identical), account lines intact; H3 flag on label; H4 malformed record text redacted; H5 read failure is UNKNOWN, only the exception type shown;
-H6 unreadable directory (uid-independent stub, not chmod) is UNKNOWN; H7 two mints sharing the 12-char prefix: two records, identical display hint twice, count by record, directory untouched; H8 handler module identity."""
+H6 unreadable directory (uid-independent stub, not chmod) is UNKNOWN; H7 two mints sharing the 12-char prefix: two records, identical display hint twice, count by record, directory untouched; H8 handler module identity; H9 missing parent directory is UNKNOWN with no writes (H1 clear case creates the home first)."""
 import hashlib, json, os, shutil, socket, sys, tempfile, time
 from types import SimpleNamespace
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -75,6 +75,7 @@ def _il(body): return [l for l in body.split("\n") if "entry-intent" in l]
 
 def h1():
     with Case() as c:
+        os.makedirs(c.home)   # CLEAR state needs an existing readable home (status_readonly: a missing parent of the records dir is UNKNOWN, see H9). v5/1f91800d omitted this.
         body, msgs = c.run(); d = gei.records_dir(gei.default_ledger_path())
         # DIAGNOSTIC split (successor to the single H1 check, which failed as one aggregate at 1f91800d): each condition is its own check, and the captured body is printed (account text only, no secrets).
         print("INFO H1 captured body: %r" % body[:1200])
@@ -89,6 +90,13 @@ def h1():
         check("H1d3 handler Cash and Spendable cash lines equal the independent snapshot (%s, %s)" % (fm(ind.get("cash")), fm(ind.get("cash_spendable"))), ("Cash: %s" % fm(ind.get("cash"))) in body and ("Spendable cash: %s" % fm(ind.get("cash_spendable"))) in body)
         print("INFO H1 retained-basis line: %r" % [l for l in body.split("\n") if "Retained cost basis" in l])
         check("H1e the view created no entry-intent directory (%s)" % d, not os.path.exists(d))
+def h9():
+    with Case() as c:
+        check("H9 precondition: home directory does not exist", not os.path.exists(c.home))
+        body, msgs = c.run(); ls = _il(body); line = ls[0] if ls else ""; d = gei.records_dir(gei.default_ledger_path())
+        check("H9 missing parent of the entry-intent directory: UNKNOWN (ledger directory unreadable), 'not reported as clear', exactly one entry-intent line, NOT silently clear",
+              len(ls) == 1 and "UNKNOWN" in line and "not reported as clear" in line and "ledger directory unreadable" in line)
+        check("H9 the view wrote nothing: neither the home directory nor the entry-intent directory exists afterwards", not os.path.exists(c.home) and not os.path.exists(d))
 def h2():
     with Case() as c:
         os.makedirs(c.home); gei.write_record(gei.default_ledger_path(), _rec()); d = gei.records_dir(gei.default_ledger_path()); before = _dsnap(d)
@@ -145,7 +153,7 @@ def h8():
     check("H8 the package module imported here is the one in sys.modules under the package name (the handler's primary import path); bare 'grad_entry_intent' is not loaded", m is gei and "grad_entry_intent" not in sys.modules)
 
 def main():
-    for f in (h1, h2, h3, h4, h5, h6, h7, h8):
+    for f in (h1, h2, h3, h4, h5, h6, h7, h8, h9):
         try: f()
         except Exception as e:
             import traceback

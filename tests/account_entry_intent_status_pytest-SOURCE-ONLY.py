@@ -29,10 +29,17 @@ def _dsnap(d):
 
 class TestAccountEntryIntentStatus:
     def test_clear_adds_no_entry_intent_line_and_keeps_account_lines(self, account, monkeypatch, tmp_path):
+        os.makedirs(str(tmp_path / 'home'))   # clear needs an existing readable home; a missing parent is UNKNOWN (next test)
         body = _run(monkeypatch, tmp_path)
         assert 'entry-intent' not in body.lower()
         assert 'Spendable cash: $8.00' in body and 'Retained cost basis (open + pending): $2.00' in body
         assert not os.path.exists(gei.records_dir(gei.default_ledger_path()))   # the view created nothing
+
+    def test_missing_home_parent_is_unknown_not_clear_and_writes_nothing(self, account, monkeypatch, tmp_path):
+        body = _run(monkeypatch, tmp_path)
+        line = [l for l in body.split("\n") if 'entry-intent' in l]
+        assert len(line) == 1 and 'UNKNOWN' in line[0] and 'not reported as clear' in line[0] and 'ledger directory unreadable' in line[0]
+        assert not os.path.exists(str(tmp_path / 'home')) and not os.path.exists(gei.records_dir(gei.default_ledger_path()))
 
     def test_pending_leftover_uses_unresolved_wording_not_unrecovered_fact(self, account, monkeypatch, tmp_path):
         monkeypatch.setenv('FOREX_AGENT_HOME', str(tmp_path / 'home')); os.makedirs(str(tmp_path / 'home'))

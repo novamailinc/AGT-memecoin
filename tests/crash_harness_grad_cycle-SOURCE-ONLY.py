@@ -65,9 +65,25 @@ print(json.dumps({"active": active, "why": why, "torn_has_fragment": "FRAG" in t
                   "open_ids": opened if opened is None else [str(i)[:14] for i in opened], "later_write_ok": bool(w), "log_append_safe": ok2,
                   "led_sha": hashlib.sha256(open(grad.LEDGER_PATH, "rb").read()).hexdigest() if os.path.exists(grad.LEDGER_PATH) else None}))
 '''
-def py(code, *args):
+import time, signal
+BUDGET_S = 60.0           # WHOLE-harness budget (the cycle harness runs alone, well under the 120 s wrapper); each child gets min(30, remaining); early stop
+_T0 = time.time(); _STOP = {"why": None}
+def py(code, *args, timeout=30):
+    """Bounded child: own process group, whole group killed and reaped on timeout or any exception. Children start no descendants."""
+    rem = BUDGET_S - (time.time() - _T0)
+    if rem <= 1.0:
+        _STOP["why"] = "budget_exhausted"; raise TimeoutError("harness budget exhausted")
     env = dict(os.environ, AGT_REPO_ROOT=REPO)
-    return subprocess.run([sys.executable, "-c", code] + list(args), capture_output=True, text=True, timeout=60, env=env)
+    p = subprocess.Popen([sys.executable, "-c", code] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, process_group=0)
+    try:
+        out, err = p.communicate(timeout=min(timeout, rem))
+    except BaseException:
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except Exception: pass
+        try: p.wait(timeout=5)
+        except Exception: pass
+        _STOP["why"] = "child_timeout_or_error"; raise
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 def seed(home, frag):
     led = os.path.join(home, "led.json"); open(led, "w").write('{"positions": {}}')
@@ -85,19 +101,40 @@ def scenario(name, frag, point, expect_kill):
     v = py(VERIFY, home, sha0)
     try: j = json.loads(v.stdout.strip().splitlines()[-1])
     except Exception: j = {}; print(v.stdout, v.stderr)
-    check("%s O1 fault active, never clean (%s)" % (name, j.get("why")), j.get("active") is True)
-    check("%s O2 fragment preserved in torn-tails or still in the log" % name, j.get("torn_has_fragment") or j.get("frag_in_log"))
-    check("%s O3 complete lines parse and known_1 still open (%s)" % (name, j.get("open_ids")), j.get("complete_lines_parse") and isinstance(j.get("open_ids"), list) and any(i.startswith("known_1") for i in j["open_ids"]))
-    check("%s O4 later fault write ok and log append-safe" % name, j.get("later_write_ok") and j.get("log_append_safe"))
-    check("%s O5 ledger untouched" % name, j.get("led_sha") == sha0)
+    for n, ok in evaluate(j, name, sha0): check(n, ok)
+
+def evaluate(j, name, sha0):
+    """PURE oracle over a captured verify result. Returns [(name, ok)]; also driven by --selfcheck on mutated captures."""
+    return [
+        ("%s O1 fault active, never clean (%s)" % (name, j.get("why")), j.get("active") is True),
+        ("%s O2 fragment preserved in torn-tails or still in the log" % name, bool(j.get("torn_has_fragment") or j.get("frag_in_log"))),
+        ("%s O3 complete lines parse and known_1 still open (%s)" % (name, j.get("open_ids")),
+         bool(j.get("complete_lines_parse")) and isinstance(j.get("open_ids"), list) and any(i.startswith("known_1") for i in j["open_ids"])),
+        ("%s O4 later fault write ok and log append-safe" % name, bool(j.get("later_write_ok") and j.get("log_append_safe"))),
+        ("%s O5 ledger untouched" % name, j.get("led_sha") == sha0),
+    ]
+
+def selfcheck():
+    """NO child process: evaluator only. A good capture passes; each single-fact mutation must make an assertion FAIL."""
+    good = {"active": True, "why": "logged_fault_without_clear_record", "torn_has_fragment": True, "frag_in_log": False, "complete_lines_parse": True,
+            "open_ids": ["known_1", "torn_tail_abc"], "later_write_ok": True, "log_append_safe": True, "led_sha": "h"}
+    check("CTL0 good capture passes", all(ok for _, ok in evaluate(good, "ctl", "h")))
+    for label, ch in (("fault reads clean", {"active": False}), ("fragment lost everywhere", {"torn_has_fragment": False, "frag_in_log": False}),
+                      ("open_ids unreadable (None)", {"open_ids": None}), ("known_1 no longer open", {"open_ids": ["torn_tail_abc"]}),
+                      ("a complete line does not parse", {"complete_lines_parse": False}), ("later fault write failed", {"later_write_ok": False}),
+                      ("log not append-safe afterwards", {"log_append_safe": False}), ("ledger bytes changed", {"led_sha": "other"})):
+        r = evaluate(dict(good, **ch), "ctl", "h"); check("CTL %s: evaluator REJECTS (%d failing)" % (label, sum(1 for _, ok in r if not ok)), any(not ok for _, ok in r))
+    print("FAILS: %d" % len(FAILS)); return 1 if FAILS else 0
 
 def main():
     short = b'{"fault_id": "FRAG'                                  # shorter than the marker
     long_ = b'{"fault_id": "FRAG' + b"x" * 600                      # longer than the marker
-    scenario("S1 short fragment, kill after marker/before truncate", short, "after_marker_before_truncate", True)
-    scenario("S2 long fragment, kill after marker/before truncate", long_, "after_marker_before_truncate", True)
-    scenario("S3 kill after preserve, before marker", short, "after_preserve_before_marker", True)
-    scenario("S0 control: no kill, repair completes", short, "none", False)
-    print("FAILS: %d" % len(FAILS)); return 1 if FAILS else 0
+    for args in (("S1 short fragment, kill after marker/before truncate", short, "after_marker_before_truncate", True),
+                 ("S2 long fragment, kill after marker/before truncate", long_, "after_marker_before_truncate", True),
+                 ("S3 kill after preserve, before marker", short, "after_preserve_before_marker", True),
+                 ("S0 control: no kill, repair completes", short, "none", False)):
+        if FAILS or _STOP["why"]: print("EARLY STOP before %s (fails=%d, stop=%s)" % (args[0], len(FAILS), _STOP["why"])); break
+        scenario(*args)
+    print("elapsed %.1fs of %.0fs budget; FAILS: %d; stop=%s" % (time.time() - _T0, BUDGET_S, len(FAILS), _STOP["why"])); return 1 if (FAILS or _STOP["why"]) else 0
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(selfcheck() if "--selfcheck" in sys.argv else main())

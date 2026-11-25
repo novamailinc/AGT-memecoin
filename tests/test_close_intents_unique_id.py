@@ -172,8 +172,8 @@ try:
     _fr1 = ci.recover_lane("lanerf", lambda op: (False, "refused (injected)"), lambda it: False, lambda it: True)
 finally:
     ci.freeze = _real_freeze
-check("recover_lane when the freeze itself FAILS: the intent is NOT reported frozen (%r) and stays pending/open for retry (%s)" % (_fr1, ci.intent_status("lanerf", _rp)),
-      _fr1 == [] and ci.intent_status("lanerf", _rp) == "open")
+check("recover_lane when the freeze itself FAILS: the intent is still returned as a BLOCKER (%r) though its status stays open (not frozen) for retry (%s)" % (_fr1, ci.intent_status("lanerf", _rp)),
+      _fr1 == [_rp] and ci.intent_status("lanerf", _rp) == "open")   # TEST EDIT (disclosed, BB40): was `_fr1 == []`. Fail-closed contract: an intent whose freeze append FAILED is still returned as a BLOCKER (not reported frozen, status stays open), never dropped
 _fr2 = ci.recover_lane("lanerf", lambda op: (False, "refused (injected)"), lambda it: False, lambda it: True)
 check("the retry with a working journal freezes it and reports it (%r, status %s)" % (_fr2, ci.intent_status("lanerf", _rp)), _fr2 == [_rp] and ci.intent_status("lanerf", _rp) == "frozen")
 

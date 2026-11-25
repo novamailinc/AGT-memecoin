@@ -222,6 +222,10 @@ def setup(cap="2.0"):
     return ()
 
 import time as _tm
+# SOURCE-VERIFIED cash contract: paper_account._apply_add stores cash = round(cash - stake, 6) (paper_account.py:890), so a before/after cash
+# delta equals the full-precision debit only to the 6 dp rounding (<= 5e-7 per rounded value). CASH_TOL applies ONLY to cash-vs-debit deltas;
+# every qty, lane and journal oracle keeps its original tolerance.
+CASH_TOL = 1e-6
 from daemon.launch_scanner import tranche as T
 import daemon.launch_scanner.paper_account as _PAm
 
@@ -284,7 +288,7 @@ check("S1 a real quote was requested for the buyback (calls %d -> %d)" % (nq, le
 ad = PAm().applied_add(bop(mint, pid))
 check("S1 account add applied with the FILL's own debit and qty (stake %.6f vs %.6f)" % ((ad or {}).get("stake", -1), f.get("total_debit_usd", -2)),
       ad is not None and abs(ad["stake"] - f["total_debit_usd"]) < 1e-9 and abs(ad["qty"] - f["qty_tokens"]) < 1e-9)
-check("S1 cash fell by exactly the fill debit (%.9f)" % (c_pre - PA_cash()), abs((c_pre - PA_cash()) - f["total_debit_usd"]) < 1e-9)
+check("S1 cash fell by exactly the fill debit (%.9f)" % (c_pre - PA_cash()), abs((c_pre - PA_cash()) - f["total_debit_usd"]) < CASH_TOL)
 check("S1 account lot qty rose by the fill qty", abs(acct_lot_qty(pid) - (q0 + f["qty_tokens"])) < 1e-9)
 _lgs = lp["legs"]; _bbq = sum(float(v.get("buyback_qty") or 0.0) for v in _lgs.values())
 check("S1 lane buyback_qty over open legs == fill qty == buyback_qty_total (%.6f)" % _bbq,
@@ -318,6 +322,8 @@ check("S1 conservation: account cash delta == sum(sim sell nets) - entry stake -
 check("S1 conservation: lane pnl_usd == the account's cash delta (%.6f vs %.6f)" % (rec.get("pnl_usd", 0), c_end - 100.0),
       abs(rec.get("pnl_usd", 1e9) - (c_end - 100.0)) < 1e-4)
 dump("S1-end", mint, pid, "c_pre=%r c_end=%r nets=%r sell_qty=%r" % (c_pre, c_end, _nets, _sold_qty))
+from daemon.launch_scanner import close_intents as _CI
+check("S1 no close intent left open (the account settle applied)", _CI.pending("grad") == [])
 JUP.mult = 1.0
 
 # ---- S2: cap breach on the QUOTE refuses; nothing applied; intent explains the (absent) fill ----
@@ -352,13 +358,21 @@ check("S4 FAULT account refuses after the fill: no buyback, cash untouched, ONE 
       out == [] and abs(PA_cash() - c0) < 1e-12 and len(fl1) == 1 and fop1 in fl1 and PAm().applied_add(bop(mint, pid)) is None)
 check("S4 intent explains the orphan: state refused:account with the reason", (lp.get("buyback_intent") or {}).get("state") == "refused:account"
       and "declined" in (lp["buyback_intent"].get("why") or "") and lp.get("buyback_used") is not True)
+# NEGATIVE CONTROL for the same-condition suppression: nothing relevant changed (lane proceeds, account cash) and no explicit retry
+# was requested, so the next cycle must NOT quote and must NOT journal another orphan fill.
+nq = len(JUP.calls)
+out = run_bb(mint, entry * 1.3); lp = lane_pos(mint)
+check("S4 suppression: unchanged state after a post-fill refusal => no quote, no new fill, no cash move",
+      out == [] and len(JUP.calls) == nq and len(fills_for(pid, mint)) == 1 and abs(PA_cash() - c0) < 1e-12
+      and (lp.get("buyback_intent") or {}).get("fill_op") == fop1)
+dd = G._read(); dd["positions"][mint]["buyback_retry_requested"] = True; G._write(dd)   # explicit retry request on the lane record
 out = run_bb(mint, entry * 1.3); lp = lane_pos(mint); fl2 = fills_for(pid, mint)
 fop2 = (lp.get("buyback_intent") or {}).get("fill_op")
-check("S4 retry takes a NEW fill op (%s != %s), two journaled fills, history keeps the first intent" % (fop1[-8:], str(fop2)[-8:]),
+check("S4 explicit retry takes a NEW fill op (%s != %s), two journaled fills, history keeps the first intent" % (fop1[-8:], str(fop2)[-8:]),
       len(out) == 1 and fop2 != fop1 and len(fl2) == 2 and (lp.get("buyback_attempts") or [{}])[-1].get("fill_op") == fop1)
 _f2 = fl2[fop2]
 print("DIAG S4 conjunct_cash c0-cash=%r debit=%r delta=%r conj_qty=%r" % (c0 - PA_cash(), _f2["total_debit_usd"], abs((c0 - PA_cash()) - _f2["total_debit_usd"]), abs(PAm().applied_add(bop(mint, pid))["qty"] - _f2["qty_tokens"])))
-check("S4 exactly ONE account debit (the retry's fill), equal to its own debit", abs((c0 - PA_cash()) - _f2["total_debit_usd"]) < 1e-9
+check("S4 exactly ONE account debit (the retry's fill), equal to its own debit", abs((c0 - PA_cash()) - _f2["total_debit_usd"]) < CASH_TOL
       and abs(PAm().applied_add(bop(mint, pid))["qty"] - _f2["qty_tokens"]) < 1e-9)
 
 # ---- S5: crash AFTER the account add, BEFORE the lane write; recovery adopts the account's numbers AND recovers the fill evidence ----
@@ -428,7 +442,7 @@ JUP.bmult = 1.0
 print("DIAG S8 conj: len(out)=%r fop_new=%r len(fl2)=%r qty_match=%r qty_diff=%r debit_delta=%r" % (len(out), fop2 != fop1, len(fl2), abs(PAm().applied_add(bop(mint, pid))["qty"] - fl2[fop2]["qty_tokens"]), abs(fl2[fop2]["qty_tokens"] - fl1[fop1]["qty_tokens"]), abs((c0 - PA_cash()) - fl2[fop2]["total_debit_usd"])))
 check("S8 retry after crash: NEW fop, the account add uses the NEW fill's qty (changed requote), the orphan fill is NOT booked",
       len(out) == 1 and fop2 != fop1 and len(fl2) == 2 and abs(PAm().applied_add(bop(mint, pid))["qty"] - fl2[fop2]["qty_tokens"]) < 1e-9
-      and abs(fl2[fop2]["qty_tokens"] - fl1[fop1]["qty_tokens"]) > 1e-6 and abs((c0 - PA_cash()) - fl2[fop2]["total_debit_usd"]) < 1e-9)
+      and abs(fl2[fop2]["qty_tokens"] - fl1[fop1]["qty_tokens"]) > 1e-6 and abs((c0 - PA_cash()) - fl2[fop2]["total_debit_usd"]) < CASH_TOL)
 
 # ---- S9: FAULT post-quote gate refusal AFTER a real fill (second call of the guard refuses): no account effect, intent says why ----
 mint = "BB9pump"
@@ -444,6 +458,85 @@ lp = lane_pos(mint); fl = fills_for(pid, mint)
 check("S9 FAULT post-quote refusal: no buyback, cash untouched, orphan fill journaled, intent state refused:post_quote_gate (guard called %d times)" % _n[0],
       out == [] and abs(PA_cash() - c0) < 1e-12 and len(fl) == 1 and PAm().applied_add(bop(mint, pid)) is None
       and (lp.get("buyback_intent") or {}).get("state") == "refused:post_quote_gate" and lp.get("buyback_used") is not True)
+
+# ---- S10: CLOSE GUARD. The account REFUSES the final close credit: the executed sale stays recorded, NO clean close is booked,
+# nothing is resold on retry, ONE close intent stays open (stable op), and the pending state clears only after a confirmed settle ----
+mint = "BB10pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3)
+lp = lane_pos(mint); bq = lp.get("buyback_qty_total")
+JUP.mult = 0.05
+_real_credit = _PAm.credit
+_ncred = [0]
+def _credit_refuse(*a, **k):
+    if str(a[3] if len(a) > 3 else k.get("op_id")).startswith("grad:close:"):
+        _ncred[0] += 1
+        return (False, "declined (test)")
+    return _real_credit(*a, **k)
+def _sells(m):
+    return FILLER[0]._locked(lambda j: [v for kk, v in j["fills"].items() if v.get("side") == "sell" and v.get("status") == "filled" and (":%s:" % m) in kk])
+with patch.object(_PAm, "credit", _credit_refuse):
+    for _ in range(4):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    s_a = len(_sells(mint)); br_a = G._read()["bankroll"]; cash_a = PA_cash()
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    s_b = len(_sells(mint)); br_b = G._read()["bankroll"]
+lp = lane_pos(mint); sp = lp.get("settlement_pending") or {}
+check("S10 refused settle: position NOT booked closed (still open, settlement_pending why account_settle_refused)", bool(lp) and sp.get("why") == "account_settle_refused" and mint in G.open_positions())
+check("S10 refused settle: no close record for it", not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint])
+check("S10 no resale on retry (sell fills %d -> %d, legs all done)" % (s_a, s_b), s_a == s_b and s_a >= 2 and all(v.get("done") for v in lp["legs"].values()))
+check("S10 lane bankroll not advanced by the unsettled close (%r vs %r) and account cash unchanged (%r)" % (br_a, br_b, cash_a), br_a == br_b and abs(PA_cash() - cash_a) < 1e-12)
+check("S10 exactly ONE open close intent despite repeated refused retries (tries %r)" % sp.get("tries"), len(_CI.pending("grad")) == 1 and int(sp.get("tries") or 0) >= 2)
+check("S10 stable credit op: the refused op id is the same each retry (refusals %d)" % _ncred[0], _ncred[0] >= 2)
+dump("S10-pending", mint, pid)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+rec = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+check("S10 after the account accepts: closed once, pending cleared, no resale", len(rec) == 1 and mint not in G.open_positions() and len(_sells(mint)) == s_a)
+check("S10 account flat after the confirmed settle", acct_lot_qty(pid) < 1e-6)
+check("S10 conservation: lane pnl == account cash delta (%r vs %r)" % (rec[0].get("pnl_usd") if rec else None, PA_cash() - 100.0), bool(rec) and abs(rec[0]["pnl_usd"] - (PA_cash() - 100.0)) < 1e-4)
+check("S10 close intent no longer pending", _CI.pending("grad") == [])
+JUP.mult = 1.0
+
+# ---- S11: FAULT crash AFTER the account add, lane never booked it, and the position then reaches its final close BEFORE adoption ran:
+# the close must HOLD visibly (account holds units the lane did not sell), never book a clean close or a wrong credit ----
+mint = "BB11pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+_rw = G._write
+def _w_boom11(dd, *a, **k):
+    pp = (dd.get("positions") or {}).get(mint) or {}
+    if pp.get("buyback_used") is True:
+        raise OSError("injected lane write failure AFTER the account add")
+    return _rw(dd, *a, **k)
+with patch.object(G, "_write", _w_boom11):
+    run_bb(mint, entry * 1.3)
+ad = PAm().applied_add(bop(mint, pid)); c_pre = PA_cash(); JUP.mult = 0.05
+for _ in range(6):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+lp = lane_pos(mint); sp = lp.get("settlement_pending") or {}
+s11 = [v for kk, v in FILLER[0]._locked(lambda j: dict(j["fills"])).items() if v.get("side") == "sell" and (":%s:" % mint) in kk and v.get("status") == "filled"]
+check("S11 add applied, lane unbooked, then close attempted: position HELD with settlement_pending why buyback_add_applied_but_lane_unbooked (got %r)" % sp.get("why"),
+      ad is not None and lp.get("buyback_used") is not True and sp.get("why") == "buyback_add_applied_but_lane_unbooked" and mint in G.open_positions())
+check("S11 no close record, no close credit applied (cash %r -> %r), account still holds the units" % (c_pre, PA_cash()),
+      not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint] and abs(PA_cash() - c_pre) < 1e-12 and acct_lot_qty(pid) > 0)
+check("S11 no resale across the retried polls (%d sells)" % len(s11), len(s11) <= 2)
+JUP.mult = 1.0
+
+# ---- S12: an OLD persisted close intent with a negative credit amount (the pre-fix shape): recovery must FREEZE it visibly, never rewrite
+# it, never apply it, never mark it applied ----
+setup()
+_ci_rec = _CI.begin("grad", "OLDNEGpump", "grad/OLDNEGpump#1",
+                    [{"kind": "credit", "op_id": "grad:close:OLDNEGpump:grad/OLDNEGpump#1", "mint": "OLDNEGpump", "amount": -0.286441, "qty": None,
+                      "price_kind": "current_price_simulated_fill", "pos_id": "grad/OLDNEGpump#1"}],
+                    {"realized_usd": 0.710559, "entry_notional_usd": 1.0, "closed_reason": "hard_stop_-50pct", "close_ts": _tm.time()})
+_cash12 = PA_cash(); G._RECOVERY_DONE = False
+G._recover_close_intents()
+_ents, _st, _ = _CI._read(_CI.journal_path("grad"))
+_evs = [e for e in _ents if e.get("intent_id") == _ci_rec]
+_amt = [o.get("amount") for e in _evs if e.get("ev") == "intent" for o in e.get("settle_ops", [])]
+check("S12 old negative intent: FROZEN visibly (not applied), amount untouched %r, no cash move" % _amt,
+      any(e.get("ev") == "frozen" for e in _evs) and not any(e.get("ev") in ("applied", "account_applied") for e in _evs) and _amt == [-0.286441] and abs(PA_cash() - _cash12) < 1e-12)
 
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

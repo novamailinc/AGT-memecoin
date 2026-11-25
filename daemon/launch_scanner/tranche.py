@@ -825,17 +825,31 @@ def _buyback_impact_refusal(pa):
 _BB_POSTFILL_REFUSALS = ("refused:post_quote_gate", "refused:fill_economics_invalid", "refused:proceeds_below_actual_debit", "refused:account")
 
 
-def _bb_fingerprint(live, pa):
-    """Deterministic state fingerprint for same-condition refusal suppression: the banked proceeds on the lane and the account's cash.
-    NOT a strategy limit and NOT an attempt cap: a post-fill refusal is retried only after one of these changed (or an explicit
-    live['buyback_retry_requested'] is set). None when the account cash cannot be read (then no suppression claim is made)."""
+def _bb_fingerprint(live, pa, state):
+    """REASON-SPECIFIC state fingerprint for same-condition refusal suppression (no strategy limit, no attempt cap): only the state that
+    can change THIS refusal reason counts, so an unrelated cash move never unblocks a non-cash failure.
+      refused:account                      -> banked proceeds + account cash_spendable (not cash_estimated)
+      refused:proceeds_below_actual_debit  -> banked proceeds
+      refused:post_quote_gate              -> the owner max_data_age_s limit value
+      refused:fill_economics_invalid       -> constant (a deterministic bad fill: only an explicit retry re-attempts)
+    None when the needed account/limit reading is unavailable (then no suppression claim is made)."""
     try:
-        snap = pa.snapshot()
-        if snap is None or snap.get("degraded"):
-            return None
-        return [round(float(live.get("realized_usd") or 0.0), 6), round(float(snap.get("cash")), 6)]
+        rz = round(float(live.get("realized_usd") or 0.0), 6)
+        if state == "refused:account":
+            snap = pa.snapshot()
+            if snap is None or snap.get("degraded"):
+                return None
+            return [rz, round(float(snap.get("cash_spendable")), 6)]
+        if state == "refused:proceeds_below_actual_debit":
+            return [rz]
+        if state == "refused:post_quote_gate":
+            v = pa.max_data_age_s()
+            return None if v is None else [float(v)]
+        if state == "refused:fill_economics_invalid":
+            return []
     except Exception:
         return None
+    return None
 
 
 def _bb_mark(engine, d, live, state, why=None, fop=None, fp=None):
@@ -1055,7 +1069,7 @@ def maybe_buyback(engine, now=None):
                     # refusal and journal another orphan fill. Re-attempt only when the banked proceeds or account cash changed, or an
                     # explicit retry is requested on the lane record. Unknown fingerprint (account unreadable) makes no suppression claim.
                     _it0 = live.get("buyback_intent") or {}
-                    _fp0 = _bb_fingerprint(live, _pa)
+                    _fp0 = _bb_fingerprint(live, _pa, _it0.get("state"))
                     if (_it0.get("state") in _BB_POSTFILL_REFUSALS and _fp0 is not None and _it0.get("fp") == _fp0
                             and not live.get("buyback_retry_requested")):
                         logger.warning("tranche buyback suppressed: same-condition refusal (%s) and banked proceeds/account cash unchanged; "
@@ -1064,8 +1078,13 @@ def maybe_buyback(engine, now=None):
                     live.pop("buyback_retry_requested", None)
                     # CHEAP PRE-GATE before any quote: the account must hold spendable cash for the planned cost (the account add refuses
                     # otherwise, after a fill). The exact actual-debit and fee check still runs after the fill.
-                    if _fp0 is not None and _fp0[1] < cost:
-                        logger.warning("tranche buyback skipped before quote: account cash %.6f < planned cost %.6f", _fp0[1], cost)
+                    try:
+                        _snap0 = _pa.snapshot()
+                        _spend = None if (_snap0 is None or _snap0.get("degraded")) else float(_snap0.get("cash_spendable"))
+                    except Exception:
+                        _spend = None
+                    if _spend is not None and _spend < cost:
+                        logger.warning("tranche buyback skipped before quote: account cash_spendable %.6f < planned cost %.6f", _spend, cost)
                         continue
                     _age_why = _eg.quote_age_refusal(_buy_row, _pa.max_data_age_s(), time.time())
                     if _age_why:
@@ -1127,7 +1146,7 @@ def maybe_buyback(engine, now=None):
                         _pq2 = _eg.post_quote_refusal(_bb_fill, None, False, _pa.max_data_age_s(), time.time())
                         if _pq2:
                             logger.warning("tranche buyback refused: %s", _pq2)
-                            _bb_mark(engine, d, live, "refused:post_quote_gate", _pq2, fp=_bb_fingerprint(live, _pa))
+                            _bb_mark(engine, d, live, "refused:post_quote_gate", _pq2, fp=_bb_fingerprint(live, _pa, "refused:post_quote_gate"))
                             continue
                         try:
                             _bst = float(_bb_fill["total_debit_usd"]); _bqty = float(_bb_fill["qty_tokens"]); _bpx = float(_bb_fill["price_usd"])
@@ -1135,11 +1154,11 @@ def maybe_buyback(engine, now=None):
                             _bst = _bqty = _bpx = 0.0
                         if not all(0 < v < float("inf") for v in (_bst, _bqty, _bpx)):
                             logger.warning("tranche buyback refused: fill economics invalid; nothing applied")
-                            _bb_mark(engine, d, live, "refused:fill_economics_invalid", fp=_bb_fingerprint(live, _pa))
+                            _bb_mark(engine, d, live, "refused:fill_economics_invalid", fp=_bb_fingerprint(live, _pa, "refused:fill_economics_invalid"))
                             continue
                         if float(live.get("realized_usd") or 0) < _bst:
                             logger.warning("tranche buyback refused: banked proceeds below the actual fill debit; nothing applied")
-                            _bb_mark(engine, d, live, "refused:proceeds_below_actual_debit", fp=_bb_fingerprint(live, _pa))
+                            _bb_mark(engine, d, live, "refused:proceeds_below_actual_debit", fp=_bb_fingerprint(live, _pa, "refused:proceeds_below_actual_debit"))
                             continue
                         cost, tokens, filled = _bst, _bqty, _bpx
                         _bb_mark(engine, d, live, "filled")   # BEFORE the account add: a crash now is 'filled, add outcome unknown'
@@ -1147,7 +1166,7 @@ def maybe_buyback(engine, now=None):
                     if not _ok:
                         logger.warning("tranche buyback refused by account: %s", _why2)
                         if _bb_fill is not None:
-                            _bb_mark(engine, d, live, "refused:account", _why2, fp=_bb_fingerprint(live, _pa))
+                            _bb_mark(engine, d, live, "refused:account", _why2, fp=_bb_fingerprint(live, _pa, "refused:account"))
                         continue
                 _open = [k for k in ("a", "b", "c") if not (live.get("legs", {}).get(k) or {}).get("done")]
                 _ofrac = sum(float(live["legs"][k]["frac"]) for k in _open)

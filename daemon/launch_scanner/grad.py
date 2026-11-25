@@ -2766,16 +2766,35 @@ def _all_exits_executed(pos):
         return False
 
 
-def _buyback_added_cost(pos):
-    """USD the shared account ALREADY debited for an applied tranche buyback (entry_features.buyback.cost, the account's applied stake
-    when the lane booked it), or 0.0 when none. Pure. Only a booked buyback (buyback_used) counts."""
+def _buyback_added_cost(pos, mint, pos_id, pa):
+    """(usd, why). USD the shared account ALREADY debited for an applied tranche buyback, from the account's own durable applied-add
+    record (full precision, authoritative, read whether or not the lane flag was booked; NOT the rounded lane copy).
+    (0.0, None): no account, or no buyback applied (proved on a healthy account view). (usd, None): applied add, lane booked it.
+    why != None (the close must HOLD visibly, never settle or close): the lane booked a buyback but the account add is unreadable or
+    mismatched; OR the account holds an applied buyback add the lane never booked (closing would strand those units); OR the account
+    view is unhealthy so absence cannot be proved. Unknown is never zero."""
     try:
-        if not pos.get("buyback_used"):
-            return 0.0
-        c = float(((pos.get("entry_features") or {}).get("buyback") or {}).get("cost") or 0.0)
-        return c if (c == c and 0.0 < c < float("inf")) else 0.0
+        if pa is None or not pos_id:
+            return 0.0, None
+        rec = pa.applied_add("%s:buyback:%s:%s" % (LANE, mint, pos_id))
+        booked = bool(pos.get("buyback_used"))
+        if not isinstance(rec, dict):
+            if booked:
+                return 0.0, "buyback_applied_add_unreadable"
+            snap = pa.snapshot()   # applied_add is None for 'absent' AND 'unreadable': prove absence on a healthy view only
+            if snap is None or snap.get("degraded"):
+                return 0.0, "buyback_absence_unprovable_account_unhealthy"
+            return 0.0, None
+        if (rec.get("lane"), rec.get("mint"), rec.get("pos_id")) != (LANE, mint, pos_id):
+            return 0.0, "buyback_applied_add_identity_mismatch"
+        if not booked:
+            return 0.0, "buyback_add_applied_but_lane_unbooked"
+        c = float(rec["stake"])
+        if not (c == c and 0.0 < c < float("inf")):
+            return 0.0, "buyback_applied_add_stake_invalid"
+        return c, None
     except Exception:
-        return 0.0
+        return 0.0, "buyback_applied_add_unreadable"
 
 
 def _account_residue(mint, pos_id, pos):
@@ -2984,6 +3003,7 @@ def _finalize(d, mint, pos, closed_reason):
                      "open, no cash booked, retry next poll", mint[:12], closed_reason)
         _write(d)
         return None
+    _prev_sp = dict(pos.get("settlement_pending") or {})   # kept across the retry: since/tries/intent id
     pos.pop("settlement_pending", None)
     realized = round(float(pos["realized_usd"]), 6)
     # CLOSE DENOMINATION (2026-10-27 fix): a close is denominated
@@ -3087,8 +3107,18 @@ def _finalize(d, mint, pos, closed_reason):
     # A buyback is an ACCOUNT debit (add_to_position) that already left cash when it was applied, and the lane's `realized` is net
     # of that cost. The close credit is the remaining SALE proceeds, so the cost the account already debited must be added back,
     # otherwise the buyback is subtracted twice (a negative credit that the account refuses and that strands the lot).
-    _bb_added = _buyback_added_cost(pos)
     _pa = _paper_account()
+    _bb_added, _bb_why = _buyback_added_cost(pos, mint, pos.get("pa_pos_id"), _pa)
+    if _bb_why:
+        # The executed sale stays durably recorded and NOTHING is credited or closed: the credit cannot be computed without the
+        # account's own applied buyback stake (unknown is never zero).
+        pos["settlement_pending"] = {"why": _bb_why, "closed_reason": closed_reason, "since": _prev_sp.get("since") or time.time(),
+                                     "last_try": time.time(), "tries": int(_prev_sp.get("tries") or 0) + 1}
+        pos["pending_exit"] = {"leg": "settlement", "why": _bb_why, "ts": time.time()}
+        logger.error("grad: %s SETTLEMENT PENDING (%s): economic exit done, buyback cost unreadable; position kept open, no cash booked", mint[:12], _bb_why)
+        d["bankroll"] = round(float(d["bankroll"]) - realized, 6)   # undo this call's lane booking: nothing is closed
+        _write(d)
+        return None
     if _pa is not None:
         # op_ids are stable per position instance so a retried
         # close after an uncertain response cannot double-settle.
@@ -3158,12 +3188,16 @@ def _finalize(d, mint, pos, closed_reason):
                 return None
         _ci = _close_intents() if _plan else None
         _iid = None
+        _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
         if _ci is not None:
-            _iid = _ci.begin(LANE, mint, _pos_id, _plan,
-                             {"realized_usd": realized,
-                              "entry_notional_usd": entry_notional,
-                              "closed_reason": closed_reason,
-                              "close_ts": time.time()})
+            if _prev_sp.get("intent_id") and _prev_sp.get("plan_sig") == _plan_sig:
+                _iid = _prev_sp["intent_id"]   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
+            else:
+                _iid = _ci.begin(LANE, mint, _pos_id, _plan,
+                                 {"realized_usd": realized,
+                                  "entry_notional_usd": entry_notional,
+                                  "closed_reason": closed_reason,
+                                  "close_ts": time.time()})
         _ok, _why = True, ""
         for _sop in _plan:
             if _sop["kind"] == "write_down":
@@ -3196,12 +3230,20 @@ def _finalize(d, mint, pos, closed_reason):
                 _ci.mark_account_applied(LANE, _iid)
                 _PENDING_CLOSE_INTENTS.append((_iid, _pos_id, mint))
         else:
-            # The intent stays open: recovery re-applies the
-            # account side at the next start (the lane close below
-            # is still booked, so lane_has_close confirms it).
-            logger.warning("grad: shared paper account settle "
-                           "for %s failed: %s (journaled, intent "
-                           "open for recovery)", mint, _why)
+            # CLOSE GUARD: the account REFUSED the settle. The executed sale stays durably recorded (every leg is done, the fills are
+            # in the journal) but the position is NOT booked as closed: it stays open in a visible settlement_pending state with the
+            # close intent open, nothing is sold again on retry, the credit op id is stable (a retry of an applied op is idempotent) and
+            # the pending state clears only when the account settle is confirmed on a later poll. The lane bankroll booked above is
+            # undone, because no close is recorded.
+            logger.error("grad: %s SETTLEMENT PENDING (account_settle_refused: %s): executed sale kept, position left open, close "
+                         "intent open, no close booked; retried next poll", mint[:12], _why)
+            pos["settlement_pending"] = {"why": "account_settle_refused", "refusal": str(_why)[:200], "closed_reason": closed_reason,
+                                         "since": _prev_sp.get("since") or time.time(), "last_try": time.time(),
+                                         "tries": int(_prev_sp.get("tries") or 0) + 1, "intent_id": _iid, "plan_sig": _plan_sig}
+            pos["pending_exit"] = {"leg": "settlement", "why": "account_settle_refused", "ts": time.time()}
+            d["bankroll"] = round(float(d["bankroll"]) - realized, 6)
+            _write(d)
+            return None
     # Minimum fundable stake is the COLD stake (base x 0.5): the
     # lane can still enter while the bankroll covers it, so the
     # exhausted flag must use the COLD stake, not the base.

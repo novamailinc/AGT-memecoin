@@ -404,6 +404,13 @@ def _intent_gate(pos, key):
     try:
         _suffix = key if str(key).startswith("remaining:") else "leg:%s" % key
         _fz = _ci.frozen_for_op(LANE, pos["mint"], pos.get("pa_pos_id"), "%s:%s:%s:%s" % (LANE, _suffix, pos["mint"], pos.get("pa_pos_id")))
+        # the zero-price write-down is a POSITION-WIDE operation (op id lane:writedown:mint:pos): a frozen unapplied write-down intent holds every close
+        # of that position the same way (a new close would otherwise probe the journal and then collide with the frozen write-down in begin()). Read-only.
+        _fw = _ci.frozen_for_op(LANE, pos["mint"], pos.get("pa_pos_id"), "%s:writedown:%s:%s" % (LANE, pos["mint"], pos.get("pa_pos_id")))
+        if _fz is None or _fw is None:
+            _fz = None
+        else:
+            _fz = list(_fz) + list(_fw)
     except Exception:
         _fz = None
     if _fz:

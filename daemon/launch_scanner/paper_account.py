@@ -2429,6 +2429,21 @@ def _registry_fold(recs):
     return lanes, ids
 
 
+@contextlib.contextmanager
+def _reg_lock(path):
+    """Exclusive flock on a sidecar of the registry copy: every registry append, torn-tail truncation and mirror repair of that copy takes it, so a truncate decided
+    from one read can never cut a record another process appended in between. Readers stay lock-free (a reader may see an in-flight partial last line: torn_tail)."""
+    fd = os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _nl_fix(path):
     """Torn tail (crash mid-append, last byte not a newline): truncate exactly the unterminated partial LAST line so a new record never glues onto it and the
     file stays parseable. Complete records are never touched. Returns b"" (kept for the call shape)."""
@@ -2465,20 +2480,22 @@ def _registry_append(rec):
     line = (json.dumps(rec, sort_keys=True) + "\n").encode()
     try:
         os.makedirs(os.path.dirname(pri), exist_ok=True)
-        fd = os.open(pri, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, _nl_fix(pri) + line); os.fsync(fd)
-        finally:
-            os.close(fd)
+        with _reg_lock(pri):
+            fd = os.open(pri, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, _nl_fix(pri) + line); os.fsync(fd)
+            finally:
+                os.close(fd)
     except Exception:
         logger.exception("paper_account: could not write the lane registry")
         return False
     try:
-        fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, _nl_fix(mir) + line); os.fsync(fd)
-        finally:
-            os.close(fd)
+        with _reg_lock(mir):
+            fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, _nl_fix(mir) + line); os.fsync(fd)
+            finally:
+                os.close(fd)
     except Exception:
         logger.exception("paper_account: could not write the lane registry mirror")
     return True
@@ -2518,7 +2535,7 @@ def register_intent_journal(lane, intent_journal_path):
 
 
 def _registry_blockers():
-    """Account-level, cross-lane admission evidence: every REGISTERED lane's persisted state judged against the CURRENT account (restart_admission_blockers per
+    """Account-level, cross-lane admission evidence (NOT read-only: it may repair a missing mirror under the mirror lock and may record an unseen account generation in the registry; it never touches lane or account ledgers): every REGISTERED lane's persisted state judged against the CURRENT account (restart_admission_blockers per
     lane, lifecycle included) plus intent-journal loss. [] = nothing known. A corrupt registry, or a primary registry that vanished while its mirror remains, is a
     block. Both copies absent is indistinguishable from 'no lane ever registered' (direct account use, first start): it blocks nothing here, and each lane's
     OWN restart check still runs against its own persisted ledger."""
@@ -2533,9 +2550,11 @@ def _registry_blockers():
     if _registry_read(mir)[1] == "missing":
         pr = _registry_read(pri)[0]
         try:
-            with open(mir, "a") as f:    # repair a missing mirror FROM the primary's own complete records
-                for e in pr: f.write(json.dumps(e, sort_keys=True) + "\n")
-                f.flush(); os.fsync(f.fileno())
+            with _reg_lock(mir):
+                if not os.path.exists(mir):   # re-checked under the mirror lock: never overwrite a copy a concurrent registrant just created
+                    with open(mir, "a") as f:    # repair a missing mirror FROM the primary's own complete records
+                        for e in pr: f.write(json.dumps(e, sort_keys=True) + "\n")
+                        f.flush(); os.fsync(f.fileno())
         except OSError:
             pass
     lanes, _ids = _registry_fold(recs)
@@ -2600,7 +2619,9 @@ def restart_admission_blockers(lane, lane_ledger_path, _from_registry=False):
                                             recorded entry op: the binding is not proven by the account,
       '<mint>@account-identity-unavailable' the account ledger/generation cannot be read,
       'account-state-lost ...'              the account ledger is MISSING although its WAL or the lane registry shows it existed,
-      'lane-ledger-<status>'                the lane ledger is missing/unreadable/corrupt WHILE the account holds open lots for the lane.
+      'lane-ledger-<status>'                the lane ledger is missing/unreadable/corrupt WHILE the account holds open lots for the lane,
+      '<pos_id>@orphan-lot'                 (lane restart only; skipped when called from the registry) an account open lot of this lane that no persisted lane position references,
+      'orphan-check-unavailable'            the orphan scan could not read a ledger.
     NEW INITIALIZATION vs LOST STATE: a missing account ledger counts as a fresh start only when NO prior-state witness exists: no WAL bytes, no registry record that
     saw an account generation, and (below) no lane position bound to one. Any witness makes it lost state, never fresh. LIMIT (impossible from inside): if every file
     on the filesystem is lost together (account ledger, WAL, registries, lane ledgers) no witness remains and it is indistinguishable from a first start; only an

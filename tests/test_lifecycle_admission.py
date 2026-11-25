@@ -6,7 +6,7 @@ L4 account ledger+WAL+registry deleted but a bound lane position remains = block
 L6 corrupt registry blocks; L7 lane ledger lost while the account holds lots blocks at account level; L8 position bound to the wrong entry op blocks; L9 an orphan account lot
 (no lane position) blocks the lane restart; L10 the real close_intents.begin registers its journal and its later loss blocks at account level; L11 generation mismatch blocks
 at ACCOUNT level (a lane that never called its own check); L12 FRESH PROCESS: account admission refuses on persisted evidence alone, and a fresh process on matching state
-admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses; L19 register-after-primary-loss refuses and the mirror keeps both lanes; L20 torn registry tail tolerated and repaired; L21 a torn intent-journal tail is never read as clean.
+admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses; L19 register-after-primary-loss refuses and the mirror keeps both lanes; L20 torn registry tail tolerated and repaired; L21 a torn intent-journal tail is never read as clean; L22 registry lock serialises appends (blocked while held, mutant sensitivity); L23 six concurrent registrants on a torn tail keep every record.
 NOT proven: lane runtime wiring (needs lane harnesses), whole-filesystem loss (no inside witness exists), journal rotation, grad closed-position witness, sim idempotency."""
 import ast, json, os, subprocess, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,7 +62,9 @@ _ci_home = _home
 from daemon.launch_scanner import close_intents as CI
 env = dict(os.environ); env["PYTHONPATH"] = ROOT
 def fresh(name):
-    d = os.path.join(_home, name); _use(d); return d, os.path.join(d, "lane.json")
+    d = os.path.join(_home, name); _use(d)
+    os.environ["FOREX_AGENT_HOME"] = os.path.join(d, "agenthome"); os.makedirs(os.environ["FOREX_AGENT_HOME"], exist_ok=True)   # PER-CASE intent-journal home (BB75c L17e leaked into later cases)
+    return d, os.path.join(d, "lane.json")
 def lane_ledger(path, positions):
     json.dump({"positions": positions, "closes": []}, open(path, "w"))
 def mkpos(mint, pid, bound, op):
@@ -132,7 +134,7 @@ os.unlink(CI.journal_path(LANE))
 check("L10c intent journal lost: account-level refuses (%r)" % blocked(), blocked() is not None and "intent-journal-lost" in blocked())
 # L11 generation mismatch at account level, L14 mutant
 d, LP, pid, ID, op = good("L11"); lane_ledger(LP, {"M": mkpos("M", pid, "other-generation", op)})
-check("L11 generation mismatch refuses at ACCOUNT level (%r)" % blocked(), blocked() is not None and "generation-mismatch" in blocked())
+check("L11 generation mismatch refuses at ACCOUNT level with exactly that reason (%r)" % blocked(), blocked() == "persisted lane evidence blocks admission (fail-closed): lane %s: M@generation-mismatch" % LANE)
 _rb = PA._registry_blockers
 PA._registry_blockers = lambda: []
 check("L14 MUTANT: with the registry check off the same state is admitted (sensitivity)", blocked() is None)
@@ -182,7 +184,7 @@ iid = CI.begin(LANE, "M", pid, [{"kind": "credit", "op_id": "lc:exit:L17", "amou
                {"realized_usd": 0.0, "entry_notional_usd": 1.0, "closed_reason": "t", "close_ts": int(time.time())}, account_id=ID)
 check("L17a a PENDING intent alone does not block account admission (%r)" % blocked(), blocked() is None)
 check("L17b freeze written", CI.freeze(LANE, iid, "test freeze") is True)
-check("L17c a FROZEN unapplied intent blocks at account level (%r)" % blocked(), blocked() is not None and "frozen unapplied" in blocked())
+check("L17c a FROZEN unapplied intent blocks at account level, only that reason (%r)" % blocked(), blocked() is not None and blocked().count("lane %s:" % LANE) == 1 and "frozen unapplied" in blocked())
 jl = [json.loads(x) for x in open(CI.journal_path(LANE))]
 check("L17d journal content: the intent carries its settle op and the freeze names it", jl[0]["settle_ops"][0]["op_id"] == "lc:exit:L17" and jl[1]["intent_id"] == iid)
 open(CI.journal_path(LANE), "a").write("{garbage-mid\n{\"ev\": \"x\"}\n")
@@ -215,7 +217,7 @@ except Exception: print("FAIL SETUP child L18: %s" % p1.stderr[-300:]); raise Sy
 check("L18a dual-failure refusal reports NOT journaled (%s)" % c18["why"], (not c18["ok"]) and "NOT journaled" in c18["why"])
 lane_ledger(LP, {"M": mkpos("M", c18["pid"], "some-other-generation", "lc:entry:L18")})   # the lane's persisted position keeps the old binding
 b18 = run_child(d)
-check("L18b storage restored, FRESH process: account-level admission refuses on persisted lane evidence (%r)" % b18, b18 is not None and "generation-mismatch" in b18)
+check("L18b storage restored, FRESH process: account-level admission refuses with EXACTLY the generation-mismatch reason and no unrelated blocker (%r)" % b18, b18 == "persisted lane evidence blocks admission (fail-closed): lane %s: M@generation-mismatch" % LANE)
 
 # L19 register-after-loss negative control: two lanes registered, primary lost, a lane restart (register_lane) must NOT recreate it from one lane
 d, LP, pid, ID, op = good("L19")
@@ -225,7 +227,7 @@ os.unlink(PA._registry_paths()[0])
 rA = PA.register_lane(LANE, LP, CI.journal_path(LANE)); rB = PA.register_lane(LANE2, LP2b, None); ri = PA.register_intent_journal(LANE, CI.journal_path(LANE))
 check("L19a after primary loss every lane restart registration refuses (%r %r %r)" % (rA, rB, ri), (rA, rB, ri) == (False, False, False))
 check("L19b the primary was NOT recreated by a single lane", not os.path.exists(PA._registry_paths()[0]))
-check("L19c the loss block still holds after the lane restarts (%r)" % blocked(), blocked() is not None and "registry lost" in blocked())
+check("L19c the loss block still holds after the lane restarts, as the ONLY blocker (%r)" % blocked(), blocked() == "persisted lane evidence blocks admission (fail-closed): lane registry lost (its mirror remains)")
 lanes19 = PA._registry_fold(PA._registry_view()[0])[0]
 check("L19d the mirror still holds BOTH lanes (union view)", LANE in lanes19 and LANE2 in lanes19)
 # L20 torn registry tail (crash mid-append): complete records kept, tail dropped, next append repaired; mid-file garbage still blocks (L6)
@@ -242,7 +244,43 @@ if os.path.exists(CI.journal_path(LANE)): os.unlink(CI.journal_path(LANE))
 iid = CI.begin(LANE, "M", pid, [{"kind": "credit", "op_id": "lc:exit:L21", "amount": 1.0, "qty": 100.0, "price_kind": "mark"}],
                {"realized_usd": 0.0, "entry_notional_usd": 1.0, "closed_reason": "t", "close_ts": int(time.time())}, account_id=ID)
 open(CI.journal_path(LANE), "a").write('{"ev": "frozen", "intent_id": "' + iid[:12])
-check("L21 a partial (torn) freeze record blocks account admission, not clean (%r)" % blocked(), blocked() is not None and "unterminated last record" in blocked())
+check("L21 a partial (torn) freeze record blocks account admission, only that reason (%r)" % blocked(), blocked() is not None and blocked().count("lane %s:" % LANE) == 1 and "unterminated last record" in blocked())
+
+# L22 registry append is serialized by the registry lock (deterministic): parent HOLDS the primary lock, a child registration must not finish; after release it must
+cL = '''
+import json, os, sys
+from daemon.launch_scanner import paper_account as PA
+d = %r
+PA.ACCOUNT_DIR = d; PA.LEDGER_PATH = os.path.join(d, "ledger.json"); PA.JOURNAL_PATH = os.path.join(d, "events.jsonl"); PA.LOCK_FILE = os.path.join(d, ".lock")
+%s
+print(json.dumps({"ok": PA.register_lane(%r, os.path.join(d, "x.json"), None)}), flush=True)
+'''
+def lock_probe(d, null_lock, lane):
+    pre = "PA._reg_lock = lambda path: __import__('contextlib').nullcontext()" if null_lock else ""
+    import contextlib
+    pr = subprocess.Popen([sys.executable, "-B", "-c", cL % (d, pre, lane)], cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try: pr.wait(timeout=3); done = True
+    except subprocess.TimeoutExpired: done = False
+    return pr, done
+d, LP = fresh("L22"); assert PA.register_lane(LANE, LP, None)
+with PA._reg_lock(PA._registry_paths()[0]):
+    pr, done = lock_probe(d, False, LANE + "_c1")
+    check("L22a while the registry lock is held a child registration is BLOCKED (not finished after 3s)", done is False)
+pr.wait(timeout=30)
+check("L22b after release the child registration completes and its record is present", pr.returncode == 0 and LANE + "_c1" in PA._registry_fold(PA._registry_view()[0])[0])
+d, LP = fresh("L22m"); assert PA.register_lane(LANE, LP, None)
+with PA._reg_lock(PA._registry_paths()[0]):
+    pr, done = lock_probe(d, True, LANE + "_c2")
+    check("L22c MUTANT (null lock) the same child finishes while the lock is held, so L22a is sensitive", done is True)
+pr.wait(timeout=30)
+# L23 concurrent registrants on a torn tail: complete records survive, all registrants recorded
+d, LP = fresh("L23"); assert PA.register_lane(LANE, LP, None)
+open(PA._registry_paths()[0], "a").write('{"lane": "tor')
+procs = [subprocess.Popen([sys.executable, "-B", "-c", cL % (d, "", "%s_p%d" % (LANE, i))], cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(6)]
+rcs = [q.wait(timeout=60) for q in procs]
+vw, vs = PA._registry_view(); ln23 = PA._registry_fold(vw)[0]
+check("L23 six concurrent registrants on one torn tail: all rc 0, registry parses ok, original lane and all six recorded (%r)" % (rcs,),
+      rcs == [0] * 6 and vs == "ok" and PA._registry_read(PA._registry_paths()[0])[1] == "ok" and LANE in ln23 and all(("%s_p%d" % (LANE, i)) in ln23 for i in range(6)))
 # L15 static wiring
 here = os.path.join(ROOT, "daemon", "launch_scanner")
 st = {n: open(os.path.join(here, n + ".py")).read() for n in ("momentum_lane", "ceo", "watcher_lane", "grad", "mirror", "close_intents")}

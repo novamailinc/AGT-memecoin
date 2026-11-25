@@ -397,5 +397,38 @@ p, entry, ok = ready(mint); pid = p["pa_pos_id"]; c0 = PA_cash(); nq = len(JUP.c
 with patch.object(G, "_is_sim", return_value=False):
     out = run_bb(mint, entry * 1.3)
 check("S7 non-sim position: refused, no quote, no add, no cash move", out == [] and len(JUP.calls) == nq and PAm().applied_add(bop(mint, pid)) is None and abs(PA_cash() - c0) < 1e-12)
+# ---- S8: FAULT crash AFTER the fill, BEFORE the add (add raises): intent stays "filled", account untouched; retry re-quotes at a CHANGED price with a new fop ----
+mint = "BB8pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]; c0 = PA_cash()
+def _boom_add(*a, **k): raise RuntimeError("injected crash before add")
+with patch.object(_PAm, "add_to_position", _boom_add):
+    try: run_bb(mint, entry * 1.3)
+    except Exception: pass
+lp = lane_pos(mint); fl1 = fills_for(pid, mint); fop1 = (lp.get("buyback_intent") or {}).get("fill_op")
+check("S8 FAULT crash before add: orphan fill journaled, account untouched, intent state filled (evidence of the unbooked fill is durable)",
+      len(fl1) == 1 and fop1 in fl1 and abs(PA_cash() - c0) < 1e-12 and PAm().applied_add(bop(mint, pid)) is None
+      and (lp.get("buyback_intent") or {}).get("state") in ("filled",) and lp.get("buyback_used") is not True)
+JUP.bmult = 0.5   # CHANGED requote: the retry gets half the tokens per SOL (canned-ratio fixture)
+out = run_bb(mint, entry * 1.3); lp = lane_pos(mint); fl2 = fills_for(pid, mint); fop2 = (lp.get("buyback_intent") or {}).get("fill_op")
+JUP.bmult = 1.0
+check("S8 retry after crash: NEW fop, the account add uses the NEW fill's qty (changed requote), the orphan fill is NOT booked",
+      len(out) == 1 and fop2 != fop1 and len(fl2) == 2 and abs(PAm().applied_add(bop(mint, pid))["qty"] - fl2[fop2]["qty_tokens"]) < 1e-9
+      and abs(fl2[fop2]["qty_tokens"] - fl1[fop1]["qty_tokens"]) > 1e-6 and abs((c0 - PA_cash()) - fl2[fop2]["total_debit_usd"]) < 1e-9)
+
+# ---- S9: FAULT post-quote gate refusal AFTER a real fill (second call of the guard refuses): no account effect, intent says why ----
+mint = "BB9pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]; c0 = PA_cash()
+_eg_mod = _il2.import_module("daemon.launch_scanner.entry_guard")
+_real_pq = _eg_mod.post_quote_refusal; _n = [0]
+def _pq_fault(*a, **k):
+    _n[0] += 1
+    return _real_pq(*a, **k) if _n[0] == 1 else "FAULT post-quote refusal (test)"
+with patch.object(_eg_mod, "post_quote_refusal", _pq_fault):
+    out = run_bb(mint, entry * 1.3)
+lp = lane_pos(mint); fl = fills_for(pid, mint)
+check("S9 FAULT post-quote refusal: no buyback, cash untouched, orphan fill journaled, intent state refused:post_quote_gate (guard called %d times)" % _n[0],
+      out == [] and abs(PA_cash() - c0) < 1e-12 and len(fl) == 1 and PAm().applied_add(bop(mint, pid)) is None
+      and (lp.get("buyback_intent") or {}).get("state") == "refused:post_quote_gate" and lp.get("buyback_used") is not True)
+
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

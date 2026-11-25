@@ -1406,26 +1406,56 @@ def _consider_candidate(cand, now):
                 pos["legs"]["c"]["peak"] = filled
                 pos["entry_snapshot"]["filled_price"] = filled
                 pos["entry_snapshot"]["cost_summary_basis"] = "MODEL_NOT_EXECUTION"
-            _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
-                                            _op, durable_refusal=_demo_mode())
-            if not _ok:
-                if _demo_mode():
+        # COMMIT BARRIER (root-cause fix for the entry race against cycle/entry-scan fault writers, which hold only the fault lock): from just before the account debit through the
+        # lane write, hold the cycle FAULT lock (order ledger -> fault, as the abort hook) and RE-CHECK the mandatory guard under it, so a fault is either recorded before this
+        # re-check (entry refused, nothing debited) or only after the write. The wait is SHORT (entry_guard.ENTRY_FAULT_WAIT_S, held while the ledger lock is held, so it bounds
+        # the delay an exit can see behind an entry); a timeout refuses the entry. Flag off: a no-op. Never taken by exits.
+        _cbx = None
+        try:
+            _cbx = _eg.commit_barrier(type("_LedgerRef", (), {"LEDGER_PATH": LEDGER_PATH})(), _eg.ENTRY_FAULT_WAIT_S)
+            _cbx.__enter__()
+        except Exception as _cbe:
+            if _demo_mode() and _pa is not None:
+                try:
+                    _demo_filler().release_intent(LANE, mint)
+                except Exception as _re:
+                    logger.warning("%s: release_intent failed (%r) after commit-barrier refusal", LANE, _re)
+            return _skip(mint, "entry commit barrier unavailable (%r); entries blocked fail-closed" % (_cbe,), False)
+        try:
+            try:
+                _why2 = _eg.mandatory_entry_refusal(LANE)
+            except Exception:
+                _why2 = "mandatory entry guard unavailable at commit; entries blocked fail-closed"
+            if _why2:
+                if _demo_mode() and _pa is not None:
                     try:
                         _demo_filler().release_intent(LANE, mint)
                     except Exception as _re:
-                        logger.warning("%s: release_intent failed (%r); a retry may replay the original (stale) fill", LANE, _re)
-                return _skip(mint, "paper account: " + _why, False)
-            # Pin the open instance so the close can never settle
-            # a later reopen of the same mint.
-            pos["pa_pos_id"] = _pid
-            _INFLIGHT_OPEN.add(str(_pid))   # account holds it, lane books do not yet: not "unknown" for the marks hook
-        d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
-        d["positions"][mint] = pos
-        d["watchlist"].pop(mint, None)
-        try:
-            _write(d)
+                        logger.warning("%s: release_intent failed (%r) after commit-time refusal", LANE, _re)
+                return _skip(mint, _why2, False)
+            if _pa is not None:
+                _ok, _why, _pid = _pa.try_debit(LANE, mint, _stake, _qty,
+                                                _op, durable_refusal=_demo_mode())
+                if not _ok:
+                    if _demo_mode():
+                        try:
+                            _demo_filler().release_intent(LANE, mint)
+                        except Exception as _re:
+                            logger.warning("%s: release_intent failed (%r); a retry may replay the original (stale) fill", LANE, _re)
+                    return _skip(mint, "paper account: " + _why, False)
+                # Pin the open instance so the close can never settle
+                # a later reopen of the same mint.
+                pos["pa_pos_id"] = _pid
+                _INFLIGHT_OPEN.add(str(_pid))   # account holds it, lane books do not yet: not "unknown" for the marks hook
+            d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
+            d["positions"][mint] = pos
+            d["watchlist"].pop(mint, None)
+            try:
+                _write(d)
+            finally:
+                _INFLIGHT_OPEN.discard(str(pos.get("pa_pos_id")))
         finally:
-            _INFLIGHT_OPEN.discard(str(pos.get("pa_pos_id")))
+            _cbx.__exit__(None, None, None)
         if _demo_mode():
             try:
                 _demo_filler().consume_intent(LANE, mint)

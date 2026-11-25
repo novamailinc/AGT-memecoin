@@ -66,7 +66,10 @@ def mandatory_entry_refusal(lane):
     return None
 
 
-def commit_barrier(engine):
+ENTRY_FAULT_WAIT_S = 0.5   # entry commits hold the LANE LEDGER LOCK while waiting: keep the wait short; a timeout REFUSES the entry (fail closed) instead of delaying exits behind it
+
+
+def commit_barrier(engine, wait_s=None):
     """Context manager for an entry-like ledger commit that does not go through the opener (the tranche buyback). Flag off: a no-op. Flag on: the cycle's
     cross-thread/cross-process FAULT LOCK (grad_cycle._fault_lock: a leaf lock, reentrant per thread, bounded acquire). Take it INSIDE the lane ledger lock
     (documented order ledger -> fault, the same as the poll-abort hook) and hold it across BOTH the mandatory_entry_refusal read and the ledger write: every
@@ -80,7 +83,7 @@ def commit_barrier(engine):
         from daemon import grad_cycle as _gcb
     except ImportError:
         import grad_cycle as _gcb
-    return _gcb._fault_lock(engine)
+    return _gcb._fault_lock(engine, wait_s)
 
 
 def unrouted_opener_refusal(lane):

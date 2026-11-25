@@ -241,8 +241,9 @@ class _fault_lock:
     timeout raises FaultLockTimeout and the caller treats the fault as NOT recorded (fail closed). The 5 s figure is a RETRY POLICY for the lock attempt
     only: open(), flock and the file I/O done while holding it have no bound, so it does not bound exit latency. The kernel frees the flock on process death.
     The fault lock does NOT order a writer against the cycle or ledger locks beyond the leaf rule above; same-thread reentrancy is by the depth map only."""
-    def __init__(self, grad):
+    def __init__(self, grad, timeout_s=None):
         self.path = _fault_lock_path(grad); self.fh = None
+        self.timeout_s = timeout_s      # None = the module default (_FAULT_LOCK_TIMEOUT_S); entry commits pass a SHORT bound (they refuse on timeout, they never wait long while holding the ledger lock)
 
     def __enter__(self):
         import fcntl  # noqa: PLC0415
@@ -252,7 +253,7 @@ class _fault_lock:
         if depth.get(self.path, 0) > 0:
             depth[self.path] += 1; return self
         fh = open(self.path, "a")
-        end = time.monotonic() + float(_FAULT_LOCK_TIMEOUT_S)      # monotonic: a wall-clock step cannot shorten or stretch the retry window
+        end = time.monotonic() + float(_FAULT_LOCK_TIMEOUT_S if self.timeout_s is None else self.timeout_s)      # monotonic: a wall-clock step cannot shorten or stretch the retry window
         while True:
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); break

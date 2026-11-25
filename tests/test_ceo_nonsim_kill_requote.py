@@ -90,11 +90,18 @@ def child_run(point):
     PA = fresh(); r = C.consider_card(csig(MINT))
     pos = (C.open_positions() or {}).get(MINT) or {}
     print("ENTRY ok=%s cash=%.6f nonsim=%s pa_pos_id=%s" % (bool(r[0]), cash(PA), (pos.get("execution") or {}).get("source") != "jupiter_quote_sim", bool(pos.get("pa_pos_id"))), flush=True)
-    if point in ("after_credit", "after_credit_nopk"):
+    if point.startswith("after_credit"):
         CI.mark_account_applied = lambda lane, iid: _die()
-        if point == "after_credit_nopk":   # labelled SETUP injection: the intent is journaled with NO price_kind (a real durable defect), then the real kill
+        _defect = point.split("_")[2] if point.count("_") >= 2 else None   # after_credit_<nopk|noreason|qtyhalf>: labelled SETUP injection recording a real durable defect, then the real kill
+        if _defect == "nopk":
             _o = C._pa_settle
             C._pa_settle = lambda pos, qty, gross, fee, suffix, price_kind=None: _o(pos, qty, gross, fee, suffix, None)
+        elif _defect == "qtyhalf":
+            _o = C._pa_settle
+            C._pa_settle = lambda pos, qty, gross, fee, suffix, price_kind=None: _o(pos, qty * 0.5, gross, fee, suffix, price_kind)
+        elif _defect == "noreason":
+            _oi = C._intent_open
+            C._intent_open = lambda ls, pos, ops, reason: _oi(ls, pos, ops, None)
     elif point == "pre_lane_marker":
         CI.mark_lane_applied = lambda lane, iid: _die()
     elif point == "before_credit":
@@ -320,6 +327,42 @@ if r is not None and pre is not None:
           % (tag, (r4 or {}).get("entry_first"), (r4 or {}).get("cash"), pre["pre_cash"], (r4 or {}).get("a_done"), (r4 or {}).get("n_pos_all"), (r4 or {}).get("rec_logs")),
           rc4 == 0 and r4 is not None and "blocked" in str(r4["entry_first"]) and _cents(r4["cash"]) == _cents(pre["pre_cash"]) and r4["a_done"] is False
           and r4["n_pos_all"] == 1 and r4["rec_logs"] >= 1)
+    rc5, err5, pre5, r5 = recover(root, "2.3", "freeze_false", "tryfirst")
+    check("%s: SECOND fresh process, entry again BEFORE any exit poll: refused (%r), recognition hit (%r), freeze attempted but still not durable (calls %r, ev %r), no credit (cash %r)"
+          % (tag, (r5 or {}).get("entry_first"), (r5 or {}).get("rec_logs"), (r5 or {}).get("freeze_calls"), (r5 or {}).get("ev"), (r5 or {}).get("cash")),
+          rc5 == 0 and r5 is not None and "blocked" in str(r5["entry_first"]) and r5["rec_logs"] >= 1 and r5["freeze_calls"] >= 1 and "frozen" not in r5["ev"]
+          and _cents(r5["cash"]) == _cents(pre["pre_cash"]) and r5["a_done"] is False)
+
+# F13: durable-defect matrix, entry attempted BEFORE any exit poll in TWO fresh processes with the freeze write failing, for leg and remaining kinds
+for kind13, kmult13, ret13 in (("leg", "2.0", "2.3"), ("remaining", "0.45", "0.4")):
+    for dfx in ("nopk", "noreason", "qtyhalf"):
+        tag = "F13-%s-%s-entry-first-freezeFalse" % (kind13, dfx)
+        root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+        rc, out, err = spawn(["run", root, "after_credit_" + dfx, kmult13])
+        check("%s: setup (real durable defect, labelled) KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+        ra, ea, pa_, rr1 = recover(root, ret13, "freeze_false", "tryfirst")
+        rb, eb, pb_, rr2 = recover(root, ret13, "freeze_false", "tryfirst")
+        for nn, (rcx, errx, prx, rx) in (("fresh #1", (ra, ea, pa_, rr1)), ("fresh #2", (rb, eb, pb_, rr2))):
+            check("%s %s: entry BEFORE any exit poll refused (%r); recognition hit (%r), freeze attempted (%r) not durable (ev %r); no extra credit (cash %r vs pre %r); position/leg not closed (n_pos %r, a_done %r)"
+                  % (tag, nn, (rx or {}).get("entry_first"), (rx or {}).get("rec_logs"), (rx or {}).get("freeze_calls"), (rx or {}).get("ev"), (rx or {}).get("cash"), (prx or {}).get("pre_cash"), (rx or {}).get("n_pos_all"), (rx or {}).get("a_done")),
+                  rcx == 0 and rx is not None and "blocked" in str(rx["entry_first"]) and rx["rec_logs"] >= 1 and rx["freeze_calls"] >= 1 and "frozen" not in rx["ev"]
+                  and _cents(rx["cash"]) == _cents(prx["pre_cash"]) and rx["n_pos_all"] == 1 and rx["a_done"] is False)
+
+# F12: foreign pa_pos_id (the open position is now a different instance than the pending intent's): the existing lane_apply False -> freeze contract
+tag = "F12-foreign-pa_pos_id"
+root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+rc, out, err = spawn(["run", root, "after_credit", "2.0"])
+check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+rc2, err2, pre, r = recover(root, "2.3", "foreign_pos_id", "tryfirst")
+check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+if r is not None and pre is not None:
+    print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+    check("%s: entry BEFORE any exit poll refused (%r); the pending intent is FROZEN (ev %r); no second credit (cash %r vs %r); the foreign position's leg a not closed (%r)"
+          % (tag, r["entry_first"], r["ev"], r["cash"], pre["pre_cash"], r["a_done"]),
+          "blocked" in str(r["entry_first"]) and "frozen" in r["ev"] and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False)
+    rc3, err3, pre3, r3 = recover(root, "2.3", None, "tryfirst")
+    check("%s: FRESH process: the persisted frozen intent blocks entry BEFORE any exit poll (%r), still frozen once (ev %r), nothing credited (cash %r)" % (tag, r3 and r3["entry_first"], r3 and r3["ev"], r3 and r3["cash"]),
+          rc3 == 0 and r3 is not None and "blocked" in str(r3["entry_first"]) and r3["ev"].count("frozen") == 1 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)
 
 # journal corrupt mid-file: sentinel/entry block + hold classification read in the child
 tag = "F9-journal-corrupt"

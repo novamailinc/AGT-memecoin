@@ -1174,11 +1174,14 @@ def _pending_unusable(lane):
                 if _op.get("kind") != "credit":
                     continue
                 _p = _pos.get(_op.get("mint"))
-                if not _p or _p.get("lane") != lane or not _p.get("pa_pos_id") or _p.get("pa_pos_id") != _op.get("pos_id"):
-                    continue
                 _oid = str(_op.get("op_id") or ""); _pre = "%s:" % lane
                 _parts = _oid[len(_pre):].split(":") if _oid.startswith(_pre) else []
                 _q = None
+                # An op whose position is ABSENT or of another instance/lane is NOT waved through as valid: its own fields (amount, fee, qty,
+                # price_kind, close reason) are still judged; only the qty-versus-position comparison needs the matching position instance.
+                _match = bool(_p and _p.get("lane") == lane and _p.get("pa_pos_id") and _p.get("pa_pos_id") == _op.get("pos_id"))
+                if not _match:
+                    _p = {}
                 if _parts and _parts[0] == "leg" and len(_parts) > 1 and _parts[1] in _p.get("legs", {}):
                     _q = _p["tokens"] * _p["legs"][_parts[1]]["frac"]
                 elif _parts and _parts[0] == "remaining" and len(_parts) > 1:
@@ -1186,7 +1189,7 @@ def _pending_unusable(lane):
                     _q = sum(_p["tokens"] * _p["legs"][k]["frac"] for k in _lg) if _lg else None
                 _w = _op_defects(_op, _int.get("close_info"), _q)
                 if _w:
-                    out.append((_it.get("intent_id"), "%s: %s" % (_oid, _w)))
+                    out.append((_it.get("intent_id"), "%s: %s%s" % (_oid, _w, "" if _match else " (position absent or another instance: own fields only)")))
     except Exception:
         logger.exception("mirror %s: pending-intent recognition failed", lane)
         out.append((None, "pending-intent recognition raised: blocking fail-closed"))

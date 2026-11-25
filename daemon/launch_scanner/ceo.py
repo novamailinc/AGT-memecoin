@@ -208,6 +208,23 @@ def _block_entries():
     _ENTRY_BLOCKED = True
 
 
+def _live_refusal(pend, why, mint):
+    """LIVE account generation refusal (journaled by the account): block entries IN-PROCESS now and freeze the intent durably when the close-intent journal is
+    available. The account side stays unresolved; nothing is credited, rebound or compensated. With the journal unavailable only the in-process block exists."""
+    if "generation refused" not in str(why):
+        return
+    _block_entries()
+    _frozen = False
+    try:
+        _ci = _close_intents()
+        if _ci is not None and pend is not None:
+            _frozen = bool(_ci.freeze(LANE, pend[0], "live account generation refusal: " + str(why)[:140]))
+    except Exception:
+        logger.exception("%s: could not freeze intent after a live generation refusal for %s", LANE, mint)
+    logger.error("%s: LIVE account generation refusal for %s (%s): ENTRIES BLOCKED in-process; intent frozen=%s (False = journal unavailable or freeze failed; "
+                 "no account credit was applied)", LANE, mint, str(why)[:140], _frozen)
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process, before
     this process's first entry/close. Account ops re-apply
@@ -218,6 +235,16 @@ def _recover_close_intents():
     _ci = _close_intents()
     if _ci is None:
         _RECOVERY_DONE = True
+        # Close-intent journal OFF: no intent exists to freeze (none is claimed). The unbound-position block does not depend on it: it is derived from the
+        # persisted lane ledger in every process, so entries stay blocked while any account-opened position has no bound generation.
+        try:
+            _unb0 = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+        except Exception:
+            _unb0 = ["unreadable-lane-ledger"]
+        if _unb0:
+            _block_entries()
+            logger.error("ceo: close-intent journal OFF; open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no intent freeze exists)", ",".join(_unb0))
+            return True
         return False
     if _RECOVERY_DONE:
         # Not once-and-forget: re-run while the journal is unreadable or any intent is still pending (a torn tail that appeared later, an
@@ -386,6 +413,7 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
             _ci2.mark_account_applied(LANE, _pend[0])
             _PENDING_CLOSE_INTENTS.append(_pend)
     else:
+        _live_refusal(_pend, _why, pos.get("mint"))
         logger.warning("ceo: shared paper account credit for %s "
                        "(%s) failed: %s (journaled, intent open "
                        "for recovery)", mint, suffix, _why)
@@ -422,6 +450,7 @@ def _pa_write_down(pos, reason):
             _ci2.mark_account_applied(LANE, _pend[0])
             _PENDING_CLOSE_INTENTS.append(_pend)
     else:
+        _live_refusal(_pend, _why, pos.get("mint"))
         logger.warning("paper account write-down for %s failed: "
                        "%s (journaled, intent open for recovery)",
                        mint, _why)

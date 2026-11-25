@@ -346,6 +346,16 @@ def _recover_close_intents():
     _RECOVERY_DONE = True
     _ci = _close_intents()
     if _ci is None:
+        # Close-intent journal OFF: no intent exists to freeze (none is claimed). The unbound-position block does not depend on it: it is derived from the
+        # persisted lane ledger in every process, so entries stay blocked while any account-opened position has no bound generation.
+        try:
+            _unb0 = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+        except Exception:
+            _unb0 = ["unreadable-lane-ledger"]
+        if _unb0:
+            _block_entries()
+            logger.error("grad: close-intent journal OFF; open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no intent freeze exists)", ",".join(_unb0))
+            return True
         return False
 
     def account_apply(op):
@@ -3347,6 +3357,14 @@ def _finalize(d, mint, pos, closed_reason):
             # close intent open, nothing is sold again on retry, the credit op id is stable (a retry of an applied op is idempotent) and
             # the pending state clears only when the account settle is confirmed on a later poll. The lane bankroll booked above is
             # undone, because no close is recorded.
+            if "generation refused" in str(_why):
+                # LIVE generation refusal: block entries in-process now and freeze the open intent durably (the position stays open and unresolved).
+                _block_entries()
+                try:
+                    if _ci is not None and _iid is not None:
+                        _ci.freeze(LANE, _iid, "live account generation refusal: " + str(_why)[:140])
+                except Exception:
+                    logger.exception("grad: could not freeze intent %s after a live generation refusal", _iid)
             logger.error("grad: %s SETTLEMENT PENDING (account_settle_refused: %s): executed sale kept, position left open, close "
                          "intent open, no close booked; retried next poll", mint[:12], _why)
             pos["settlement_pending"] = {"why": "account_settle_refused", "refusal": str(_why)[:200], "closed_reason": closed_reason,

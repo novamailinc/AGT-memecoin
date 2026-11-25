@@ -16,7 +16,9 @@ import tests._guard_fixture as G
 G.block_network()
 sys.path.insert(0, os.path.join(ROOT, "daemon", "launch_scanner"))
 def child(kind):
-    os.environ["PAPER_ACCOUNT_ENABLED"] = "1"; os.environ["PAPER_ACCOUNT_START"] = "10"
+    _off = kind == "recover" and len(sys.argv) > 3 and sys.argv[3] == "off"
+    if not _off: os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+    os.environ["PAPER_ACCOUNT_START"] = "10"
     from daemon.launch_scanner import momentum_lane as L
     import daemon.launch_scanner.paper_account as PA
     PA = importlib.reload(PA); G.install(PA)
@@ -41,12 +43,12 @@ def run(args):
 def res(out):
     l = [x for x in out.splitlines() if x.startswith("RESULT ")]
     return json.loads(l[0][7:]) if l else None
-for kind, expect in (("unbound", True), ("plain", False)):
-    root = tempfile.mkdtemp(prefix="genbind-lane-%s-" % kind)
+for kind, expect, jmode in (("unbound", True, "on"), ("plain", False, "on"), ("unbound", True, "off"), ("plain", False, "off")):
+    root = tempfile.mkdtemp(prefix="genbind-lane-%s-%s-" % (kind, jmode))
     rc, out, err = run(["setup", root, kind])
     check("%s: setup ok (rc %d, err %r)" % (kind, rc, err[-120:]), rc == 0 and "SETUP-OK" in out)
     for n in (1, 2):
-        rc, out, err = run(["recover", root])
+        rc, out, err = run(["recover", root, jmode])
         r = res(out)
-        check("%s: restart %d recovery result %r (expect blocked=%s)" % (kind, n, r, expect), rc == 0 and r is not None and r["blocked"] is expect and r["flag"] is expect)
+        check("%s journal-%s: restart %d recovery result %r (expect blocked=%s)" % (kind, jmode, n, r, expect), rc == 0 and r is not None and r["blocked"] is expect and r["flag"] is expect)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

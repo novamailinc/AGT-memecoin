@@ -142,12 +142,8 @@ ok4d, why4d = PA.credit(LANE, "MINTF", 9.9, "gb:exit:F1", pos_id=pidF, qty=100.0
 check("F4d same-op retry with DIFFERENT proceeds is refused (%s)" % why4d, (not ok4d) and "parameter conflict" in why4d)
 ok4e, why4e = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=50.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
 check("F4e same-op retry with a DIFFERENT qty is refused (%s)" % why4e, not ok4e)
-_ledF2 = _bytes(PA.LEDGER_PATH)
-with open(PA.JOURNAL_PATH, "a") as _f: _f.write("{torn record\n")
-ok4f, why4f = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
-check("F4f same-op retry with a torn journal is NOT answered as success (%s)" % why4f, not ok4f)
-ok3, why3 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id="wrong#9", qty=100.0, expected_account_id=None, entry_op_id=None)
-check("F5 same op_id with a DIFFERENT pos_id is not a retry: refused (%s)" % why3, not ok3)
+ok3, why3 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id="wrong#9", qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
+check("F5 REAL binding but a DIFFERENT pos_id on the same op_id is refused for the pos_id (%s)" % why3, (not ok3) and "differs from the settled pos_id" in why3)
 
 # ---- G: mixed-generation replay (G2): journal has a bound credit, a restored OLDER ledger replays it
 _use(os.path.join(_home, "G"))
@@ -213,5 +209,79 @@ check("M1 MUTANT (guard removed) credits with a WRONG binding, proving the refus
 # ---- C2: new generation closed under the IDENTICAL op id; the stale old-generation intent retries it (A1)
 ok, why = PA.credit(LANE, "MINTC", 1.1, "gb:exit:C", pos_id=pid1, qty=100.0, expected_account_id=old_bind, entry_op_id="gb:entry:C")
 check("C5 stale OLD-generation retry of an op id the NEW generation already applied is REFUSED, not acked (%s)" % why, not ok)
+# ---- T: torn journal. EOF tail = designed crash repair (positive); MID-FILE corruption = never accepted (negative)
+_use(os.path.join(_home, "T1"))
+r = _need("debit T1", PA.try_debit(LANE, "MINTT", 1.0, 100.0, "gb:entry:T", marks=_mk()))
+pidT = r[2]; bindT = PA.entry_binding(LANE, "MINTT", "gb:entry:T", pidT)
+_need("credit T1", PA.credit(LANE, "MINTT", 1.1, "gb:exit:T", pos_id=pidT, qty=100.0, expected_account_id=bindT, entry_op_id="gb:entry:T"))
+with open(PA.JOURNAL_PATH, "a") as _f: _f.write("{torn record\n")
+okT, whyT = PA.credit(LANE, "MINTT", 1.1, "gb:exit:T", pos_id=pidT, qty=100.0, expected_account_id=bindT, entry_op_id="gb:entry:T")
+_jt = [l for l in open(PA.JOURNAL_PATH).read().splitlines() if l.strip()]
+check("T1 POSITIVE: a single torn EOF record is the designed crash repair: truncated, journal valid again, identical retry acks once (%s)" % whyT,
+      okT and all(l.startswith("{") and l.endswith("}") for l in _jt) and sum(1 for l in _jt if '"event": "credit"' in l) == 1)
+_use(os.path.join(_home, "T2"))
+r = _need("debit T2", PA.try_debit(LANE, "MINTT2", 1.0, 100.0, "gb:entry:T2", marks=_mk()))
+pidT2 = r[2]; bindT2 = PA.entry_binding(LANE, "MINTT2", "gb:entry:T2", pidT2)
+_need("credit T2", PA.credit(LANE, "MINTT2", 1.1, "gb:exit:T2", pos_id=pidT2, qty=100.0, expected_account_id=bindT2, entry_op_id="gb:entry:T2"))
+_lines = open(PA.JOURNAL_PATH).read().splitlines(keepends=True)
+with open(PA.JOURNAL_PATH, "w") as _f: _f.writelines(_lines[:-1] + ["{torn mid-file record\n"] + _lines[-1:])
+_jb = _bytes(PA.JOURNAL_PATH); _lb = _bytes(PA.LEDGER_PATH)
+okT2, whyT2 = PA.credit(LANE, "MINTT2", 1.1, "gb:exit:T2", pos_id=pidT2, qty=100.0, expected_account_id=bindT2, entry_op_id="gb:entry:T2")
+check("T2 NEGATIVE: MID-FILE corruption is never accepted, the retry is NOT an ack (%s)" % whyT2, (not okT2) and _bytes(PA.LEDGER_PATH) == _lb)
+check("T3 mid-file corruption leaves the journal bytes unchanged apart from a journaled degraded/refusal record (no truncation)", _bytes(PA.JOURNAL_PATH).startswith(_jb))
+
+# ---- N1: shadow restore (live ledger unreadable, .bak loaded) still stamps the generation on non-debit/credit mutation records
+_use(os.path.join(_home, "N1"))
+r = _need("debit N1", PA.try_debit(LANE, "MINTN", 1.0, 100.0, "gb:entry:N", marks=_mk()))
+_idN = json.load(open(PA.LEDGER_PATH))["account_id"]
+if not os.path.exists(PA.LEDGER_PATH + ".bak"): shutil.copy(PA.LEDGER_PATH, PA.LEDGER_PATH + ".bak")
+with open(PA.LEDGER_PATH, "w") as _f: _f.write("{not json")
+okN, whyN = PA.book_fee(0.01, "gb:fee:N1")
+_evN = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip() and '"event": "fee"' in l]
+check("N1a fee booked through a shadow-restored ledger (%s)" % whyN, okN is True)
+check("N1b the fee record carries the LOADED generation although the live file was unreadable", len(_evN) == 1 and _evN[0].get("account_id") == _idN)
+check("N1c the account is not degraded afterwards (no spurious mixed-generation divergence)", PA.snapshot() is not None and not (PA.snapshot() or {}).get("degraded"))
+
+# ---- A3: other mutation kinds (fee) obey the generation guard in replay
+_use(os.path.join(_home, "K"))
+r = _need("debit K", PA.try_debit(LANE, "MINTK", 1.0, 100.0, "gb:entry:K", marks=_mk()))
+shutil.copy(PA.LEDGER_PATH, os.path.join(_home, "K.l0"))
+_need("fee K", PA.book_fee(0.01, "gb:fee:K"))
+_orig_j = open(PA.JOURNAL_PATH).read()
+def _restore_l0():
+    for d_ in (PA.LEDGER_PATH, PA.LEDGER_PATH + ".bak"): shutil.copy(os.path.join(_home, "K.l0"), d_)
+_restore_l0()
+PA.snapshot()
+check("K1 POSITIVE: a same-generation fee journaled past an older ledger replays once", "gb:fee:K" in (json.load(open(PA.LEDGER_PATH)).get("ops") or {}))
+_restore_l0()
+with open(PA.JOURNAL_PATH, "w") as _f:
+    for l in _orig_j.splitlines(keepends=True):
+        e = json.loads(l)
+        if e.get("event") == "fee": e.pop("account_id", None); l = json.dumps(e) + "\n"
+        _f.write(l)
+PA.snapshot()
+check("K2 NEGATIVE: an UNBOUND fee after the first bound event is NOT replayed (mixed-generation journal)", "gb:fee:K" not in (json.load(open(PA.LEDGER_PATH)).get("ops") or {}))
+_restore_l0()
+with open(PA.JOURNAL_PATH, "w") as _f:
+    for l in _orig_j.splitlines(keepends=True):
+        e = json.loads(l)
+        if e.get("event") == "fee": e["account_id"] = "foreign-generation"; l = json.dumps(e) + "\n"
+        _f.write(l)
+PA.snapshot()
+check("K3 NEGATIVE: a fee stamped with another generation is NOT replayed", "gb:fee:K" not in (json.load(open(PA.LEDGER_PATH)).get("ops") or {}))
+
+# ---- N3: retry-contract MUTANT. With the retry check neutralised, a different-proceeds retry is acked, proving F4d is sensitive to it.
+_use(os.path.join(_home, "N3"))
+r = _need("debit N3", PA.try_debit(LANE, "MINTR", 1.0, 100.0, "gb:entry:R", marks=_mk()))
+pidR = r[2]; bindR = PA.entry_binding(LANE, "MINTR", "gb:entry:R", pidR)
+_need("credit R", PA.credit(LANE, "MINTR", 1.1, "gb:exit:R", pos_id=pidR, qty=100.0, expected_account_id=bindR, entry_op_id="gb:entry:R"))
+_real_rc = PA._retry_contract_refusal
+PA._retry_contract_refusal = lambda *a, **k: None
+try:
+    okR, whyR = PA.credit(LANE, "MINTR", 9.9, "gb:exit:R", pos_id=pidR, qty=100.0, expected_account_id=bindR, entry_op_id="gb:entry:R")
+finally:
+    PA._retry_contract_refusal = _real_rc
+check("N3 MUTANT (retry contract removed) acks a different-proceeds retry, proving F4d/F4e are sensitive (%s)" % whyR, okR is True)
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

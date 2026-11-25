@@ -386,6 +386,23 @@ def _block_entries():
     _ENTRY_BLOCKED = True
 
 
+def _live_refusal(pend, why, mint):
+    """LIVE account generation refusal (journaled by the account): block entries IN-PROCESS now and freeze the intent durably when the close-intent journal is
+    available. pend = (lane, intent_id, pos_id, mint, suffix) or None. Nothing is credited, rebound or compensated; without the journal only the in-process block exists."""
+    if "generation refused" not in str(why):
+        return
+    _block_entries()
+    _frozen = False
+    try:
+        _ci = _close_intents()
+        if _ci is not None and pend is not None:
+            _frozen = bool(_ci.freeze(pend[0], pend[1], "live account generation refusal: " + str(why)[:140]))
+    except Exception:
+        logger.exception("mirror: could not freeze intent after a live generation refusal for %s", mint)
+    logger.error("mirror: LIVE account generation refusal for %s (%s): ENTRIES BLOCKED in-process; intent frozen=%s (False = journal unavailable or freeze failed; "
+                 "no account credit was applied)", mint, str(why)[:140], _frozen)
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process for every mirror
     lane before the first entry/close. A frozen intent (account and ledger
@@ -396,6 +413,16 @@ def _recover_close_intents():
     _RECOVERY_DONE = True
     _ci = _close_intents()
     if _ci is None:
+        # Close-intent journal OFF: no intent exists to freeze (none is claimed). The unbound-position block does not depend on it: it is derived from the
+        # persisted lane ledger in every process, so entries stay blocked while any account-opened position has no bound generation.
+        try:
+            _unb0 = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+        except Exception:
+            _unb0 = ["unreadable-lane-ledger"]
+        if _unb0:
+            _block_entries()
+            logger.error("mirror: close-intent journal OFF; open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no intent freeze exists)" % ",".join(_unb0))
+            return True
         return False
     for lane in sorted(set(LANE_BY_CHAIN.values())):
         def account_apply(op, lane=lane):
@@ -535,6 +562,7 @@ def _pa_apply(pos, suffix, kind_op, apply_fn):
             _ci.mark_account_applied(lane, _pend[1])
             _PENDING_CLOSE_INTENTS.append(_pend)
     else:
+        _live_refusal(_pend, _why, pos.get("mint"))
         logger.warning("mirror: shared paper account %s for %s (%s) failed: "
                        "%s (journaled, intent open for recovery)",
                        kind_op["kind"], mint, suffix, _why)

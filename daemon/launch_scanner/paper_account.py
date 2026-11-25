@@ -767,10 +767,10 @@ def _journal(event: Dict[str, Any], strict: bool = False) -> None:
     event = dict(event)
     event["ts"] = event.get("ts") or time.time()
     if event.get("event") in _MUTATION_EVENTS and "account_id" not in event:
-        # Every mutation record names the generation that wrote it (callers hold the account lock; the ledger's account_id is immutable for its life).
-        _lg = _read_json(LEDGER_PATH)
-        if isinstance(_lg, dict) and isinstance(_lg.get("account_id"), str):
-            event["account_id"] = _lg["account_id"]
+        # Every mutation record names the generation the writer LOADED under the account lock (_TL.ident, set by _load_locked: shadow restore included).
+        _ident = getattr(_TL, "ident", None)
+        if isinstance(_ident, str) and _ident:
+            event["account_id"] = _ident
     try:
         with open(JOURNAL_PATH, "a") as f:
             f.write(json.dumps(event) + "\n")
@@ -1420,7 +1420,7 @@ def verify_replay() -> Tuple[Optional[bool], str]:
         return None, "verify_replay_error:%r" % (e,)
 
 
-def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
+def _load_locked_impl() -> Tuple[Optional[Dict[str, Any]], bool,
                             Optional[str]]:
     """Read the ledger under the lock. Returns (ledger, healthy,
     degraded). First run creates it; a corrupt live file falls
@@ -2171,6 +2171,17 @@ def list_holds(prefix: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     if prefix is None:
         return holds
     return {k: v for k, v in holds.items() if k.startswith(prefix)}
+
+
+def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool, Optional[str]]:
+    """_load_locked_impl plus the generation the CALLER now holds: _TL.ident is the account_id of the ledger actually loaded under this lock (shadow
+    restore included), which _journal stamps onto every mutation record. None when no ledger was loaded."""
+    _TL.ident = None
+    res = _load_locked_impl()
+    _led = res[0]
+    if isinstance(_led, dict) and isinstance(_led.get("account_id"), str):
+        _TL.ident = _led["account_id"]
+    return res
 
 
 def _generation_refusal(led, expected, entry_op_id, lane, mint, pos_id):

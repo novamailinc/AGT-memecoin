@@ -124,8 +124,9 @@ class _H(_logging.Handler):
         except Exception: pass
 def _inject(kind):
     """Labelled NAMED fault injection in THIS recovery process only (scratch root; no repo state, config or flag changes)."""
-    real = C._recorded_credit_op
+    real = getattr(C, "_recorded_credit_op", None)   # absent on a source without the recorded-op helper: only the helper-based injections need it
     if kind in ("qty_mismatch", "qty_near", "amount_nan", "fee_negative", "amount_missing", "price_kind_missing", "reason_missing"):
+        assert real is not None, "recorded-op helper absent: this injection is not applicable"
         def wrap(pos, suffix):
             op = real(pos, suffix)
             if op is None: return None
@@ -208,6 +209,7 @@ def spawn(args):
     return p.returncode, p.stdout, p.stderr
 FOUR = ["intent", "account_applied", "lane_applied", "applied"]
 HAS_HELPER = None
+REFUSAL = "close-intent divergence frozen: entries blocked until operator resolution"   # the EXISTING production refusal text, unchanged
 def recover(root, mult, inject=None, try_entry=False):
     rc, out, err = spawn(["recover", root, str(mult), inject or "-"] + ([try_entry if isinstance(try_entry, str) else "try"] if try_entry else []))
     rl = [l for l in out.splitlines() if l.startswith("RESULT ")]; pl = [l for l in out.splitlines() if l.startswith("PRE ")]
@@ -269,7 +271,7 @@ for tag, inj in (FZ if HAS_HELPER else ()):
     rc, out, err = spawn(["run", root, "after_credit", "2.0"])
     check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
     rc2, err2, pre, r = recover(root, "2.3", inj, True)
-    check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+    check("%s: recovery exited 0, no crash trace in stderr (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
     if r is None or pre is None: continue
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
     check("%s: the mutation REACHED the guard (hits %d >= 1) and the guard logged its refusal (guard_logs %d >= 1, once per refusal)" % (tag, r["hits"], r["guard_logs"]), r["hits"] >= 1 and r["guard_logs"] >= 1)
@@ -278,11 +280,11 @@ for tag, inj in (FZ if HAS_HELPER else ()):
     check("%s: the intent is FROZEN (lifecycle %r, frozen_open %d, pending %d), still exactly 1 intent, entries BLOCKED (in-process flag %r; entry attempt %r)"
           % (tag, r["ev"], r["frozen_open"], r["pending"], r["entry_blocked"], r["entry_try"]),
           "frozen" in r["ev"] and r["frozen_open"] == 1 and r["pending"] == 0 and r["n_intents"] == 1 and "lane_applied" not in r["ev"]
-          and r["entry_blocked"] is True and "blocked" in str(r["entry_try"]) and r["n_pos_all"] == 1)
+          and r["entry_blocked"] is True and REFUSAL in str(r["entry_try"]) and r["n_pos_all"] == 1)
     rc3, err3, pre3, r3 = recover(root, "2.3", None, True)
     check("%s: after a FRESH restart (no injection) the frozen intent still BLOCKS entries and nothing is credited or closed (rc %d; frozen_open %r, blocked %r, entry %r, cash %r)"
           % (tag, rc3, (r3 or {}).get("frozen_open"), (r3 or {}).get("entry_blocked"), (r3 or {}).get("entry_try"), (r3 or {}).get("cash")),
-          rc3 == 0 and r3 is not None and r3["frozen_open"] == 1 and r3["entry_blocked"] is True and "blocked" in str(r3["entry_try"])
+          rc3 == 0 and r3 is not None and r3["frozen_open"] == 1 and r3["entry_blocked"] is True and REFUSAL in str(r3["entry_try"])
           and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False and r3["n_pos_all"] == 1)
 
 if HAS_HELPER:
@@ -304,18 +306,18 @@ root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
 rc, out, err = spawn(["run", root, "after_credit_nopk", "2.0"])
 check("%s: setup child (intent journaled WITHOUT price_kind, labelled) KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
 rc2, err2, pre, r = recover(root, "2.3", "freeze_false", True)
-check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+check("%s: recovery exited 0, no crash trace in stderr (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
 if r is not None and pre is not None:
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
     check("%s: freeze was ATTEMPTED (%d calls) and NOT durable (lifecycle %r, frozen_open %d), restart recognition logged (%d)" % (tag, r["freeze_calls"], r["ev"], r["frozen_open"], r["rec_logs"]),
           r["freeze_calls"] >= 1 and "frozen" not in r["ev"] and r["frozen_open"] == 0 and r["rec_logs"] >= 1)
     check("%s: entries BLOCKED anyway (flag %r, entry attempt %r); no second credit (cash %.6f vs %.6f), leg a not done (%r), n_pos %d"
           % (tag, r["entry_blocked"], r["entry_try"], r["cash"], pre["pre_cash"], r["a_done"], r["n_pos_all"]),
-          r["entry_blocked"] is True and "blocked" in str(r["entry_try"]) and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos_all"] == 1)
+          r["entry_blocked"] is True and REFUSAL in str(r["entry_try"]) and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos_all"] == 1)
     rc3, err3, pre3, r3 = recover(root, "2.3", "freeze_false", True)
     check("%s: FRESH restart, freeze STILL failing: entries still blocked from the durable data alone (rc %d; frozen_open %r, ev %r, entry %r, cash %r)"
           % (tag, rc3, (r3 or {}).get("frozen_open"), (r3 or {}).get("ev"), (r3 or {}).get("entry_try"), (r3 or {}).get("cash")),
-          rc3 == 0 and r3 is not None and r3["frozen_open"] == 0 and "frozen" not in r3["ev"] and "blocked" in str(r3["entry_try"])
+          rc3 == 0 and r3 is not None and r3["frozen_open"] == 0 and "frozen" not in r3["ev"] and REFUSAL in str(r3["entry_try"])
           and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["n_pos_all"] == 1)
     check("%s: that fresh restart HIT the recognition (rec_logs %r >= 1) and the failed freeze was logged truthfully (freeze_calls %r >= 1, fz_logs %r >= 1)"
           % (tag, (r3 or {}).get("rec_logs"), (r3 or {}).get("freeze_calls"), (r3 or {}).get("fz_logs")),
@@ -325,12 +327,12 @@ if r is not None and pre is not None:
     rc4, err4, pre4, r4 = recover(root, "2.3", "freeze_false", "tryfirst")
     check("%s: refused BEFORE any exit poll (entry %r), then no credit/close (cash %r vs %r, leg a done %r, n_pos %r), recognition hit (%r)"
           % (tag, (r4 or {}).get("entry_first"), (r4 or {}).get("cash"), pre["pre_cash"], (r4 or {}).get("a_done"), (r4 or {}).get("n_pos_all"), (r4 or {}).get("rec_logs")),
-          rc4 == 0 and r4 is not None and "blocked" in str(r4["entry_first"]) and _cents(r4["cash"]) == _cents(pre["pre_cash"]) and r4["a_done"] is False
+          rc4 == 0 and r4 is not None and REFUSAL in str(r4["entry_first"]) and _cents(r4["cash"]) == _cents(pre["pre_cash"]) and r4["a_done"] is False
           and r4["n_pos_all"] == 1 and r4["rec_logs"] >= 1)
     rc5, err5, pre5, r5 = recover(root, "2.3", "freeze_false", "tryfirst")
     check("%s: SECOND fresh process, entry again BEFORE any exit poll: refused (%r), recognition hit (%r), freeze attempted but still not durable (calls %r, ev %r), no credit (cash %r)"
           % (tag, (r5 or {}).get("entry_first"), (r5 or {}).get("rec_logs"), (r5 or {}).get("freeze_calls"), (r5 or {}).get("ev"), (r5 or {}).get("cash")),
-          rc5 == 0 and r5 is not None and "blocked" in str(r5["entry_first"]) and r5["rec_logs"] >= 1 and r5["freeze_calls"] >= 1 and "frozen" not in r5["ev"]
+          rc5 == 0 and r5 is not None and REFUSAL in str(r5["entry_first"]) and r5["rec_logs"] >= 1 and r5["freeze_calls"] >= 1 and "frozen" not in r5["ev"]
           and _cents(r5["cash"]) == _cents(pre["pre_cash"]) and r5["a_done"] is False)
 
 # F13: durable-defect matrix, entry attempted BEFORE any exit poll in TWO fresh processes with the freeze write failing, for leg and remaining kinds
@@ -345,7 +347,7 @@ for kind13, kmult13, ret13 in (("leg", "2.0", "2.3"), ("remaining", "0.45", "0.4
         for nn, (rcx, errx, prx, rx) in (("fresh #1", (ra, ea, pa_, rr1)), ("fresh #2", (rb, eb, pb_, rr2))):
             check("%s %s: entry BEFORE any exit poll refused (%r); recognition hit (%r), freeze attempted (%r) not durable (ev %r); no extra credit (cash %r vs pre %r); position/leg not closed (n_pos %r, a_done %r)"
                   % (tag, nn, (rx or {}).get("entry_first"), (rx or {}).get("rec_logs"), (rx or {}).get("freeze_calls"), (rx or {}).get("ev"), (rx or {}).get("cash"), (prx or {}).get("pre_cash"), (rx or {}).get("n_pos_all"), (rx or {}).get("a_done")),
-                  rcx == 0 and rx is not None and "blocked" in str(rx["entry_first"]) and rx["rec_logs"] >= 1 and rx["freeze_calls"] >= 1 and "frozen" not in rx["ev"]
+                  rcx == 0 and rx is not None and REFUSAL in str(rx["entry_first"]) and rx["rec_logs"] >= 1 and rx["freeze_calls"] >= 1 and "frozen" not in rx["ev"]
                   and _cents(rx["cash"]) == _cents(prx["pre_cash"]) and rx["n_pos_all"] == 1 and rx["a_done"] is False)
 
 # F12: foreign pa_pos_id (the open position is now a different instance than the pending intent's): the existing lane_apply False -> freeze contract
@@ -354,15 +356,33 @@ root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
 rc, out, err = spawn(["run", root, "after_credit", "2.0"])
 check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
 rc2, err2, pre, r = recover(root, "2.3", "foreign_pos_id", "tryfirst")
-check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+check("%s: recovery exited 0, no crash trace in stderr (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
 if r is not None and pre is not None:
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
     check("%s: entry BEFORE any exit poll refused (%r); the pending intent is FROZEN (ev %r); no second credit (cash %r vs %r); the foreign position's leg a not closed (%r)"
           % (tag, r["entry_first"], r["ev"], r["cash"], pre["pre_cash"], r["a_done"]),
-          "blocked" in str(r["entry_first"]) and "frozen" in r["ev"] and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False)
+          REFUSAL in str(r["entry_first"]) and "frozen" in r["ev"] and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False)
     rc3, err3, pre3, r3 = recover(root, "2.3", None, "tryfirst")
     check("%s: FRESH process: the persisted frozen intent blocks entry BEFORE any exit poll (%r), still frozen once (ev %r), nothing credited (cash %r)" % (tag, r3 and r3["entry_first"], r3 and r3["ev"], r3 and r3["cash"]),
-          rc3 == 0 and r3 is not None and "blocked" in str(r3["entry_first"]) and r3["ev"].count("frozen") == 1 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)
+          rc3 == 0 and r3 is not None and REFUSAL in str(r3["entry_first"]) and r3["ev"].count("frozen") == 1 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)
+
+# H1: HEALTHY positive control (documents the CURRENT admission behavior; it is not a policy claim): the same real SIGKILL-after-credit pending intent with a
+# VALID recorded op. In a fresh process a new entry attempted BEFORE any exit poll is NOT refused with the divergence text, no recognition or freeze ran, and the
+# exit then completes at the recorded amounts. This isolates the refusal text of the F-cases to the recognition/frozen branches.
+tag = "H1-healthy-pending-admission-control"
+root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+rc, out, err = spawn(["run", root, "after_credit", "2.0"])
+check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+rc2, err2, pre, r = recover(root, "2.3", None, "tryfirst")
+if r is not None and pre is not None:
+    print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+    check("%s: entry BEFORE any exit poll is NOT refused with the divergence text (entry %r), no recognition hit (%r), no freeze call (%r), nothing frozen (ev %r)"
+          % (tag, r["entry_first"], r["rec_logs"], r["freeze_calls"], r["ev"]),
+          rc2 == 0 and REFUSAL not in str(r["entry_first"]) and r["rec_logs"] == 0 and r["freeze_calls"] == 0 and "frozen" not in r["ev"])
+    check("%s: the pending exit then completes once at the recorded amounts (leg a done %r, lifecycle %r, cash %r)" % (tag, r["a_done"], r["ev"][:4], r["cash"]),
+          r["a_done"] is True and r["ev"][:4] == FOUR)
+else:
+    check("%s: recovery produced PRE and RESULT (rc %d, stderr tail %r)" % (tag, rc2, err2[-160:]), False)
 
 # journal corrupt mid-file: sentinel/entry block + hold classification read in the child
 tag = "F9-journal-corrupt"
@@ -370,11 +390,11 @@ root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
 rc, out, err = spawn(["run", root, "after_credit", "2.0"])
 check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
 rc2, err2, pre, r = recover(root, "2.3", "journal_corrupt", True)
-check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+check("%s: recovery exited 0, no crash trace in stderr (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
 if r is not None and pre is not None:
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
     check("%s: NO second credit (cash %.6f vs pre %.6f), leg a NOT done (%r), position open (n_pos %d), no lane_applied/applied written (%r)" % (tag, r["cash"], pre["pre_cash"], r["a_done"], r["n_pos"], r["ev"]),
           _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos"] == 1 and "lane_applied" not in r["ev"] and "applied" not in r["ev"])
     check("%s: journal reported corrupt (status %r), entries BLOCKED (flag %r, entry attempt %r), exit held visibly (pending_exit %r)" % (tag, r["journal_status"], r["entry_blocked"], r["entry_try"], r["pend_why"]),
-          r["journal_status"] is not None and r["entry_blocked"] is True and "blocked" in str(r["entry_try"]) and bool(r["pend_why"]) and r["n_pos_all"] == 1)
+          r["journal_status"] is not None and r["entry_blocked"] is True and REFUSAL in str(r["entry_try"]) and bool(r["pend_why"]) and r["n_pos_all"] == 1)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

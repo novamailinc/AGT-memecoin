@@ -32,9 +32,26 @@ def child(mode, root, modname, flag):
     calls = {"freeze": 0}
     if mode == "setup":
         iid = CI.begin(lane, "FrzMint1", "pos-frz-1", [{"kind": "credit", "op_id": "%s:leg:a:FrzMint1:pos-frz-1" % lane, "mint": "FrzMint1", "amount": 1.0, "qty": 100.0,
-                       "fee": 0.01, "price_kind": "test", "pos_id": "pos-frz-1"}],
+                       "fee": 0.01, "price_kind": "test", "pos_id": "pos-frz-1"}] if modname != "grad" else [{"kind": "credit", "op_id": "%s:leg:a:FrzMint1:pos-frz-1" % lane, "mint": "FrzMint1", "amount": 1.0, "qty": -1.0,
+                       "fee": 0.0, "price_kind": "test", "pos_id": "pos-frz-1"}],
                        {"realized_usd": 1.0, "closed_reason": "engineering_setup", "close_ts": 1.0, "leg_suffix": "leg:a"})
         print("RESULT " + json.dumps({"iid": iid, "status": CI.intent_status(lane, iid)})); return
+    import hashlib
+    opid = "%s:leg:a:FrzMint1:pos-frz-1" % lane
+    def _led():
+        try: return hashlib.sha256(json.dumps(M._read(), sort_keys=True, default=str).encode()).hexdigest()
+        except Exception as e: return "unreadable:%s" % type(e).__name__
+    hits = {"n": 0}
+    _real_pa = M._paper_account
+    class _PX:
+        def __init__(self, pa): self._pa = pa
+        def __getattr__(self, n): return getattr(self._pa, n)
+        def credit(self, *a, **k):
+            oid = k.get("op_id") if "op_id" in k else (a[3] if len(a) > 3 else None)
+            if oid == opid: hits["n"] += 1   # scoped to THIS setup op id only
+            return self._pa.credit(*a, **k)
+    M._paper_account = lambda *a, **k: (lambda p: _PX(p) if p is not None else None)(_real_pa(*a, **k))
+    led0 = _led()
     _real = CI.freeze
     def _fz(l, i, why):
         calls["freeze"] += 1
@@ -45,7 +62,8 @@ def child(mode, root, modname, flag):
     ents, st, _t = CI._read(CI.journal_path(lane))
     iids = [i for i, x in CI._state(ents).items() if x["intent"] is not None]
     print("RESULT " + json.dumps({"ret": ret, "flag": bool(M._ENTRY_BLOCKED), "freeze_calls": calls["freeze"], "journal_status": st,
-                                  "status": CI.intent_status(lane, iids[0]) if iids else None, "n": len(iids)}))
+                                  "status": CI.intent_status(lane, iids[0]) if iids else None, "n": len(iids),
+                                  "hits": hits["n"], "led_same": led0 == _led() and not led0.startswith("unreadable"), "led0": led0[:12]}))
 
 if MODE != "parent":
     child(MODE, sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""); sys.exit(0)
@@ -68,12 +86,15 @@ for mod in LANES:
     rc, a1, err = run("recover", ra, mod, "freeze_false")
     check("%s A freeze write FAILS: still a BLOCKER (%r), freeze attempted, intent NOT frozen (status %r)" % (mod, a1, (a1 or {}).get("status")),
           rc == 0 and a1 is not None and a1["ret"] is True and a1["flag"] is True and a1["freeze_calls"] >= 1 and a1["status"] != "frozen" and a1["n"] == 1 and "Traceback" not in err)
+    check("%s A the REAL account refusal path was hit (credit calls for the setup op id %r >= 1) and the lane ledger was NOT mutated (same %r, hash %s)" % (mod, (a1 or {}).get("hits"), (a1 or {}).get("led_same"), (a1 or {}).get("led0")),
+          a1 is not None and a1["hits"] >= 1 and a1["led_same"] is True)
     rc, a2, err = run("recover", ra, mod, "freeze_false")
     check("%s A fresh process, freeze still failing: still blocks (%r)" % (mod, a2), rc == 0 and a2 is not None and a2["ret"] is True and a2["flag"] is True and a2["freeze_calls"] >= 1 and a2["status"] != "frozen")
     rb = tempfile.mkdtemp(prefix="frz-B-%s-" % mod)
     rc, s, err = run("setup", rb, mod)
     rc, b1, err = run("recover", rb, mod)
     check("%s B first process freezes durably and blocks (%r)" % (mod, b1), rc == 0 and b1 is not None and b1["ret"] is True and b1["flag"] is True and b1["freeze_calls"] >= 1 and b1["status"] == "frozen" and b1["n"] == 1)
+    check("%s B the account path was hit (%r >= 1) and the lane ledger was NOT mutated (same %r)" % (mod, (b1 or {}).get("hits"), (b1 or {}).get("led_same")), b1 is not None and b1["hits"] >= 1 and b1["led_same"] is True)
     rc, b2, err = run("recover", rb, mod)
     check("%s B FRESH process: the PERSISTED frozen intent still blocks, no re-freeze (%r)" % (mod, b2), rc == 0 and b2 is not None and b2["ret"] is True and b2["flag"] is True and b2["freeze_calls"] == 0 and b2["status"] == "frozen" and b2["n"] == 1)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

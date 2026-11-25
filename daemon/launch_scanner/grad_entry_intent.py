@@ -315,3 +315,52 @@ def recover_pass(ledger_path, lane, read_lane, adopt, evidence, drop_intent):
         return blocked, actions
     except Exception as e:
         return "entry-intent recovery failed (%s); entries blocked fail-closed" % type(e).__name__, actions
+
+
+# ---- read-only visibility (status/account views) ----------------------------------------------------------------------------------------------------
+def default_ledger_path(env=None):
+    """The grad lane ledger path WITHOUT importing the engine: mirrors grad.py's own derivation (HOME = FOREX_AGENT_HOME or ~/.forex-agent, file grad_ledger.json).
+    Valid for the grad lane only; other lanes have their own ledgers and are out of scope."""
+    env = os.environ if env is None else env
+    home = env.get("FOREX_AGENT_HOME") or os.path.expanduser("~/.forex-agent")
+    return os.path.join(home, "grad_ledger.json")
+
+def status_readonly(ledger_path):
+    """READ-ONLY, bounded, no locks, no repair, no file removal (scan() would delete stale tmp files, so it is NOT used here).
+    -> {"state": "clear"|"pending"|"unknown", "records": [{"file","op_id","mint","valid"}], "why": str|None}.
+    clear only when the directory is absent with a readable parent, or present and empty. Any listing/parse problem is unknown or a pending-invalid record, never clear."""
+    d = records_dir(ledger_path)
+    try:
+        names = sorted(os.listdir(d))
+    except FileNotFoundError:
+        ok = os.path.isdir(os.path.dirname(os.path.abspath(d)) or ".")
+        return {"state": "clear", "records": [], "why": None} if ok else {"state": "unknown", "records": [], "why": "ledger directory unreadable"}
+    except Exception as e:
+        return {"state": "unknown", "records": [], "why": "entry-intent directory unreadable (%s)" % type(e).__name__}
+    recs = []
+    for n in names[:MAX_PER_PASS + 1]:
+        p = os.path.join(d, n)
+        if n.endswith(".tmp"):
+            recs.append({"file": n, "op_id": None, "mint": None, "valid": False}); continue
+        try:
+            with open(p) as f:
+                r = json.load(f)
+            lane_ok = isinstance(r, dict) and validate(r, r.get("lane")) is None
+            recs.append({"file": n, "op_id": (r or {}).get("op_id"), "mint": (r or {}).get("mint"), "valid": bool(lane_ok)})
+        except Exception:
+            recs.append({"file": n, "op_id": None, "mint": None, "valid": False})
+    if not recs and not names:
+        return {"state": "clear", "records": [], "why": None}
+    more = len(names) > MAX_PER_PASS + 1
+    return {"state": "pending", "records": recs[:MAX_PER_PASS], "why": "%d record file(s)%s" % (len(names), " (list truncated)" if more else "")}
+
+def format_status_lines(st, flag_on):
+    """Pure. Lines for the account view. Clear -> NO lines (the default output is unchanged). Pending/unknown are labeled as recorded state, and distinct from an ordinary cycle fault.
+    The flag reported is THIS process's environment; the trader process's flag may differ, said in the text."""
+    if not isinstance(st, dict) or st.get("state") == "clear":
+        return []
+    flag = ("recovery flag in this process: ON" if flag_on else "recovery flag in this process: OFF (records are recorded state; they are processed only by a trader process with AGT_GRAD_ENTRY_INTENT_ENABLED=1)")
+    if st.get("state") == "pending":
+        items = ", ".join("%s%s" % ((r.get("mint") or "?")[:12], "" if r.get("valid") else " (INVALID/UNREADABLE)") for r in st.get("records") or [])
+        return ["⚠️ Grad entry-intent: %d unresolved record(s) [%s] (%s). An unrecovered entry, not an ordinary cycle fault; %s." % (len(st.get("records") or []), items, st.get("why"), flag)]
+    return ["⚠️ Grad entry-intent state: UNKNOWN (%s); not reported as clear. %s." % (st.get("why") or "read failed", flag)]

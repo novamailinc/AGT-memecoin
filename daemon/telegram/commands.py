@@ -809,6 +809,20 @@ def _cmd_positions(ctx, chat_id, user_id, update_id, args):
     ctx.send(chat_id, "\n\n".join(sections), None)
 
 
+def _entry_intent_lines():
+    """READ-ONLY, bounded visibility of the grad lane's durable entry-intent records (file listing only, no engine import, no lock, no repair). Never raises:
+    a read failure is reported as UNKNOWN, never as clear. Clear state adds no lines. Shown whatever the recovery flag is (recorded state is not hidden)."""
+    try:
+        try:
+            from daemon.launch_scanner import grad_entry_intent as _gei  # noqa: PLC0415
+        except ImportError:
+            import grad_entry_intent as _gei  # noqa: PLC0415
+        st = _gei.status_readonly(_gei.default_ledger_path())
+        return _gei.format_status_lines(st, _gei.enabled())
+    except Exception as exc:
+        return ["⚠️ Grad entry-intent state: UNKNOWN (status read failed: %s); not reported as clear." % type(exc).__name__]
+
+
 def _cmd_account(ctx, chat_id, user_id, update_id, args):
     """/account [demo|forex] — explicit account selection; with no
     argument BOTH books are shown, each labeled. The demo book is the
@@ -842,6 +856,7 @@ def _cmd_account(ctx, chat_id, user_id, update_id, args):
                              % (snap.get("marks_status") or "no marks"))
             if snap.get("degraded"):
                 lines.append("⚠️ ledger degraded: %s" % snap["degraded"])
+            lines.extend(_entry_intent_lines())
             sections.append("\n".join(lines))
     if sel in ("", "forex"):
         try:

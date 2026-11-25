@@ -3219,7 +3219,8 @@ def _finalize(d, mint, pos, closed_reason):
                                      {"realized_usd": realized,
                                       "entry_notional_usd": entry_notional,
                                       "closed_reason": closed_reason,
-                                      "close_ts": time.time()})
+                                      "close_ts": time.time()},
+                                     supersedes=(_prev_sp.get("intent_id") if _prev_sp.get("intent_id") in _open_ids else None))
                 except _ci.IntentNotDurable as _nd:
                     # FAIL CLOSED: no durable plan, so NO account op. Position stays open, visible, nothing resold, bankroll booking undone;
                     # an earlier open intent (if any) keeps its id/plan_sig so a later poll can still recover or reuse it.

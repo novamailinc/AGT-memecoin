@@ -7,7 +7,7 @@ second with an explicit close_ts (no sleeping, no clock dependence) against the 
 journal logic only: no account, no network, no engine.
 Run: python3 -B tests/test_close_intents_unique_id.py
 """
-import os, sys, tempfile
+import os, sys, tempfile, subprocess
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(prefix="ci-uniq-")
@@ -31,12 +31,48 @@ OPS = [{"kind": "credit", "op_id": "op-1", "amount": 1.0}]
 INFO = {"close_ts": 1795593430.2, "realized_usd": 1.0, "entry_notional_usd": 1.0, "closed_reason": "t"}
 a = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))
 ci.freeze("grad", a, "superseded by a changed settle plan")
-b = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO, close_ts=1795593430.9))   # same integer second
-c = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))                          # same second again
-check("same-second begin after a freeze gets a DIFFERENT id (%s vs %s)" % (a, b), a != b)
-check("a third same-second begin is distinct from both (%s)" % c, len({a, b, c}) == 3)
+# FROZEN NEVER REVIVES: a plain begin on an operation whose intent is frozen is refused unless the caller names the frozen intent (explicit supersede).
+check("a plain begin of the SAME operation after its intent was frozen is REFUSED (frozen never revives; no new intent appended)",
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO, close_ts=1795593430.9)))
+      and len([e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent"]) == 1)
+check("a begin that names a DIFFERENT intent as supersedes is also refused", _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO, close_ts=1795593430.9), supersedes="grad:nope:1")))
+b = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO, close_ts=1795593430.9), supersedes=a)   # explicit journaled supersede, same integer second
+_sup = [e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("intent_id") == b]
+check("explicit supersede opens a NEW intent with a different id (%s vs %s), recording supersedes=%s" % (a, b, a), a != b and len(_sup) == 1 and _sup[0].get("supersedes") == a)
+b2 = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))
+check("a plain begin of the same operation while the superseding intent is PENDING resumes it (same id, no second intent)", b2 == b)
+# DISTINCT operations (other pos / other op ids) in the same second get distinct ids; the frozen original is not in the way of them
+c = ci.begin("grad", "MINT1", "grad/MINT1#2", OPS, dict(INFO))
+c2 = ci.begin("grad", "MINT1", "grad/MINT1#1", [{"kind": "credit", "op_id": "op-other", "amount": 1.0}], dict(INFO))
+check("distinct operations in the same second are distinct from each other and from both earlier intents (%s, %s)" % (c, c2), len({a, b, c, c2}) == 4)
+ci.freeze("grad", b, "second freeze"); 
+check("after a SECOND freeze the same operation again needs an explicit supersede naming the LATEST frozen intent (plain refused, supersedes=a refused, supersedes=b ok)",
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=a))
+      and bool(ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=b)))
+check("a SAME-operation begin with a DIFFERENT plan (same op ids, other amount) while an intent is pending raises, and appends nothing",
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#2", [{"kind": "credit", "op_id": "op-1", "amount": 5.0}], dict(INFO)))
+      and len([e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("pos_id") == "grad/MINT1#2"]) == 1)
+# concurrent explicit supersedes of ONE frozen operation: exactly one new intent, every caller gets its id
+_f0 = ci.begin("lanefz", "MF", "pf", OPS, dict(INFO)); ci.freeze("lanefz", _f0, "r")
+import threading as _t0
+_sid = []; _sl = _t0.Lock()
+def _sw():
+    x = ci.begin("lanefz", "MF", "pf", OPS, dict(INFO), supersedes=_f0)
+    with _sl: _sid.append(x)
+_tt = [_t0.Thread(target=_sw) for _ in range(8)]; [t.start() for t in _tt]; [t.join() for t in _tt]
+_fe = [e for e in ci._read(ci.journal_path("lanefz"))[0] if e.get("ev") == "intent"]
+check("8 concurrent explicit supersedes of one frozen op: 2 intent events in all (%d), ONE new id returned to all 8 (%d distinct of %d), chain recorded" % (len(_fe), len(set(_sid)), len(_sid)),
+      len(_fe) == 2 and len(set(_sid)) == 1 and len(_sid) == 8 and _fe[1].get("supersedes") == _f0 and _sid[0] == _fe[1]["intent_id"] and _f0 not in [x["intent_id"] for x in ci.pending("lanefz")])
+_cs = ("import sys; sys.path.insert(0, %r); import daemon.launch_scanner.close_intents as ci; "
+       "print(ci.begin('lanefp','MF','pf',[{'kind':'credit','op_id':'op-1','amount':1.0}],{'close_ts':1795593430.2,'realized_usd':1.0},supersedes=sys.argv[1]))" % REPO)
+_g0 = ci.begin("lanefp", "MF", "pf", OPS, dict(INFO)); ci.freeze("lanefp", _g0, "r")
+_pp2 = [subprocess.Popen([sys.executable, "-B", "-c", _cs, _g0], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ)) for _ in range(4)]
+_oo = [p.communicate() for p in _pp2]
+_fp = [e for e in ci._read(ci.journal_path("lanefp"))[0] if e.get("ev") == "intent"]
+check("4 processes concurrently superseding one frozen op: rcs %r, 2 intent events (%d), ONE new id (%d)" % ([p.returncode for p in _pp2], len(_fp), len({o[0].strip() for o in _oo})),
+      all(p.returncode == 0 for p in _pp2) and len(_fp) == 2 and len({o[0].strip() for o in _oo}) == 1 and {o[0].strip() for o in _oo} == {_fp[1]["intent_id"]})
 pend = [x["intent_id"] for x in ci.pending("grad")]
-check("the new intents are OPEN and the frozen one stays terminal (pending=%r)" % pend, a not in pend and b in pend and c in pend)
+check("the new intents are OPEN and the frozen ones stay terminal (pending=%r)" % pend, a not in pend and b not in pend and c in pend and c2 in pend)
 d = ci.begin("grad", "MINT2", "grad/MINT2#1", OPS, dict(INFO))
 check("id keeps the readable base (lane:mint:pos:second) plus a suffix (%s)" % d, d.startswith("grad:MINT2:grad/MINT2#1:1795593430:") and len(d.rsplit(":", 1)[-1]) == 24)
 
@@ -59,8 +95,9 @@ try:
     _fz = ci.freeze("lanex", "grad:M:p:1:abc", "x")
 finally:
     _lg.removeHandler(_cap); _lg.propagate = _prop
-_exp = [r for r in _cap.recs if r.getMessage().startswith("close_intents: append failed") and r.exc_info and r.exc_info[0] is IsADirectoryError]
-check("the injected fault was logged EXACTLY as expected: %d records, all 'append failed' with IsADirectoryError, none other (%d total)" % (len(_exp), len(_cap.recs)), len(_exp) == 2 and len(_cap.recs) == 2)
+_rf = [r for r in _cap.recs if r.getMessage().startswith("close_intents: journal not cleanly readable (") and "refusing append" in r.getMessage() and r.exc_info is None]
+check("the directory fault is a CLASSIFICATION refusal: begin refuses at the read (no log), freeze logs EXACTLY one 'journal not cleanly readable ... refusing append' record with no exc_info (%d such, %d total: %r)" % (len(_rf), len(_cap.recs), [r.getMessage() for r in _cap.recs]),
+      len(_rf) == 1 and len(_cap.recs) == 1)
 check("unwritable journal: begin raises IntentNotDurable (no id for a non-durable intent) and freeze returns False (%r, %r)" % (_raised, _fz), _raised is True and _fz is False)
 shutil.rmtree(jp)
 check("healthy journal again: freeze returns True and begin works", ci.freeze("lanex", "grad:M:p:1:abc", "y") is True and bool(ci.begin("lanex", "M", "p", OPS, dict(INFO))))
@@ -79,8 +116,11 @@ check("freeze returns True, status frozen", ci.freeze("lanes", st1, "terminal") 
 st3 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True)
 check("stable begin after a FREEZE returns the existing frozen handle and opens NO new intent (still one event, still terminal, not pending)",
       st3 == st1 and len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent"]) == 1 and st1 not in [x["intent_id"] for x in ci.pending("lanes")])
-ci.mark_account_applied("lanes", st1); ci.mark_lane_applied("lanes", st1)
-check("intent_status: applied after the terminal events; intent_status of an absent id is None", ci.intent_status("lanes", st1) == "applied" and ci.intent_status("lanes", "nope") is None)
+_ma1 = ci.mark_account_applied("lanes", st1); _ml1 = ci.mark_lane_applied("lanes", st1)
+check("a FROZEN intent refuses both markers (%r, %r) and its status stays frozen (%s); an absent id is None" % (_ma1, _ml1, ci.intent_status("lanes", st1)),
+      _ma1 is False and _ml1 is False and ci.intent_status("lanes", st1) == "frozen" and ci.intent_status("lanes", "nope") is None)
+st4 = ci.begin("lanes", "MS", "ps-fresh", OPS, dict(INFO), stable_id=True)
+check("a SEPARATE fresh intent still reaches applied through both markers (%s)" % st4, ci.mark_account_applied("lanes", st4) is True and ci.mark_lane_applied("lanes", st4) is True and ci.intent_status("lanes", st4) == "applied")
 # serialization: 8 threads begin the SAME operation concurrently -> ONE intent, one distinct id
 import threading, subprocess
 _ids = []; _l = threading.Lock()
@@ -120,28 +160,46 @@ check("marker appends that fail return False (%r, %r) and the intent is still PE
 _okm = ci.mark_account_applied("lanem", mk) and ci.mark_lane_applied("lanem", mk)
 check("healthy markers return True and the intent becomes terminal (applied)", _okm is True and ci.intent_status("lanem", mk) == "applied")
 
-# concurrency: 8 threads x 25 begins on the SAME position in the same second -> all ids distinct, every intent event recorded once
+# concurrency, DISTINCT operations: 8 threads x 25 begins, each with its OWN op id (and pos) in the same second -> all ids distinct, every intent recorded once
 import threading
 ids = []; lk = threading.Lock()
-def work():
-    for _ in range(25):
-        x = ci.begin("lanecs", "MC", "pc", OPS, dict(INFO))   # fresh stress journal: "lanec" already holds the stable-begin section's one op_key intent
+def work(tn):
+    for k in range(25):
+        x = ci.begin("lanecs", "MC", "pc-%d-%d" % (tn, k), [{"kind": "credit", "op_id": "op-%d-%d" % (tn, k), "amount": 1.0}], dict(INFO))
         with lk:
             ids.append(x)
-ts = [threading.Thread(target=work) for _ in range(8)]
+ts = [threading.Thread(target=work, args=(n,)) for n in range(8)]
 [t_.start() for t_ in ts]; [t_.join() for t_ in ts]
 ev = [e for e in ci._read(ci.journal_path("lanecs"))[0] if e.get("ev") == "intent"]
-check("8 threads x 25 same-second begins: %d ids, %d distinct, %d intent events, %d distinct in journal" % (len(ids), len(set(ids)), len(ev), len({e["intent_id"] for e in ev})),
+check("8 threads x 25 same-second begins of DISTINCT operations: %d ids, %d distinct, %d intent events, %d distinct in journal" % (len(ids), len(set(ids)), len(ev), len({e["intent_id"] for e in ev})),
       len(ids) == 200 and len(set(ids)) == 200 and len(ev) == 200 and len({e["intent_id"] for e in ev}) == 200)
+_sm = []
+def work_same():
+    for _ in range(25):
+        x = ci.begin("lanecss", "MC", "pc", OPS, dict(INFO))
+        with lk:
+            _sm.append(x)
+ts = [threading.Thread(target=work_same) for _ in range(8)]
+[t_.start() for t_ in ts]; [t_.join() for t_ in ts]
+ev = [e for e in ci._read(ci.journal_path("lanecss"))[0] if e.get("ev") == "intent"]
+check("8 threads x 25 begins of the SAME single operation: ONE intent (%d) and ONE id (%d distinct of %d)" % (len(ev), len(set(_sm)), len(_sm)),
+      len(ev) == 1 and len(set(_sm)) == 1 and len(_sm) == 200)
 
-# concurrency across PROCESSES (real begin callers can be separate processes): 4 children x 25 begins
-import subprocess
-code = ("import os,sys;sys.path.insert(0,%r);import daemon.launch_scanner.close_intents as ci;"
-        "[ci.begin('laneps','MP','pp',[{'kind':'credit','op_id':'o','amount':1.0}],{'close_ts':1795593430.5}) for _ in range(25)]") % REPO
-procs = [subprocess.Popen([sys.executable, "-B", "-c", code], env=dict(os.environ)) for _ in range(4)]
+# concurrency across PROCESSES: 4 children x 25 begins of DISTINCT operations (child index in the op id)
+code = ("import os,sys;sys.path.insert(0,%r);import daemon.launch_scanner.close_intents as ci;n=sys.argv[1];"
+        "[ci.begin('laneps','MP','pp-'+n+'-'+str(k),[{'kind':'credit','op_id':'o-'+n+'-'+str(k),'amount':1.0}],{'close_ts':1795593430.5}) for k in range(25)]") % REPO
+procs = [subprocess.Popen([sys.executable, "-B", "-c", code, str(n)], env=dict(os.environ)) for n in range(4)]
 rcs = [p_.wait() for p_ in procs]
 ev = [e for e in ci._read(ci.journal_path("laneps"))[0] if e.get("ev") == "intent"]
-check("4 processes x 25 same-second begins: rcs %r, %d intent events, %d distinct ids, journal not torn" % (rcs, len(ev), len({e["intent_id"] for e in ev})),
+check("4 processes x 25 same-second begins of DISTINCT operations: rcs %r, %d intent events, %d distinct ids, journal not torn" % (rcs, len(ev), len({e["intent_id"] for e in ev})),
       rcs == [0, 0, 0, 0] and len(ev) == 100 and len({e["intent_id"] for e in ev}) == 100 and ci._read(ci.journal_path("laneps"))[1] is None)
+code2 = ("import os,sys;sys.path.insert(0,%r);import daemon.launch_scanner.close_intents as ci;"
+         "[print(ci.begin('lanepss','MP','pp',[{'kind':'credit','op_id':'o','amount':1.0}],{'close_ts':1795593430.5})) for _ in range(25)]") % REPO
+procs2 = [subprocess.Popen([sys.executable, "-B", "-c", code2], stdout=subprocess.PIPE, text=True, env=dict(os.environ)) for _ in range(4)]
+outs2 = [p_.communicate()[0].split() for p_ in procs2]
+ev = [e for e in ci._read(ci.journal_path("lanepss"))[0] if e.get("ev") == "intent"]
+_all2 = {x for o in outs2 for x in o}
+check("4 processes x 25 begins of the SAME single operation: rcs %r, ONE intent (%d), ONE id (%d), 100 returns (%d)" % ([p_.returncode for p_ in procs2], len(ev), len(_all2), sum(len(o) for o in outs2)),
+      all(p_.returncode == 0 for p_ in procs2) and len(ev) == 1 and len(_all2) == 1 and sum(len(o) for o in outs2) == 100)
 print("fails: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

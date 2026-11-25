@@ -223,14 +223,17 @@ class IntentNotDurable(RuntimeError):
 
 def begin(lane: str, mint: str, pos_id: Optional[str],
           settle_ops: List[Dict[str, Any]],
-          close_info: Dict[str, Any], stable_id: bool = False) -> str:
+          close_info: Dict[str, Any], stable_id: bool = False, supersedes: Optional[str] = None) -> str:
     """Open an intent. settle_ops is the ordered list of account
     operations this close performs, each {kind: credit|write_down,
     op_id, amount?, qty?, price_kind?, reason?}; close_info carries
     what the lane ledger needs to re-book the close (realized_usd,
     entry_notional_usd, closed_reason). Returns the intent id.
     Raises IntentNotDurable when the intent event could not be durably appended (fail closed: no account op may run without it).
-    stable_id=True: idempotent per OPERATION KEY (lane:mint:pos:close_ts), see below; the intent id itself is always unique."""
+    stable_id=True: idempotent per OPERATION KEY (lane:mint:pos:close_ts), see below; the intent id itself is always unique.
+    supersedes=<frozen intent id>: the ONLY way a plain begin may open a new intent for an operation whose earlier intent is FROZEN (frozen is terminal and
+    never revives). The caller must have frozen that intent with a journaled reason first; the new intent event records the previous id. A plain begin on
+    a frozen operation without it raises IntentNotDurable (fail closed: the position stays pending and visible)."""
     intent_id = "%s:%s:%s:%d" % (lane, mint, pos_id or "legacy",
                                  int(close_info.get("close_ts")
                                      or time.time() * 1000))
@@ -254,7 +257,12 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
             elif st is not None:
                 raise IntentNotDurable("journal not cleanly readable (%s): refusing to open an intent" % st)
             _ids = sorted(str(o.get("op_id")) for o in settle_ops)
-            for iid0, st0 in _state(ents).items():
+            _stt = _state(ents)
+            _sup_done = {e.get("supersedes") for e in ents if e.get("ev") == "intent" and e.get("supersedes")}
+            _frozen_same = [i0 for i0, s0 in _stt.items() if s0["intent"] is not None and not s0["applied"] and s0["frozen"] is not None
+                            and s0["intent"].get("mint") == mint and s0["intent"].get("pos_id") == pos_id
+                            and sorted(str(o.get("op_id")) for o in s0["intent"].get("settle_ops") or []) == _ids and i0 not in _sup_done]
+            for iid0, st0 in _stt.items():
                 e0 = st0["intent"]
                 if (e0 is not None and not st0["applied"] and not st0["frozen"] and e0.get("mint") == mint and e0.get("pos_id") == pos_id
                         and sorted(str(o.get("op_id")) for o in e0.get("settle_ops") or []) == _ids):
@@ -262,6 +270,11 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
                     if json.dumps(e0.get("settle_ops"), sort_keys=True) != json.dumps(settle_ops, sort_keys=True):
                         raise IntentNotDurable("operation %s already pending with a DIFFERENT plan" % iid0)
                     return iid0
+            if _frozen_same and set(_frozen_same) != {supersedes}:
+                raise IntentNotDurable("operation already has FROZEN intent(s) %s: a frozen intent never revives; a new intent needs an explicit supersedes=<that id>"
+                                       % ",".join(sorted(_frozen_same)))
+            if supersedes:
+                ev["supersedes"] = supersedes
             if not _append(journal_path(lane), ev):
                 raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
             if _read_consistent(journal_path(lane))[1] is not None:
@@ -504,6 +517,8 @@ def recover_lane(
                 and st["lane_applied"]:
             _mark_once(lane, iid, "applied")
         elif why is not None:
-            freeze(lane, iid, why)
-            frozen.append(iid)
+            if freeze(lane, iid, why):
+                frozen.append(iid)
+            else:
+                logger.error("close_intents: recover_lane could not durably freeze %s (%s): it stays pending and is retried", iid, why)
     return frozen

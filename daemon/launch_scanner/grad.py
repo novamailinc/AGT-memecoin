@@ -3204,17 +3204,41 @@ def _finalize(d, mint, pos, closed_reason):
         if _ci is not None:
             try:
                 _prev_id = _prev_sp.get("intent_id")
-                # the status read raises IntentNotDurable when the journal is not cleanly readable: that FAILS CLOSED below (never an empty-set fallback)
-                _prev_st = _ci.intent_status(LANE, _prev_id) if _prev_id else None
-                if _prev_st == "open" and _prev_sp.get("plan_sig") == _plan_sig:
+                _chain_moved = False
+                _prev_ev = None
+                if _prev_id:
+                    # FOLLOW the journal's supersede chain to its TIP (raises IntentNotDurable when unreadable or ambiguous: never an empty fallback).
+                    # After a crash the position state may still name an OLD frozen parent although its successor was created, even applied.
+                    _tip, _prev_st, _prev_ev = _ci.chain_tip(LANE, _prev_id)
+                    _chain_moved = _tip != _prev_id
+                    _prev_id = _tip
+                else:
+                    _prev_st = None
+                if _chain_moved and _prev_st == "applied":
+                    # the successor chain already durably APPLIED this settle (the lane state write was lost): reconcile onto the tip; the account ops
+                    # below are idempotent by op id and the lane booking then completes exactly once
+                    _iid = _prev_id
+                elif _prev_st == "open" and ((not _chain_moved and _prev_sp.get("plan_sig") == _plan_sig)
+                                             or (_chain_moved and json.dumps(_prev_ev.get("settle_ops"), sort_keys=True) == json.dumps(_plan, sort_keys=True))):
                     _iid = _prev_id   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
                 else:
+                    if _prev_st in ("open", "frozen") and _prev_ev is not None:
+                        # Changing the op set must not DROP (or re-kind) an op that is already booked in the account: that would evade conflict
+                        # detection (e.g. a booked write-down, then a sale of the written-down units). Unreadable account history cannot prove it.
+                        _newk = {(o.get("op_id"), o.get("kind")) for o in _plan}
+                        _gone = [o.get("op_id") for o in (_prev_ev.get("settle_ops") or []) if (o.get("op_id"), o.get("kind")) not in _newk]
+                        if _gone:
+                            if _pa._journal_read()[1] is not None:
+                                raise _ci.IntentNotDurable("account journal unreadable: cannot prove the dropped op(s) %s were not applied" % _gone)
+                            _booked = [x for x in _gone if _pa.op_outcome(x) == "applied"]
+                            if _booked:
+                                raise _ci.IntentNotDurable("the changed settle plan would DROP op(s) %s that are already APPLIED in the account: refusing (needs reconciliation)" % _booked)
                     if _prev_st == "open":
                         # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
                         # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
                         if not _ci.freeze(LANE, _prev_id, "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160]):
                             raise _ci.IntentNotDurable("superseded intent freeze not durable")
-                    # prev OPEN (frozen just above) or prev FROZEN (an earlier poll froze it and the begin then failed or was lost): the replacement
+                    # prev OPEN (frozen just above) or prev FROZEN (an earlier poll froze it and begin then failed or was lost): the replacement
                     # is opened, or resumed if it already landed, through the explicit supersede of exactly that intent
                     _iid = _ci.begin(LANE, mint, _pos_id, _plan,
                                      {"realized_usd": realized,

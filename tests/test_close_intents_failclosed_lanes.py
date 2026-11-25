@@ -187,6 +187,39 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
     check("%s generations: the older position's fill is not adopted by resume (%r), the new generation sells under ITS OWN op id (%r != %r) and credits its own fill (gross %r)"
           % (modname, _rg, M._exit_op(posg, "a"), M._exit_op(posg_old, "a"), spyg.credits[0][2] if spyg.credits else None),
           _rg is None and M._exit_op(posg, "a") != M._exit_op(posg_old, "a") and len(spyg.credits) == 1 and abs(float(spyg.credits[0][2]) - 0.1) < 1e-12 and _ng > 0)
+    # FROZEN OPERATION HOLD (N4): a plain-begin lane never revives a FROZEN operation. First attempt: the account declines, the intent stays open; the
+    # test freezes it (as recover_lane does). A restart-fresh position object then retries with an accepting account: begin refuses, the exit is held
+    # visibly (close_intent_not_durable), NO credit, NO second intent, the frozen intent stays terminal. CONTROL: the same sequence WITHOUT the freeze resumes
+    # the SAME intent and credits exactly once.
+    class _RefuseAccount(_SpyAccount):
+        def credit(self, *a, **k):
+            self.credits.append(a); return (False, "declined (test)")
+    def _lane_ints(m): return [e for e in CI._read(CI.journal_path(lane))[0] if e.get("ev") == "intent" and e.get("mint") == m]
+    for _freeze_it in (True, False):
+        _tag = ("FZ" if _freeze_it else "FY") + modname[:3]
+        ffz = _FakeFiller(); spyr = _RefuseAccount(); spyr.max_price_impact_pct = lambda: 50.0
+        pz_a = mkpos(_tag, lm)
+        with patch.object(M, "_paper_account", lambda: spyr), patch.object(M, "_demo_filler", lambda: ffz), patch.object(M, "_exit_fee_venue", lambda p: None):
+            M._close_leg(pz_a, "a", 0.001, "leg_a_2x")
+        _iz = _lane_ints(_tag)
+        _iid = _iz[0]["intent_id"] if _iz else None
+        if _freeze_it and _iid:
+            CI.freeze(lane, _iid, "test: frozen after the account declined")
+        spyz = _SpyAccount(); spyz.max_price_impact_pct = lambda: 50.0
+        pz_b = mkpos(_tag, lm)
+        with patch.object(M, "_paper_account", lambda: spyz), patch.object(M, "_demo_filler", lambda: ffz), patch.object(M, "_exit_fee_venue", lambda p: None):
+            _rb = M._close_leg(pz_b, "a", 0.001, "leg_a_2x")
+        _pe = pz_b.get("pending_exit") or {}
+        if _freeze_it:
+            check("%s FROZEN op: the retry is held (ret %r, leg done %r, pending why %r), NO credit (%d), NO second intent (%d), the intent stays frozen (%s)"
+                  % (modname, _rb, pz_b["legs"]["a"]["done"], _pe.get("why"), len(spyz.credits), len(_lane_ints(_tag)), CI.intent_status(lane, _iid) if _iid else None),
+                  bool(_iid) and _rb == 0.0 and pz_b["legs"]["a"]["done"] is False and _pe.get("why") == "close_intent_not_durable" and not spyz.credits
+                  and len(_lane_ints(_tag)) == 1 and CI.intent_status(lane, _iid) == "frozen")
+        else:
+            check("%s CONTROL (same sequence, NOT frozen): the retry RESUMES the same intent (%d intent), credits once (%d), leg done %r, intent %s"
+                  % (modname, len(_lane_ints(_tag)), len(spyz.credits), pz_b["legs"]["a"]["done"], CI.intent_status(lane, _iid) if _iid else None),
+                  bool(_iid) and _rb > 0 and pz_b["legs"]["a"]["done"] is True and len(spyz.credits) == 1 and len(_lane_ints(_tag)) == 1
+                  and CI.intent_status(lane, _iid) in ("open", "applied"))
     # COMBINED REMAINDER goes through the sale too (mirror previously modelled it): one fill under the remainder key, one credit with the fill's gross
     ffr = _FakeFiller(); spyr = _SpyAccount(); spyr.max_price_impact_pct = lambda: 50.0
     posr = mkpos("FM" + modname[:3], lm)

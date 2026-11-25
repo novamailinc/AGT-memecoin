@@ -715,6 +715,92 @@ check("S16 account accepts: closes exactly once, flat, bankroll +realized once (
       and _CI.intent_status("grad", _gi2[1]["intent_id"]) == "applied" and _CI.intent_status("grad", _i0) == "frozen" and len(_gi2) == 2)
 JUP.mult = 1.0
 
+# ---- S17/S18: DROPPED-OP SAFETY (N2) and CHAIN-TIP RECONCILIATION (N3). Real grad poll, real journal, real shared account. NAMED STATE INJECTIONS are
+# labelled where used (stored plan_sig / intent pointer; a crafted two-op intent opened through the real begin; real account ops booked by the test). ----
+def _gi2(m):
+    return [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("mint") == m]
+def _point(m, iid, sig="INJECTED-previous-plan-signature"):
+    _d = G._read(); _sp = _d["positions"][m]["settlement_pending"]; _sp["intent_id"] = iid; _sp["plan_sig"] = sig; G._write(_d)
+def _refused_setup(m):
+    p_, entry_, ok_ = ready(m); pid_ = p_["pa_pos_id"]
+    run_bb(m, entry_ * 1.3); JUP.mult = 0.05
+    with patch.object(_PAm, "credit", _credit_refuse):
+        for _ in range(3):
+            G.poll_exits(price_fn=prices([entry_ * 0.05]))
+    return pid_, entry_, (lane_pos(m).get("settlement_pending") or {}).get("intent_id")
+
+# S17a: the old intent carries a write-down op (":wd") that the new plan does not; that op is BOOKED in the account -> the change is refused
+mint = "BB17pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+_two = [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+        {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}]
+_i2 = _CI.begin("grad", mint, pid, _two, {"realized_usd": 1.0, "close_ts": 1795600777.0, "closed_reason": "crafted"}, supersedes=_ir)
+_wd_ok, _wd_why = _PAm.write_down("grad", mint, _opc + ":wd", pos_id=pid, qty=None, reason="crafted booked write-down")
+_point(mint, _i2); _cash17 = PA_cash(); _br17 = G._read()["bankroll"]; _n17 = len(_gi2(mint))
+G.poll_exits(price_fn=prices([entry * 0.05]))
+_sp17 = lane_pos(mint).get("settlement_pending") or {}
+check("S17a setup: the crafted write-down op is really BOOKED in the account (ok %r, outcome %r)" % (_wd_ok, _PAm.op_outcome(_opc + ":wd")), _wd_ok is True and _PAm.op_outcome(_opc + ":wd") == "applied")
+check("S17a a changed plan that would DROP the booked write-down is REFUSED: no new intent (%d -> %d), crafted intent still open (%s), position open and pending (%r), nothing booked"
+      % (_n17, len(_gi2(mint)), _CI.intent_status("grad", _i2), _sp17.get("why")),
+      len(_gi2(mint)) == _n17 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions() and _sp17.get("why") == "close_intent_not_durable"
+      and G._read()["bankroll"] == _br17 and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint])
+# S17b NEGATIVE CONTROL: identical setup but the ":wd" op was NOT booked -> the change proceeds (freeze, then a recorded successor)
+mint = "BB18pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+_two = [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+        {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}]
+_i2 = _CI.begin("grad", mint, pid, _two, {"realized_usd": 1.0, "close_ts": 1795600778.0, "closed_reason": "crafted"}, supersedes=_ir)
+_point(mint, _i2)
+with patch.object(_PAm, "credit", _credit_refuse):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+_g18 = _gi2(mint)
+check("S17b control (wd NOT booked, outcome %r): the same change proceeds: crafted intent FROZEN, a successor recorded with supersedes (intents %d)" % (_PAm.op_outcome(_opc + ":wd"), len(_g18)),
+      _PAm.op_outcome(_opc + ":wd") != "applied" and _CI.intent_status("grad", _i2) == "frozen" and len(_g18) == 3 and _g18[2].get("supersedes") == _i2)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S17b control: the account accepts, the close books once and the successor is applied", len([c for c in (G._read().get("closes") or []) if c.get("mint") == mint]) == 1 and mint not in G.open_positions()
+      and _CI.intent_status("grad", _g18[2]["intent_id"]) == "applied")
+
+def _to_successor(m):
+    pid_, entry_, i0_ = _refused_setup(m)
+    _d = G._read(); _d["positions"][m]["settlement_pending"]["plan_sig"] = "INJECTED-previous-plan-signature"; G._write(_d)
+    with patch.object(_PAm, "credit", _credit_refuse):
+        G.poll_exits(price_fn=prices([entry_ * 0.05]))
+    g_ = _gi2(m)
+    return pid_, entry_, i0_, g_[1]["intent_id"], g_
+
+# S18a: successor B created and still OPEN, but the state write was lost (position still names the frozen parent I0): follow the chain to the tip, reuse B
+mint = "BB19pump"; pid, entry, _i0, _b, _g = _to_successor(mint)
+check("S18a setup: I0 frozen, successor B open (2 intents)", len(_g) == 2 and _CI.intent_status("grad", _i0) == "frozen" and _CI.intent_status("grad", _b) == "open" and _g[1].get("supersedes") == _i0)
+_point(mint, _i0, sig=(lane_pos(mint).get("settlement_pending") or {}).get("plan_sig"))   # INJECTION: the lost state write
+with patch.object(_PAm, "credit", _credit_refuse):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S18a the stale pointer to the frozen parent follows the chain to the open tip: NO third intent (%d), position now points at B (%r)" % (len(_gi2(mint)), (lane_pos(mint).get("settlement_pending") or {}).get("intent_id") == _b),
+      len(_gi2(mint)) == 2 and (lane_pos(mint).get("settlement_pending") or {}).get("intent_id") == _b and _CI.intent_status("grad", _b) == "open")
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S18a the account accepts: one close, B applied, I0 frozen", len([c for c in (G._read().get("closes") or []) if c.get("mint") == mint]) == 1 and _CI.intent_status("grad", _b) == "applied" and _CI.intent_status("grad", _i0) == "frozen")
+
+# S18b: B was driven to APPLIED in the journal (account credit booked, both markers) but the LANE write was lost, and the position still names I0
+mint = "BB20pump"; pid, entry, _i0, _b, _g = _to_successor(mint)
+_bop = [o for o in _g[1]["settle_ops"] if o.get("kind") == "credit"][0]
+_ok20, _w20 = _real_credit("grad", mint, _bop["amount"], _bop["op_id"], pos_id=pid, qty=_bop.get("qty"), price_kind=_bop.get("price_kind"))   # INJECTION: real account op booked
+_m1 = _CI.mark_account_applied("grad", _b); _m2 = _CI.mark_lane_applied("grad", _b)
+_cash20 = PA_cash(); _br20 = G._read()["bankroll"]
+check("S18b setup: B credit booked in the account (%r), journal says B applied (%r), the lane still holds the position open" % (_ok20, _CI.intent_status("grad", _b)),
+      _ok20 is True and _m1 and _m2 and _CI.intent_status("grad", _b) == "applied" and mint in G.open_positions())
+_point(mint, _i0, sig=(lane_pos(mint).get("settlement_pending") or {}).get("plan_sig"))
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+_rec20 = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+check("S18b follows the chain to the APPLIED tip and reconciles: no new intent (%d), ONE close, flat, bankroll once (%r -> %r), the credit not booked a second time (cash %r vs %r)"
+      % (len(_gi2(mint)), _br20, G._read()["bankroll"], PA_cash(), _cash20),
+      len(_gi2(mint)) == 2 and len(_rec20) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (_br20 + _rec20[0]["realized_usd"])) < 1e-6
+      and abs(PA_cash() - _cash20) < 1e-9 and acct_lot_qty(pid) < 1e-6)
+JUP.mult = 1.0
+
 # ---- S15: REAL DemoFiller sale idempotency and the execute-before-save window (real filler, real sim executor, FakeJup quotes = canned quote fixture, engineering only) ----
 setup(); _F = FILLER[0]; _mint15 = "S15pump"; _op15 = "grad:exit:%s:a" % _mint15
 _f1 = _F.sell(_op15, _mint15, 100.0, 2.0); _n1 = len(JUP.calls)

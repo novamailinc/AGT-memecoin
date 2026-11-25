@@ -270,7 +270,13 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
             for e in ents:
                 if e.get("ev") == "intent" and e.get("supersedes"):
                     _succ.setdefault(e["supersedes"], []).append(e.get("intent_id"))
-            _pend = [i0 for i0, s0 in _stt.items() if _same_op(s0["intent"]) and not s0["applied"] and s0["frozen"] is None]
+            _pend_pos = [i0 for i0, s0 in _stt.items() if _same_pos(s0["intent"]) and not s0["applied"] and s0["frozen"] is None]
+            _pend = [i0 for i0 in _pend_pos if _same_op(_stt[i0]["intent"])]
+            if len(_pend_pos) != len(_pend):
+                # POSITION-WIDE exclusivity: one position never carries two pending intents (a different op set on a pending position is refused,
+                # with or without supersedes); the pending one must be finalized or frozen first
+                raise IntentNotDurable("position %s/%s already has pending intent(s) %s with a DIFFERENT op set: refusing a second pending intent"
+                                       % (mint, pos_id, ",".join(sorted(set(_pend_pos) - set(_pend)))))
             if _pend:
                 # same logical operation still pending (crash before its terminal event): RESUME it, never open a second intent. The caller's
                 # lineage must match the recorded one (a plain begin resumes a plain intent; supersedes=X resumes the successor of X): an unknown
@@ -282,7 +288,8 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
                 if json.dumps(e0.get("settle_ops"), sort_keys=True) != json.dumps(settle_ops, sort_keys=True):
                     raise IntentNotDurable("operation %s already pending with a DIFFERENT plan" % iid0)
                 return iid0
-            _frozen_open = [i0 for i0, s0 in _stt.items() if _same_op(s0["intent"]) and not s0["applied"] and s0["frozen"] is not None and i0 not in _succ]
+            # frozen-unsuperseded exclusivity is position-wide too: a frozen intent of this position (any op set) blocks a new one unless named
+            _frozen_open = [i0 for i0, s0 in _stt.items() if _same_pos(s0["intent"]) and not s0["applied"] and s0["frozen"] is not None and i0 not in _succ]
             if supersedes:
                 # explicit supersede: must name an EXISTING, FROZEN, UNAPPLIED intent of this very position that has no successor yet (an applied or
                 # already-replaced chain is never re-opened, nothing foreign is accepted), validated even when no frozen intent of this op set exists
@@ -357,6 +364,30 @@ def intent_status(lane: str, intent_id: str) -> Optional[str]:
     if not s_ or s_["intent"] is None:
         return None
     return "applied" if s_["applied"] else ("frozen" if s_["frozen"] is not None else "open")
+
+
+def chain_tip(lane: str, intent_id: str) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    """Follow the journal's supersede chain from intent_id to its TIP. Returns (tip_id, status, intent_event) where status is 'applied' | 'frozen' |
+    'open' (None when the id is absent). Raises IntentNotDurable when the journal is not cleanly readable or the chain is ambiguous (two successors, a
+    loop): never an empty fallback. A caller whose own state still names an old frozen parent after a crash uses the tip to reconcile."""
+    ents, st, _ = _read_consistent(journal_path(lane))
+    if st is not None:
+        raise IntentNotDurable("journal not cleanly readable (%s)" % st)
+    stt = _state(ents)
+    succ: Dict[str, List[str]] = {}
+    for e in ents:
+        if e.get("ev") == "intent" and e.get("supersedes"):
+            succ.setdefault(e["supersedes"], []).append(e.get("intent_id"))
+    cur, seen = intent_id, set()
+    while cur in succ:
+        if len(succ[cur]) != 1 or cur in seen:
+            raise IntentNotDurable("ambiguous supersede chain at %s: %r" % (cur, succ[cur]))
+        seen.add(cur)
+        cur = succ[cur][0]
+    s_ = stt.get(cur)
+    if not s_ or s_["intent"] is None:
+        return cur, None, None
+    return cur, ("applied" if s_["applied"] else ("frozen" if s_["frozen"] is not None else "open")), s_["intent"]
 
 
 def _mark_once(lane: str, intent_id: str, kind: str) -> bool:

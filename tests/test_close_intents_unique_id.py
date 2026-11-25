@@ -47,9 +47,17 @@ check("the SAME supersedes while the successor is pending RESUMES it (same id %s
       b2 == b and len([e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("pos_id") == "grad/MINT1#1" and e.get("settle_ops") == OPS]) == 2)
 # DISTINCT operations (other pos / other op ids) in the same second get distinct ids; the frozen original is not in the way of them
 c = ci.begin("grad", "MINT1", "grad/MINT1#2", OPS, dict(INFO))
-c2 = ci.begin("grad", "MINT1", "grad/MINT1#1", [{"kind": "credit", "op_id": "op-other", "amount": 1.0}], dict(INFO))
-check("distinct operations in the same second are distinct from each other and from both earlier intents (%s, %s)" % (c, c2), len({a, b, c, c2}) == 4)
-ci.freeze("grad", b, "second freeze"); 
+_OTHER = [{"kind": "credit", "op_id": "op-other", "amount": 1.0}]
+def _ngrad(): return len([e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent"])
+_n0 = _ngrad()
+check("POSITION-WIDE exclusivity: a DIFFERENT op set on a position that already has a pending intent is refused, plain or with supersedes, nothing appended (%d -> %d)" % (_n0, _ngrad()),
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO), supersedes=a))
+      and _ngrad() == _n0)
+c2 = ci.begin("grad", "MINT1", "grad/MINT1#3", _OTHER, dict(INFO))
+check("distinct POSITIONS in the same second are distinct from each other and from both earlier intents (%s, %s)" % (c, c2), len({a, b, c, c2}) == 4)
+ci.freeze("grad", b, "second freeze")
+check("position-wide FROZEN exclusivity: with b frozen (unsuperseded) a different op set on the same position is refused unless it names b",
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", _OTHER, dict(INFO), supersedes=a)))
 check("after a SECOND freeze the same operation again needs an explicit supersede naming the LATEST frozen intent (plain refused, supersedes=a refused, supersedes=b ok)",
       _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))) and _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=a))
       and bool(ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=b)))
@@ -98,6 +106,21 @@ check("stable_id together with supersedes is an explicit refusal (never a silent
       _raises(lambda: ci.begin("lanev5", "MV", "pv", OPS, dict(INFO), stable_id=True, supersedes="x")) and _nint("lanev5") == 0)
 check("supersedes of a frozen intent with a CHANGED op set (same position) is allowed and recorded (changed settle plan)",
       bool(ci.begin("lanev3", "MV", "pv-other", [{"kind": "credit", "op_id": "op-changed", "amount": 2.0}], dict(INFO), supersedes=_fo)) and _nint("lanev3") == 2)
+
+# ---- chain_tip: follow the journal's supersede chain (N3 support) ----
+_t1 = ci.begin("lanect", "MT", "pt", OPS, dict(INFO)); ci.freeze("lanect", _t1, "r")
+_t2 = ci.begin("lanect", "MT", "pt", OPS, dict(INFO), supersedes=_t1); ci.freeze("lanect", _t2, "r2")
+_t3 = ci.begin("lanect", "MT", "pt", OPS, dict(INFO), supersedes=_t2)
+check("chain_tip from the root follows frozen A -> frozen B -> open C: tip C, status open, event carries its parent (%s)" % (ci.chain_tip("lanect", _t1)[:2],),
+      ci.chain_tip("lanect", _t1)[0] == _t3 and ci.chain_tip("lanect", _t1)[1] == "open" and ci.chain_tip("lanect", _t1)[2].get("supersedes") == _t2 and ci.chain_tip("lanect", _t3)[0] == _t3)
+ci.mark_account_applied("lanect", _t3); ci.mark_lane_applied("lanect", _t3)
+check("chain_tip reports the tip's status after it applies (applied); an absent id gives (id, None, None)", ci.chain_tip("lanect", _t2)[1] == "applied" and ci.chain_tip("lanect", "lanect:none:1") == ("lanect:none:1", None, None))
+_ev_amb = {"ev": "intent", "intent_id": "lanect:amb:2", "lane": "lanect", "mint": "MT", "pos_id": "pt", "settle_ops": OPS, "close_info": {}, "supersedes": _t1, "ts": 1.0}
+import json as _json
+with open(ci.journal_path("lanect"), "a") as _fh: _fh.write(_json.dumps(_ev_amb) + "\n")
+check("an AMBIGUOUS chain (two successors recorded for one parent) raises IntentNotDurable (never a guess)", _raises(lambda: ci.chain_tip("lanect", _t1)))
+open(ci.journal_path("lanecu"), "w").write("{not json}\n{also not json}\n")
+check("chain_tip on an unreadable journal raises IntentNotDurable (never an empty fallback)", _raises(lambda: ci.chain_tip("lanecu", "x")))
 
 # ---- recover_lane on a supersede chain, with canned callbacks (journal logic only; the callbacks are interface stubs, no account) ----
 _ca = ci.begin("lanerc", "MR", "pr", OPS, dict(INFO)); ci.freeze("lanerc", _ca, "account re-apply refused: earlier")

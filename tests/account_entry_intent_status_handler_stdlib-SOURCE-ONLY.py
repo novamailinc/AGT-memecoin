@@ -80,8 +80,13 @@ def h1():
         print("INFO H1 captured body: %r" % body[:1200])
         check("H1a exactly one message captured locally (count %d)" % len(msgs), len(msgs) == 1)
         check("H1b clear adds NO entry-intent line", "entry-intent" not in body.lower())
-        check("H1c existing account lines present: Cash / Spendable cash lines", "Cash: $" in body and "Spendable cash: $" in body)
-        check("H1d existing account line: Retained cost basis line present (exact amount reported as INFO, not asserted)", "Retained cost basis (open + pending): $" in body)
+        check("H1c Cash and Spendable cash line prefixes present", "Cash: $" in body and "Spendable cash: $" in body)
+        # ECONOMIC CORRECTNESS (kept, grounded). Rationale: the fixture debits stake 2.0 from PAPER_ACCOUNT_START 10 via try_debit_instance. The existing tests/test_paper_account_instances.py asserts under the SAME fixture, for stakes 1 then 2, cash == 7 and cost_exposure == 3 (10 - 3, 1 + 2), so one stake of 2 gives cash 8 and cost_exposure 2. Two independent checks: (i) the grounded values on a direct pa.snapshot() taken by the test itself, (ii) the handler's printed lines equal the formatter contract "$%.2f" of that independent snapshot (not a hard-coded string).
+        ind = pa.snapshot(); fm = lambda v: "$%.2f" % float(v)
+        print("INFO H1 independent snapshot: cash %r cash_spendable %r cost_exposure %r pending_sol_basis %r book_value %r" % (ind.get("cash"), ind.get("cash_spendable"), ind.get("cost_exposure"), ind.get("pending_sol_basis"), ind.get("book_value")))
+        check("H1d1 independent account snapshot has the grounded economics: cash 8.0 and cost_exposure 2.0 (existing fixture test: stakes 1+2 -> cash 7, cost 3)", abs(float(ind["cash"]) - 8.0) < 1e-6 and abs(float(ind["cost_exposure"]) - 2.0) < 1e-6)
+        check("H1d2 handler Retained cost basis line equals the independent snapshot's cost_exposure formatted (%s)" % fm(ind.get("cost_exposure")), ("Retained cost basis (open + pending): %s" % fm(ind.get("cost_exposure"))) in body)
+        check("H1d3 handler Cash and Spendable cash lines equal the independent snapshot (%s, %s)" % (fm(ind.get("cash")), fm(ind.get("cash_spendable"))), ("Cash: %s" % fm(ind.get("cash"))) in body and ("Spendable cash: %s" % fm(ind.get("cash_spendable"))) in body)
         print("INFO H1 retained-basis line: %r" % [l for l in body.split("\n") if "Retained cost basis" in l])
         check("H1e the view created no entry-intent directory (%s)" % d, not os.path.exists(d))
 def h2():

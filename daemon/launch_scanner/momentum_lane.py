@@ -60,6 +60,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 import urllib.request
 
@@ -202,24 +203,36 @@ def _recover_close_intents():
     if _ci is None:
         return False
 
+    lane = LANE   # FINAL runtime lane, read at call time (the module assigns LANE twice at import)
+
     def account_apply(op):
         _pa = _paper_account()
         if _pa is None:
             return False, "paper account disabled"
+        if not (isinstance(op.get("mint"), str) and op.get("mint") and isinstance(op.get("pos_id"), str) and op.get("pos_id")
+                and isinstance(op.get("op_id"), str) and op.get("op_id")):
+            return False, "recorded op lacks mint/pos_id/op_id, NOT applied"
         if op.get("kind") == "write_down":
+            if not (isinstance(op.get("reason"), str) and op.get("reason").strip()):
+                return False, "recorded write_down op has no recorded reason, NOT applied (no reason is invented)"
             ok, why = _pa.write_down(
-                LANE, op.get("mint"), op.get("op_id"),
+                lane, op.get("mint"), op.get("op_id"),
                 pos_id=op.get("pos_id"), qty=op.get("qty"),
-                reason=op.get("reason") or "recovered")
+                reason=op.get("reason"))
+        elif op.get("kind") != "credit":
+            return False, "recorded op kind %r is not supported, NOT applied" % (op.get("kind"),)
         else:
+            _dw = _op_defects(op, None, None, need_reason=False)   # amount/fee/qty/price_kind only: the close reason is judged with the intent by the gate
+            if _dw:
+                return False, "recorded credit op unusable, NOT applied: " + _dw
             ok, why = _pa.credit(
-                LANE, op.get("mint"), op.get("amount"),
+                lane, op.get("mint"), op.get("amount"),
                 op.get("op_id"), pos_id=op.get("pos_id"),
                 qty=op.get("qty"), fee=op.get("fee") or 0.0,
                 price_kind=op.get("price_kind"))
         if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
                 and not _pa.pos_ever_existed(
-                    pos_id=op.get("pos_id"), lane=LANE,
+                    pos_id=op.get("pos_id"), lane=lane,
                     mint=op.get("mint")):
             return True, "orphan (converged, epoch-proven)"
         return ok, why
@@ -231,9 +244,6 @@ def _recover_close_intents():
                                      info.get("leg_suffix"))
 
     def lane_apply(intent):
-        # An open position re-fires the tranche naturally (account
-        # dedupes by op_id). A tranche lost from a CLOSED position
-        # is genuine divergence: never reconstruct it silently.
         d = _read()
         pos = (d.get("positions") or {}).get(intent.get("mint"))
         if pos is not None and (
@@ -242,22 +252,28 @@ def _recover_close_intents():
             return None
         return False
 
-    frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
-                              lane_apply)
-    if not frozen:
-        _un = _pending_unusable()
-        if _un:
-            for _iid, _w in _un:
-                logger.error("momentum: pending intent %s has an unusable recorded op (%s): freezing, ENTRIES BLOCKED", _iid, _w)
-                _fzok = False
-                try:
-                    if _iid:
-                        _fzok = bool(_ci.freeze(LANE, _iid, "unusable recorded op: " + _w))   # best effort; the block below does not depend on this write
-                except Exception:
-                    logger.exception("momentum: could not freeze intent %s", _iid)
-                if not _fzok:
-                    logger.error("momentum: freeze event for %s NOT written; entries stay blocked from the durable record alone", _iid)
-            frozen = [str(i or "unreadable-pending") for i, _w in _un]
+    # PRE-APPLY GATE (bb58 port): judge every pending intent of this lane from durable data BEFORE shared recovery can apply any op. Identified invalid
+    # intents are frozen (valid siblings still converge); a hold-class finding blocks entries and leaves recovery for the lane unrun (nothing mutated).
+    _holds, _bad = _gate_lane(lane, _ci)
+    _fzfail = False
+    for _iid, _w in _bad:
+        logger.error("momentum %s: pending intent %s rejected by the gate (%s): NOT applied to the account, freezing, ENTRIES BLOCKED", lane, _iid, _w)
+        _fzok = False
+        try:
+            if _iid:
+                _fzok = bool(_ci.freeze(lane, _iid, "gate: " + _w))
+        except Exception:
+            logger.exception("momentum %s: could not freeze intent %s", lane, _iid)
+        if not _fzok:
+            _fzfail = True
+            logger.error("momentum %s: freeze event for %s NOT written; entries stay blocked and shared recovery is NOT run for this lane", lane, _iid)
+    for _iid, _w in _holds:
+        logger.error("momentum %s: HOLD (nothing appended, nothing applied) intent %s: %s ENTRIES BLOCKED", lane, _iid, _w)
+    _gated = [str(i or "unreadable-pending") for i, _w in _bad] + [str(i or "unreadable-pending") for i, _w in _holds]
+    if _holds or _fzfail:
+        frozen = _gated
+    else:
+        frozen = list(_ci.recover_lane(lane, account_apply, lane_has_close, lane_apply) or []) + _gated
     if frozen:
         _ENTRY_BLOCKED = True
         logger.error("momentum: %d close intent(s) FROZEN - ledgers "
@@ -1478,9 +1494,10 @@ def _recorded_credit_op(pos, suffix):
     return None
 
 
-def _op_defects(op, close_info, qty, suffix=None):
-    """Why a RECORDED pending credit op cannot be settled by a retry (None = usable). Pure check of durable data: non-finite/negative amount or fee, a qty
-    that is not exactly the exit qty (when qty is given), a missing price_kind, a missing close reason. Used both at the retry and by restart recognition."""
+def _op_defects(op, close_info, qty, suffix=None, need_reason=True):
+    """Why a RECORDED pending credit op cannot be settled (None = usable). Pure check of durable data: non-finite/negative amount or fee, a qty that is
+    not exactly the exit qty (when qty is given), a missing price_kind, a missing close reason. Used at the retry, by restart recognition and
+    BEFORE shared recovery applies the op to the account."""
     try:
         _g = float(op["amount"]); _f = float(op.get("fee") or 0.0); _rq = float(op["qty"])
     except Exception:
@@ -1491,31 +1508,34 @@ def _op_defects(op, close_info, qty, suffix=None):
         return "recorded qty %r is not exactly the exit qty %r" % (op.get("qty"), qty)
     if not op.get("price_kind"):
         return "price_kind not recorded"
-    if not (close_info or {}).get("closed_reason"):
+    if need_reason and not (close_info or {}).get("closed_reason"):
         return "close reason not recorded"
     return None
 
 
-def _pending_unusable():
-    """Restart recognition from DURABLE data only (journal + ledger): pending intents whose recorded credit op is unusable for the retry. Judged only for
-    an op of THIS momentum position instance (matching mint and pa_pos_id): a foreign or absent position is not judged here. Returns [(intent_id, why)]."""
+def _pending_unusable(lane):
+    """Recognition from DURABLE data only (journal + ledger): pending intents of THIS momentum lane whose recorded credit op is unusable. Judged only for an
+    op of a position of this lane and instance (matching mint, lane and pa_pos_id): a foreign or absent position is not judged here. Returns [(intent_id, why)]."""
     _ci = _close_intents()
     if _ci is None:
         return []
     out = []
     try:
         _pos = (_read().get("positions") or {})
-        for _it in _ci.pending(LANE):
+        for _it in _ci.pending(lane):
             _int = _it.get("intent") or {}
             for _op in (_int.get("settle_ops") or []):
                 if _op.get("kind") != "credit":
                     continue
                 _p = _pos.get(_op.get("mint"))
-                if not _p or not _p.get("pa_pos_id") or _p.get("pa_pos_id") != _op.get("pos_id"):
-                    continue
-                _oid = str(_op.get("op_id") or ""); _pre = "%s:" % LANE
+                _oid = str(_op.get("op_id") or ""); _pre = "%s:" % lane
                 _parts = _oid[len(_pre):].split(":") if _oid.startswith(_pre) else []
                 _q = None
+                # An op whose position is ABSENT or of another instance/lane is NOT waved through as valid: its own fields (amount, fee, qty,
+                # price_kind, close reason) are still judged; only the qty-versus-position comparison needs the matching position instance.
+                _match = bool(_p and _p.get("lane") == lane and _p.get("pa_pos_id") and _p.get("pa_pos_id") == _op.get("pos_id"))
+                if not _match:
+                    _p = {}
                 if _parts and _parts[0] == "leg" and len(_parts) > 1 and _parts[1] in _p.get("legs", {}):
                     _q = _p["tokens"] * _p["legs"][_parts[1]]["frac"]
                 elif _parts and _parts[0] == "remaining" and len(_parts) > 1:
@@ -1523,11 +1543,184 @@ def _pending_unusable():
                     _q = sum(_p["tokens"] * _p["legs"][k]["frac"] for k in _lg) if _lg else None
                 _w = _op_defects(_op, _int.get("close_info"), _q)
                 if _w:
-                    out.append((_it.get("intent_id"), "%s: %s" % (_oid, _w)))
+                    out.append((_it.get("intent_id"), "%s: %s%s" % (_oid, _w, "" if _match else " (position absent or another instance: own fields only)")))
     except Exception:
-        logger.exception("momentum: pending-intent recognition failed")
+        logger.exception("momentum %s: pending-intent recognition failed", lane)
         out.append((None, "pending-intent recognition raised: blocking fail-closed"))
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# PRE-APPLY GATE (bb58 port of the bb53 mirror gate, MOMENTUM LANE ONLY (bb58); the other lanes and shared close_intents are NOT changed). One lane-side owner. Before shared recovery
+# applies ANY op of ANY pending intent of this lane, every pending intent is judged from DURABLE data with READ-ONLY readers:
+#   freeze  = identified invalid intent (field/identity defect, unsupported/missing kind, op id not exactly the expected id, lane cannot identify the
+#             position instance): journal freeze, entries blocked, NO account op of that intent is applied. Valid siblings still converge.
+#   hold    = non-mutating: mint/pos_id missing (unidentifiable, never wildcard-matched), ledger missing/unreadable/corrupt, account-marker versus
+#             account-outcome inconsistency, recognition raised. Nothing is appended or applied, entries blocked, shared recovery is NOT run for the lane.
+# No compensation, no liquidation, no ledger rewrite, no legacy migration and no economic policy is chosen here.
+_GATE_STATS = {"ok": 0, "freeze": 0, "hold": 0}
+_GATE_LEG = ("leg:a", "leg:b", "leg:c")
+_OP_KEYS = {"credit": {"kind", "op_id", "mint", "amount", "qty", "fee", "price_kind", "pos_id"},   # exactly what _pa_settle records
+            "write_down": {"kind", "op_id", "mint", "pos_id", "reason"}}                          # exactly what _pa_write_down records (no qty/amount/fee)
+
+
+def _read_status():
+    """READ-ONLY ledger read with an EXPLICIT status (data, status): ok | missing | unreadable | corrupt. Never substitutes an empty ledger, takes no
+    lock, creates and writes nothing. (The bare _read above keeps its empty fallback for the writers; an empty fallback is NOT evidence of absence.)"""
+    try:
+        with open(LEDGER_PATH) as _f:
+            _raw = _f.read()
+    except FileNotFoundError:
+        return None, "missing"
+    except Exception:
+        return None, "unreadable"
+    try:
+        _d = json.loads(_raw)
+    except Exception:
+        return None, "corrupt"
+    if not (isinstance(_d, dict) and isinstance(_d.get("positions", {}), dict) and isinstance(_d.get("closes", []), list)):
+        return None, "corrupt"
+    return _d, "ok"
+
+
+def _expected_op_id(lane, kind, suffix, mint, pid):
+    """The exact op id the lane writes for this kind (see _pa_settle / _pa_write_down): built from intent fields, never parsed. None = unsupported."""
+    if kind == "credit" and (suffix in _GATE_LEG or (isinstance(suffix, str) and re.match(r"^remaining:[abc]{1,3}$", suffix))):
+        return "%s:%s:%s:%s" % (lane, suffix, mint, pid)
+    if kind == "write_down":
+        return "%s:writedown:%s:%s" % (lane, mint, pid)
+    return None
+
+
+def _identify_instance(d, lane, mint, pid):
+    """PURE instance evidence from an ok ledger dict: 'open_same' (open position with exactly this mint, pa_pos_id and an EXPLICIT lane equal to this lane),
+    'closed_same' (close record with exactly this pa_pos_id, mint and explicit lane), 'legacy_lane_missing' (id and mint match but the record has no lane field:
+    unjudgeable, a HOLD, never a match), else None. Never matches on a missing id. LIMITS (not proof): the closes list is capped (MAX_CLOSES), so None means
+    'THIS lane cannot identify it', not 'never existed'; a real empty ledger with a pending journal is weak evidence of absence for the same reason."""
+    if not (isinstance(mint, str) and mint and isinstance(pid, str) and pid):
+        return None
+    _legacy = False
+    _p = (d.get("positions") or {}).get(mint)
+    if isinstance(_p, dict) and _p.get("pa_pos_id") == pid:
+        if _p.get("lane") == lane:
+            return "open_same"
+        _legacy = _legacy or ("lane" not in _p)
+    for _r in (d.get("closes") or []):
+        if isinstance(_r, dict) and _r.get("pa_pos_id") == pid and _r.get("mint") == mint:
+            if _r.get("lane") == lane:
+                return "closed_same"
+            _legacy = _legacy or ("lane" not in _r)
+    return "legacy_lane_missing" if _legacy else None
+
+
+def _outcome_diag(op_ids):
+    """Account evidence per op id (read-only): credited | orphan | unknown. 'unknown' means no applied/orphan record was FOUND (not applied, a hard refusal,
+    or an unreadable account journal): op_outcome cannot tell those apart, so it is never reported as proof of 'not applied'."""
+    _pa = _paper_account()
+    out = {}
+    for _o in op_ids:
+        try:
+            _r = _pa.op_outcome(_o) if _pa is not None else "unknown"
+        except Exception:
+            _r = "unknown"
+        out[_o] = {"applied": "credited", "orphan": "orphan"}.get(_r, "unknown")
+    return out
+
+
+def _gate_intent(lane, it, d, status):
+    """-> (verdict, why, diag) for one pending intent; verdict ok | freeze | hold. READ-ONLY."""
+    _int = it.get("intent") if isinstance(it.get("intent"), dict) else None
+    if _int is None:
+        return "hold", "intent record unreadable", {}
+    mint = _int.get("mint"); pid = _int.get("pos_id")
+    if not (isinstance(mint, str) and mint and isinstance(pid, str) and pid):
+        return "hold", "mint/pos_id missing: position unidentifiable (no wildcard match, nothing applied, no automatic migration)", {}
+    if _int.get("lane") != lane:
+        return "freeze", "intent lane %r is not this lane" % (_int.get("lane"),), {}
+    if not pid.startswith("%s/%s#" % (lane, mint)):
+        return "freeze", "pos_id %r is not an account instance of %s/%s" % (pid, lane, mint), {}
+    _ops = _int.get("settle_ops")
+    if not (isinstance(_ops, list) and _ops):
+        return "freeze", "settle_ops missing or empty", {}
+    _suffix = (_int.get("close_info") or {}).get("leg_suffix") if isinstance(_int.get("close_info"), dict) else None
+    _seen = set(); _probs = []; _legacy = []
+    for _i, _op in enumerate(_ops):
+        if not isinstance(_op, dict):
+            _probs.append("op[%d] is not a record" % _i); continue
+        _k = _op.get("kind")
+        _exp = _expected_op_id(lane, _k, _suffix, mint, pid)
+        if _exp is None:
+            _probs.append("op[%d] kind %r (leg suffix %r) is missing or unsupported" % (_i, _k, _suffix)); continue
+        if _op.get("op_id") != _exp:
+            _probs.append("op[%d] op_id %r is not the expected %r" % (_i, _op.get("op_id"), _exp))
+        if _op.get("op_id") in _seen:
+            _probs.append("op[%d] duplicate op_id" % _i)
+        _seen.add(_op.get("op_id"))
+        _extra = sorted(set(_op) - _OP_KEYS[_k])
+        if _extra:
+            _probs.append("op[%d] carries fields %r the %s writer never records" % (_i, _extra, _k))
+        if _op.get("mint") != mint or _op.get("pos_id") != pid:
+            _probs.append("op[%d] mint/pos_id %r/%r differ from the intent %r/%r" % (_i, _op.get("mint"), _op.get("pos_id"), mint, pid))
+        if _k == "credit":
+            _w = _op_defects(_op, _int.get("close_info"), None)
+            if _w:
+                _probs.append("op[%d] %s" % (_i, _w))
+        elif _k == "write_down":
+            if not (isinstance(_op.get("reason"), str) and _op.get("reason").strip()):
+                _legacy.append("op[%d] write_down has no recorded reason (legacy/missing field: held, no reason is invented)" % _i)
+    _ids = [o.get("op_id") for o in _ops if isinstance(o, dict) and isinstance(o.get("op_id"), str)]
+    _diag = _outcome_diag(_ids)
+    _dtxt = ", ".join("%s=%s" % (k, v) for k, v in sorted(_diag.items())) or "no op ids"
+    if _probs:
+        return "freeze", "invalid recorded intent, NOTHING of it applied: %s [account evidence: %s]" % ("; ".join(_probs), _dtxt), _diag
+    if _legacy:
+        return "hold", "legacy/missing-field record, NOTHING applied, nothing appended: %s [account evidence: %s]" % ("; ".join(_legacy), _dtxt), _diag
+    if status != "ok":
+        return "hold", "lane ledger %s: position instance cannot be judged (a missing/unreadable ledger is NOT an empty ledger) [account evidence: %s]" % (status, _dtxt), _diag
+    _inst = _identify_instance(d, lane, mint, pid)
+    if _inst == "legacy_lane_missing":
+        return "hold", "position/close record matches id and mint but has no lane field (legacy): cannot be judged, nothing applied [account evidence: %s]" % _dtxt, _diag
+    if _inst is None and not ((d.get("positions") or {}) or (d.get("closes") or [])):
+        return "hold", "lane ledger has NO positions and NO closes while an intent is pending: weak evidence of absence (lost/reset ledger is indistinguishable from a real close), nothing applied, nothing appended [account evidence: %s]" % _dtxt, _diag
+    if _inst is None:
+        return "freeze", "lane cannot identify this position instance %s (absent or another instance): NOT applied by this gate [account evidence: %s]" % (pid, _dtxt), _diag
+    if it.get("account_applied") and any(v == "unknown" for v in _diag.values()):
+        return "hold", "account_applied marker present but account outcome not proven (%s): marker and outcome disagree" % _dtxt, _diag
+    if not it.get("account_applied") and any(v == "credited" for v in _diag.values()):
+        logger.warning("momentum %s: intent %s credit-before-mark: account evidence %s, instance %s identified; converges by marker only (idempotent op ids)", lane, it.get("intent_id"), _dtxt, _inst)
+    return "ok", "instance %s identified [account evidence: %s]" % (_inst, _dtxt), _diag
+
+
+def _gate_lane(lane, _ci):
+    """-> (holds, bad): holds = [(intent_id|None, why)] non-mutating; bad = [(intent_id, why)] to freeze. READ-ONLY."""
+    holds, bad = [], []
+    try:
+        _pend = _ci.pending(lane)
+    except Exception as _e:
+        return [(None, "pending journal read raised %r" % (_e,))], []
+    if not _pend:
+        return holds, bad
+    _d, _st = _read_status()
+    _seen = set()
+    for _it in _pend:
+        _iid = _it.get("intent_id")
+        try:
+            _v, _w, _dg = _gate_intent(lane, _it, _d, _st)
+        except Exception as _e:
+            _v, _w = "hold", "gate raised %r" % (_e,)
+        _GATE_STATS[_v] += 1
+        logger.error("momentum %s: GATE verdict=%s intent=%s: %s", lane, _v, _iid, _w) if _v != "ok" else logger.info("momentum %s: GATE verdict=ok intent=%s: %s", lane, _iid, _w)
+        if _v == "hold":
+            holds.append((_iid, _w))
+        elif _v == "freeze":
+            bad.append((_iid, _w)); _seen.add(_iid)
+    for _iid, _w in _pending_unusable(lane):   # qty-versus-position and other defects of the existing recognition (judged from the same durable data)
+        if _iid is None:
+            holds.append((None, _w))
+        elif _iid not in _seen:
+            bad.append((_iid, "unusable recorded op: " + _w)); _seen.add(_iid)
+            _GATE_STATS["freeze"] += 1
+    return holds, bad
 
 
 def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):

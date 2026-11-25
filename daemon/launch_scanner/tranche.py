@@ -960,9 +960,7 @@ def maybe_buyback(engine, now=None):
                 if _pa is None:
                     logger.warning("tranche buyback refused: shared paper account unavailable; fail-closed")
                     continue
-                if engine._is_sim(live):
-                    logger.warning("tranche buyback refused: simulated-fill position (no reconciled buyback fill path); fail-closed")
-                    continue
+                _sim = bool(engine._is_sim(live))   # a quote-simulation position buys back through the REAL DemoFiller quote path below
                 _pid = live.get("pa_pos_id")
                 if not _pid:
                     logger.warning("tranche buyback refused: position has no account lot id (cannot reconcile); fail-closed")
@@ -991,10 +989,52 @@ def maybe_buyback(engine, now=None):
                     # slippage is NOT interchangeable with it. Today this model-fill path has NO Jupiter quote-impact measurement, so
                     # _buyback_impact_refusal always refuses (reason names whether the owner limit is set). A positive buyback needs a real
                     # Jupiter-quote impact measure wired in there. Entry-side model-fill protection is tracked separately.
-                    _imp = _buyback_impact_refusal(_pa)
-                    if _imp:
-                        logger.warning("tranche buyback refused: %s", _imp)
-                        continue
+                    _bb_fill, _fop = None, None
+                    if not _sim:
+                        _imp = _buyback_impact_refusal(_pa)
+                        if _imp:
+                            logger.warning("tranche buyback refused: %s", _imp)
+                            continue
+                    else:
+                        # REAL quote-simulation buyback: the fill comes from the DemoFiller (a real Jupiter V1 quote through the
+                        # sim executor, impact checked against the owner cap on the QUOTE), never from the model fill. The owner cap
+                        # unset or an unavailable filler REFUSES. The fill op id is fresh per attempt: a crash before the account add
+                        # moved no money, so a retry re-quotes; a crash after the add is recovered by the applied-add adoption above
+                        # (the account's own stake/qty are authoritative, never a re-issued fill).
+                        _cap = _pa.max_price_impact_pct()
+                        if _cap is None:
+                            logger.warning("tranche buyback refused: %s", _buyback_impact_refusal(_pa))
+                            continue
+                        try:
+                            _dfl = engine._demo_filler()
+                        except Exception as _de:
+                            logger.warning("tranche buyback refused: demo filler unavailable (%r); fail-closed", _de)
+                            continue
+                        if _dfl is None:
+                            logger.warning("tranche buyback refused: quote-simulation filler unavailable; fail-closed")
+                            continue
+                        _fop = "%s:fill:%d" % (_bop, int(time.time() * 1000))
+                        try:
+                            _bb_fill = _dfl.buy(_fop, mint, cost, _cap)
+                        except Exception as _fe:
+                            logger.warning("tranche buyback refused: demo fill failed (%s: %s); nothing applied", type(_fe).__name__,
+                                           getattr(_fe, "reason", None) or str(_fe)[:120])
+                            continue
+                        _pq2 = _eg.post_quote_refusal(_bb_fill, None, False, _pa.max_data_age_s(), time.time())
+                        if _pq2:
+                            logger.warning("tranche buyback refused: %s", _pq2)
+                            continue
+                        try:
+                            _bst = float(_bb_fill["total_debit_usd"]); _bqty = float(_bb_fill["qty_tokens"]); _bpx = float(_bb_fill["price_usd"])
+                        except Exception:
+                            _bst = _bqty = _bpx = 0.0
+                        if not all(0 < v < float("inf") for v in (_bst, _bqty, _bpx)):
+                            logger.warning("tranche buyback refused: fill economics invalid; nothing applied")
+                            continue
+                        if float(live.get("realized_usd") or 0) < _bst:
+                            logger.warning("tranche buyback refused: banked proceeds below the actual fill debit; nothing applied")
+                            continue
+                        cost, tokens, filled = _bst, _bqty, _bpx
                     _ok, _why2 = _pa.add_to_position(engine.LANE, mint, _pid, cost, tokens, _bop, ts=now)
                     if not _ok:
                         logger.warning("tranche buyback refused by account: %s", _why2)
@@ -1017,6 +1057,13 @@ def maybe_buyback(engine, now=None):
                 ef["buyback"] = {
                     "ts": now, "price": filled, "tokens": tokens,
                     "cost": round(cost, 6)}
+                if _adopting:
+                    ef["buyback"]["adopted_from_account"] = True   # crash recovery: the account's numbers, no fill evidence on the lane
+                elif _bb_fill is not None:
+                    ef["buyback"].update({"execution_source": _bb_fill.get("execution_source"), "fill_op": _fop,
+                                          "fee_usd": _bb_fill.get("fee_usd"), "signature": _bb_fill.get("signature"),
+                                          "synthetic_signature": _bb_fill.get("synthetic_signature"),
+                                          "provenance": _bb_fill.get("provenance")})
                 engine._write(d)
             done.append({"mint": mint, "symbol": pos.get("symbol"),
                          "price": filled, "tokens": tokens,

@@ -171,12 +171,14 @@ def account_evidence(pa, op_id, wait_s):
     wal = [e for e in entries if e.get("op_id") == op_id]
     pid = (op or {}).get("pos_id") if isinstance(op, dict) else None
     open_pos = None
+    open_key = None
     for st in (led.get("lanes") or {}).values():
-        for p in (st.get("open") or {}).values():
+        for k, p in (st.get("open") or {}).items():
             if isinstance(p, dict) and pid and p.get("pos_id") == pid:
                 open_pos = p
+                open_key = k
     settle = [e for e in entries if pid and e.get("pos_id") == pid and e.get("event") in ("credit", "write_down")]
-    return {"ok": True, "op": op, "wal": wal, "open_pos": open_pos, "settle": settle}
+    return {"ok": True, "op": op, "wal": wal, "open_pos": open_pos, "open_key": open_key, "settle": settle}
 
 def classify(rec, lane_d, ev):
     """Pure. -> (class, reason, pos_id_or_None). lane_d: the lane ledger dict read under the lane lock. ev: account_evidence result."""
@@ -207,7 +209,12 @@ def classify(rec, lane_d, ev):
     op_pos = ev.get("open_pos")
     closes = [c for c in (lane_d.get("closes") or []) if isinstance(c, dict) and c.get("pa_pos_id") == pid and c.get("mint") == mint]
     if op_pos is not None:
-        if op_pos.get("mint") != mint or not _close(op_pos.get("qty"), rec["qty"]):
+        # Account schema (paper_account._apply_debit): a non-instance open position is KEYED BY MINT and carries no "mint" field; only instance positions store "mint".
+        # The mint is therefore proven from (a) the ledger op record (always carries mint) AND (b) the position's own mint field when present, else its open-dict key.
+        if op.get("mint") != mint:
+            return "E", "account ledger op mint differs from the record", pid
+        _pm = op_pos.get("mint") if "mint" in op_pos else ev.get("open_key")
+        if _pm != mint or not _close(op_pos.get("qty"), rec["qty"]):
             return "E", "account open position mint/qty differ from the record", pid
         if lane_pos is not None:
             if lane_pos.get("pa_pos_id") == pid and _close(lane_pos.get("tokens"), rec["qty"]):

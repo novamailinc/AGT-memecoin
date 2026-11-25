@@ -22,7 +22,7 @@ def mkrec(**over):
         body = {k: v for k, v in r.items() if k != "checksum"}; body.update(over); body["checksum"] = M._sha(body); return body
     return r
 def ev(**kw):
-    e = {"ok": True, "op": {"event": "debit", "pos_id": PID, "stake": 1.0, "qty": 998.5}, "wal": [{"event": "debit", "op_id": OP}], "open_pos": {"mint": MINT, "qty": 998.5, "pos_id": PID}, "settle": []}
+    e = {"ok": True, "op": {"event": "debit", "lane": "grad", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5}, "wal": [{"event": "debit", "op_id": OP}], "open_pos": {"qty": 998.5, "pos_id": PID}, "open_key": MINT, "settle": []}
     e.update(kw); return e
 def lane(pos=None, closes=None, dead=None):
     return {"positions": ({MINT: pos} if pos else {}), "closes": closes or [], "dead_mints": dead or {}}
@@ -61,6 +61,11 @@ check("classify D-refused: ledger refusal confirmed by WAL, no debit", cls(R, la
 check("classify E: ledger refusal NOT confirmed by WAL", cls(R, lane(), ev(op={"event": "debit_refused"}, wal=[], open_pos=None)) == "E")
 check("classify E: ledger debit but WAL has no debit", cls(R, lane(), ev(wal=[])) == "E")
 check("classify E: account stake differs from record", cls(R, lane(), ev(op={"event": "debit", "pos_id": PID, "stake": 2.0, "qty": 998.5})) == "E")
+check("classify B with the REAL account schema (open position keyed by mint, NO mint field)", cls(R, lane(), ev()) == "B")
+check("classify E: open position key is another mint (schema-faithful, no mint field)", cls(R, lane(), ev(open_key="OtherMint")) == "E")
+check("classify E: ledger op mint differs", cls(R, lane(), ev(op={"event": "debit", "lane": "grad", "mint": "OtherMint", "pos_id": PID, "stake": 1.0, "qty": 998.5})) == "E")
+check("classify E: ledger op carries no mint (unproven)", cls(R, lane(), ev(op={"event": "debit", "pos_id": PID, "stake": 1.0, "qty": 998.5})) == "E")
+check("classify B/E: instance-style position with its own mint field is compared too", cls(R, lane(), ev(open_pos={"mint": MINT, "instance": True, "qty": 998.5, "pos_id": PID})) == "B" and cls(R, lane(), ev(open_pos={"mint": "OtherMint", "instance": True, "qty": 998.5, "pos_id": PID})) == "E")
 check("classify E: account open qty differs", cls(R, lane(), ev(open_pos={"mint": MINT, "qty": 5.0, "pos_id": PID})) == "E")
 check("classify E: account holds it but the lane has a closes record for it", cls(R, lane(closes=[{"mint": MINT, "pa_pos_id": PID}]), ev()) == "E")
 check("classify E: account holds it but mint is in dead_mints", cls(R, lane(dead={MINT: 1}), ev()) == "E")

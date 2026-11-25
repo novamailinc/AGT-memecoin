@@ -100,7 +100,10 @@ def kill_phase(h, code, flag, label, n=None):
     check("%s kill child hit the seam (fsynced token) and died by SIGKILL (rc %s), SURVIVED absent" % (label, pk.returncode), t is not None and pk.returncode == -9 and B.tok(h, "k" + label, "SURVIVED", 0.0) is None)
     return t
 def run(h, code, name, *args):
-    p = B.spawn(code, h, name, *args); r = B.finish(p); return p, r
+    p = B.spawn(code, h, name, *args); r = B.finish(p)
+    if isinstance(r, dict) and r.get("acts"):  # DIAGNOSTIC (read-only): every recovery action as (op, class, bounded enum reason); reasons are fixed classify() strings, no secrets
+        print("INFO %s recovery actions: %s" % (name, [(str(x[0])[-24:], x[2], str(x[3])[:200]) for x in r["acts"]]))
+    return p, r
 def debits(j): return B.stakes(j)
 def r1(future=False):
     lab = "R1x" if future else "R1"; h = B.newhome(); t = kill_phase(h, KA, "1", lab)

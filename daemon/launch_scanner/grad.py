@@ -3782,6 +3782,9 @@ def _publish_health():
 
 # In-process status of aborted poll cycles (no durable marker is possible when the I/O that failed is the ledger itself): surfaced by recon_health.
 _POLL_ABORTS = {"count": 0, "last_ts": None, "last_mint": None, "last_error": None}
+# Seam (default None = no behavior): called inside the ledger lock, right after an abort is counted, so a wiring layer can make the abort durable
+# BEFORE the lock is released. It must not raise; any exception is swallowed here so the abort path is unchanged.
+_ABORT_HOOK = None
 
 
 def _persist_poll_failure(d, mint, pos, exc):
@@ -4334,6 +4337,11 @@ def _poll_exits(price_fn):
                     # the in-memory ledger may hold half-mutated state and could not be replaced by a fresh persisted view: FAIL CLOSED,
                     # abort the rest of this cycle so no later write can persist it. Positions not yet visited are retried next poll.
                     _POLL_ABORTS["count"] += 1; _POLL_ABORTS.update(last_ts=time.time(), last_mint=str(mint), last_error=repr(e)[:200])
+                    if _ABORT_HOOK is not None:
+                        try:
+                            _ABORT_HOOK(str(mint), repr(e)[:200])
+                        except Exception:
+                            pass
                     _warn_throttled(("poll_abort", str(mint)), "grad poll_exits: cycle ABORTED after %s failed and its failure state could not be restored; no further writes this cycle (aborts so far: %d; see recon_health poll_aborts)", str(mint)[:12], _POLL_ABORTS["count"])
                     break
                 continue

@@ -17,6 +17,8 @@ def fake(demo=True, closes_t=0, closes_e=0, raise_exits=False):
     calls = []
     g = types.SimpleNamespace(LEDGER_PATH=os.path.join(TMP, "led%d.json" % len(os.listdir(TMP))), calls=calls)
     g._demo_mode = lambda: demo
+    g._POLL_ABORTS = {"count": 0}
+    g.LANE = "lane_%d" % len(os.listdir(TMP))
     g.poll_time_exits = lambda: (calls.append("time_exits") or [1] * closes_t)
     def pe(price_fn=None):
         calls.append("exits")
@@ -106,17 +108,22 @@ g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g))
 check("G23 flag off: entry_scan is the plain scan, no journal", ran is True and g.calls == ["scan"] and not os.path.exists(g.LEDGER_PATH + ".cycle.json"))
 os.environ[GC.ENV_FLAG] = "1"
 g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g)); j = json.load(open(g.LEDGER_PATH + ".cycle.json"))
-check("G24 flag on: entry-thread scan runs JOURNALED (status done, kind entry_thread)", ran is True and g.calls == ["scan"] and j["status"] == "done" and j.get("kind") == "entry_thread" and r_.get("opened") == 1)
+ej = json.load(open(g.LEDGER_PATH + ".entry-scan.json"))
+check("G24 (v3) flag on: entry-thread scan runs journaled in ITS OWN file (entry-scan.json done) and never touches cycle.json", ran is True and g.calls == ["scan"] and ej["status"] == "done" and not os.path.exists(g.LEDGER_PATH + ".cycle.json") and r_.get("opened") == 1)
+g = fake(); lk = open(g.LEDGER_PATH + ".entry-scan.lock", "w"); fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ran, why, r_ = T.entry_scan(g, scan_for(g)); fcntl.flock(lk, fcntl.LOCK_UN); lk.close()
+check("G25 (v3) entry scan with the ENTRY lock held elsewhere: skipped, not run (%s)" % why, ran is False and g.calls == [] and why == "entry_scan_busy")
 g = fake(); lk = open(GC._cycle_lock_path(g), "w"); fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
 ran, why, r_ = T.entry_scan(g, scan_for(g)); fcntl.flock(lk, fcntl.LOCK_UN); lk.close()
-check("G25 entry scan with the cycle lock held elsewhere: skipped, not run (%s)" % why, ran is False and g.calls == [])
+check("G25b (v3) the main CYCLE lock held does not block the entry thread (it never takes it)", ran is True and g.calls == ["scan"])
 g = fake(); GC._write_journal(g, {"status": "running", "boot_id": "older", "cycle_seq": 7}, {}); GC.run_cycle(g, price_fn=PF)
 ran, why, r_ = T.entry_scan(g, scan_for(g))
 check("G26 entry scan under an active fault: refused", ran is False and "scan" not in g.calls)
 check("G27 commit_refusal: flag off None", (os.environ.pop(GC.ENV_FLAG), T.commit_refusal("lane_x"))[1] is None)
 os.environ[GC.ENV_FLAG] = "1"
+os.environ.pop(GC.LANES_ENV, None)
 g = fake(); g.LANE = "lane_unreg"
-check("G28 commit_refusal: unregistered lane unaffected, registered clean lane None", T.commit_refusal("lane_unreg") is None and (T.register(g), T.commit_refusal("lane_unreg"))[1] is None)
+check("G28 (v3) commit_refusal: lane NOT named in AGT_GRAD_CYCLE_LANES and unregistered: None; registered clean lane: None", T.commit_refusal("lane_unreg") is None and (T.register(g), T.commit_refusal("lane_unreg"))[1] is None)
 g2 = fake(); g2.LANE = "lane_fault"; T.register(g2); GC._write_journal(g2, {"status": "running", "boot_id": "older", "cycle_seq": 7}, {}); GC.run_cycle(g2, price_fn=PF)
 check("G29 commit_refusal: registered lane with a fault refuses", "unresolved" in (T.commit_refusal("lane_fault") or ""))
 _fa = GC.fault_active
@@ -150,5 +157,61 @@ finally:
 check("G31 entry_guard: flag off passes; flag on refuses a faulted registered lane; unregistered passes; broken import refuses", r_off is None and r_fault and "unresolved" in r_fault and r_clean is None and r_imp and "unavailable" in r_imp)
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "grad-select-trader")).read()
 check("G32 static: trader entry thread goes through entry_scan and refuses when flag on and the module is missing", "_gtc.entry_scan(engine, _fresh)" in src and "cycle flag on, wiring missing" in src and "_gtc.register(engine)" in src)
+# ---- v3 additions (UNEXECUTED) ----
+def _lane_env(v):
+    if v is None: os.environ.pop(GC.LANES_ENV, None)
+    else: os.environ[GC.LANES_ENV] = v
+os.environ[GC.ENV_FLAG] = "1"; _lane_env(None)
+# G33 two-writer interleaving, deterministic, single process: main's deferred cycle leaves cycle.json running/awaiting_scan; an entry scan then runs and
+# finishes; the main loop 'dies' (scan_phase never called). The entry scan must NOT have overwritten the main record, so the next cycle faults.
+g = fake(); rec = GC.run_cycle(g, price_fn=PF, scan_fn=scan_for(g), defer_scan=True)
+j0 = json.load(open(g.LEDGER_PATH + ".cycle.json")); ran, why, r_ = T.entry_scan(g, scan_for(g)); j1 = json.load(open(g.LEDGER_PATH + ".cycle.json"))
+rec2 = GC.run_cycle(g, price_fn=PF, scan_fn=scan_for(g), defer_scan=True)
+check("G33 two-writer interleave: entry scan between main's deferred cycle and its death leaves cycle.json running; next cycle records interrupted_prior_cycle (%s/%s)" % (j0.get("status"), j0.get("phase")),
+      j0.get("status") == "running" and j1 == j0 and ran is True and any(f.get("reason") == "interrupted_prior_cycle" for f in rec2.get("faults", [])))
+# G34 reverse direction: a dead entry scan (record running, lock free) is found by BOTH the entry thread and the main loop's check
+g = fake(); T.entry_scan(g, scan_for(g)); ejp = g.LEDGER_PATH + ".entry-scan.json"; ej = json.load(open(ejp)); ej["status"] = "running"; json.dump(ej, open(ejp, "w"))
+ok_main, why_main = T._entry_check(g); act, _w = GC.fault_active(g); ran, why, _r = T.entry_scan(g, scan_for(g))
+check("G34 dead entry scan (running + free lock): main-side check records interrupted_entry_scan, fault active, entries refused (%s)" % why_main, ok_main is False and why_main == "interrupted_entry_scan" and act and ran is False and g.calls.count("scan") == 1)
+# G35 a LIVE entry scan (lock held) is not a fault
+g = fake(); T.entry_scan(g, scan_for(g)); ej = json.load(open(g.LEDGER_PATH + ".entry-scan.json")); ej["status"] = "running"
+json.dump(ej, open(g.LEDGER_PATH + ".entry-scan.json", "w")); lk = open(g.LEDGER_PATH + ".entry-scan.lock", "w"); fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ok_live, why_live = T._entry_check(g); fcntl.flock(lk, fcntl.LOCK_UN); lk.close()
+check("G35 a running entry record with the lock HELD (live scan) is not a fault", ok_live is True and GC.fault_active(g)[0] is False)
+# G36 unreadable entry journal is a fault, fail closed
+g = fake(); open(g.LEDGER_PATH + ".entry-scan.json", "w").write("{not json")
+ran, why, _r = T.entry_scan(g, scan_for(g))
+check("G36 unreadable entry journal: durable fault, scan refused (%s)" % why, ran is False and why == "entry_scan_journal_unreadable" and GC.fault_active(g)[0] and "scan" not in g.calls)
+# G37 abort baseline: count above the baseline refuses at commit even with NO fault file yet; advancing only via a completed cycle
+g = fake(); g.LANE = "lane_abort"; T.register(g)
+before = T.commit_refusal("lane_abort"); g._POLL_ABORTS["count"] = 1; after = T.commit_refusal("lane_abort")
+check("G37 abort baseline: clean None; one abort after registration refuses with no fault file written (%s)" % after, before is None and after and "above acknowledged baseline" in after and not os.path.exists(GC._fault_path(g)))
+# G38 the abort hook (called by grad.py inside the ledger lock) makes the fault durable at once
+g = fake(); g.LANE = "lane_hook"; T.register(g); check("G38a register installs the hook flag on", callable(getattr(g, "_ABORT_HOOK", None)))
+g._ABORT_HOOK("mintX", "boom"); fr = GC._read_fault(g)
+check("G38 abort hook writes a durable poll_abort_live fault and the append-only log record", fr and fr.get("reason") == "poll_abort_live" and GC._open_logged_faults(g))
+# G39 baseline advances only after a completed cycle and only past a durable fault
+g = fake(); g.LANE = "lane_adv"; T.register(g); g._POLL_ABORTS["count"] = 2
+rec = {"status": "done", "aborts_end": 2, "fault_write_failure": "x"}; T._advance_baseline(g, rec); stuck = T._BASELINE["lane_adv"]
+rec = {"status": "done", "aborts_end": 2}; T._advance_baseline(g, rec)
+check("G39 baseline not advanced when the fault write failed; advanced after a completed cycle", stuck == 0 and T._BASELINE["lane_adv"] == 2)
+# G40 unreadable abort counter refuses
+g = fake(); g.LANE = "lane_nocount"; T.register(g); del g._POLL_ABORTS
+check("G40 unreadable abort counter refuses fail-closed", "unreadable" in (T.commit_refusal("lane_nocount") or ""))
+# G41 selected_lanes semantics: named + unregistered (known or unknown to grad_cycle) refuses; named + registered clean None; not named None
+_lane_env("lane_named_unreg,grad_select"); T._ENGINES.pop("grad_select", None)
+r_unk = T.commit_refusal("lane_named_unreg"); r_known = T.commit_refusal("grad_select"); r_other = T.commit_refusal("lane_not_named")
+_lane_env(None)
+check("G41 lane named in AGT_GRAD_CYCLE_LANES but unregistered refuses (known and unknown names); a lane not named is untouched", r_unk and "selected" in r_unk and r_known and "selected" in r_known and r_other is None)
+# G42 startup_report modes
+os.environ.pop(GC.ENV_FLAG, None); sr_off = T.startup_report(fake())
+os.environ[GC.ENV_FLAG] = "1"; sr_nd = T.startup_report(fake(demo=False)); sr_on = T.startup_report(fake()); T._gc = _brk
+try: sr_ref = T.startup_report(fake())
+finally: T._gc = _orig
+check("G42 startup_report distinguishes flag_off, off_non_demo, on, refuse", sr_off.get("detail") == "flag_off" and sr_nd.get("detail") == "off_non_demo" and sr_on.get("mode") == "on" and sr_on.get("active") is True and sr_ref.get("mode") == "refuse")
+# G43 static: the entry thread path never imports/uses the cycle lock or the cycle journal; post-scan flag is not part of this source
+gsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "grad_trader_cycle.py")).read()
+i = gsrc.index("def entry_scan("); j2 = gsrc.index("# ---------------------------------------------------------- main loop")
+check("G43 static: entry_scan never uses scan_phase, the cycle lock or cycle.json; no post-scan flag in this source", all(x not in gsrc[i:j2] for x in ("scan_phase", "_cycle_lock_path", "_journal_path", "cycle.json")) and "POST_SCAN" not in gsrc)
 print("FAILS: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

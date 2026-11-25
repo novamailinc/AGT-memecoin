@@ -97,8 +97,29 @@ def child_run(point):
     C.poll_exits(price_fn=pf_mult(KILL_MULT))
     print("CHILD SURVIVED point=%s (kill point not reached)" % point, flush=True); sys.exit(7)
 
-def child_recover(mult):
+def _inject(kind):
+    """Labelled NAMED fault injection in THIS recovery process only (scratch root; no repo state, config or flag changes)."""
+    real = C._recorded_credit_op
+    if kind in ("qty_mismatch", "amount_nan", "fee_negative", "amount_missing"):
+        def wrap(pos, suffix):
+            op = real(pos, suffix)
+            if op is None: return None
+            op = dict(op)
+            if kind == "qty_mismatch": op["qty"] = float(op["qty"]) * 1.5
+            elif kind == "amount_nan": op["amount"] = float("nan")
+            elif kind == "fee_negative": op["fee"] = -1.0
+            else: op.pop("amount", None)
+            return op
+        C._recorded_credit_op = wrap
+    elif kind == "foreign_position":
+        C._recorded_credit_op = lambda pos, suffix: None   # the pending intent belongs to another position instance: no recorded op matches this one
+    elif kind == "journal_corrupt":
+        jp = CI.journal_path("ceo"); lines = open(jp).read().split("\n")
+        lines.insert(1, "{garbage-not-json"); open(jp, "w").write("\n".join(lines))
+
+def child_recover(mult, inject=None):
     PA = fresh()
+    if inject: _inject(inject)
     ents0, st0, _t = CI._read(CI.journal_path("ceo"))
     intents0 = [e for e in ents0 if e.get("ev") == "intent"]
     op0 = ((intents0[0].get("settle_ops") or [{}])[0]) if intents0 else {}
@@ -125,7 +146,7 @@ def child_recover_kill(mult):
 
 if MODE == "run": child_run(sys.argv[3]); sys.exit(0)
 if MODE == "recover_kill": child_recover_kill(sys.argv[3]); sys.exit(0)
-if MODE == "recover": child_recover(sys.argv[3]); sys.exit(0)
+if MODE == "recover": child_recover(sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None); sys.exit(0)
 
 # ---- parent
 FAILS = []
@@ -136,8 +157,8 @@ def spawn(args):
     p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=30)
     return p.returncode, p.stdout, p.stderr
 FOUR = ["intent", "account_applied", "lane_applied", "applied"]
-def recover(root, mult):
-    rc, out, err = spawn(["recover", root, str(mult)])
+def recover(root, mult, inject=None):
+    rc, out, err = spawn(["recover", root, str(mult)] + ([inject] if inject else []))
     rl = [l for l in out.splitlines() if l.startswith("RESULT ")]; pl = [l for l in out.splitlines() if l.startswith("PRE ")]
     return rc, err, (_json.loads(pl[0][4:]) if pl else None), (_json.loads(rl[0][7:]) if rl else None)
 SCEN = (("S1", "after_credit", "2.0", "2.3", "leg", False), ("S2", "pre_lane_marker", "2.0", "2.3", "leg", False), ("S3-control", "after_credit", "2.0", "2.0", "leg", False),
@@ -179,4 +200,22 @@ for tag, point, kmult, mult, kind, kill2 in SCEN:
     same = r3 is not None and all(r3[k] == r[k] for k in ("cash", "a_done", "a_realized", "ev", "pending", "n_pos", "n_intents", "journal_status"))
     check("%s: a SECOND fresh restart changes nothing (rc %d; cash %r -> %r, lifecycle %r -> %r) and the exit is complete (%r)"
           % (tag, rc3, r["cash"], (r3 or {}).get("cash"), r["ev"], (r3 or {}).get("ev"), done_ok), rc3 == 0 and same and done_ok)
+# ---- fail-closed named injections: after a real SIGKILL-after-credit, the recovery must refuse visibly, never double-credit, never presume
+for tag, inj in (("F1-qty-mismatch", "qty_mismatch"), ("F2-amount-nan", "amount_nan"), ("F3-fee-negative", "fee_negative"), ("F4-amount-missing", "amount_missing"),
+                 ("F5-foreign-position", "foreign_position"), ("F6-journal-corrupt", "journal_corrupt")):
+    root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+    rc, out, err = spawn(["run", root, "after_credit", "2.0"])
+    check("%s: setup child KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+    rc2, err2, pre, r = recover(root, "2.3", inj)
+    check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+    if r is None or pre is None: continue
+    print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+    check("%s: NO second credit (cash %.6f == pre-recovery cash %.6f), leg a NOT marked done (%r), position still open (n_pos %d)" % (tag, r["cash"], pre["pre_cash"], r["a_done"], r["n_pos"]),
+          _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos"] == 1)
+    if inj != "journal_corrupt":
+        check("%s: refusal is VISIBLE: pending_exit set (%r), 1 pending intent, still exactly 1 intent, lifecycle %r" % (tag, r["pend_why"], r["pending"], r["ev"]),
+              bool(r["pend_why"]) and r["pending"] == 1 and r["n_intents"] == 1 and "lane_applied" not in r["ev"])
+    else:
+        check("%s: journal reported corrupt (status %r), no lane_applied/applied written (%r), no new intent (%d)" % (tag, r["journal_status"], r["ev"], r["n_intents"]),
+              r["journal_status"] is not None and "lane_applied" not in r["ev"] and "applied" not in r["ev"] and r["n_intents"] <= 1)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

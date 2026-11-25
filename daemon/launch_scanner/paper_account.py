@@ -2219,14 +2219,22 @@ def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Option
     return debit_binding(entry_op_id, pos_id)
 
 
-def _applied_same_generation(led, op_id, event, lane, mint, pos_id):
-    """EXACT same-op retry of a mutation THIS ledger generation already applied (op stored with this ledger's account_id and the same event/lane/mint/pos_id):
-    answering it from the recorded op mutates nothing, so the entry proof is not needed. A legacy op (no account_id), or an op from any other generation,
-    is NOT accepted here and goes through the full proof (refused)."""
+def _applied_same_generation(led, op_id, event, lane, mint, pos_id, expected=None, econ=None):
+    """EXACT same-op retry of a mutation THIS ledger generation already applied. All must hold: the op is stored with THIS ledger's account_id and the same
+    event/lane/mint/pos_id; a SUPPLIED expected generation equals the ledger's (a wrong binding never bypasses just because the op exists); every economic
+    argument the op stored equals the retry's (`econ`); and when the op stored NO economics (non-instance lots) the caller must have supplied the matching
+    generation (otherwise the full proof decides). Answering from the recorded op mutates nothing. Legacy ops (no account_id) and other generations are NOT accepted."""
     op = (led.get("ops") or {}).get(op_id)
     ident = led.get("account_id")
-    return bool(isinstance(op, dict) and isinstance(ident, str) and ident and op.get("account_id") == ident and op.get("event") == event
-                and op.get("lane") == lane and op.get("mint") == mint and isinstance(pos_id, str) and pos_id and op.get("pos_id") == pos_id)
+    if not (isinstance(op, dict) and isinstance(ident, str) and ident and op.get("account_id") == ident and op.get("event") == event
+            and op.get("lane") == lane and op.get("mint") == mint and isinstance(pos_id, str) and pos_id and op.get("pos_id") == pos_id):
+        return False
+    if expected is not None and expected != ident:
+        return False
+    stored = {k: op.get(k) for k in (econ or {}) if op.get(k) is not None}
+    if any(stored[k] != (econ or {})[k] for k in stored):
+        return False
+    return bool(stored) or expected == ident
 
 
 def _last_journal_record():
@@ -2312,7 +2320,7 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                       "reason": degraded})
             return False, ("account degraded: %s (journaled for "
                            "manual reconciliation)" % degraded)
-        _grf = None if _applied_same_generation(led, op_id, "credit", lane, mint, pos_id) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+        _grf = None if _applied_same_generation(led, op_id, "credit", lane, mint, pos_id, expected_account_id, {"proceeds": proceeds, "fee": fee, "qty": qty, "price_kind": price_kind}) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
         if _grf is not None:
             return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         rec, conflict = _op_lookup(led, op_id, "credit", lane, mint,
@@ -2469,7 +2477,7 @@ def write_down(lane: str, mint: str, op_id: str,
         if led is None:
             return False, "ledger unreadable"
         if degraded is None:
-            _grf = None if _applied_same_generation(led, op_id, "write_down", lane, mint, pos_id) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+            _grf = None if _applied_same_generation(led, op_id, "write_down", lane, mint, pos_id, expected_account_id, {"qty": qty, "reason": reason}) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
             if _grf is not None:
                 return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         prior = led["ops"].get(op_id)

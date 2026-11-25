@@ -359,12 +359,15 @@ rc2, err2, pre, r = recover(root, "2.3", "foreign_pos_id", "tryfirst")
 check("%s: recovery exited 0, no crash trace in stderr (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
 if r is not None and pre is not None:
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
-    check("%s: entry BEFORE any exit poll refused (%r); the pending intent is FROZEN (ev %r); no second credit (cash %r vs %r); the foreign position's leg a not closed (%r)"
-          % (tag, r["entry_first"], r["ev"], r["cash"], pre["pre_cash"], r["a_done"]),
-          REFUSAL in str(r["entry_first"]) and "frozen" in r["ev"] and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False)
+    # EXISTING contract (unchanged): the lane's own settle is never blocked by an account failure. After the poll the foreign position's leg a is booked in the lane,
+    # its NEW intent's account credit is refused (the fixture's foreign pa_pos_id has no account position), so that second intent is FROZEN: divergence visible, entries blocked.
+    check("%s: entry BEFORE any exit poll refused (%r); the pending intent is FROZEN first (ev %r, exactly 2 intents %r, both frozen); no credit for either (cash %r vs %r); the lane booked the foreign leg a (%r) while its new intent is frozen, not silently applied"
+          % (tag, r["entry_first"], r["ev"], r["n_intents"], r["cash"], pre["pre_cash"], r["a_done"]),
+          REFUSAL in str(r["entry_first"]) and r["ev"] == ["intent", "account_applied", "frozen", "intent", "frozen"] and r["n_intents"] == 2
+          and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is True and r["pending"] == 0 and r["entry_blocked"] is True)
     rc3, err3, pre3, r3 = recover(root, "2.3", None, "tryfirst")
-    check("%s: FRESH process: the persisted frozen intent blocks entry BEFORE any exit poll (%r), still frozen once (ev %r), nothing credited (cash %r)" % (tag, r3 and r3["entry_first"], r3 and r3["ev"], r3 and r3["cash"]),
-          rc3 == 0 and r3 is not None and REFUSAL in str(r3["entry_first"]) and r3["ev"].count("frozen") == 1 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)
+    check("%s: FRESH process: the persisted frozen intent blocks entry BEFORE any exit poll (%r), still the same two frozen intents, no new events (ev %r), nothing credited (cash %r)" % (tag, r3 and r3["entry_first"], r3 and r3["ev"], r3 and r3["cash"]),
+          rc3 == 0 and r3 is not None and REFUSAL in str(r3["entry_first"]) and r3["ev"] == r["ev"] and r3["n_intents"] == 2 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)
 
 # H1: HEALTHY positive control (documents the CURRENT admission behavior; it is not a policy claim): the same real SIGKILL-after-credit pending intent with a
 # VALID recorded op. In a fresh process a new entry attempted BEFORE any exit poll is NOT refused with the divergence text, no recognition or freeze ran, and the

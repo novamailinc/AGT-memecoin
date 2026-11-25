@@ -1474,6 +1474,58 @@ def _pkind(reason, pkind=None):
     return _pk.classify_reason(
         reason, getattr(_f2, "F2_REASON", None) if _f2 else None)
 
+def _recorded_credit_op(pos, suffix):
+    """The RECORDED credit op of a still-pending (open, unfrozen, unapplied) close intent for this exact op id of this position instance, or None.
+    A process death after the account credit and before the lane write leaves exactly this record; the account side is already done at THESE amounts."""
+    _ci = _close_intents()
+    if _ci is None or not pos.get("pa_pos_id"):
+        return None
+    _op_id = "%s:%s:%s:%s" % (LANE, suffix, pos["mint"], pos["pa_pos_id"])
+    for _it in _ci.pending(LANE):
+        for _op in ((_it.get("intent") or {}).get("settle_ops") or []):
+            if _op.get("op_id") == _op_id and _op.get("kind") == "credit":
+                return _op
+    return None
+
+
+def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):
+    """(filled_exit, gross, fee, kind, fee_venue) of a NON-sim (modelled-fill) exit. When a pending intent already RECORDED a credit for this same op id and
+    quantity, the retry settles those recorded amounts (the account credited them; a fresh live quote would be a different plan that begin() must refuse
+    forever). Otherwise the live honest_exit price, as before. A write-down never reuses a credit."""
+    _kind = _pkind(reason, pkind)
+    _fv = _exit_fee_venue(pos)
+    if _kind != "write_down_zero":
+        _rec = _recorded_credit_op(pos, suffix)
+        if _rec is not None:
+            # A pending intent already RECORDED this exact op. Either settle exactly what it recorded, or refuse visibly: never a different quote.
+            _ci = _close_intents()
+            try:
+                _g = float(_rec["amount"]); _f = float(_rec.get("fee") or 0.0); _rq = float(_rec["qty"])
+                _okrec = (_g == _g and _f == _f and 0.0 <= _g < float("inf") and 0.0 <= _f < float("inf") and qty > 0
+                          and abs(_rq - qty) <= 1e-9 * max(1.0, qty))
+            except Exception:
+                _okrec = False
+            if not _okrec:
+                raise _ci.IntentNotDurable("pending intent recorded a credit for op %s that does not match this exit (recorded qty %r, exit qty %r, amount %r, fee %r): "
+                                           "refusing to re-quote or presume; operator resolution required" % (_rec.get("op_id"), _rec.get("qty"), qty, _rec.get("amount"), _rec.get("fee")))
+            return _g / qty, _g, _f, (_rec.get("price_kind") or _kind), _fv
+    try:
+        filled_exit = _fills.honest_exit(
+            exit_price, qty * exit_price,
+            # F5 (2026-10-23): exit-time liquidity beats the entry
+            # snapshot — pools drain between entry and exit.
+            pos.get("last_liquidity")
+            or pos["entry_snapshot"].get("liquidity") or None)
+    except Exception:
+        filled_exit = exit_price
+    gross = qty * filled_exit
+    # A write-down is NOT a sale (design v4 Stage B): no fee is
+    # booked on units nobody bought.
+    gas_out = (0.0 if _kind == "write_down_zero"
+               else _costs.tx_cost_usd(pos["chain"], gross, venue=_fv))
+    return filled_exit, gross, gas_out, _kind, _fv
+
+
 def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     chain = pos["chain"]
@@ -1502,23 +1554,8 @@ def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
         pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
         _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key, price_kind=_kind)
         return net
-    try:
-        leg_usd = leg_tokens * exit_price
-        filled_exit = _fills.honest_exit(
-            exit_price, leg_usd,
-            # F5 (2026-10-23): exit-time liquidity beats the entry
-            # snapshot — pools drain between entry and exit.
-            pos.get("last_liquidity")
-            or pos["entry_snapshot"].get("liquidity") or None)
-    except Exception:
-        filled_exit = exit_price
-    gross = leg_tokens * filled_exit
-    _kind = _pkind(reason, pkind)
-    # A write-down is NOT a sale (design v4 Stage B): no fee is
-    # booked on units nobody bought.
-    _fv = _exit_fee_venue(pos)
-    gas_out = (0.0 if _kind == "write_down_zero"
-               else _costs.tx_cost_usd(chain, gross, venue=_fv))
+    filled_exit, gross, gas_out, _kind, _fv = _nonsim_figures(
+        pos, leg_tokens, exit_price, reason, pkind, "leg:%s" % leg_key)
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
@@ -1567,23 +1604,9 @@ def _close_remaining_impl(pos, exit_price, reason, pkind=None):
         pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
         _pa_settle(pos, total_tokens, gross, gas_out, _rkey, price_kind=_kind)
         return net
-    try:
-        leg_usd = total_tokens * exit_price
-        filled_exit = _fills.honest_exit(
-            exit_price, leg_usd,
-            # F5 (2026-10-23): exit-time liquidity beats the entry
-            # snapshot — pools drain between entry and exit.
-            pos.get("last_liquidity")
-            or pos["entry_snapshot"].get("liquidity") or None)
-    except Exception:
-        filled_exit = exit_price
-    gross = total_tokens * filled_exit
-    _kind = _pkind(reason, pkind)
-    # A write-down is NOT a sale (design v4 Stage B): no fee is
-    # booked on units nobody bought.
-    _fv = _exit_fee_venue(pos)
-    gas_out = (0.0 if _kind == "write_down_zero"
-               else _costs.tx_cost_usd(chain, gross, venue=_fv))
+    filled_exit, gross, gas_out, _kind, _fv = _nonsim_figures(
+        pos, total_tokens, exit_price, reason, pkind,
+        "remaining:%s" % "".join(open_legs))
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]

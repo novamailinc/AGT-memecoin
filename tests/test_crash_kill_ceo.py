@@ -191,7 +191,8 @@ def child_recover():
     PA, F, CT = fresh(fresh_state=False)
     pre_ents, pre_st, _t = CI._read(CI.journal_path("ceo"))
     pre_fills = len({k: v for k, v in _journal(F).items() if k.startswith("ceo:exit:") and v.get("status") == "filled"})
-    pre = {"pre_cash": cash(PA), "pre_status": pre_st, "pre_ev": [e.get("ev") for e in pre_ents], "pre_fills": pre_fills}
+    pre = {"pre_cash": cash(PA), "pre_status": pre_st, "pre_ev": [e.get("ev") for e in pre_ents if e.get("intent_id")],   # LIFECYCLE rows only (carry an intent_id)
+           "pre_other": sorted({str(e.get("ev")) for e in pre_ents if not e.get("intent_id")}), "pre_fills": pre_fills}
     print("PRE " + _json.dumps(pre), flush=True)
     FakeJup.mult = 1.9
     C.poll_exits(price_fn=pf_mult(C, 1.9)); C.poll_exits(price_fn=pf_mult(C, 1.9))
@@ -200,7 +201,8 @@ def child_recover():
     ents, st, _ = CI._read(CI.journal_path("ceo"))
     res = {"cash": cash(PA), "legs": sorted(k.split(":")[3] for k in fl), "net": sum(v["net_proceeds_usd"] for v in fl.values()),
            "a_done": [bool(p.get("legs", {}).get("a", {}).get("done")) for p in pos.values()], "n_pos": len(pos),
-           "pending": len(CI.pending("ceo")), "journal_status": st, "n_events": len(ents), "ev": [e.get("ev") for e in ents]}
+           "pending": len(CI.pending("ceo")), "journal_status": st, "n_events": len(ents), "ev": [e.get("ev") for e in ents if e.get("intent_id")],
+           "other": sorted({str(e.get("ev")) for e in ents if not e.get("intent_id")}), "pend_why": [(p.get("pending_exit") or {}).get("why") for p in pos.values()]}
     print("RESULT " + _json.dumps(res), flush=True)
 
 if MODE == "run": child_run(sys.argv[3]); sys.exit(0)
@@ -231,13 +233,26 @@ for point in ("pre_intent", "torn_intent", "after_credit", "pre_lane_marker"):
     # PREDECLARED durable state at the moment of the kill (read by the fresh process BEFORE it recovers anything)
     want_ev = {"pre_intent": [], "torn_intent": [], "after_credit": ["intent"], "pre_lane_marker": ["intent", "account_applied"]}[point]
     want_st = "torn_tail" if point == "torn_intent" else None
-    check("%s: durable state at kill: journal status %r (want %r), events %r (want %r), sale fills %d (want 1: the fill is journaled before the intent)"
+    check("%s: durable state at kill: journal status %r (want %r), lifecycle events %r (want %r), sale fills %d (want 1: the fill is journaled before the intent)"
           % (point, pre["pre_status"], want_st, pre["pre_ev"], want_ev, pre["pre_fills"]), pre["pre_status"] == want_st and pre["pre_ev"] == want_ev and pre["pre_fills"] == 1)
     credited = point in ("after_credit", "pre_lane_marker")
     check("%s: durable account cash at kill %.6f vs entry %.6f (credit applied before the kill: %r; also proves the recovery process did not reset the account)"
           % (point, pre["pre_cash"], entry_cash, credited), (_cents(pre["pre_cash"]) > _cents(entry_cash)) if credited else (_cents(pre["pre_cash"]) == _cents(entry_cash)))
+    check("%s: rows WITHOUT an intent_id are only liveness probes, before (%r) and after (%r) recovery (never lifecycle events)" % (point, pre["pre_other"], r["other"]),
+          set(pre["pre_other"]) <= {"probe"} and set(r["other"]) <= {"probe"})
+    if point == "torn_intent":
+        # PREDECLARED from the call ORDER (not weakened): the recovery process polls; the first journal touch is the _intent_gate liveness probe (ceo.py 286-296), which appends
+        # onto the unterminated half line, then close_intents.begin(stable_id) reads the journal, sees it not cleanly readable and raises IntentNotDurable (close_intents.py 198-200).
+        # close_intents.recover_lane (which truncates a torn tail, 362-368) runs only from the entry path (ceo.py 1226) and _finalize (1818), neither reached by a poll that holds. So the
+        # poll must FAIL CLOSED: leg a UNDONE, exactly the one journaled fill (no resale), cash == entry (no credit), pending_exit close_intent_not_durable, the journal still reported
+        # torn_tail, no lifecycle event, no pending intent.
+        check("torn_intent: FAILS CLOSED, no convergence: leg a done %r (want [False]), fills %r (want ['a']), cash delta %.6f (want 0), hold %r (want close_intent_not_durable), journal %r (want torn_tail), lifecycle %r (want [])"
+              % (r["a_done"], r["legs"], r["cash"] - entry_cash, r["pend_why"], r["journal_status"], r["ev"]),
+              r["a_done"] == [False] and r["legs"] == ["a"] and _cents(r["cash"] - entry_cash) == 0 and r["pend_why"] == ["close_intent_not_durable"]
+              and r["journal_status"] == "torn_tail" and r["ev"] == [] and r["pending"] == 0)
+        continue
     check("%s: leg a done after recovery %r, one sale fill per leg %r (no resale)" % (point, r["a_done"], r["legs"]), r["a_done"] == [True] and r["legs"] == ["a"])
     check("%s: cash delta since entry %.6f == journaled net proceeds %.6f (exactly one credit)" % (point, r["cash"] - entry_cash, r["net"]), _cents(r["cash"] - entry_cash) == _cents(r["net"]))
-    check("%s: applied-marker sequence %r == ['intent', 'account_applied', 'lane_applied'], no pending intent (%d), journal cleanly readable (%r)" % (point, r["ev"], r["pending"], r["journal_status"]),
-          r["ev"] == ["intent", "account_applied", "lane_applied"] and r["pending"] == 0 and r["journal_status"] is None)
+    check("%s: lifecycle sequence %r == ['intent', 'account_applied', 'lane_applied', 'applied'] (terminal applied last), no pending intent (%d), journal cleanly readable (%r)" % (point, r["ev"], r["pending"], r["journal_status"]),
+          r["ev"] == ["intent", "account_applied", "lane_applied", "applied"] and r["pending"] == 0 and r["journal_status"] is None)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

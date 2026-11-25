@@ -45,22 +45,34 @@ put("t1b", json.dumps({"ev": "probe", "lane": "t1b"}).encode())
 ok = ci._append(ci.journal_path("t1b"), {"ev": "probe", "lane": "t1b"})
 ents, st, _ = ci._read(ci.journal_path("t1b"))
 check("t1b: complete unterminated last record keeps its data and gets a newline (ok %r, status %r, rows %d)" % (ok, st, len(ents)), ok and st is None and len(ents) == 2)
-# (2) genuine mid-file corruption
+# (2) genuine mid-file corruption, with a PENDING intent journaled before the garbage (so recover_lane has something real to freeze)
+ci.begin("t2", "M", "p#1", OPS, dict(INFO))
+pend_id = [x["intent_id"] for x in ci.pending("t2")]
 good = json.dumps({"ev": "probe", "lane": "t2"}).encode() + b"\n"
-put("t2", good + b"{garbage not json\n" + good)
+put("t2", raw("t2") + b"{garbage not json\n" + good)       # newline-TERMINATED garbage in the middle
 before = hashlib.sha256(raw("t2")).hexdigest()
-check("setup t2: status torn (mid-file)", ci._read(ci.journal_path("t2"))[1] == "torn")
+check("setup t2: one pending intent %r and status torn (mid-file, newline-terminated)" % pend_id, len(pend_id) == 1 and ci._read(ci.journal_path("t2"))[1] == "torn")
 r1 = ci._append(ci.journal_path("t2"), {"ev": "probe", "lane": "t2"})
 r2 = ci.journal_writable("t2")
 r3 = raises(lambda: ci.begin("t2", "M", "p#1", OPS, dict(INFO)))
+r3b = ci.mark_account_applied("t2", pend_id[0])
 r4 = ci.recover_lane("t2", lambda op: (True, "x"), lambda i: False, lambda i: True)
 after = hashlib.sha256(raw("t2")).hexdigest()
-check("t2 mid-file corruption: append refused %r, journal_writable %r, begin raises %r, recover_lane returns %r, bytes unchanged %r" % (r1, r2, r3, r4, before == after),
-      r1 is False and r2 is False and r3 is True and r4 == [] and before == after)
-# mid-file corruption plus unterminated tail also refuses
-put("t2b", good + b"{garbage\n" + good + b'{"ev": "half')
+check("t2 mid-file corruption: append refused %r, journal_writable %r, begin raises %r, marker refused %r, recover_lane returns the pending id %r (want %r), bytes UNCHANGED %r"
+      % (r1, r2, r3, r3b, r4, pend_id, before == after), r1 is False and r2 is False and r3 is True and r3b is False and r4 == pend_id and before == after)
+# t2b: mid-file corruption AND an unterminated torn tail
+base = raw("t2")
+put("t2b", base + b'{"ev": "half')
 b2 = hashlib.sha256(raw("t2b")).hexdigest()
-check("t2b mid-file corruption with a torn tail: append refused and bytes unchanged", ci._append(ci.journal_path("t2b"), {"ev": "probe"}) is False and hashlib.sha256(raw("t2b")).hexdigest() == b2)
+r5 = ci._append(ci.journal_path("t2b"), {"ev": "probe"})
+r6 = ci.recover_lane("t2b", lambda op: (True, "x"), lambda i: False, lambda i: True)
+check("t2b mid-file corruption plus torn tail: append refused %r, recover returns the pending id %r, bytes unchanged %r" % (r5, r6, hashlib.sha256(raw("t2b")).hexdigest() == b2),
+      r5 is False and r6 == pend_id and hashlib.sha256(raw("t2b")).hexdigest() == b2)
+# negative control: a RAW append without the repair merges into the half line (proves the guard is what prevents it)
+put("t2c", json.dumps({"ev": "probe"}).encode() + b'\n{"ev": "half')
+with open(ci.journal_path("t2c"), "a") as f: f.write(json.dumps({"ev": "probe"}) + "\n")
+check("t2c negative control: a raw append onto a half line is NOT clean (status %r)" % ci._read(ci.journal_path("t2c"))[1], ci._read(ci.journal_path("t2c"))[1] == "torn")
+
 # (3) resume
 a = ci.begin("t3", "M", "p#1", OPS, dict(INFO))
 b = ci.begin("t3", "M", "p#1", OPS, dict(INFO, close_ts=1795599999.9))
@@ -68,7 +80,22 @@ check("t3 begin with a different close_ts RESUMES the pending intent (%s == %s),
       a == b and len([e for e in ci._read(ci.journal_path("t3"))[0] if e.get("ev") == "intent"]) == 1)
 c = raises(lambda: ci.begin("t3", "M", "p#1", [dict(OPS[0], amount=2.0)], dict(INFO)))
 check("t3 same op ids with a DIFFERENT plan refuses", c)
-ci.mark_account_applied("t3", a); ci.mark_lane_applied("t3", a)
+e1 = ci.begin("t3", "M", "p#1", [dict(OPS[0], op_id="tail:leg:c:M:p#1")], dict(INFO, leg_suffix="c"))
+check("t3 DIFFERENT op ids for the same position open a NEW intent (%s != %s)" % (e1, a), e1 != a)
+ci.mark_account_applied("t3", a); ci.mark_account_applied("t3", a); ci.mark_account_applied("t3", a)
+n_aa = len([e for e in ci._read(ci.journal_path("t3"))[0] if e.get("ev") == "account_applied" and e.get("intent_id") == a])
+n_aa_other = len([e for e in ci._read(ci.journal_path("t3"))[0] if e.get("ev") == "account_applied" and e.get("intent_id") == e1])
+ci.mark_account_applied("t3", e1)
+n_aa_other2 = len([e for e in ci._read(ci.journal_path("t3"))[0] if e.get("ev") == "account_applied" and e.get("intent_id") == e1])
+check("t3 repeated mark_account_applied writes ONE event (%d); a different intent still appends (%d -> %d)" % (n_aa, n_aa_other, n_aa_other2), n_aa == 1 and n_aa_other == 0 and n_aa_other2 == 1)
+ci.mark_lane_applied("t3", a); ci.mark_lane_applied("t3", a)
+evs = [e["ev"] for e in ci._read(ci.journal_path("t3"))[0] if e.get("intent_id") == a]
+check("t3 mark_lane_applied twice: lifecycle %r (terminal applied exactly once)" % evs, evs == ["intent", "account_applied", "lane_applied", "applied"])
+ci.freeze("t3", e1, "test freeze")
+fm = ci.mark_lane_applied("t3", e1)
+evs1 = [e["ev"] for e in ci._read(ci.journal_path("t3"))[0] if e.get("intent_id") == e1]
+check("t3 a FROZEN intent refuses markers (returned %r), lifecycle stays %r" % (fm, evs1), fm is False and evs1 == ["intent", "account_applied", "frozen"])
+
 d = ci.begin("t3", "M", "p#1", OPS, dict(INFO, close_ts=1795600000.1))
 check("t3 after the terminal applied a new begin is a new intent (%s != %s)" % (d, a), d != a)
 # (4) concurrency with a torn tail present

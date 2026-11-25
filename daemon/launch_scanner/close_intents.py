@@ -79,30 +79,24 @@ def _append(path: str, event: Dict[str, Any]) -> bool:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with _append_lock(path):
             prefix = ""
-            try:
-                with open(path, "rb") as _f:
-                    _f.seek(0, 2)
-                    _size = _f.tell()
-                    if _size:
-                        _f.seek(_size - 1)
-                        _last = _f.read(1)
-                    else:
-                        _last = b"\n"
-            except FileNotFoundError:
-                _last = b"\n"
-            if _last != b"\n":
-                # Unterminated tail: appending would MERGE our record into the half line. Repair only a PROVABLE torn tail (exactly one
-                # unparseable last record, the crash-mid-append signature, truncated like recover_lane); a complete last record that merely
-                # lacks its newline gets the newline first; any other corruption is never healed and nothing is appended.
+            if os.path.exists(path):
+                # ALWAYS classify the whole journal under the append lock (a newline-terminated mid-file garbage line is as unreadable as a torn one).
                 _e, _st, _tail = _read(path)
-                if _st is None:
-                    prefix = "\n"
-                elif _st == "torn_tail" and _tail is not None:
+                if _st == "torn":
+                    logger.error("close_intents: journal not cleanly readable (torn); refusing append (%s)", event.get("ev"))
+                    return False
+                if _st == "torn_tail" and _tail is not None:
+                    # Provable crash-mid-append signature (exactly one unparseable LAST record): truncate it like recover_lane before writing.
                     _truncate(path, _tail)
                     logger.error("close_intents: torn tail truncated at %s before append (%s)", _tail, path)
                 else:
-                    logger.error("close_intents: journal not cleanly readable (%s); refusing append (%s)", _st, event.get("ev"))
-                    return False
+                    with open(path, "rb") as _f:
+                        _f.seek(0, 2)
+                        _size = _f.tell()
+                        if _size:
+                            _f.seek(_size - 1)
+                            if _f.read(1) != b"\n":
+                                prefix = "\n"   # complete last record that merely lacks its newline
             with open(path, "a") as f:
                 f.write(prefix + json.dumps(event) + "\n")
                 f.flush()
@@ -142,6 +136,12 @@ class _append_lock:
             self.fh.close()
         finally:
             self.tl.release()
+
+
+def _read_consistent(path: str):
+    """_read taken under the same per-path lock as every append/truncate, so a concurrent writer's in-flight line cannot be mistaken for a torn tail."""
+    with _append_lock(path):
+        return _read(path)
 
 
 def _read(path: str) -> Tuple[List[Dict[str, Any]], Optional[str],
@@ -247,7 +247,7 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
           "settle_ops": settle_ops, "close_info": dict(close_info)}
     if op_key is None:
         with _op_key_lock(lane):
-            ents, st, _ = _read(journal_path(lane))
+            ents, st, _ = _read_consistent(journal_path(lane))
             if st == "torn_tail":
                 # the append below repairs a provable torn tail; re-read after to prove the journal is clean
                 pass
@@ -264,12 +264,12 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
                     return iid0
             if not _append(journal_path(lane), ev):
                 raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
-            if _read(journal_path(lane))[1] is not None:
+            if _read_consistent(journal_path(lane))[1] is not None:
                 raise IntentNotDurable("journal not cleanly readable after append")
         return intent_id
     ev["op_key"] = op_key
     with _op_key_lock(lane):
-        ents, st, _ = _read(journal_path(lane))
+        ents, st, _ = _read_consistent(journal_path(lane))
         if st is not None:
             raise IntentNotDurable("journal not cleanly readable (%s): cannot prove operation %s is new" % (st, op_key))
         for e in ents:
@@ -318,7 +318,7 @@ class _op_key_lock:
 
 def intent_status(lane: str, intent_id: str) -> Optional[str]:
     """'applied' | 'frozen' | 'open' for an intent id, None when absent. Raises IntentNotDurable when the journal is not cleanly readable."""
-    ents, st, _ = _read(journal_path(lane))
+    ents, st, _ = _read_consistent(journal_path(lane))
     if st is not None:
         raise IntentNotDurable("journal not cleanly readable (%s)" % st)
     s_ = _state(ents).get(intent_id)
@@ -327,18 +327,36 @@ def intent_status(lane: str, intent_id: str) -> Optional[str]:
     return "applied" if s_["applied"] else ("frozen" if s_["frozen"] is not None else "open")
 
 
+def _mark_once(lane: str, intent_id: str, kind: str) -> bool:
+    """Append one marker event for an intent exactly once. Read-check-append runs under the lane lock (the same _op_key_lock begin and recover use, then the
+    per-path append lock inside _append), so two writers (recovery plus the resumed re-close, or two processes) cannot both add it. A marker already
+    durably present returns True without a second row. A journal that is not cleanly readable cannot prove absence, so a write failure propagates as False
+    exactly as _append would (the caller sees the failure)."""
+    path = journal_path(lane)
+    with _op_key_lock(lane):
+        ents, st, _ = _read_consistent(path)
+        if st is None:
+            if kind != "frozen" and any(e.get("ev") == "frozen" and e.get("intent_id") == intent_id for e in ents):
+                logger.error("close_intents: intent %s is FROZEN; refusing marker %s", intent_id, kind)
+                return False
+            for e in ents:
+                if e.get("ev") == kind and e.get("intent_id") == intent_id:
+                    return True
+        # st == torn_tail: _append repairs it (provable) before writing; any other unreadable state makes _append refuse (False)
+        return bool(_append(path, {"ev": kind, "intent_id": intent_id}))
+
+
 def mark_account_applied(lane: str, intent_id: str) -> bool:
     """Returns False when the marker was not durably written. The intent then stays open: recovery re-applies by the idempotent op ids
-    (a lost marker never loses an account op, it only delays convergence), so callers continue but may surface the False."""
-    return bool(_append(journal_path(lane), {"ev": "account_applied", "intent_id": intent_id}))
+    (a lost marker never loses an account op, it only delays convergence), so callers continue but may surface the False. Idempotent per intent."""
+    return _mark_once(lane, intent_id, "account_applied")
 
 
 def mark_lane_applied(lane: str, intent_id: str) -> bool:
-    path = journal_path(lane)
-    ok1 = bool(_append(path, {"ev": "lane_applied", "intent_id": intent_id}))
+    ok1 = _mark_once(lane, intent_id, "lane_applied")
     # Terminal event in the same pass when both sides are durable: the account side always precedes the lane write by design.
-    # The terminal "applied" is written ONLY if the lane marker landed (a terminal state must never outrun its evidence).
-    return bool(ok1 and _append(path, {"ev": "applied", "intent_id": intent_id}))
+    # The terminal "applied" is written ONLY if the lane marker landed (a terminal state must never outrun its evidence). Idempotent per intent.
+    return bool(ok1 and _mark_once(lane, intent_id, "applied"))
 
 
 def journal_writable(lane: str) -> bool:
@@ -347,7 +365,7 @@ def journal_writable(lane: str) -> bool:
     begin() still raises IntentNotDurable if the real intent write fails."""
     if not _append(journal_path(lane), {"ev": "probe", "lane": lane}):
         return False
-    return _read(journal_path(lane))[1] is None
+    return _read_consistent(journal_path(lane))[1] is None
 
 
 def freeze(lane: str, intent_id: str, why: str) -> bool:
@@ -429,7 +447,7 @@ def recover_lane(
     journal's own history is suspect.
     """
     path = journal_path(lane)
-    entries, status, tail = _read(path)
+    entries, status, tail = _read_consistent(path)
     if status == "torn":
         logger.error("close_intents: %s journal corrupt; recovery "
                      "frozen", lane)
@@ -465,19 +483,16 @@ def recover_lane(
                            % (op_why or "?"))
                     break
             if why is None:
-                _append(path, {"ev": "account_applied",
-                               "intent_id": iid})
+                _mark_once(lane, iid, "account_applied")
                 st["account_applied"] = True
         if why is None and not st["lane_applied"]:
             if lane_has_close(intent):
-                _append(path, {"ev": "lane_applied",
-                               "intent_id": iid})
+                _mark_once(lane, iid, "lane_applied")
                 st["lane_applied"] = True
             else:
                 res = lane_apply(intent)
                 if res is True:
-                    _append(path, {"ev": "lane_applied",
-                                   "intent_id": iid})
+                    _mark_once(lane, iid, "lane_applied")
                     st["lane_applied"] = True
                 elif res is False:
                     why = "lane re-book failed"
@@ -487,7 +502,7 @@ def recover_lane(
             continue
         if why is None and st["account_applied"] \
                 and st["lane_applied"]:
-            _append(path, {"ev": "applied", "intent_id": iid})
+            _mark_once(lane, iid, "applied")
         elif why is not None:
             freeze(lane, iid, why)
             frozen.append(iid)

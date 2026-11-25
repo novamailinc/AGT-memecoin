@@ -48,7 +48,8 @@ lines = M.format_status_lines(s1, False)
 check("format pending, flag off: one labeled line; says unresolved entry attempt that MAY be pre-debit, post-commit cleanup or unrecovered, does NOT classify, not an ordinary cycle fault, flag OFF here, trader process may differ",
       len(lines) == 1 and "UNRESOLVED entry attempt" in lines[0] and "may be a pre-debit leftover" in lines[0] and "cleanup leftover" in lines[0] and "does not classify" in lines[0] and "not an ordinary cycle fault" in lines[0] and "OFF" in lines[0] and "trader process" in lines[0])
 check("format pending does NOT assert an unrecovered position as fact (no 'unrecovered entry' without 'may be')", "or an unrecovered entry" in lines[0] and "An unrecovered entry" not in lines[0])
-check("format pending shows recorded state even though the flag is off (not hidden)", "GradMint1pump" in lines[0])
+# DISPLAY CONTRACT (production unchanged): format_status_lines shows each record's mint truncated to its first 12 characters. That prefix is a DISPLAY HINT, not a unique identifier; the full mint is in st["records"].
+check("format pending shows recorded state even though the flag is off (not hidden): the 12-char display prefix is present and the full 13-char mint is NOT in the line", "GradMint1pum" in lines[0] and "GradMint1pump" not in lines[0] and s1["records"][0]["mint"] == "GradMint1pump")
 check("format pending, flag on: says ON", "ON" in M.format_status_lines(s1, True)[0] and "OFF" not in M.format_status_lines(s1, True)[0])
 bad = M.format_status_lines(s3, True)[0]
 check("format: invalid/unreadable record labeled INVALID/UNREADABLE", "INVALID/UNREADABLE" in bad)
@@ -62,4 +63,13 @@ se = M.status_readonly(L); ev = [r for r in se["records"] if r["file"] == "evil.
 txt = "\n".join(M.format_status_lines(se, True))
 check("redaction: malformed mint/op_id text is NOT surfaced (None) and the record is INVALID", ev["mint"] is None and ev["op_id"] is None and ev["valid"] is False)
 check("redaction: formatted lines never contain the malformed text, markup or the long string", "evil.example" not in txt and "<b>" not in txt and "AAAA" not in txt and "xxxx" not in txt and "/start" not in txt)
+# Two DISTINCT mints that share the same 12-character display prefix: the records stay distinct in the data; the displayed strings are identical and are never used to dedupe or count.
+def rec_m(mint, op):
+    pos = {"mint": mint, "tokens": 1.0, "entry_price": 1e-05, "entry_ts": 1.0, "legs": {}, "entry_features": {}, "execution": {"entry_op": op}}
+    return M.build_record("grad", mint, op, 1.0, 1.0, pos, {"qty_tokens": 1.0, "price_usd": 1e-05}, {"entry_day": "2026-11-24"})
+L4 = home(); M.write_record(L4, rec_m("GradMint1pump", "opA")); M.write_record(L4, rec_m("GradMint1pumq", "opB")); d4 = M.records_dir(L4); b4 = snap(d4); s6 = M.status_readonly(L4)
+check("same-prefix: two valid records are REPORTED as two distinct records with distinct full mints and op_ids", s6["state"] == "pending" and len(s6["records"]) == 2 and len({r["mint"] for r in s6["records"]}) == 2 and {r["mint"] for r in s6["records"]} == {"GradMint1pump", "GradMint1pumq"} and {r["op_id"] for r in s6["records"]} == {"opA", "opB"} and all(r["valid"] for r in s6["records"]))
+l6 = M.format_status_lines(s6, False)
+check("same-prefix: the line counts 2 record file(s) by RECORDS, shows the identical 12-char prefix twice (a display hint that cannot tell them apart) and neither full mint", len(l6) == 1 and "2 record file(s)" in l6[0] and l6[0].count("GradMint1pum") == 2 and "GradMint1pump" not in l6[0] and "GradMint1pumq" not in l6[0])
+check("same-prefix: status_readonly left the directory byte-identical", snap(d4) == b4)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

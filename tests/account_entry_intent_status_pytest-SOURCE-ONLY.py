@@ -41,12 +41,23 @@ class TestAccountEntryIntentStatus:
         monkeypatch.delenv(gei.FLAG, raising=False)
         body = _run(monkeypatch, tmp_path)
         line = [l for l in body.split("\n") if 'entry-intent' in l][0]
-        assert 'GradMint1pump' in line and 'UNRESOLVED entry attempt' in line
+        assert 'GradMint1pum' in line and 'GradMint1pump' not in line and 'UNRESOLVED entry attempt' in line   # 12-char display hint, not a unique identifier
         assert 'may be a pre-debit leftover' in line and 'cleanup leftover' in line and 'does not classify' in line
         assert 'An unrecovered entry' not in line and 'not an ordinary cycle fault' in line
         assert 'recovery flag in this process: OFF' in line      # recorded state shown with the flag off, labeled
         assert _dsnap(d) == before                                  # read-only
         assert 'Spendable cash: $8.00' in body
+
+    def test_same_prefix_mints_are_two_records_with_identical_display_hint(self, account, monkeypatch, tmp_path):
+        monkeypatch.setenv('FOREX_AGENT_HOME', str(tmp_path / 'home')); os.makedirs(str(tmp_path / 'home'))
+        gei.write_record(gei.default_ledger_path(), _rec("GradMint1pump", "opA")); gei.write_record(gei.default_ledger_path(), _rec("GradMint1pumq", "opB"))
+        d = gei.records_dir(gei.default_ledger_path()); before = _dsnap(d)
+        st = gei.status_readonly(gei.default_ledger_path())
+        assert len(st["records"]) == 2 and {r["mint"] for r in st["records"]} == {"GradMint1pump", "GradMint1pumq"}
+        body = _run(monkeypatch, tmp_path)
+        line = [l for l in body.split("\n") if 'entry-intent' in l][0]
+        assert '2 record file(s)' in line and line.count('GradMint1pum') == 2 and 'GradMint1pump' not in line and 'GradMint1pumq' not in line
+        assert _dsnap(d) == before
 
     def test_flag_on_label(self, account, monkeypatch, tmp_path):
         monkeypatch.setenv('FOREX_AGENT_HOME', str(tmp_path / 'home')); os.makedirs(str(tmp_path / 'home'))

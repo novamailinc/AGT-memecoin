@@ -497,7 +497,10 @@ class MemecoinAdapter(BrokerAdapter):
                        "shared_entry_op_id": intent["shared_entry"]["op_id"],
                        "shared_entry_fx": intent["shared_entry"]["fx"],
                        "shared_entry_usd": receipt["stake"], "shared_lane": receipt["lane"],
-                       "shared_mint": receipt["mint"], "shared_book_id": self._shared_book_id}
+                       "shared_mint": receipt["mint"], "shared_book_id": self._shared_book_id,
+                       # ORIGINAL generation captured atomically by the debit made in THIS process (None when the entry was adopted from a recovered
+                       # receipt: unbound, so its exits are refused fail-closed rather than rebound)
+                       "shared_account_id": (getattr(self._shared_account, "debit_binding", lambda *_a: None)(intent["shared_entry"]["op_id"], receipt["pos_id"]))}
             after["positions"][str(fill["ticket"])].update(binding)
             fill.update(binding)
             self._seal_intent(intent)

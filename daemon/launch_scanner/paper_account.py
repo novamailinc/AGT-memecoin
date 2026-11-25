@@ -1056,6 +1056,11 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         return led, None
     pending.sort(key=lambda t: t[0])
     replayed = 0
+    # LEGACY POLICY (engineering safety, owner decision pending): a debit/credit/write_down WITHOUT an account_id is replayable only if it precedes the
+    # first generation-bound event in the journal; once any bound event exists, an unbound one is a divergence (an operator restore of one file).
+    _bound_seqs = [e.get("seq") for e in entries if isinstance(e.get("account_id"), str) and e.get("event") in ("debit", "credit", "write_down")
+                   and isinstance(e.get("seq"), int)]
+    _first_bound = min(_bound_seqs) if _bound_seqs else None
     for ev_seq, ev in pending:
         kind = ev.get("event")
         lane, mint = ev.get("lane"), ev.get("mint")
@@ -1065,6 +1070,10 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             # GENERATION SAFETY: a mutation journaled under another account generation must never be replayed into this ledger.
             return led, ("replay divergence: %s %s journaled under account generation %s, ledger is %s"
                          % (kind, op_id, str(ev.get("account_id"))[:8], str(led.get("account_id"))[:8]))
+        if (kind in ("debit", "credit", "write_down") and not isinstance(ev.get("account_id"), str) and isinstance(led.get("account_id"), str)
+                and _first_bound is not None and ev_seq > _first_bound):
+            return led, ("replay divergence: %s %s carries no account generation after the first generation-bound event (mixed-generation journal)"
+                         % (kind, op_id))
         if kind in _MUTATION_EVENTS and op_id and op_id in ops:
             # Caller op already applied: idempotent skip. The seq
             # still advances — the state includes this mutation.
@@ -1126,7 +1135,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                              % (lane, mint, why))
             if op_id:
                 ops[op_id] = {"event": "credit", "lane": lane,
-                              "mint": mint, "pos_id": pid,
+                              "mint": mint, "pos_id": pid, "account_id": ev.get("account_id"),
                               "realized": realized,
                               **({"instance": True, "proceeds": ev.get("proceeds"),
                                   "fee": ev.get("fee"), "qty": ev.get("qty"),
@@ -1142,7 +1151,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                              "%s/%s: %s" % (lane, mint, why))
             if op_id:
                 ops[op_id] = {"event": "write_down", "lane": lane,
-                              "mint": mint,
+                              "mint": mint, "account_id": ev.get("account_id"),
                               "pos_id": ev.get("pos_id"),
                               **({"instance": True, "qty": ev.get("qty"),
                                   "reason": ev.get("reason")}
@@ -1959,6 +1968,7 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
     crash between the two journaled events is repaired by retry:
     an applied entry with the hold still present finishes the
     release."""
+    _TL.debit = None   # stale-capture guard, as in _try_debit
     if not _valid_amount(stake) or stake <= 0:
         return False, "stake must be a positive finite number", None
     if not _valid_amount(qty) or qty <= 0:
@@ -2004,6 +2014,7 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
                           "reason": "consumed (crash repair)",
                           "seq": led["seq"], "ts": ts})
                 _save_locked(led)
+            _TL.debit = (entry_op_id, rec["pos_id"], rec.get("account_id"))
             return True, "ok (retry of applied op)", rec["pos_id"]
         if held is None:
             return False, "no such hold to consume", None
@@ -2049,6 +2060,7 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
                   "amount": float(held["amount"]), "reason": "consumed",
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
+        _TL.debit = (entry_op_id, pid, led.get("account_id"))   # atomic original identity, same lock hold as the entry debit
         return True, "ok", pid
 
 
@@ -2178,7 +2190,9 @@ def _generation_refusal(led, expected, entry_op_id, lane, mint, pos_id):
     op = (led.get("ops") or {}).get(entry_op_id)
     if not (isinstance(op, dict) and op.get("event") == "debit" and op.get("lane") == lane and op.get("mint") == mint):
         return "entry op %s not proven in the ledger" % entry_op_id
-    if pos_id and op.get("pos_id") != pos_id:
+    if not (isinstance(pos_id, str) and pos_id):
+        return "caller bound no pos_id"
+    if op.get("pos_id") != pos_id:
         return "entry op pos_id %s differs from the settled pos_id %s" % (op.get("pos_id"), pos_id)
     if op.get("account_id") != ident:
         return "entry op carries no matching account generation"
@@ -2205,7 +2219,31 @@ def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Option
     return debit_binding(entry_op_id, pos_id)
 
 
+def _applied_same_generation(led, op_id, event, lane, mint, pos_id):
+    """EXACT same-op retry of a mutation THIS ledger generation already applied (op stored with this ledger's account_id and the same event/lane/mint/pos_id):
+    answering it from the recorded op mutates nothing, so the entry proof is not needed. A legacy op (no account_id), or an op from any other generation,
+    is NOT accepted here and goes through the full proof (refused)."""
+    op = (led.get("ops") or {}).get(op_id)
+    ident = led.get("account_id")
+    return bool(isinstance(op, dict) and isinstance(ident, str) and ident and op.get("account_id") == ident and op.get("event") == event
+                and op.get("lane") == lane and op.get("mint") == mint and isinstance(pos_id, str) and pos_id and op.get("pos_id") == pos_id)
+
+
+def _last_journal_record():
+    try:
+        with open(JOURNAL_PATH, "rb") as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 4096))
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        return json.loads(lines[-1].decode("utf-8", "replace")) if lines else None
+    except (OSError, ValueError):
+        return None
+
+
 def _refuse_generation(op_id, lane, mint, pos_id, reason):
+    _last = _last_journal_record()
+    if (isinstance(_last, dict) and _last.get("event") == "settle_generation_refused" and _last.get("op_id") == op_id
+            and _last.get("pos_id") == pos_id and _last.get("reason") == reason):
+        return False, "generation refused: %s (already journaled, nothing applied)" % reason   # retry of the same refusal: no unbounded growth
     _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason})
     return False, "generation refused: %s (journaled, nothing applied)" % reason
 
@@ -2274,7 +2312,7 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                       "reason": degraded})
             return False, ("account degraded: %s (journaled for "
                            "manual reconciliation)" % degraded)
-        _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+        _grf = None if _applied_same_generation(led, op_id, "credit", lane, mint, pos_id) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
         if _grf is not None:
             return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         rec, conflict = _op_lookup(led, op_id, "credit", lane, mint,
@@ -2323,12 +2361,13 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "credit", "lane": lane,
                              "mint": mint, "pos_id": pid,
+                             "account_id": led.get("account_id"),
                              "realized": realized,
                              **({"instance": True, "proceeds": proceeds,
                                  "fee": fee, "qty": qty, "price_kind": price_kind}
                                 if pos.get("instance") is True else {})}
         _journal({"event": "credit", "event_id": "ev#%d" % led["seq"],
-                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "op_id": op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "qty": qty, "proceeds": proceeds, "fee": fee,
                   **({"instance": True} if pos.get("instance") is True else {}),
                   "net": net, "realized": realized,
@@ -2430,7 +2469,7 @@ def write_down(lane: str, mint: str, op_id: str,
         if led is None:
             return False, "ledger unreadable"
         if degraded is None:
-            _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+            _grf = None if _applied_same_generation(led, op_id, "write_down", lane, mint, pos_id) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
             if _grf is not None:
                 return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         prior = led["ops"].get(op_id)
@@ -2479,12 +2518,12 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, "%s (journaled, not applied)" % why
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "write_down", "lane": lane,
-                             "mint": mint, "pos_id": pid,
+                             "mint": mint, "pos_id": pid, "account_id": led.get("account_id"),
                              **({"instance": True, "qty": qty, "reason": reason}
                                 if instance else {})}
         _journal({"event": "write_down",
                   "event_id": "ev#%d" % led["seq"],
-                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "op_id": op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "pos_id": pid, "reason": reason,
                   **({"instance": True} if instance else {}),
                   "qty": qty,

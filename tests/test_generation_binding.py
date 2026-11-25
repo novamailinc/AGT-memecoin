@@ -116,5 +116,64 @@ check("E4 another thread never sees this thread's capture", _box == [None])
 _rt = PA.try_debit(LANE, "MINTE3", 1.0, 100.0, "gb:entry:E3", marks=_mk())
 check("E5 retry of the applied op re-captures the ORIGINAL stored account_id (%r)" % (_rt[:2],), _rt[0] is True and PA.entry_binding(LANE, "MINTE3", "gb:entry:E3", r[2]) == json.load(open(PA.LEDGER_PATH))["account_id"])
 
+# ---- F: G1 pos_id None bypass refused
+_use(os.path.join(_home, "F"))
+r = _need("debit F", PA.try_debit(LANE, "MINTF", 1.0, 100.0, "gb:entry:F", marks=_mk()))
+pidF = r[2]; bindF = PA.entry_binding(LANE, "MINTF", "gb:entry:F", pidF); ledF = _bytes(PA.LEDGER_PATH)
+ok, why = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F0", pos_id=None, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
+check("F1 credit with pos_id=None and a valid binding is REFUSED (%s)" % why, (not ok) and "no pos_id" in why and _bytes(PA.LEDGER_PATH) == ledF)
+ok, why = PA.write_down(LANE, "MINTF", "gb:wd:F0", pos_id=None, qty=100.0, reason="t", expected_account_id=bindF, entry_op_id="gb:entry:F")
+check("F2 write_down with pos_id=None REFUSED (%s)" % why, not ok)
+# G5 refusal dedupe
+_n0 = len(open(PA.JOURNAL_PATH).read().splitlines())
+for _i in range(5):
+    PA.credit(LANE, "MINTF", 1.1, "gb:exit:F0", pos_id=pidF, qty=100.0, expected_account_id="acct-WRONG", entry_op_id="gb:entry:F")
+_n1 = len(open(PA.JOURNAL_PATH).read().splitlines())
+check("F3 five identical refusals add exactly ONE journal record (%d -> %d)" % (_n0, _n1), _n1 - _n0 == 1)
+# G6 exact same-op retry after the credit applied returns the recorded outcome
+ok, why = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
+ok2, why2 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=None, entry_op_id=None)
+check("F4 same-op retry of an applied credit is answered from the recorded op even without the caller binding (%s / %s)" % (why, why2), ok and ok2)
+ok3, why3 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id="wrong#9", qty=100.0, expected_account_id=None, entry_op_id=None)
+check("F5 same op_id with a DIFFERENT pos_id is not a retry: refused (%s)" % why3, not ok3)
+
+# ---- G: mixed-generation replay (G2): journal has a bound credit, a restored OLDER ledger replays it
+_use(os.path.join(_home, "G"))
+r = _need("debit G", PA.try_debit(LANE, "MINTG", 1.0, 100.0, "gb:entry:G", marks=_mk()))
+pidG = r[2]; bindG = PA.entry_binding(LANE, "MINTG", "gb:entry:G", pidG)
+shutil.copy(PA.LEDGER_PATH, os.path.join(_home, "G.pre-credit.json"))
+_need("credit G", PA.credit(LANE, "MINTG", 1.1, "gb:exit:G", pos_id=pidG, qty=100.0, expected_account_id=bindG, entry_op_id="gb:entry:G"))
+ev = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip()]
+cr = [e for e in ev if e.get("event") == "credit"]
+check("G1 credit and write_down events now carry the account_id", len(cr) == 1 and cr[0].get("account_id") == bindG)
+# same-generation older ledger: replay applies the credit once (positive control)
+shutil.copy(os.path.join(_home, "G.pre-credit.json"), PA.LEDGER_PATH)
+if os.path.exists(PA.LEDGER_PATH + ".bak"): shutil.copy(os.path.join(_home, "G.pre-credit.json"), PA.LEDGER_PATH + ".bak")
+snapG = PA.snapshot()
+led = json.load(open(PA.LEDGER_PATH))
+check("G2 positive control: same-generation older ledger replays the credit exactly once (ops has it: %s)" % ("gb:exit:G" in (led.get("ops") or {}), ), "gb:exit:G" in (led.get("ops") or {}) and sum(1 for l in open(PA.JOURNAL_PATH) if '"event": "credit"' in l) == 1)
+# foreign generation: rewrite the journal credit to ANOTHER account_id and restore the older ledger again
+shutil.copy(os.path.join(_home, "G.pre-credit.json"), PA.LEDGER_PATH)
+if os.path.exists(PA.LEDGER_PATH + ".bak"): shutil.copy(os.path.join(_home, "G.pre-credit.json"), PA.LEDGER_PATH + ".bak")
+lines = open(PA.JOURNAL_PATH).read().splitlines(keepends=True)
+with open(PA.JOURNAL_PATH, "w") as f:
+    for l in lines:
+        e = json.loads(l) if l.strip() else None
+        if e and e.get("event") == "credit": e["account_id"] = "foreign-generation"; l = json.dumps(e) + "\n"
+        f.write(l)
+r2 = PA.try_debit(LANE, "MINTG2", 1.0, 100.0, "gb:entry:G2", marks=_mk())
+check("G3 a journal credit from another generation is NOT replayed: the account degrades and refuses (%r)" % (r2[:2],), r2[0] is False and "gb:exit:G" not in (json.load(open(PA.LEDGER_PATH)).get("ops") or {}))
+# unbound credit AFTER a bound event: mixed-generation divergence
+shutil.copy(os.path.join(_home, "G.pre-credit.json"), PA.LEDGER_PATH)
+if os.path.exists(PA.LEDGER_PATH + ".bak"): shutil.copy(os.path.join(_home, "G.pre-credit.json"), PA.LEDGER_PATH + ".bak")
+lines = open(PA.JOURNAL_PATH).read().splitlines(keepends=True)
+with open(PA.JOURNAL_PATH, "w") as f:
+    for l in lines:
+        e = json.loads(l) if l.strip() else None
+        if e and e.get("event") == "credit": e.pop("account_id", None); l = json.dumps(e) + "\n"
+        f.write(l)
+r3 = PA.try_debit(LANE, "MINTG3", 1.0, 100.0, "gb:entry:G3", marks=_mk())
+check("G4 an UNBOUND credit after the first bound event is refused as mixed-generation (%r)" % (r3[:2],), r3[0] is False and "gb:exit:G" not in (json.load(open(PA.LEDGER_PATH)).get("ops") or {}))
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

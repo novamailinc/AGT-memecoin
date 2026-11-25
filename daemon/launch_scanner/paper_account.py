@@ -1646,6 +1646,9 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        _ub = _entries_blocked_by_refusal()
+        if _ub and not (led.get("ops", {}).get(op_id) or {}).get("event") == "debit":
+            return False, "account entries blocked: %s" % _ub, None
         prior = led.get("ops", {}).get(op_id)
         if prior is not None and prior.get("event") == "debit_refused":
             _exp = {"lane": lane, "mint": mint, "stake": stake, "qty": qty}
@@ -1993,6 +1996,9 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        _ub = _entries_blocked_by_refusal()
+        if _ub and not (led.get("ops", {}).get(entry_op_id) or {}).get("event") == "debit":
+            return False, "account entries blocked: %s" % _ub, None
         rec, conflict = _op_lookup(led, entry_op_id, "debit", lane, mint,
                                    {"stake": stake, "qty": qty,
                                     "instance": instance})
@@ -2273,7 +2279,56 @@ def _recent_refusals(window=262144):
         return []
 
 
+def _unresolved_path():
+    return os.path.join(os.path.dirname(LEDGER_PATH), "unresolved_generation_refusals.jsonl")
+
+
+def unresolved_refusals():
+    """DURABLE marker of settlement refusals that nothing has resolved. [] = none; None = the marker file is unreadable (callers treat that as BLOCKED). It is written
+    by _refuse_generation, is independent of the close-intent journal and of whether the lane position still exists, survives restarts, and is NEVER cleared by
+    code: an operator reconciles and removes it. It is evidence of an unresolved refusal, not authority for any action."""
+    try:
+        with open(_unresolved_path()) as f:
+            out = []
+            for ln in f:
+                if ln.strip():
+                    out.append(json.loads(ln))
+            return out
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return None
+
+
+def _record_unresolved(op_id, lane, mint, pos_id, reason):
+    try:
+        cur = unresolved_refusals()
+        if cur and any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in cur):
+            return True
+        os.makedirs(os.path.dirname(_unresolved_path()), exist_ok=True)
+        fd = os.open(_unresolved_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps({"ts": time.time(), "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason}, sort_keys=True) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+    except Exception:
+        logger.exception("paper_account: could not write the unresolved-refusal marker")
+        return False
+
+
+def _entries_blocked_by_refusal():
+    u = unresolved_refusals()
+    if u is None:
+        return "unresolved-refusal marker unreadable (fail-closed)"
+    if u:
+        return "unresolved generation refusal(s) on record (%d, first %s %s): operator reconciliation required" % (len(u), u[0].get("lane"), u[0].get("pos_id"))
+    return None
+
+
 def _refuse_generation(op_id, lane, mint, pos_id, reason):
+    _record_unresolved(op_id, lane, mint, pos_id, reason)
     if any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in _recent_refusals()):
         return False, "generation refused: %s (already journaled, nothing applied)" % reason   # retry of the same refusal: no unbounded growth
     _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason})

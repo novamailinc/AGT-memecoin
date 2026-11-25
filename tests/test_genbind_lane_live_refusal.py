@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bb68 LIVE-REFUSAL lane test (momentum), SOURCE ONLY, NOT RUN until cleared. ONE process. Real lane entry (real PA.try_debit, real binding), then a LABELLED injection on
 the scratch account (wipe_all: a new account generation) in the SAME process, then a real close attempt (L.poll_exits with the canned feed doubling the price). Predeclared
-(hand-written, UNVERIFIED): the close-time credit is REFUSED by the account with a generation refusal, no credit/write_down event is journaled for the old pos_id, the lane
+(hand-written, UNVERIFIED): the position is PRESERVED unresolved, a durable account marker exists and still blocks entries after a restart with the journal and position removed, the close-time credit is REFUSED by the account with a generation refusal, no credit/write_down event is journaled for the old pos_id, the lane
 sets _ENTRY_BLOCKED IN THE SAME PROCESS, the close intent is FROZEN durably (journal on), and a fresh entry attempt is NOT opened. Engineering canned fixtures only."""
 if __name__ != "__main__":
     import pytest
@@ -89,7 +89,12 @@ if FAILS: print("FAILS: %d" % len(FAILS)); sys.exit(1)
 ad = os.path.join(ROOTDIR, "home", "paper_account")
 for n in ("ledger.json", "ledger.json.bak", "events.jsonl"):
     if os.path.exists(os.path.join(ad, n)): os.remove(os.path.join(ad, n))
-cash(PA)   # real load: a NEW account generation is created
+PA.snapshot()   # real load of the now-missing account: a NEW account generation (guarded below)
+_newid = None
+try: _newid = _json.load(open(os.path.join(ad, "ledger.json"))).get("account_id")
+except Exception: pass
+check("SETUP injection produced a DIFFERENT account generation (old %s, new %s)" % (str(pos.get("pa_account_id"))[:8], str(_newid)[:8]), _newid is not None and _newid != pos.get("pa_account_id"))
+if FAILS: print("FAILS: %d" % len(FAILS)); sys.exit(1)
 def _pf(chain, mint, spot_index=None):
     p = (L.open_positions() or {}).get(mint) or {}
     return float(p.get("entry_price") or 0) * 2.0
@@ -99,13 +104,25 @@ try:
     evs = [_json.loads(l) for l in open(os.path.join(ad, "events.jsonl")) if l.strip()]
 except OSError: pass
 old_pid = pos.get("pa_pos_id")
-check("no credit or write_down journaled for the old pos_id on the new generation (%d)" % len([e for e in evs if e.get("event") in ("credit", "write_down") and e.get("pos_id") == old_pid]),
-      not [e for e in evs if e.get("event") in ("credit", "write_down") and e.get("pos_id") == old_pid])
+check("no credit or write_down journaled for the old pos_id on the new generation", not [e for e in evs if e.get("event") in ("credit", "write_down") and e.get("pos_id") == old_pid])
 check("the account journaled a generation refusal", any(e.get("event") == "settle_generation_refused" for e in evs))
 check("LIVE refusal blocked entries IN THIS PROCESS (_ENTRY_BLOCKED=%s)" % L._ENTRY_BLOCKED, bool(L._ENTRY_BLOCKED))
+pos2 = (L.open_positions() or {}).get(MINT) or {}
+check("the lane position is PRESERVED unresolved: still open, no leg booked done, marked pa_settle_refused (%r)" % (str(pos2.get("pa_settle_refused"))[:60],),
+      bool(pos2) and not any(v.get("done") for v in (pos2.get("legs") or {}).values()) and bool(pos2.get("pa_settle_refused")))
+_u = PA.unresolved_refusals()
+check("the account holds a DURABLE unresolved-refusal marker (%r)" % (None if _u is None else len(_u),), bool(_u))
 ents, st, _ = CI._read(CI.journal_path(L.LANE))
 fro = [i for i, x in CI._state(ents).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None]
 check("the close intent is FROZEN durably (frozen intents %d, journal status %r)" % (len(fro), st), len(fro) >= 1)
 e2 = _enter("EpochDiagNew")
 check("a fresh entry attempt is NOT opened afterwards (%r)" % (repr(e2)[:160],), not e2[0])
+# RESTART with NO intent journal and NO lane position: the durable account marker alone must still block entries
+try: os.remove(CI.journal_path(L.LANE))
+except OSError: pass
+_lj = _json.load(open(L.LEDGER_PATH)); _lj["positions"] = {}
+with open(L.LEDGER_PATH, "w") as _f: _json.dump(_lj, _f)
+L._ENTRY_BLOCKED = False; L._RECOVERY_DONE = False
+e3 = _enter("EpochDiagNew2")
+check("RESTART, intent journal deleted AND lane position gone: a new entry is STILL refused by the durable account marker (%r)" % (repr(e3)[:160],), not e3[0])
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

@@ -386,11 +386,35 @@ def _block_entries():
     _ENTRY_BLOCKED = True
 
 
+_GEN_REFUSED = []   # reasons of generation refusals raised during the CURRENT close attempt (see _preserve_unresolved)
+
+
+def _preserve_unresolved(fn):
+    """A live account generation refusal must leave the position UNRESOLVED: the lane does not book its own close over an account it could not settle.
+    The pre-attempt position is restored in place and marked, so the caller persists an OPEN position (which stays visibly unresolved) and returns 0.0.
+    The durable account marker + frozen intent block entries."""
+    def wrapper(pos, *a, **k):
+        _saved = copy.deepcopy(pos)
+        del _GEN_REFUSED[:]
+        r = fn(pos, *a, **k)
+        if _GEN_REFUSED:
+            _why = _GEN_REFUSED[0]
+            del _GEN_REFUSED[:]
+            pos.clear()
+            pos.update(_saved)
+            pos["pa_settle_refused"] = _why
+            return 0.0
+        return r
+    wrapper.__name__ = getattr(fn, "__name__", "wrapper")
+    return wrapper
+
+
 def _live_refusal(pend, why, mint):
     """LIVE account generation refusal (journaled by the account): block entries IN-PROCESS now and freeze the intent durably when the close-intent journal is
     available. pend = (lane, intent_id, pos_id, mint, suffix) or None. Nothing is credited, rebound or compensated; without the journal only the in-process block exists."""
     if "generation refused" not in str(why):
         return
+    _GEN_REFUSED.append(str(why)[:140])
     _block_entries()
     _frozen = False
     try:
@@ -1690,11 +1714,13 @@ def _guard_close(impl, pos, key, *args, meta=None):
         pos.pop("_exit_meta", None)
 
 
+@_preserve_unresolved
 def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     return _guard_close(_close_leg_impl, pos, leg_key, pos, leg_key, exit_price, reason, pkind,
                         meta={"reason": reason, "pkind": pkind})
 
 
+@_preserve_unresolved
 def _close_remaining(pos, exit_price, reason, pkind=None):
     return _guard_close(_close_remaining_impl, pos, "remaining", pos, exit_price, reason, pkind,
                         meta={"reason": reason, "pkind": pkind})

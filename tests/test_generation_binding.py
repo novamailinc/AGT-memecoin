@@ -283,5 +283,21 @@ finally:
     PA._retry_contract_refusal = _real_rc
 check("N3 MUTANT (retry contract removed) acks a different-proceeds retry, proving F4d/F4e are sensitive (%s)" % whyR, okR is True)
 
+# ---- U: durable unresolved-refusal marker (independent of any lane intent journal or lane position)
+_use(os.path.join(_home, "U"))
+r = _need("debit U", PA.try_debit(LANE, "MINTU", 1.0, 100.0, "gb:entry:U", marks=_mk()))
+pidU = r[2]; bindU = PA.entry_binding(LANE, "MINTU", "gb:entry:U", pidU)
+check("U0 no marker before any refusal", PA.unresolved_refusals() == [])
+okU, whyU = PA.credit(LANE, "MINTU", 1.1, "gb:exit:U", pos_id=pidU, qty=100.0, expected_account_id="some-other-generation", entry_op_id="gb:entry:U")
+check("U1 a generation refusal is refused AND writes a durable marker (%s)" % whyU, (not okU) and len(PA.unresolved_refusals() or []) == 1)
+okE, whyE, _x = PA.try_debit(LANE, "MINTU2", 1.0, 100.0, "gb:entry:U2", marks=_mk())
+check("U2 a NEW entry is refused while the marker exists (%s)" % whyE, (not okE) and "unresolved generation refusal" in whyE)
+okS, whyS = PA.credit(LANE, "MINTU", 1.1, "gb:exit:U", pos_id=pidU, qty=100.0, expected_account_id=bindU, entry_op_id="gb:entry:U")
+check("U3 the marker does not block a CORRECTLY bound settlement of the already-open position (%s)" % whyS, okS is True)
+_mp = PA._unresolved_path()
+with open(_mp, "a") as _f: _f.write("{garbage\n")
+okG, whyG, _x = PA.try_debit(LANE, "MINTU3", 1.0, 100.0, "gb:entry:U3", marks=_mk())
+check("U4 an UNREADABLE marker blocks entries fail-closed (%s)" % whyG, (not okG) and PA.unresolved_refusals() is None)
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

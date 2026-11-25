@@ -2148,6 +2148,13 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
             if _iid:
                 pos["pending_exit"]["intent_id"] = _iid
             return False
+        if "generation refused" in str(why):
+            # The account refused this leg's settlement for its generation: the leg stays pending (position preserved, nothing booked), entries are blocked in
+            # this process, and the account holds a DURABLE unresolved-refusal marker that blocks every entry across restarts. Nothing is rebound or compensated.
+            _block_entries()
+            pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_generation_refused", "detail": str(why)[:200], "ts": time.time()}
+            logger.error("grad: tranche credit %s %s REFUSED for account generation: leg stays pending, ENTRIES BLOCKED (durable account marker)", pos["mint"][:12], leg_key)
+            return False
         # a credit larger than the account's remaining units (receipt qty on an earlier leg was smaller than a recompute) is a QTY
         # DIVERGENCE with a specific why, not a generic refusal
         pos["pending_exit"] = {"leg": leg_key, "why": ("account_remaining_qty_mismatch" if "exceeds remaining" in str(why) else "tranche_credit_refused"),

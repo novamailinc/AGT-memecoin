@@ -200,8 +200,11 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
             raise IntentNotDurable("journal not cleanly readable (%s): cannot prove operation %s is new" % (st, op_key))
         for e in ents:
             if e.get("ev") == "intent" and e.get("op_key") == op_key:
+                _ci0 = {k: v for k, v in (e.get("close_info") or {}).items() if k != "close_ts"}
+                _ci1 = {k: v for k, v in close_info.items() if k != "close_ts"}
                 same = (json.dumps(e.get("settle_ops"), sort_keys=True) == json.dumps(settle_ops, sort_keys=True)
-                        and e.get("mint") == mint and e.get("pos_id") == pos_id)
+                        and e.get("mint") == mint and e.get("pos_id") == pos_id
+                        and json.dumps(_ci0, sort_keys=True) == json.dumps(_ci1, sort_keys=True))   # economics + reason, not only the ops
                 if not same:
                     raise IntentNotDurable("operation %s already has intent %s with a DIFFERENT plan: refusing to reuse or replace it"
                                            % (op_key, e.get("intent_id")))

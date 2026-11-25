@@ -299,11 +299,7 @@ def _intent_gate(pos, key):
     if _ok:
         return True
     logger.error("ceo: close intent journal NOT writable: exit %s not executed (pending_exit close_intent_not_durable), retried next poll", key)
-    _p0 = pos.get("pending_exit"); _pe = dict(_p0) if isinstance(_p0, dict) else {}
-    if _p0:   # keep a pre-existing pending exit in full (its identity moves under "prior")
-        _pe["prior"] = {k: v for k, v in _p0.items() if k != "prior"}
-    _pe.update({"leg": key, "why": "close_intent_not_durable", "ts": time.time()})
-    pos["pending_exit"] = _pe
+    _hold_not_durable(pos, key)
     return False
 
 
@@ -1347,9 +1343,9 @@ def _demo_sell(pos, leg_tokens, key):
     cap, src = _exit_cap()
     try:
         return _df.sell("%s:exit:%s:%s" % (LANE, pos["mint"], key), pos["mint"], leg_tokens,
-                        cap), cap, src
+                        cap, meta=_sell_meta(pos)), cap, src
     except _demo.DemoSkip as e:
-        pos["pending_exit"] = {"leg": key, "why": e.reason, "detail": e.detail, "ts": time.time()}
+        _hold_not_durable(pos, key, e.reason, detail=e.detail)
         logger.warning("ceo demo exit pending %s %s: %s", pos["mint"][:12], key, e.reason)
         return None
 
@@ -1633,17 +1629,15 @@ def _peak_fields(pos):
 
 
 
-def _guard_close(impl, pos, key, *args, resume=None):
-    """Run one leg/close implementation; if the close intent could not be made durable (begin raised IntentNotDurable AFTER the sale fill), UNDO the
-    in-memory leg/realized changes and report nothing done: no account op ran (begin precedes it), the lane persists nothing, pending_exit
-    close_intent_not_durable is visible, and the next poll re-runs the exit. The sale is NOT repeated: the exit fill op id is deterministic
-    ("<lane>:exit:<mint>:<key>") and the filler returns the already-journaled fill for an existing op id (demo_fill _existing), so the retry
-    re-reads the same fill and only the intent write is retried."""
-    _snap = copy.deepcopy(pos); _pe0 = copy.deepcopy(pos.get("pending_exit")); _live_legs = pos.get("legs"); _live_leg = {k: v for k, v in (_live_legs or {}).items()}
+def _guard_close(impl, pos, key, *args, meta=None):
+    """Run one leg/close implementation. If the close intent could not be made durable AFTER the sale fill (begin raised IntentNotDurable),
+    restore the WHOLE position (leg dict objects in place, so poll-loop aliases stay valid) and hold the exit visibly: no account op ran (begin
+    precedes it), the lane persists nothing. The journaled sale fill (deterministic op id "<lane>:exit:<mint>:<key>", carrying the exit
+    reason/kind in its own record via sell(meta=)) is what the next poll's journal-derived resume settles; the sale is not repeated."""
+    _snap = copy.deepcopy(pos); _live_legs = pos.get("legs"); _live_leg = {k: v for k, v in (_live_legs or {}).items()}
+    pos["_exit_meta"] = dict(meta or {}, key=key)
     try:
-        _ret = impl(*args)
-        _stamp_resume(pos, resume)
-        return _ret
+        return impl(*args)
     except Exception as _e:
         _ci = _close_intents()
         if _ci is None or not isinstance(_e, _ci.IntentNotDurable):
@@ -1653,53 +1647,106 @@ def _guard_close(impl, pos, key, *args, resume=None):
         for _k, _lv in _live_leg.items():
             _lv.clear(); _lv.update(pos["legs"][_k]); pos["legs"][_k] = _lv
         if _live_legs is not None:
-            _live_legs.clear(); _live_legs.update(pos["legs"]); pos["legs"] = _live_legs   # EVERY field of the position is restored (legs, realized, pending_exit, quote journal, peaks, ...)
-        logger.error("close intent NOT DURABLE (%s): exit %s rolled back in memory (nothing persisted, no account op), retried next poll", _e, key)
-        _pe = dict(_pe0) if isinstance(_pe0, dict) else {}
-        if _pe0:   # a pre-existing pending exit is kept in full; its own identity moves under "prior" (nothing is overwritten)
-            _pe["prior"] = {k: v for k, v in _pe0.items() if k != "prior"}
-        _pe.update({"leg": key, "why": "close_intent_not_durable", "ts": time.time()})
-        pos["pending_exit"] = _pe
-        _stamp_resume(pos, resume)
+            _live_legs.clear(); _live_legs.update(pos["legs"]); pos["legs"] = _live_legs
+        pos["_exit_meta"] = dict(meta or {}, key=key)
+        logger.error("close intent NOT DURABLE (%s): exit %s rolled back in memory (nothing persisted, no account op)", _e, key)
+        _hold_not_durable(pos, key)
         return 0.0
+    finally:
+        pos.pop("_exit_meta", None)
 
 
 def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     return _guard_close(_close_leg_impl, pos, leg_key, pos, leg_key, exit_price, reason, pkind,
-                        resume={"fn": "leg", "key": leg_key, "price": exit_price, "reason": reason, "pkind": pkind})
+                        meta={"reason": reason, "pkind": pkind})
 
 
 def _close_remaining(pos, exit_price, reason, pkind=None):
     return _guard_close(_close_remaining_impl, pos, "remaining", pos, exit_price, reason, pkind,
-                        resume={"fn": "remaining", "key": "remaining", "price": exit_price, "reason": reason, "pkind": pkind})
+                        meta={"reason": reason, "pkind": pkind})
 
 
-def _stamp_resume(pos, resume):
-    """When the exit is held for a non-durable close intent, remember EXACTLY what was being closed (which leg or the combined remainder, its price,
-    reason and kind), so the next poll resumes THE SAME exit (same deterministic sale op id, so the same journaled fill) whether or not the
-    price trigger still holds. Without this a price reversal would let a different leg/remainder key sell the same units a second time."""
-    _pe = pos.get("pending_exit")
-    if resume and isinstance(_pe, dict) and _pe.get("why") == "close_intent_not_durable":
-        _pe["resume"] = dict(resume)
+def _sell_meta(pos):
+    """Exit reason/kind recorded INSIDE the journaled fill (atomic with it) so a later resume knows what the sale was for."""
+    _m = pos.get("_exit_meta") or {}
+    return {"reason": _m.get("reason"), "pkind": _m.get("pkind"), "key": _m.get("key"), "ts": time.time()} if _m else None
+
+
+def _hold_not_durable(pos, key, why="close_intent_not_durable", detail=None):
+    """Visible, DURABLE hold (pending_exit is persisted by the poll's own write): keeps a pre-existing pending exit in full under "prior", counts the
+    tries and the first-held time, flags OPERATOR ATTENTION from the 3rd consecutive try, and marks a RISK exit (stop / time stop / dark-position exit)
+    as blocked: a risk exit held by storage failure is never silently waived and the log alone is not the escalation."""
+    _p0 = pos.get("pending_exit"); _pe = dict(_p0) if isinstance(_p0, dict) else {}
+    _was = _pe.get("why") == why
+    if _p0 and not _was:
+        _pe["prior"] = {k: v for k, v in _p0.items() if k != "prior"}
+    _m = pos.get("_exit_meta") or {}
+    _rs = _m.get("reason") or _pe.get("reason") or ""
+    _tries = int(_pe.get("tries") or 0) + 1 if _was else 1
+    _pe.update({"leg": key, "why": why, "ts": time.time(), "tries": _tries,
+                "first_ts": _pe.get("first_ts") if _was else time.time(), "reason": _rs,
+                "risk_exit_blocked": bool(any(t in str(_rs) for t in ("stop", "f2", "unquotable", "backstop"))),
+                "operator_attention": _tries >= 3})
+    if detail is not None:
+        _pe["detail"] = detail
+    if why == "close_intent_not_durable" or str(why).startswith("unresolved_"):
+        # An exit held on UNRESOLVED evidence (storage or an unknown/inflight sale) excludes the position from any qualification, and says how it is
+        # resolved: by an operator reconciling the sale record against the fill journal; observed records are never rewritten to clear it.
+        _pe["qualification_excluded"] = True
+        _pe["resolution"] = "operator: reconcile the sale record against the fill journal; observed evidence is not rewritten to clear this hold"
+    pos["pending_exit"] = _pe
+    if _pe["risk_exit_blocked"]:
+        logger.error("RISK EXIT BLOCKED by close-intent storage failure: %s %s reason=%s tries=%d operator_attention=%s",
+                     pos.get("mint"), key, _rs, _tries, _pe["operator_attention"])
 
 
 def _resume_pending_exit(pos):
-    """Poll-start hook. None = nothing to resume. "held" = resumed but still not durable (position stays open, nothing else is evaluated on it
-    this poll). "closed:<reason>" = every leg is now done (finalize with that reason). "resumed" = progressed but legs remain (normal evaluation continues)."""
-    _pe = pos.get("pending_exit")
-    if not isinstance(_pe, dict) or _pe.get("why") != "close_intent_not_durable" or not isinstance(_pe.get("resume"), dict):
+    """Poll-start journal reconciliation. A sale fill that is journaled under THIS position's deterministic exit op id while the leg is still open
+    is a landed sale the lane never settled (a close intent that was not durable, or a crash between the fill and the lane/account writes). It is
+    settled FIRST, before any price or trigger logic and whether or not the trigger still holds, from the journaled fill (its own record carries the
+    exit reason/kind). A position with NO journaled fill is never touched here: an unsold gate refusal does not force a sale.
+    None = nothing to resume; "held" = still not durable (or an inflight claim, never double-executed); "closed:<reason>" = all legs now done;
+    "resumed" = progressed, legs remain."""
+    if not pos.get("pa_pos_id") or (pos.get("execution") or {}).get("source") != "jupiter_quote_sim":
         return None
-    _r = _pe["resume"]
-    if _r.get("fn") == "leg":
-        _close_leg(pos, _r["key"], _r["price"], _r["reason"], _r.get("pkind"))
-    else:
-        _close_remaining(pos, _r["price"], _r["reason"], _r.get("pkind"))
-    _pe2 = pos.get("pending_exit")
-    if isinstance(_pe2, dict) and _pe2.get("why") == "close_intent_not_durable":
-        return "held"
-    if all((v or {}).get("done") for v in pos["legs"].values()):
-        return "closed:%s" % _r["reason"]
-    return "resumed"
+    _df = _demo_filler()
+    if _df is None:
+        return None
+    _open = [k for k in ("a", "b", "c") if not (pos["legs"].get(k) or {}).get("done")]
+    if not _open:
+        return None
+    _lane = pos.get("lane") or globals().get("LANE")
+    _cands = [("remaining", "remaining:%s" % "".join(_open))] + [("leg", k) for k in _open]
+    for _kind, _key in _cands:
+        try:
+            _rec = _df.get_fill("%s:exit:%s:%s" % (_lane, pos["mint"], _key))
+        except Exception:
+            return None
+        if not _rec:
+            continue
+        if _rec.get("status") == "inflight":
+            pos["_exit_meta"] = {"reason": "inflight_unresolved", "key": _key}
+            try:
+                _hold_not_durable(pos, _key, "unresolved_inflight")
+            finally:
+                pos.pop("_exit_meta", None)
+            return "held"
+        if _rec.get("status") != "filled":
+            continue
+        _it = _rec.get("intent") or {}
+        _reason = _it.get("reason") or "journaled_fill_resume"
+        _pk = _it.get("pkind")
+        if _kind == "leg":
+            _close_leg(pos, _key, float(_rec.get("price_usd") or 0.0), _reason, _pk)
+        else:
+            _close_remaining(pos, float(_rec.get("price_usd") or 0.0), _reason, _pk)
+        _pe2 = pos.get("pending_exit")
+        if isinstance(_pe2, dict) and _pe2.get("why") == "close_intent_not_durable":
+            return "held"
+        if all((v or {}).get("done") for v in pos["legs"].values()):
+            return "closed:%s" % _reason
+        return "resumed"
+    return None
 
 
 def _append_close(closes, rec):

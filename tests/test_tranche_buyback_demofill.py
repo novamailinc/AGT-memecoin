@@ -710,5 +710,100 @@ except RuntimeError:
     _r = True
 check("S15d marker not writable: the sale raises and the executor was never reached (execute calls %d -> %d)" % (_n0, len(JUP.calls)), _r and len(JUP.calls) == _n0)
 
+
+# ---- S15e-n: atomic claim, mint-level guard, timeout->unknown->reconcile, BUY path controls (real DemoFiller, canned FakeJup quotes) ----
+import threading as _thr
+# e. two concurrent callers of the SAME sell op id: exactly ONE executes (claim is a single locked check-and-claim)
+setup(); _F = FILLER[0]; _n0 = len(JUP.calls); _res = []; _lk = _thr.Lock()
+def _t():
+    try:
+        r = _F.sell("grad:exit:S15conc:a", "S15conc", 100.0, 2.0); o = ("fill", r.get("status"))
+    except DF.DemoSkip as e:
+        o = ("skip", e.reason)
+    with _lk: _res.append(o)
+_ts = [_thr.Thread(target=_t) for _ in range(6)]
+[t.start() for t in _ts]; [t.join() for t in _ts]
+_ex = len(JUP.calls) - _n0
+check("S15e 6 concurrent sells of ONE op id: swap executed exactly %d time(s) (quote calls), outcomes %r, final record %r" % (_ex, sorted(set(_res)), (_F.get_fill("grad:exit:S15conc:a") or {}).get("status")),
+      _ex == 1 and (_F.get_fill("grad:exit:S15conc:a") or {}).get("status") == "filled" and all(o[0] == "fill" or o[1] == "unresolved_inflight" for o in _res) and ("fill", "filled") in _res)
+# f. MINT-LEVEL guard: leg a left inflight (save failed after execute), then the combined remainder under a DIFFERENT op id must NOT execute
+setup(); _F = FILLER[0]; _real_save = _F._save
+def _bad(op_id, fill): raise RuntimeError("INJECTED save failure")
+_F._save = _bad
+try: _F.sell("grad:exit:S15mint:a", "S15mint", 100.0, 2.0)
+except RuntimeError: pass
+_F._save = _real_save; _n1 = len(JUP.calls)
+try: _F.sell("grad:exit:S15mint:remaining:abc", "S15mint", 300.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+check("S15f leg a inflight, then a remainder under another op id: refused (%r), NO executor call (%d -> %d), no record created for the remainder (%r)" % (_w, _n1, len(JUP.calls), _F.get_fill("grad:exit:S15mint:remaining:abc")),
+      _w == "unresolved_inflight" and len(JUP.calls) == _n1 and _F.get_fill("grad:exit:S15mint:remaining:abc") is None)
+_n2 = len(JUP.calls)
+_o = _F.sell("grad:exit:S15other:a", "S15other", 100.0, 2.0)
+check("S15f control: a DIFFERENT mint is unaffected by that inflight claim (fills, calls +%d)" % (len(JUP.calls) - _n2), _o.get("status") == "filled" and len(JUP.calls) > _n2)
+# g. confirm_timeout -> UNKNOWN replaces the claim -> retry refused (unresolved_unknown) -> reconcile settled adopts the ORIGINAL fill
+setup(); _F = FILLER[0]; _F._inject_outage = "settled"
+try: _F.sell("grad:exit:S15to:a", "S15to", 100.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+_st = (_F.get_fill("grad:exit:S15to:a") or {}).get("status"); _n3 = len(JUP.calls)
+try: _F.sell("grad:exit:S15to:a", "S15to", 100.0, 2.0); _w2 = None
+except DF.DemoSkip as e: _w2 = e.reason
+_fr = _F.reconcile("grad:exit:S15to:a")
+check("S15g confirm_timeout (%r) leaves an UNKNOWN record (%r) not inflight; retry refused %r with no executor call (%d -> %d); reconcile(settled) adopts a filled record (%r)"
+      % (_w, _st, _w2, _n3, len(JUP.calls), (_fr or {}).get("status")),
+      _w == "confirm_timeout" and _st == "unknown" and _w2 == "unresolved_unknown" and len(JUP.calls) == _n3 and (_fr or {}).get("status") == "filled")
+setup(); _F = FILLER[0]; _F._inject_outage = "unlanded"
+try: _F.sell("grad:exit:S15to2:a", "S15to2", 100.0, 2.0)
+except DF.DemoSkip: pass
+_F.reconcile("grad:exit:S15to2:a")
+check("S15g' reconcile(unlanded) clears the unknown (no fill, record %r) and a retry may execute again" % (_F.get_fill("grad:exit:S15to2:a"),),
+      _F.get_fill("grad:exit:S15to2:a") is None and _F.sell("grad:exit:S15to2:a", "S15to2", 100.0, 2.0).get("status") == "filled")
+# h. the claim survives a failure while recording the timeout: still INFLIGHT (fail closed), never cleared
+setup(); _F = FILLER[0]; _F._inject_outage = "settled"; _real_ra = _F._record_attempt
+def _bad_ra(*a, **k): raise RuntimeError("INJECTED: attempt journal not writable")
+_F._record_attempt = _bad_ra
+try: _F.sell("grad:exit:S15ra:a", "S15ra", 100.0, 2.0)
+except RuntimeError: pass
+_F._record_attempt = _real_ra
+check("S15h a timeout whose attempt record cannot be written leaves the INFLIGHT claim (%r), not cleared" % ((_F.get_fill("grad:exit:S15ra:a") or {}).get("status"),),
+      (_F.get_fill("grad:exit:S15ra:a") or {}).get("status") == "inflight")
+# i. an unlisted/unknown refusal reason keeps the claim (only PROVEN pre-execution reasons clear)
+setup(); _F = FILLER[0]
+_orig = _F._executor
+class _Ex:
+    def __init__(s, ex): s.ex = ex
+    def execute_swap(s, *a, **k): raise BrokerError(BROKER_UNAVAILABLE, "x", detail={"reason": "zero_output", "signature": "sig"})
+_F._executor = lambda *a, **k: _Ex(_orig(*a, **k))
+try: _F.sell("grad:exit:S15zero:a", "S15zero", 100.0, 2.0)
+except DF.DemoSkip as e: _zr = e.reason
+_F._executor = _orig
+check("S15i zero_output (swap landed, no output measured) does NOT clear the claim (reason %r, record %r)" % (_zr, (_F.get_fill("grad:exit:S15zero:a") or {}).get("status")),
+      _zr == "zero_output" and (_F.get_fill("grad:exit:S15zero:a") or {}).get("status") == "inflight")
+# BUY path controls
+setup(); _F = FILLER[0]
+_b = _F.buy("grad:entry:S15b:1", "S15b", 10.0, 2.0)
+check("S15j healthy BUY: filled record, NO inflight left (%r), a repeat returns the same fill with no new quote" % (_b.get("status"),),
+      _b.get("status") == "filled" and (_F.get_fill("grad:entry:S15b:1") or {}).get("status") == "filled")
+_nb = len(JUP.calls); _b2 = _F.buy("grad:entry:S15b:1", "S15b", 10.0, 2.0)
+check("S15j repeat BUY same op id: same fill, calls unchanged (%d -> %d)" % (_nb, len(JUP.calls)), _b2 == _b and len(JUP.calls) == _nb)
+setup(); _F = FILLER[0]; _real_save = _F._save; _F._save = _bad
+try: _F.buy("grad:entry:S15bs:1", "S15bs", 10.0, 2.0)
+except RuntimeError: pass
+_F._save = _real_save; _nbs = len(JUP.calls)
+try: _F.buy("grad:entry:S15bs:1", "S15bs", 10.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+check("S15k BUY save failure after execute: inflight kept, retry refused (%r) with no second execute (%d -> %d)" % (_w, _nbs, len(JUP.calls)), _w == "unresolved_inflight" and len(JUP.calls) == _nbs)
+setup(); _F = FILLER[0]; _real_get = JUP.get_quote
+def _fail_buy(inp, out, amount, slippage_bps=100):
+    raise BrokerError(BROKER_UNAVAILABLE, "no route", detail={"http_status": 400})
+JUP.get_quote = _fail_buy
+try: _F.buy("grad:entry:S15bn:1", "S15bn", 10.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+_after = _F.get_fill("grad:entry:S15bn:1"); JUP.get_quote = _real_get
+check("S15l BUY clean refusal (%r) clears the claim (%r) and a retry executes" % (_w, _after), _w is not None and _after is None and _F.buy("grad:entry:S15bn:1", "S15bn", 10.0, 2.0).get("status") == "filled")
+setup(); _F = FILLER[0]; _n0 = len(JUP.calls); _F._mark_inflight = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("INJECTED"))
+try: _F.buy("grad:entry:S15bw:1", "S15bw", 10.0, 2.0); _r = False
+except RuntimeError: _r = True
+check("S15m BUY claim not writable: raises, executor never reached (%d -> %d)" % (_n0, len(JUP.calls)), _r and len(JUP.calls) == _n0)
+
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

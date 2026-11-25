@@ -89,9 +89,13 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
         def sell(self, op_id, mint, qty, cap, *a, **k):
             self.calls.append(op_id)
             if op_id not in self.fills:
-                self.fills[op_id] = {"price_usd": 0.001, "gross_usd": 0.1, "fee_usd": 0.001, "execution_source": "canned_fixture",
+                self.fills[op_id] = {"status": "filled", "price_usd": 0.001, "gross_usd": 0.1, "fee_usd": 0.001, "execution_source": "canned_fixture",
                                      "signature": "fixture-sig", "provenance": {"fixture": True}}
+                if k.get("meta"):
+                    self.fills[op_id]["intent"] = dict(k["meta"])
             return self.fills[op_id]
+        def get_fill(self, op_id):
+            return self.fills.get(op_id)
     ff = _FakeFiller(); spy2 = _SpyAccount(); spy2.max_price_impact_pct = lambda: 50.0
     pos2 = mkpos("FR" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":
@@ -116,8 +120,7 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
           % (modname, len(ff.calls), [c[3] if len(c) > 3 else None for c in spy2.credits], [e.get("ev") for e in ev2]),
           r_ok > 0 and pos2["legs"]["a"]["done"] is True and len(set(ff.calls)) == 1 and len(ff.calls) == 2 and len(spy2.credits) == 1
           and abs(float(spy2.credits[0][2]) - 0.1) < 1e-12 and [e.get("ev") for e in ev2][:2] == ["intent", "account_applied"])
-    # RESUME after a held exit: the position is persisted (JSON round trip = process restart), the price trigger is GONE (a reversal), and the poll-start
-    # hook still resumes THE SAME exit (same deterministic sale op id, same journaled fill) and settles once; a pre-existing pending_exit field survives the hold.
+    # JOURNAL-DERIVED RESUME. Only a sale that really landed (a journaled fill) is ever resumed; an unsold gate refusal never forces a sale.
     lm = "mirror" if modname == "mirror" else None
     ff5 = _FakeFiller(); spy5 = _SpyAccount(); spy5.max_price_impact_pct = lambda: 50.0
     pos5 = mkpos("FS" + modname[:3], lm); pos5["pending_exit"] = {"leg": "a", "why": "earlier_reason", "custom_field": 42}; pos5["peak_price"] = 7.0
@@ -125,19 +128,50 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
          patch.object(CI, "_append", _no_intent_only):
         M._close_leg(pos5, "a", 0.001, "leg_a_2x")
     pe5 = pos5.get("pending_exit") or {}
-    check("%s hold keeps the pre-existing pending fields (prior %r, peak_price %r) and records the resume target (%r)"
-          % (modname, (pe5.get("prior") or {}).get("custom_field"), pos5.get("peak_price"), (pe5.get("resume") or {}).get("key")),
-          (pe5.get("prior") or {}).get("custom_field") == 42 and pos5.get("peak_price") == 7.0 and (pe5.get("resume") or {}).get("fn") == "leg"
-          and (pe5.get("resume") or {}).get("key") == "a" and pe5.get("why") == "close_intent_not_durable")
+    _fl5 = ff5.fills.get("%s:exit:%s:a" % (lane, pos5["mint"])) or {}
+    check("%s hold keeps pre-existing pending fields (prior %r, peak_price %r), counts tries (%r) and the sale fill carries the exit reason in its own record (%r)"
+          % (modname, (pe5.get("prior") or {}).get("custom_field"), pos5.get("peak_price"), pe5.get("tries"), (_fl5.get("intent") or {}).get("reason")),
+          (pe5.get("prior") or {}).get("custom_field") == 42 and pos5.get("peak_price") == 7.0 and pe5.get("tries") == 1
+          and (_fl5.get("intent") or {}).get("reason") == "leg_a_2x" and "resume" not in pe5)
     import json as _json
     pos5r = _json.loads(_json.dumps(pos5))   # persisted and reloaded: a restart
     with patch.object(M, "_paper_account", lambda: spy5), patch.object(M, "_demo_filler", lambda: ff5), patch.object(M, "_exit_fee_venue", lambda p: None):
         _rr = M._resume_pending_exit(pos5r)   # NO price trigger is evaluated anywhere in this call
-    check("%s restart + price reversal: resume returns %r, leg a done, ONE credit (%d), the SAME sale op id reused (%r), pending_exit cleared (%r)"
-          % (modname, _rr, len(spy5.credits), sorted(set(ff5.calls)), pos5r.get("pending_exit")),
-          _rr == "resumed" and pos5r["legs"]["a"]["done"] is True and len(spy5.credits) == 1 and len(set(ff5.calls)) == 1 and "pending_exit" not in pos5r)
-    check("%s resume with nothing pending is a no-op (None)" % modname, M._resume_pending_exit(pos5r) is None)
-
+    check("%s restart + price reversal: resume returns %r, leg a done with the journaled reason (%r), ONE credit (%d), SAME sale op id (%r), pending cleared (%r)"
+          % (modname, _rr, pos5r["legs"]["a"].get("exit_reason"), len(spy5.credits), sorted(set(ff5.calls)), pos5r.get("pending_exit")),
+          _rr == "resumed" and pos5r["legs"]["a"]["done"] is True and pos5r["legs"]["a"].get("exit_reason") == "leg_a_2x" and len(spy5.credits) == 1
+          and len(set(ff5.calls)) == 1 and "pending_exit" not in pos5r)
+    check("%s resume with nothing pending/journaled is a no-op (None)" % modname, M._resume_pending_exit(pos5r) is None)
+    # CRASH BEFORE the hold was persisted: the position on disk shows leg a open with NO pending_exit at all, the sale fill is in the journal
+    ff6 = _FakeFiller(); spy6 = _SpyAccount(); spy6.max_price_impact_pct = lambda: 50.0
+    pos6 = mkpos("FG" + modname[:3], lm); _op6 = "%s:exit:%s:a" % (lane, pos6["mint"])
+    ff6.fills[_op6] = {"status": "filled", "price_usd": 0.001, "gross_usd": 0.1, "fee_usd": 0.001, "execution_source": "canned_fixture",
+                       "signature": "fixture-sig", "provenance": {"fixture": True}, "intent": {"reason": "leg_a_2x", "pkind": None, "key": "a"}}
+    with patch.object(M, "_paper_account", lambda: spy6), patch.object(M, "_demo_filler", lambda: ff6), patch.object(M, "_exit_fee_venue", lambda p: None):
+        _r6 = M._resume_pending_exit(pos6)
+    check("%s crash before the hold persisted (ghost fill, no pending_exit): poll-start reconciliation settles it once (%r, credits %d, leg done %r)"
+          % (modname, _r6, len(spy6.credits), pos6["legs"]["a"]["done"]), _r6 == "resumed" and len(spy6.credits) == 1 and pos6["legs"]["a"]["done"] is True)
+    # UNSOLD gate refusal must NOT force a stale sale after the price recovers
+    ff7 = _FakeFiller(); spy7 = _SpyAccount(); spy7.max_price_impact_pct = lambda: 50.0
+    pos7 = mkpos("FU" + modname[:3], lm)
+    with patch.object(M, "_paper_account", lambda: spy7), patch.object(M, "_demo_filler", lambda: ff7), patch.object(M, "_exit_fee_venue", lambda p: None), \
+         patch.object(CI, "_append", _no_write):
+        M._close_leg(pos7, "a", 0.001, "hard_stop_-50pct"); M._close_leg(pos7, "a", 0.001, "hard_stop_-50pct"); M._close_leg(pos7, "a", 0.001, "hard_stop_-50pct")
+    pe7 = pos7.get("pending_exit") or {}
+    with patch.object(M, "_paper_account", lambda: spy7), patch.object(M, "_demo_filler", lambda: ff7), patch.object(M, "_exit_fee_venue", lambda p: None):
+        _r7 = M._resume_pending_exit(pos7)   # storage is back and the price has recovered: nothing must sell
+    check("%s gate refusal (x3, nothing sold): sale calls %d, resume %r (no sale forced), hold tries %r, operator_attention %r, risk_exit_blocked %r, leg still open %r"
+          % (modname, len(ff7.calls), _r7, pe7.get("tries"), pe7.get("operator_attention"), pe7.get("risk_exit_blocked"), not pos7["legs"]["a"]["done"]),
+          not ff7.calls and _r7 is None and pe7.get("tries") == 3 and pe7.get("operator_attention") is True and pe7.get("risk_exit_blocked") is True
+          and pos7["legs"]["a"]["done"] is False and not spy7.credits)
+    # an INFLIGHT sale claim is never re-executed by resume: held, visible, counted
+    ff8 = _FakeFiller(); spy8 = _SpyAccount(); spy8.max_price_impact_pct = lambda: 50.0
+    pos8 = mkpos("FI" + modname[:3], lm); ff8.fills["%s:exit:%s:a" % (lane, pos8["mint"])] = {"status": "inflight"}
+    with patch.object(M, "_paper_account", lambda: spy8), patch.object(M, "_demo_filler", lambda: ff8):
+        _r8 = M._resume_pending_exit(pos8); _r8b = M._resume_pending_exit(pos8)
+    check("%s inflight claim: resume holds (%r, %r), no sale call (%d), why %r, tries %r" % (modname, _r8, _r8b, len(ff8.calls), (pos8.get("pending_exit") or {}).get("why"),
+          (pos8.get("pending_exit") or {}).get("tries")),
+          _r8 == "held" and _r8b == "held" and not ff8.calls and pos8["pending_exit"]["why"] == "unresolved_inflight" and pos8["pending_exit"]["tries"] == 2)
     # an exception that is NOT IntentNotDurable still propagates (the rollback is narrow, never a blanket catch)
     pos3 = mkpos("FX" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":

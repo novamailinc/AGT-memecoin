@@ -172,7 +172,7 @@ _a2 = _need("credit A", PA.credit(LANE, "MINTA", 1.4, "grad:exit:MINTA:k1", pos_
 _a3 = _deb(LANE, "MINTA", 1.0, 80.0, "grad:entry:MINTA:2")          # the SAME mint reopened: a second instance
 _b1 = _deb(LANE, "MINTB", 1.0, 50.0, "grad:entry:MINTB:1")
 _b2 = _need("partial credit B", PA.credit(LANE, "MINTB", 0.6, "grad:exit:MINTB:k1", pos_id=_b1[2], qty=20.0, fee=0.01, price_kind="current_price_simulated_fill"))   # PARTIAL: B stays open
-_h1 = _need("hold 1", PA.hold_stake(LANE, 0.3, "grad:hold:1", marks=_mk(PA))); _h2 = _need("hold 2", PA.hold_stake(LANE, 0.2, "grad:hold:2", marks=_mk(PA))); _h3 = _need("release hold 2", PA.release_hold("grad:hold:2", "test: provider reports the tx never landed"))
+_h1 = _need("hold 1", PA.hold_stake(LANE, 0.3, "grad:hold:1", marks=_mk(PA), mint="MINTC")); _h2 = _need("hold 2", PA.hold_stake(LANE, 0.2, "grad:hold:2", marks=_mk(PA), mint="MINTC")); _h3 = _need("release hold 2", PA.release_hold("grad:hold:2", "test: provider reports the tx never landed"))
 _all = (_a1, _a2, _a3, _b1, _b2, _h1, _h2, _h3)
 check("R0 every real call in the realistic WAL succeeded (%s)" % [x[0] if isinstance(x, tuple) else x for x in _all], all(isinstance(x, tuple) and x[0] is True for x in _all))
 _ev = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip()]

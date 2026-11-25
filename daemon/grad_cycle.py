@@ -313,6 +313,17 @@ def unmark_inflight(grad, tok):
         return False
 
 
+def _marker_unchanged(grad, gathered):
+    """Commit-time re-read (call UNDER the fault lock): True only when the marker on disk is exactly the one the evidence step gathered (same absence,
+    or the same token, n and prior_tokens). A marker written or replaced after gathering was never seen by the evidence and must not be removed."""
+    cur = _read_json(_inflight_path(grad))
+    if gathered is None or cur is None:
+        return gathered is None and cur is None
+    if cur.get("unreadable") or gathered.get("unreadable"):
+        return False
+    return all(cur.get(k) == gathered.get(k) for k in ("token", "n", "prior_tokens", "since"))
+
+
 def _inflight_state(grad):
     """None = no marker; else a reason string. Unreadable counts as present."""
     m = _read_json(_inflight_path(grad))
@@ -604,6 +615,8 @@ def clear_fault(grad, account=None, operator_note=""):
         return False, dict(ev, blocked=["cycle_lock_unavailable:%r" % (e,)])
     try:
       with lock(), _fault_lock(grad):     # commit step (fault lock = leaf, taken last): bare reads only, after re-checking no cycle runs and the full state is unchanged
+        if not _marker_unchanged(grad, _mk):
+            return False, dict(ev, blocked=["inflight_marker_changed_during_evidence"])
         j2 = _read_journal(grad)
         if j2 and (j2.get("unreadable") or j2.get("status") == "running"):
             return False, dict(ev, blocked=["cycle_running_at_commit"])

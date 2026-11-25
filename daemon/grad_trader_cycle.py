@@ -74,6 +74,7 @@ def _abort_count(engine):
         return None
 
 
+_BEGIN_FAILED = {}  # lane -> True once a write-ahead marker write failed in this process (cleared only by register, i.e. a restart)
 _INFLIGHT = {}      # lane -> token of the write-ahead marker for the failure currently being handled (set by BEGIN, used by the abort hook)
 
 
@@ -81,8 +82,13 @@ def _make_begin_hook(engine):
     lane = str(engine.LANE)
 
     def _begin(mint, err):
-        tok = _gc().mark_inflight(engine, mint, err)
+        try:
+            tok = _gc().mark_inflight(engine, mint, err)
+        except Exception:
+            tok = None
         _INFLIGHT[lane] = tok
+        if tok is None:
+            _BEGIN_FAILED[lane] = True      # write-ahead marker NOT durable for this failure: visible, refuses entries for the life of this process
         return tok
     return _begin
 
@@ -116,6 +122,7 @@ def register(engine):
         c = _abort_count(engine)
         _BASELINE[lane] = c
         _HOOK_FAILED.pop(lane, None)
+        _BEGIN_FAILED.pop(lane, None)
         if os.environ.get(FLAG) == "1":
             engine._ABORT_HOOK = _make_abort_hook(engine)
             engine._FAILURE_BEGIN_HOOK = _make_begin_hook(engine)
@@ -136,7 +143,8 @@ def startup_report(engine):
     except Exception as e:
         act, why = True, "fault_state_unreadable:%r" % (e,)
     return {"active": True, "mode": "on", "detail": "", "fault_active": bool(act), "why": why,
-            "registered": str(getattr(engine, "LANE", "?")) in _ENGINES, "abort_baseline": _BASELINE.get(str(engine.LANE)), "entry_scan_state": _entry_state(engine)}
+            "registered": str(getattr(engine, "LANE", "?")) in _ENGINES, "begin_failed": bool(_BEGIN_FAILED.get(str(engine.LANE))), "hook_failed": bool(_HOOK_FAILED.get(str(engine.LANE))),
+            "inflight_marker": _gc()._inflight_state(engine), "abort_baseline": _BASELINE.get(str(engine.LANE)), "entry_scan_state": _entry_state(engine)}
 
 
 def _advance_baseline(engine, rec):
@@ -176,6 +184,8 @@ def commit_refusal(lane):
         return "grad_cycle fault unresolved (%s): entries blocked" % why
     if _HOOK_FAILED.get(lane):
         return "abort hook could not record a fault: entries blocked"
+    if _BEGIN_FAILED.get(lane):
+        return "poll-failure write-ahead marker could not be written: entries blocked (durable protection degraded; exits unaffected)"
     base, cur = _BASELINE.get(lane), _abort_count(eng)
     if base is None or cur is None:
         return "abort count unreadable: entries blocked fail-closed"

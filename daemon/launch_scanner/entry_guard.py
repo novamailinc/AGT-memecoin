@@ -49,6 +49,20 @@ def mandatory_entry_refusal(lane):
     if unset:
         return ("mandatory entry guard: no owner-approved limit for %s; "
                 "entries blocked fail-closed" % ", ".join(unset))
+    # Commit-time cycle fault check (R1). Flag off: nothing below runs. Flag on: a registered lane with an unresolved fault refuses, and a broken
+    # import refuses (fail closed). Fault files only; no ledger lock is taken here (the caller already holds the lane ledger lock).
+    if os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1":
+        try:
+            try:
+                from daemon import grad_trader_cycle as _gtc
+            except ImportError:
+                import grad_trader_cycle as _gtc
+            _why = _gtc.commit_refusal(lane)
+        except Exception:
+            return ("mandatory entry guard: cycle fault check unavailable with "
+                    "AGT_GRAD_CYCLE_ENABLED=1; entries blocked fail-closed")
+        if _why:
+            return "mandatory entry guard: " + _why
     return None
 
 

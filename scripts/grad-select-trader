@@ -61,6 +61,13 @@ except Exception:
     except Exception:
         _recorder = None
 
+# R1/R2 (flag-off source): cycle journal + entry gate for the main loop. Fail-soft import: a missing module leaves the old loop untouched.
+try:
+    from daemon import grad_trader_cycle as _gtc
+except Exception:
+    _gtc = None
+_FLAG_ON = os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1"
+
 POLL_SECS = 5
 GT_BACKFILL_EVERY_S = 60
 GT_BACKFILL_PAGES = 5
@@ -186,8 +193,25 @@ def main():
             try:
                 q = getattr(feed, "_q", None)
                 if q is not None and not q.empty():
-                    _sel.scan_once(engine, feed=feed, gt_rows=None,
-                                   on_items=_observe, fresh_only=True)
+                    def _fresh():
+                        return _sel.scan_once(
+                            engine, feed=feed, gt_rows=None,
+                            on_items=_observe, fresh_only=True)
+                    if _gtc is None:
+                        if _FLAG_ON:
+                            # flag on but the wiring module is missing:
+                            # NEVER scan ungated (fail closed).
+                            logger.warning("grad-select entries refused: "
+                                           "cycle flag on, wiring missing")
+                            time.sleep(1.0)
+                            continue
+                        _fresh()
+                    else:
+                        _ran, _why, _r = _gtc.entry_scan(engine, _fresh)
+                        if not _ran:
+                            logger.warning("grad-select entry scan "
+                                           "skipped: %s", _why)
+                            time.sleep(0.2)
                 else:
                     time.sleep(0.1)
             except Exception:
@@ -202,6 +226,10 @@ def main():
                    "%s, verdict sample %d closes)",
                    float(state.get("bankroll") or 0), state.get("state"),
                    _sel.VERDICT_SAMPLE_CLOSES)
+    if _gtc is not None:
+        _gtc.register(engine)
+        logger.warning("grad-select cycle wiring: %s",
+                       _gtc.startup_report(engine))
     last_gt = 0.0
     while True:
         try:
@@ -210,12 +238,33 @@ def main():
             if now - last_gt >= GT_BACKFILL_EVERY_S:
                 last_gt = now
                 gt_rows = engine.fetch_candidates(GT_BACKFILL_PAGES)
-            res = _sel.scan_once(engine, feed=feed, gt_rows=gt_rows,
-                                 on_items=_observe)
-            # Time-only exit FIRST: the 24h stop fires on the last
-            # known price with no price read at all, so it works
-            # even when every pricing source is down.
-            closes = engine.poll_time_exits() + engine.poll_exits(_armed_price_fn)
+            def _legacy():
+                # ORIGINAL order, used whenever the cycle wiring is off.
+                r = _sel.scan_once(engine, feed=feed, gt_rows=gt_rows,
+                                   on_items=_observe)
+                # Time-only exit FIRST: the 24h stop fires on the last
+                # known price with no price read at all, so it works
+                # even when every pricing source is down.
+                c = engine.poll_time_exits() + engine.poll_exits(
+                    _armed_price_fn)
+                return r, len(c)
+            if _gtc is None and _FLAG_ON:
+                # flag on, wiring missing: exits only, no entries.
+                logger.warning("grad-select entries refused: cycle flag "
+                               "on, wiring missing")
+                n_closes = len(engine.poll_time_exits()
+                               + engine.poll_exits(_armed_price_fn))
+                res = {"stream": 0, "opened": 0, "select_rejected": 0,
+                       "select_reasons": {}}
+            elif _gtc is None:
+                res, n_closes = _legacy()
+            else:
+                res, n_closes, _rec = _gtc.main_cycle(
+                    engine, _armed_price_fn,
+                    lambda: _sel.scan_once(engine, feed=feed,
+                                           gt_rows=gt_rows,
+                                           on_items=_observe),
+                    _legacy)
             try:
                 _sel.maybe_confirmation_cards(engine)
             except Exception:
@@ -227,7 +276,7 @@ def main():
             watcher.set_positions(
                 _aw.armed_positions(engine.open_positions()))
             _sel.maybe_verdict_report(engine)
-            if res.get("opened") or closes or \
+            if res.get("opened") or n_closes or \
                     res.get("select_rejected"):
                 st = engine.account_state()
                 logger.warning(
@@ -237,7 +286,7 @@ def main():
                     res.get("stream", 0), res.get("opened", 0),
                     res.get("select_rejected", 0),
                     res.get("select_reasons") or {},
-                    len(closes), st.get("bankroll", 0.0),
+                    n_closes, st.get("bankroll", 0.0),
                     st.get("n_open", 0), st.get("state"))
         except Exception:
             logger.exception("grad-select-trader loop failed")

@@ -15,6 +15,7 @@ Behavior when ON (DEMO engine only):
  * the unit lock is NOT re-entered: nothing here takes a ledger lock, and the cycle lock is non-blocking, so there is no lock-order cycle.
 """
 import logging
+import os
 import time
 
 logger = logging.getLogger("grad_trader_cycle")
@@ -27,17 +28,57 @@ def _gc():
     return grad_cycle
 
 
-def active(engine):
-    """True only when the flag is exactly '1' AND the engine reports DEMO. Anything unreadable is False (legacy path)."""
+FLAG = "AGT_GRAD_CYCLE_ENABLED"
+_ENGINES = {}      # lane -> engine, filled by the wired trader at startup; read by the commit-time check in entry_guard
+
+
+def register(engine):
+    """Record the engine so the commit-time entry check (entry_guard) can find its ledger path by lane. No I/O."""
     try:
-        return bool(_gc().enabled() and engine._demo_mode())
+        _ENGINES[str(engine.LANE)] = engine
     except Exception:
-        return False
+        pass
+
+
+def mode(engine):
+    """'off' (flag not exactly '1', or the engine is explicitly NOT DEMO: legacy path, the cycle never drives a non-simulated lane),
+    'on' (flag on and DEMO), or 'refuse' (flag on but the cycle module or the DEMO state is unreadable: exits only, NO entries, fail closed)."""
+    if os.environ.get(FLAG) != "1":
+        return "off"
+    try:
+        gc = _gc()
+        if not gc.enabled():
+            return "refuse"
+        return "on" if bool(engine._demo_mode()) else "off"
+    except Exception:
+        return "refuse"
+
+
+def active(engine):
+    return mode(engine) == "on"
+
+
+def commit_refusal(lane):
+    """Called by entry_guard under the lane ledger lock, right before the debit. Flag off: None. Flag on: a registered lane with an active or unreadable
+    fault refuses; an UNregistered lane (not wired) is not affected. Reads fault files only: takes no ledger lock, so it cannot self-deadlock."""
+    if os.environ.get(FLAG) != "1":
+        return None
+    eng = _ENGINES.get(str(lane))
+    if eng is None:
+        return None
+    try:
+        act, why = _gc().fault_active(eng)
+    except Exception as e:
+        return "cycle fault state unreadable (%r): entries blocked fail-closed" % (e,)
+    return ("grad_cycle fault unresolved (%s): entries blocked" % why) if act else None
 
 
 def startup_report(engine):
     """Read-only snapshot for the startup log. Does not heal, clear, or write. Returns a small dict."""
-    if not active(engine):
+    m = mode(engine)
+    if m == "refuse":
+        return {"active": False, "mode": "refuse", "why": "flag on but cycle module or DEMO state unreadable: entries refused, exits only"}
+    if m != "on":
         return {"active": False}
     try:
         act, why = _gc().fault_active(engine)
@@ -48,8 +89,11 @@ def startup_report(engine):
 
 def entry_allowed(engine):
     """(ok, why). Flag off or non-DEMO: (True, None), the old behavior. On: scan_gate; any exception refuses (entries only, never exits)."""
-    if not active(engine):
+    m = mode(engine)
+    if m == "off":
         return True, None
+    if m == "refuse":
+        return False, "flag_on_cycle_unavailable"
     try:
         return _gc().scan_gate(engine)
     except Exception as e:
@@ -59,9 +103,18 @@ def entry_allowed(engine):
 def main_cycle(engine, price_fn, scan_fn, legacy):
     """One main-loop tick. scan_fn() runs the entry scan and returns the scan_once result dict. legacy() runs the ORIGINAL scan+exits code and returns
     (res, n_closes). Returns (res, n_closes, record_or_None). Never raises past what legacy itself would."""
-    if not active(engine):
+    m = mode(engine)
+    if m == "off":
         res, n = legacy()
         return res, n, None
+    if m == "refuse":
+        # flag on but the cycle cannot be used: NEVER fall back to ungated entries. Exits still run directly.
+        try:
+            n = len(engine.poll_time_exits() or []) + len(engine.poll_exits(price_fn) or [])
+        except Exception:
+            logger.exception("grad_trader_cycle: direct exits failed")
+            n = 0
+        return dict(_EMPTY_SCAN, skipped="flag_on_cycle_unavailable"), n, None
     held = {}
 
     def _scan():
@@ -96,3 +149,28 @@ def main_cycle(engine, price_fn, scan_fn, legacy):
     if not isinstance(res, dict):
         res = dict(_EMPTY_SCAN, skipped=rec.get("scan_skipped") or "scan_not_run")
     return res, n, rec
+
+
+def entry_scan(engine, scan_fn):
+    """One entry-thread scan. Flag off: scan_fn() directly, as before. On: JOURNALED through scan_phase under the non-blocking cycle lock (gate
+    re-checked inside); busy means skipped this attempt (the caller retries). Refuse mode: skipped. Returns (ran, why_or_None, result)."""
+    m = mode(engine)
+    if m == "off":
+        return True, None, scan_fn()
+    if m == "refuse":
+        return False, "flag_on_cycle_unavailable", None
+    gc = _gc()
+    held = {}
+
+    def _scan():
+        held["res"] = scan_fn()
+        return held["res"]
+    rec = {"boot_id": gc._BOOT["id"], "cycle_seq": gc._BOOT["seq"], "ts": time.time(), "steps": {}, "scan_deferred": True,
+           "aborts_end": gc._abort_count(engine), "kind": "entry_thread"}
+    try:
+        gc.scan_phase(engine, _scan, rec)
+    except Exception as e:
+        return False, "scan_phase_error:%r" % (e,), None
+    if rec.get("scan_skipped"):
+        return False, rec["scan_skipped"], None
+    return True, None, held.get("res")

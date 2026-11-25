@@ -66,6 +66,7 @@ try:
     from daemon import grad_trader_cycle as _gtc
 except Exception:
     _gtc = None
+_FLAG_ON = os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1"
 
 POLL_SECS = 5
 GT_BACKFILL_EVERY_S = 60
@@ -192,15 +193,25 @@ def main():
             try:
                 q = getattr(feed, "_q", None)
                 if q is not None and not q.empty():
-                    _ok, _why = (True, None) if _gtc is None else \
-                        _gtc.entry_allowed(engine)
-                    if not _ok:
-                        logger.warning("grad-select entries skipped "
-                                       "(cycle gate): %s", _why)
-                        time.sleep(1.0)
-                        continue
-                    _sel.scan_once(engine, feed=feed, gt_rows=None,
-                                   on_items=_observe, fresh_only=True)
+                    def _fresh():
+                        return _sel.scan_once(
+                            engine, feed=feed, gt_rows=None,
+                            on_items=_observe, fresh_only=True)
+                    if _gtc is None:
+                        if _FLAG_ON:
+                            # flag on but the wiring module is missing:
+                            # NEVER scan ungated (fail closed).
+                            logger.warning("grad-select entries refused: "
+                                           "cycle flag on, wiring missing")
+                            time.sleep(1.0)
+                            continue
+                        _fresh()
+                    else:
+                        _ran, _why, _r = _gtc.entry_scan(engine, _fresh)
+                        if not _ran:
+                            logger.warning("grad-select entry scan "
+                                           "skipped: %s", _why)
+                            time.sleep(0.2)
                 else:
                     time.sleep(0.1)
             except Exception:
@@ -216,6 +227,7 @@ def main():
                    float(state.get("bankroll") or 0), state.get("state"),
                    _sel.VERDICT_SAMPLE_CLOSES)
     if _gtc is not None:
+        _gtc.register(engine)
         logger.warning("grad-select cycle wiring: %s",
                        _gtc.startup_report(engine))
     last_gt = 0.0
@@ -236,7 +248,15 @@ def main():
                 c = engine.poll_time_exits() + engine.poll_exits(
                     _armed_price_fn)
                 return r, len(c)
-            if _gtc is None:
+            if _gtc is None and _FLAG_ON:
+                # flag on, wiring missing: exits only, no entries.
+                logger.warning("grad-select entries refused: cycle flag "
+                               "on, wiring missing")
+                n_closes = len(engine.poll_time_exits()
+                               + engine.poll_exits(_armed_price_fn))
+                res = {"stream": 0, "opened": 0, "select_rejected": 0,
+                       "select_reasons": {}}
+            elif _gtc is None:
                 res, n_closes = _legacy()
             else:
                 res, n_closes, _rec = _gtc.main_cycle(

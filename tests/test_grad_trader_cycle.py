@@ -76,7 +76,79 @@ check("G15 on, scan gate raising: entry refused (fail closed), no raise", T.entr
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "grad-select-trader")).read()
 m = re.search(r"def _legacy\(\):(.*?)return r, len\(c\)", src, re.S)
 check("G16 static: the trader's legacy path keeps the ORIGINAL order scan_once -> poll_time_exits -> poll_exits", bool(m) and m.group(1).index("scan_once") < m.group(1).index("poll_time_exits") < m.group(1).index("poll_exits"))
-check("G17 static: the trader imports the wiring fail-soft and the entry thread consults entry_allowed", "except Exception:\n    _gtc = None" in src and "_gtc.entry_allowed(engine)" in src)
+check("G17 static: the trader imports the wiring fail-soft", "except Exception:\n    _gtc = None" in src)
 check("G18 static: push-price and ExitPoller paths still call engine.poll_exits directly (unjournaled by design)", src.count("engine.poll_exits(_armed_price_fn)") >= 2)
+# ---- R1 refinements: exits-before-scan qualification, fail-closed mode, journaled entry scan, commit-time fault check ----
+os.environ[GC.ENV_FLAG] = "1"
+g = fake(); st = {"closed": False}
+g.poll_exits = lambda price_fn=None: (g.calls.append("exits") or st.__setitem__("closed", True) or [1])
+seen = {}
+def _s():
+    seen["closed_before_scan"] = st["closed"]; return {"stream": 1, "opened": 0, "select_rejected": 0, "select_reasons": {}}
+res, n, rec = T.main_cycle(g, PF, _s, legacy_for(g))
+check("G19 qualification: a position closed by the exit step is already closed when the scan runs (capacity and cash freed before entries; same ledger lock serialises both)", seen.get("closed_before_scan") is True and n == 1)
+g = fake(); g.poll_exits = lambda price_fn=None: (_ for _ in ()).throw(RuntimeError("x"))
+res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g))
+check("G20 qualification: a failing or slow exit never waits behind a scan (scan is not even started after an exit failure)", "scan" not in g.calls)
+g = fake(); g._demo_mode = lambda: (_ for _ in ()).throw(RuntimeError("state"))
+res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g))
+check("G21 flag on, DEMO state unreadable: FAIL CLOSED, exits run directly, NO scan, NO legacy ungated path (%s)" % g.calls, g.calls == ["time_exits", "exits"] and res.get("skipped") == "flag_on_cycle_unavailable" and T.entry_allowed(g) == (False, "flag_on_cycle_unavailable") and T.mode(g) == "refuse")
+_orig = T._gc
+def _brk(): raise ImportError("grad_cycle broken")
+T._gc = _brk
+try:
+    g = fake(); res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g)); ea = T.entry_allowed(g); es = T.entry_scan(g, scan_for(g))
+finally:
+    T._gc = _orig
+check("G22 flag on, grad_cycle import broken: no entries from main loop, entry gate or entry thread (%s)" % g.calls, "scan" not in g.calls and "LEGACY" not in g.calls and ea[0] is False and es[0] is False)
+os.environ.pop(GC.ENV_FLAG, None)
+g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g))
+check("G23 flag off: entry_scan is the plain scan, no journal", ran is True and g.calls == ["scan"] and not os.path.exists(g.LEDGER_PATH + ".cycle.json"))
+os.environ[GC.ENV_FLAG] = "1"
+g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g)); j = json.load(open(g.LEDGER_PATH + ".cycle.json"))
+check("G24 flag on: entry-thread scan runs JOURNALED (status done, kind entry_thread)", ran is True and g.calls == ["scan"] and j["status"] == "done" and j.get("kind") == "entry_thread" and r_.get("opened") == 1)
+g = fake(); lk = open(GC._cycle_lock_path(g), "w"); fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+ran, why, r_ = T.entry_scan(g, scan_for(g)); fcntl.flock(lk, fcntl.LOCK_UN); lk.close()
+check("G25 entry scan with the cycle lock held elsewhere: skipped, not run (%s)" % why, ran is False and g.calls == [])
+g = fake(); GC._write_journal(g, {"status": "running", "boot_id": "older", "cycle_seq": 7}, {}); GC.run_cycle(g, price_fn=PF)
+ran, why, r_ = T.entry_scan(g, scan_for(g))
+check("G26 entry scan under an active fault: refused", ran is False and "scan" not in g.calls)
+check("G27 commit_refusal: flag off None", (os.environ.pop(GC.ENV_FLAG), T.commit_refusal("lane_x"))[1] is None)
+os.environ[GC.ENV_FLAG] = "1"
+g = fake(); g.LANE = "lane_unreg"
+check("G28 commit_refusal: unregistered lane unaffected, registered clean lane None", T.commit_refusal("lane_unreg") is None and (T.register(g), T.commit_refusal("lane_unreg"))[1] is None)
+g2 = fake(); g2.LANE = "lane_fault"; T.register(g2); GC._write_journal(g2, {"status": "running", "boot_id": "older", "cycle_seq": 7}, {}); GC.run_cycle(g2, price_fn=PF)
+check("G29 commit_refusal: registered lane with a fault refuses", "unresolved" in (T.commit_refusal("lane_fault") or ""))
+_fa = GC.fault_active
+GC.fault_active = lambda grad: (_ for _ in ()).throw(RuntimeError("io"))
+try: cr = T.commit_refusal("lane_fault")
+finally: GC.fault_active = _fa
+check("G30 commit_refusal: fault state unreadable refuses (fail closed)", cr is not None and "unreadable" in cr)
+# entry_guard integration with a stub paper_account so the earlier mandatory checks pass
+import daemon.launch_scanner as _LS
+from daemon.launch_scanner import entry_guard as EG
+_stub = types.SimpleNamespace(gates_enabled=lambda: True, max_daily_loss_usd=lambda: 1.0, max_drawdown_pct=lambda: 1.0, max_exposure_pct=lambda: 1.0)
+_had = getattr(_LS, "paper_account", None); _had_m = sys.modules.get("daemon.launch_scanner.paper_account")
+_LS.paper_account = _stub; sys.modules["daemon.launch_scanner.paper_account"] = _stub
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
+try:
+    os.environ.pop(GC.ENV_FLAG, None)
+    r_off = EG.mandatory_entry_refusal("lane_fault")
+    os.environ[GC.ENV_FLAG] = "1"
+    r_fault = EG.mandatory_entry_refusal("lane_fault"); r_clean = EG.mandatory_entry_refusal("lane_unreg")
+    _gt = sys.modules.get("daemon.grad_trader_cycle"); _attr = getattr(sys.modules["daemon"], "grad_trader_cycle")
+    sys.modules["daemon.grad_trader_cycle"] = None; delattr(sys.modules["daemon"], "grad_trader_cycle")
+    try: r_imp = EG.mandatory_entry_refusal("lane_unreg")
+    finally:
+        sys.modules["daemon.grad_trader_cycle"] = _gt; setattr(sys.modules["daemon"], "grad_trader_cycle", _attr)
+finally:
+    os.environ.pop("PAPER_ACCOUNT_ENABLED", None)
+    if _had is not None: _LS.paper_account = _had
+    else: delattr(_LS, "paper_account")
+    if _had_m is not None: sys.modules["daemon.launch_scanner.paper_account"] = _had_m
+    else: sys.modules.pop("daemon.launch_scanner.paper_account", None)
+check("G31 entry_guard: flag off passes; flag on refuses a faulted registered lane; unregistered passes; broken import refuses", r_off is None and r_fault and "unresolved" in r_fault and r_clean is None and r_imp and "unavailable" in r_imp)
+src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "grad-select-trader")).read()
+check("G32 static: trader entry thread goes through entry_scan and refuses when flag on and the module is missing", "_gtc.entry_scan(engine, _fresh)" in src and "cycle flag on, wiring missing" in src and "_gtc.register(engine)" in src)
 print("FAILS: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

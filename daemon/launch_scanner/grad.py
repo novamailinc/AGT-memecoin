@@ -2766,6 +2766,18 @@ def _all_exits_executed(pos):
         return False
 
 
+def _buyback_added_cost(pos):
+    """USD the shared account ALREADY debited for an applied tranche buyback (entry_features.buyback.cost, the account's applied stake
+    when the lane booked it), or 0.0 when none. Pure. Only a booked buyback (buyback_used) counts."""
+    try:
+        if not pos.get("buyback_used"):
+            return 0.0
+        c = float(((pos.get("entry_features") or {}).get("buyback") or {}).get("cost") or 0.0)
+        return c if (c == c and 0.0 < c < float("inf")) else 0.0
+    except Exception:
+        return 0.0
+
+
 def _account_residue(mint, pos_id, pos):
     """(why, residue_qty) for a lane-flat marked position: (None, 0.0) when the account holds no units for this pos_id (flat) or the
     residue is within technical rounding (max(1e-9, 1e-6 * tokens)); ("account_remaining_qty_mismatch", qty) for a residue;
@@ -3072,6 +3084,10 @@ def _finalize(d, mint, pos, closed_reason):
     _tc = pos.get("tranche_credited") if pos.get("tranche_credit") else None
     _cr_net = float((_tc or {}).get("net") or 0.0)
     _cr_qty = float((_tc or {}).get("qty") or 0.0)
+    # A buyback is an ACCOUNT debit (add_to_position) that already left cash when it was applied, and the lane's `realized` is net
+    # of that cost. The close credit is the remaining SALE proceeds, so the cost the account already debited must be added back,
+    # otherwise the buyback is subtracted twice (a negative credit that the account refuses and that strands the lot).
+    _bb_added = _buyback_added_cost(pos)
     _pa = _paper_account()
     if _pa is not None:
         # op_ids are stable per position instance so a retried
@@ -3097,7 +3113,7 @@ def _finalize(d, mint, pos, closed_reason):
             # units: the close is final, and grad leg fractions
             # can leave dust the per-leg qty would strand.
             _plan = [{"kind": "credit", "op_id": _op, "mint": mint,
-                      "amount": round(realized - _cr_net, 6), "qty": max(_sold_qty - _cr_qty, 0.0) + (_dust(pos) if pos.get("tranche_dust_leg") and pos["tranche_dust_leg"] not in ((_tc or {}).get("legs") or {}) else 0.0),
+                      "amount": round(realized + _bb_added - _cr_net, 6), "qty": max(_sold_qty - _cr_qty, 0.0) + (_dust(pos) if pos.get("tranche_dust_leg") and pos["tranche_dust_leg"] not in ((_tc or {}).get("legs") or {}) else 0.0),
                       "price_kind": _sold_kind, "pos_id": _pos_id},
                      {"kind": "write_down", "op_id": _op + ":wd",
                       "mint": mint, "pos_id": _pos_id,
@@ -3113,7 +3129,7 @@ def _finalize(d, mint, pos, closed_reason):
             # Full close (qty=None settles all remaining units).
             # A non-current aggregate kind routes the WHOLE credit
             # to the quarantined estimated bucket.
-            _rem = round(realized - _cr_net, 6)
+            _rem = round(realized + _bb_added - _cr_net, 6)
             _ukinds = _uncredited_kinds(pos)
             _rem_kind = (_pk.aggregate(_ukinds) if (_pk is not None and _ukinds) else _close_kind)
             if _sold_legs_all_credited(pos):

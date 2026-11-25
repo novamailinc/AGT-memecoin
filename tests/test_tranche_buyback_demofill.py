@@ -255,6 +255,16 @@ def acct_lot_qty(pid):
     return sum(float(q.get("qty") or 0.0) for q in ((snap.get("lanes") or {}).get(G.LANE) or {}).get("positions") or []
                if str(q.get("pos_id")) == str(pid))
 
+def dump(label, mint, pid, *extra):
+    """DIAGNOSTIC ONLY (no assertion): print the operands behind the checks, from the persisted account/lane/journal records."""
+    snap = PAm().snapshot(); lp = lane_pos(mint) or {}
+    led = (G._read().get("closes") or [])[-1:] or [{}]
+    print("DIAG %s cash=%r lot_qty=%r account_ops=%r" % (label, snap.get("cash"), acct_lot_qty(pid), {k: (v.get("event"), v.get("stake"), v.get("qty"), v.get("realized")) for k, v in (PAm()._ledger_ops() if hasattr(PAm(), "_ledger_ops") else {}).items()}))
+    print("DIAG %s lane intent=%r fill_ops=%r ef.buyback=%r" % (label, lp.get("buyback_intent"), lp.get("buyback_fill_ops"), {k: v for k, v in ((lp.get("entry_features") or {}).get("buyback") or {}).items() if k != "provenance"}))
+    print("DIAG %s fills=%r" % (label, {k[-40:]: {x: v.get(x) for x in ("side", "status", "price_usd", "qty_tokens", "total_debit_usd", "net_proceeds_usd", "fee_usd")} for k, v in FILLER[0]._locked(lambda j: dict(j["fills"])).items()}))
+    print("DIAG %s last_close=%r" % (label, {x: led[0].get(x) for x in ("pnl_usd", "realized_usd", "pending_exit", "settlement_pending", "closed_reason")}))
+    for e in extra: print("DIAG %s %s" % (label, e))
+
 def fills_for(pid, mint):
     pre = bop(mint, pid) + ":fill:"
     return FILLER[0]._locked(lambda j: {k: v for k, v in j["fills"].items() if k.startswith(pre)})
@@ -307,6 +317,7 @@ check("S1 conservation: account cash delta == sum(sim sell nets) - entry stake -
       abs((c_end - 100.0) - (_nets - 1.0 - f["total_debit_usd"])) < 1e-5)
 check("S1 conservation: lane pnl_usd == the account's cash delta (%.6f vs %.6f)" % (rec.get("pnl_usd", 0), c_end - 100.0),
       abs(rec.get("pnl_usd", 1e9) - (c_end - 100.0)) < 1e-4)
+dump("S1-end", mint, pid, "c_pre=%r c_end=%r nets=%r sell_qty=%r" % (c_pre, c_end, _nets, _sold_qty))
 JUP.mult = 1.0
 
 # ---- S2: cap breach on the QUOTE refuses; nothing applied; intent explains the (absent) fill ----
@@ -346,6 +357,7 @@ fop2 = (lp.get("buyback_intent") or {}).get("fill_op")
 check("S4 retry takes a NEW fill op (%s != %s), two journaled fills, history keeps the first intent" % (fop1[-8:], str(fop2)[-8:]),
       len(out) == 1 and fop2 != fop1 and len(fl2) == 2 and (lp.get("buyback_attempts") or [{}])[-1].get("fill_op") == fop1)
 _f2 = fl2[fop2]
+print("DIAG S4 conjunct_cash c0-cash=%r debit=%r delta=%r conj_qty=%r" % (c0 - PA_cash(), _f2["total_debit_usd"], abs((c0 - PA_cash()) - _f2["total_debit_usd"]), abs(PAm().applied_add(bop(mint, pid))["qty"] - _f2["qty_tokens"])))
 check("S4 exactly ONE account debit (the retry's fill), equal to its own debit", abs((c0 - PA_cash()) - _f2["total_debit_usd"]) < 1e-9
       and abs(PAm().applied_add(bop(mint, pid))["qty"] - _f2["qty_tokens"]) < 1e-9)
 
@@ -369,6 +381,7 @@ f = list(fl.values())[0]
 check("S5 recovery adopts: buyback booked once, NO new quote, NO second debit", len(out) == 1 and len(JUP.calls) == nq and abs(PA_cash() - c1) < 1e-12)
 check("S5 recovery uses the ACCOUNT's applied stake/qty (== the journaled fill's)", abs(ef.get("cost", -1) - ad["stake"]) < 1e-6 and abs(ef.get("tokens", -1) - ad["qty"]) < 1e-9
       and abs(ad["stake"] - f["total_debit_usd"]) < 1e-9)
+dump("S5", mint, pid)
 check("S5 evidence RECOVERED from the journal via the lane intent (fill_evidence recovered, provenance with percent_v2 stamp, fill op)",
       ef.get("adopted_from_account") is True and ef.get("fill_evidence") == "recovered" and ef.get("fill_op") == list(fl.keys())[0]
       and (ef.get("provenance") or {}).get("price_impact_unit") == "percent_v2")
@@ -388,6 +401,7 @@ with patch.object(G, "_write", _w_boom6):
     run_bb(mint, entry * 1.3)
 dd = G._read(); dd["positions"][mint]["buyback_intent"]["fill_op"] = "FAULT:evidence-lost"; _real_w(dd)   # FAULT: the intent no longer names a journaled fill
 out = run_bb(mint, entry * 1.3); ef = (lane_pos(mint).get("entry_features") or {}).get("buyback") or {}
+dump("S6", mint, pid)
 check("S6 adoption without evidence: booked from the account's numbers, fill_evidence says fill_missing, NO provenance claimed",
       len(out) == 1 and ef.get("adopted_from_account") is True and ef.get("fill_evidence") == "fill_missing" and "provenance" not in ef)
 
@@ -411,6 +425,7 @@ check("S8 FAULT crash before add: orphan fill journaled, account untouched, inte
 JUP.bmult = 0.5   # CHANGED requote: the retry gets half the tokens per SOL (canned-ratio fixture)
 out = run_bb(mint, entry * 1.3); lp = lane_pos(mint); fl2 = fills_for(pid, mint); fop2 = (lp.get("buyback_intent") or {}).get("fill_op")
 JUP.bmult = 1.0
+print("DIAG S8 conj: len(out)=%r fop_new=%r len(fl2)=%r qty_match=%r qty_diff=%r debit_delta=%r" % (len(out), fop2 != fop1, len(fl2), abs(PAm().applied_add(bop(mint, pid))["qty"] - fl2[fop2]["qty_tokens"]), abs(fl2[fop2]["qty_tokens"] - fl1[fop1]["qty_tokens"]), abs((c0 - PA_cash()) - fl2[fop2]["total_debit_usd"])))
 check("S8 retry after crash: NEW fop, the account add uses the NEW fill's qty (changed requote), the orphan fill is NOT booked",
       len(out) == 1 and fop2 != fop1 and len(fl2) == 2 and abs(PAm().applied_add(bop(mint, pid))["qty"] - fl2[fop2]["qty_tokens"]) < 1e-9
       and abs(fl2[fop2]["qty_tokens"] - fl1[fop1]["qty_tokens"]) > 1e-6 and abs((c0 - PA_cash()) - fl2[fop2]["total_debit_usd"]) < 1e-9)

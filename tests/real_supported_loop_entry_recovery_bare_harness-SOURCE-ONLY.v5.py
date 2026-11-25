@@ -323,7 +323,7 @@ def t2(lab, cyc):
 # Fail-closed here blocks ENTRIES only: the adopted position must still be managed (risk-reducing exits are not frozen).
 PLANT_NAME = "0" * 40 + ".json"   # sorts BEFORE any sha256-hex genuine name (not "0"*40 itself, collision asserted below), so recover_pass meets the block first and must keep going to adopt the genuine record
 def plant_phase(h, lab, variant, t):
-    d = os.path.join(h, "grad_ledger.json.entry-intents")
+    d = os.path.join(h, "led", "grad.json.entry-intents")
     before = sorted(os.listdir(d)) if os.path.isdir(d) else None
     genuine = (t or {}).get("rec_files")
     check("%s PLANT SITE (derived path %s): the entry-intent directory exists and lists exactly the genuine record(s) the kill child reported at its seam (listing %s == seam rec_files %s, 1 file)" % (lab, os.path.basename(d), before, genuine), before is not None and before == genuine and len(before) == 1)
@@ -362,7 +362,7 @@ def t_refuse(lab, variant):
     if variant == "garbage":
         check("%s ENTRY REFUSAL REASON (variant-specific): every fresh refusal reason names an unreadable record (%s)" % (lab, [str(x[3]) for x in fresh][:1]), len(fresh) >= 1 and all("unreadable record" in str(x[3]) for x in fresh))
     import hashlib as _h
-    pf = os.path.join(h, "grad_ledger.json.entry-intents", PLANT_NAME)
+    pf = os.path.join(h, "led", "grad.json.entry-intents", PLANT_NAME)
     now = _h.sha256(open(pf, "rb").read()).hexdigest() if os.path.exists(pf) else None
     check("%s EVIDENCE PRESERVED: the planted file is byte-identical at the end (sha %s == %s); no cycle fault was recorded (%s) and no clear log (%s)" % (lab, (now or "")[:12], psha[:12], [p_["fault_reasons"] for p_ in passes], r["clear_log_exists"]),
           now == psha and all(p_["fault_reasons"] == [] for p_ in passes) and r["clear_log_exists"] is False and r["clear_enabled"] is False)

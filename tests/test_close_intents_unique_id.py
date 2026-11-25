@@ -125,23 +125,23 @@ import threading
 ids = []; lk = threading.Lock()
 def work():
     for _ in range(25):
-        x = ci.begin("lanec", "MC", "pc", OPS, dict(INFO))
+        x = ci.begin("lanecs", "MC", "pc", OPS, dict(INFO))   # fresh stress journal: "lanec" already holds the stable-begin section's one op_key intent
         with lk:
             ids.append(x)
 ts = [threading.Thread(target=work) for _ in range(8)]
 [t_.start() for t_ in ts]; [t_.join() for t_ in ts]
-ev = [e for e in ci._read(ci.journal_path("lanec"))[0] if e.get("ev") == "intent"]
+ev = [e for e in ci._read(ci.journal_path("lanecs"))[0] if e.get("ev") == "intent"]
 check("8 threads x 25 same-second begins: %d ids, %d distinct, %d intent events, %d distinct in journal" % (len(ids), len(set(ids)), len(ev), len({e["intent_id"] for e in ev})),
       len(ids) == 200 and len(set(ids)) == 200 and len(ev) == 200 and len({e["intent_id"] for e in ev}) == 200)
 
 # concurrency across PROCESSES (real begin callers can be separate processes): 4 children x 25 begins
 import subprocess
 code = ("import os,sys;sys.path.insert(0,%r);import daemon.launch_scanner.close_intents as ci;"
-        "[ci.begin('lanep','MP','pp',[{'kind':'credit','op_id':'o','amount':1.0}],{'close_ts':1795593430.5}) for _ in range(25)]") % REPO
+        "[ci.begin('laneps','MP','pp',[{'kind':'credit','op_id':'o','amount':1.0}],{'close_ts':1795593430.5}) for _ in range(25)]") % REPO
 procs = [subprocess.Popen([sys.executable, "-B", "-c", code], env=dict(os.environ)) for _ in range(4)]
 rcs = [p_.wait() for p_ in procs]
-ev = [e for e in ci._read(ci.journal_path("lanep"))[0] if e.get("ev") == "intent"]
+ev = [e for e in ci._read(ci.journal_path("laneps"))[0] if e.get("ev") == "intent"]
 check("4 processes x 25 same-second begins: rcs %r, %d intent events, %d distinct ids, journal not torn" % (rcs, len(ev), len({e["intent_id"] for e in ev})),
-      rcs == [0, 0, 0, 0] and len(ev) == 100 and len({e["intent_id"] for e in ev}) == 100 and ci._read(ci.journal_path("lanep"))[1] is None)
+      rcs == [0, 0, 0, 0] and len(ev) == 100 and len({e["intent_id"] for e in ev}) == 100 and ci._read(ci.journal_path("laneps"))[1] is None)
 print("fails: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

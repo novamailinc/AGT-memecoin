@@ -2071,7 +2071,7 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
         if _diverged:
             global _ENTRY_BLOCKED
             _ENTRY_BLOCKED = True
-            _jfail = False
+            _jfail = False; _applied = False
             _prior = pos.get("pending_exit") or {}
             _iid = _prior.get("intent_id") if _prior.get("leg") == leg_key else None
             if _prior.get("why") != "tranche_credit_divergence":
@@ -2087,6 +2087,7 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
                         _st = _ci.intent_status(LANE, _iid)
                         if _st == "applied":
                             # an APPLIED intent is never frozen: that contradicts a divergence claim, so it is held visibly, not resolved
+                            _applied = True   # contradicts the divergence claim: a distinct, truthful hold (not a journal-write failure)
                             raise RuntimeError("intent %s is already APPLIED: refusing to freeze it" % _iid)
                         if _st != "frozen" and not _ci.freeze(LANE, _iid, "tranche credit refused: debited position absent from account (divergence): %s" % str(why)[:120]):
                             raise RuntimeError("freeze of intent %s was not durable" % _iid)
@@ -2095,9 +2096,13 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
                 except Exception as _fe:
                     # journal write failed: entries stay blocked in-process; the intent id (if begin landed) is kept so
                     # the retry freezes the SAME intent instead of opening a second one
-                    _jfail = True
+                    if _applied:
+                        _jfail = False
+                        logger.error("grad: divergence claim contradicts an APPLIED close intent (%r); entries blocked, operator must reconcile", _fe)
+                    else:
+                        _jfail = True
                     logger.error("grad: divergence freeze journal write failed (%r); entries blocked, will retry", _fe)
-            pos["pending_exit"] = {"leg": leg_key, "why": ("tranche_credit_refused" if _jfail else "tranche_credit_divergence"),
+            pos["pending_exit"] = {"leg": leg_key, "why": ("tranche_credit_applied_conflict" if _applied else ("tranche_credit_refused" if _jfail else "tranche_credit_divergence")),
                                    "detail": str(why)[:200], "ts": time.time()}
             if _iid:
                 pos["pending_exit"]["intent_id"] = _iid

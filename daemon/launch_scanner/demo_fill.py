@@ -329,7 +329,7 @@ class DemoFiller:
                            {"op_id": op_id, "why": "confirm_timeout not reconciled; retry blocked"})
         return rec
 
-    def _mark_inflight(self, op_id, side, mint):
+    def _mark_inflight(self, op_id, side, mint, meta=None):
         """ATOMIC check-and-claim under the fill-journal lock, BEFORE the swap executes: when any record already exists for the op id (a filled
         fill, an inflight claim by another executor, an UNKNOWN) it is returned and NOTHING is claimed, so two concurrent executors of the same op
         id cannot both execute. Returns None when this caller now owns the claim. Raises (nothing executes) when the claim cannot be written."""
@@ -341,9 +341,12 @@ class DemoFiller:
             # remainder exit or a buyback that overlaps the same units) must block every other buy/sell for the mint until it is resolved.
             _lane = str(op_id).split(":", 1)[0]
             for _k, _v in j["fills"].items():
-                if _k != op_id and (_v or {}).get("status") == "inflight" and _v.get("mint") == mint and str(_k).split(":", 1)[0] == _lane:
-                    return {"status": "inflight", "op_id": _k, "mint": mint, "mint_guard": True}
-            j["fills"][op_id] = {"status": "inflight", "op_id": op_id, "side": side, "mint": mint, "ts": self._now()}
+                if _k != op_id and (_v or {}).get("status") in ("inflight", "unknown") and _v.get("mint") == mint and str(_k).split(":", 1)[0] == _lane:
+                    return {"status": _v.get("status"), "op_id": _k, "mint": mint, "mint_guard": True}
+            _c = {"status": "inflight", "op_id": op_id, "side": side, "mint": mint, "ts": self._now()}
+            if meta:
+                _c["intent"] = dict(meta)   # what the sale was FOR survives a crash with the claim itself
+            j["fills"][op_id] = _c
             return None
         return self._locked(f)
 
@@ -354,6 +357,28 @@ class DemoFiller:
         if cur.get("status") == "unknown":
             raise DemoSkip("unresolved_unknown", {"op_id": op_id, "why": "confirm_timeout not reconciled; retry blocked"})
         return cur
+
+    def fills_by_prefix(self, prefix, suffix=""):
+        """Every journal record (any status) whose op id starts with prefix and ends with suffix: lets a caller enumerate ALL records of one position
+        generation instead of probing candidate keys."""
+        return self._locked(lambda j: {k: dict(v) for k, v in j["fills"].items() if k.startswith(prefix) and k.endswith(suffix)})
+
+    def resolve_inflight(self, op_id, outcome, evidence, operator):
+        """OPERATOR resolution of an unresolved inflight claim. Append-only: the observed claim is copied into j["resolutions"] with the operator,
+        evidence and time BEFORE it is removed; nothing observed is rewritten. Only outcome "not_executed" is supported (the claim is cleared so the op
+        may execute); "executed" needs the real fill and is NOT automated (it must be adopted through reconcile with a signature). Requires non-empty
+        evidence and operator and an existing inflight claim; returns the resolution record."""
+        if outcome != "not_executed" or not str(evidence or "").strip() or not str(operator or "").strip():
+            raise DemoSkip("resolution_refused", {"op_id": op_id, "why": "only outcome not_executed with evidence and operator is supported"})
+        def f(j):
+            cur = j["fills"].get(op_id)
+            if not cur or cur.get("status") != "inflight":
+                raise DemoSkip("resolution_refused", {"op_id": op_id, "why": "no inflight claim"})
+            rec = {"op_id": op_id, "claim": dict(cur), "outcome": outcome, "evidence": str(evidence), "operator": str(operator), "ts": self._now()}
+            j.setdefault("resolutions", []).append(rec)
+            del j["fills"][op_id]
+            return rec
+        return self._locked(f)
 
     def _clear_inflight(self, op_id):
         def f(j):
@@ -373,11 +398,13 @@ class DemoFiller:
             d["_ctx"] = dict(ctx, px=fx, quote={
                 "requested_at": _q.get("requested_at"), "received_at": _q.get("received_at"),
                 "slippage_bps": _q.get("slippage_bps"), "route": _route_labels(_q.get("quote"))})
-        if reason in _PROVEN_NO_EXECUTION:
-            self._clear_inflight(op_id)   # ONLY a refusal proven to precede execution (or a landed-FAILED tx: reverted, no swap) clears the claim
-        # confirm_timeout becomes an UNKNOWN record in _record_attempt; zero_output (a landed swap with no measured output), unknown_signature and any
-        # reason not on the list keep the INFLIGHT claim: an unknown outcome is never cleared.
+        # The attempt (and, for a landed-failed tx, its booked/owed FEE) is made durable FIRST. If that raises, the claim stays (fail closed) and no
+        # fee evidence is lost; only then is the claim cleared, and only for a reason PROVEN to precede execution (or a reverted tx).
         self._record_attempt(op_id, side, mint, reason, d, fx)
+        # confirm_timeout became an UNKNOWN record inside _record_attempt; zero_output (a landed swap with no measured output), unknown_signature and
+        # any reason not on the list KEEP the INFLIGHT claim: an unknown outcome is never cleared.
+        if reason in _PROVEN_NO_EXECUTION:
+            self._clear_inflight(op_id)
         raise DemoSkip(reason, d)
 
     # ---- buy / sell ---------------------------------------------------
@@ -416,7 +443,7 @@ class DemoFiller:
         if base_units <= 0:
             raise DemoSkip("amount_too_small", {})
         ex = self._executor(total_fee + 1, {mint: base_units})
-        _cur = self._mark_inflight(op_id, "sell", mint)
+        _cur = self._mark_inflight(op_id, "sell", mint, meta)
         if _cur is not None:
             return self._resolve_claim(op_id, _cur)
         try:

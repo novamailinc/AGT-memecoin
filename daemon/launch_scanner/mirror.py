@@ -1369,7 +1369,7 @@ def _hold_not_durable(pos, key, why="close_intent_not_durable", detail=None):
     _tries = int(_pe.get("tries") or 0) + 1 if _was else 1
     _pe.update({"leg": key, "why": why, "ts": time.time(), "tries": _tries,
                 "first_ts": _pe.get("first_ts") if _was else time.time(), "reason": _rs,
-                "risk_exit_blocked": bool(any(t in str(_rs) for t in ("stop", "f2", "unquotable", "backstop"))),
+                "risk_exit_blocked": bool(any(t in str(_rs) for t in ("stop", "f2", "unquotable", "backstop", "trail"))),
                 "operator_attention": _tries >= 3})
     if detail is not None:
         _pe["detail"] = detail
@@ -1379,18 +1379,23 @@ def _hold_not_durable(pos, key, why="close_intent_not_durable", detail=None):
         _pe["qualification_excluded"] = True
         _pe["resolution"] = "operator: reconcile the sale record against the fill journal; observed evidence is not rewritten to clear this hold"
     pos["pending_exit"] = _pe
+    _h = pos.setdefault("exit_hold_history", [])   # append-only provenance, carried into the close record
+    _h.append({"ts": _pe["ts"], "key": key, "why": why, "reason": _rs, "tries": _tries, "risk_exit_blocked": _pe["risk_exit_blocked"],
+               "qualification_excluded": bool(_pe.get("qualification_excluded"))})
+    del _h[:-50]
     if _pe["risk_exit_blocked"]:
         logger.error("RISK EXIT BLOCKED by close-intent storage failure: %s %s reason=%s tries=%d operator_attention=%s",
                      pos.get("mint"), key, _rs, _tries, _pe["operator_attention"])
 
 
 def _resume_pending_exit(pos):
-    """Poll-start journal reconciliation. A sale fill that is journaled under THIS position's deterministic exit op id while the leg is still open
-    is a landed sale the lane never settled (a close intent that was not durable, or a crash between the fill and the lane/account writes). It is
-    settled FIRST, before any price or trigger logic and whether or not the trigger still holds, from the journaled fill (its own record carries the
-    exit reason/kind). A position with NO journaled fill is never touched here: an unsold gate refusal does not force a sale.
-    None = nothing to resume; "held" = still not durable (or an inflight claim, never double-executed); "closed:<reason>" = all legs now done;
-    "resumed" = progressed, legs remain."""
+    """Poll-start journal reconciliation for THIS position generation. SCOPE: only a position with an account instance id (pa_pos_id) whose exit
+    executed through the quote sim; a position without them (no shared account, non-sim model exits) has no journaled sale and is never touched.
+    ALL exit records of the generation are enumerated by prefix (lane:exit:mint:..., ending in the instance id), so a record cannot hide behind a
+    candidate key. Unresolved evidence HOLDS the position visibly and no trigger is evaluated: an unreadable journal, an inflight or UNKNOWN
+    record, an unrecognised key, a partially booked or drifted key (the remainder key must equal the CURRENT open legs), and more than one unbooked
+    filled record (overlap). Exactly one unbooked filled record is settled from the journal (its own record carries the exit reason and kind).
+    None = nothing to resume; "held"; "closed:<reason>" (all legs done); "resumed" (legs remain)."""
     if not pos.get("pa_pos_id") or (pos.get("execution") or {}).get("source") != "jupiter_quote_sim":
         return None
     _df = _demo_filler()
@@ -1399,43 +1404,66 @@ def _resume_pending_exit(pos):
     _open = [k for k in ("a", "b", "c") if not (pos["legs"].get(k) or {}).get("done")]
     if not _open:
         return None
-    _cands = [("remaining", "remaining:%s" % "".join(_open))] + [("leg", k) for k in _open]
-    for _kind, _key in _cands:
+    _pre = _exit_op(pos, "")[:-len(":%s" % pos["pa_pos_id"])]   # "<lane>:exit:<mint>:"
+    _suf = ":%s" % pos["pa_pos_id"]
+    def _hold(key, why, reason):
+        pos["_exit_meta"] = {"reason": reason or why, "key": key}
         try:
-            _rec = _df.get_fill(_exit_op(pos, _key))
-        except Exception:
-            # FAIL CLOSED: an unreadable fill journal cannot prove that no sale landed, so no other exit may be evaluated for this position
-            pos["_exit_meta"] = {"reason": "fill_journal_unreadable", "key": _key}
-            try:
-                _hold_not_durable(pos, _key, "unresolved_fill_journal")
-            finally:
-                pos.pop("_exit_meta", None)
-            return "held"
-        if not _rec:
+            _hold_not_durable(pos, key, why)
+        finally:
+            pos.pop("_exit_meta", None)
+        return "held"
+    try:
+        _recs = _df.fills_by_prefix(_pre, _suf)
+    except Exception:
+        return _hold("*", "unresolved_fill_journal", "fill_journal_unreadable")   # unknown evidence is never read as "no fill"
+    _cand = []
+    for _op, _rec in sorted(_recs.items()):
+        _key = _op[len(_pre):-len(_suf)]
+        _st = (_rec or {}).get("status")
+        _why_r = ((_rec or {}).get("intent") or {}).get("reason")
+        if _st in ("inflight", "unknown"):
+            return _hold(_key, "unresolved_inflight" if _st == "inflight" else "unresolved_unknown", _why_r)
+        if _st != "filled":
             continue
-        if _rec.get("status") == "inflight":
-            pos["_exit_meta"] = {"reason": "inflight_unresolved", "key": _key}
-            try:
-                _hold_not_durable(pos, _key, "unresolved_inflight")
-            finally:
-                pos.pop("_exit_meta", None)
-            return "held"
-        if _rec.get("status") != "filled":
-            continue
-        _it = _rec.get("intent") or {}
-        _reason = _it.get("reason") or "journaled_fill_resume"
-        _pk = _it.get("pkind")
-        if _kind == "leg":
-            _close_leg(pos, _key, float(_rec.get("price_usd") or 0.0), _reason, _pk)
-        else:
-            _close_remaining(pos, float(_rec.get("price_usd") or 0.0), _reason, _pk)
-        _pe2 = pos.get("pending_exit")
-        if isinstance(_pe2, dict) and _pe2.get("why") == "close_intent_not_durable":
-            return "held"
-        if all((v or {}).get("done") for v in pos["legs"].values()):
-            return "closed:%s" % _reason
-        return "resumed"
-    return None
+        _legs = list(_key[len("remaining:"):]) if _key.startswith("remaining:") else ([_key] if _key in ("a", "b", "c") else None)
+        if not _legs or any(l not in ("a", "b", "c") for l in _legs):
+            return _hold(_key, "unresolved_exit_key", _why_r)
+        _still = [l for l in _legs if l in _open]
+        if not _still:
+            continue   # every leg of this fill is already booked on the lane
+        if len(_still) != len(_legs) or (_key.startswith("remaining:") and sorted(_legs) != sorted(_open)):
+            return _hold(_key, "unresolved_key_drift", _why_r)   # partially booked, or the remainder no longer equals the open legs
+        _cand.append((_key, _legs, _rec))
+    if not _cand:
+        return None
+    if len(_cand) > 1:
+        return _hold(_cand[0][0], "unresolved_exit_overlap", ((_cand[0][2] or {}).get("intent") or {}).get("reason"))
+    _key, _legs, _rec = _cand[0]
+    _it = _rec.get("intent") or {}
+    _reason = _it.get("reason") or "journaled_fill_resume"
+    _pk = _it.get("pkind")
+    if _key.startswith("remaining:"):
+        _close_remaining(pos, float(_rec.get("price_usd") or 0.0), _reason, _pk)
+    else:
+        _close_leg(pos, _key, float(_rec.get("price_usd") or 0.0), _reason, _pk)
+    _pe2 = pos.get("pending_exit")
+    if isinstance(_pe2, dict) and _pe2.get("why") == "close_intent_not_durable":
+        return "held"
+    if all((v or {}).get("done") for v in pos["legs"].values()):
+        return "closed:%s" % _reason
+    return "resumed"
+
+
+def held_exits():
+    """READER: open positions whose exit is held on unresolved evidence ({mint: pending_exit}). The poll's own persisted write carries the state; this
+    is how an operator or a monitor reads it (operator_attention from the 3rd try, qualification_excluded, risk_exit_blocked)."""
+    try:
+        _ps = open_positions() or {}
+    except Exception:
+        return {}
+    return {m: dict(p["pending_exit"]) for m, p in _ps.items() if isinstance(p.get("pending_exit"), dict)
+            and (p["pending_exit"].get("operator_attention") or p["pending_exit"].get("qualification_excluded") or p["pending_exit"].get("risk_exit_blocked"))}
 
 
 def _append_close(closes, rec):
@@ -1492,6 +1520,10 @@ def _finalize(d, mint, pos, closed_reason):
     # the record and the verdict-ledger payload below.
     if pos.get("_f2"):
         rec["f2"] = dict(pos["_f2"])
+    _hh = list(pos.get("exit_hold_history") or [])
+    if _hh:   # the close record says it was held on unresolved evidence; such a close is excluded from any qualification
+        rec["exit_hold_history"] = _hh
+        rec["qualification_excluded"] = any(x.get("qualification_excluded") for x in _hh)
     d["closes"].append(rec)
     d["closes"] = d["closes"][-MAX_CLOSES:]
     del d["positions"][mint]

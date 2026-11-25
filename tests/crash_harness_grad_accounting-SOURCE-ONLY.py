@@ -10,12 +10,13 @@ Accounting kill windows (per sold leg n = 1 -> leg a, n = 2 -> leg b; each leg s
   W1 after_fill_journaled        : _demo_sell returned (DemoFiller journaled the fill), nothing credited
   W2 before_account_credit       : settle done, the account credit not yet called
   W3 after_account_credit        : the account credit APPLIED (receipt journaled), the lane has not booked the leg
-  W4 after_lane_leg_done_pre_write: leg marked done in memory, lane ledger not yet persisted (first _write after the credit)
+  W4 first_write_after_nth_credit : the FIRST lane _write after the nth credit returned True is cut off (whatever it would have persisted). Durably this may be the same
+                                    state as W3 if no lane write happens between the credit and that write; it is NOT claimed to be a distinct window
   W0 control (no exit).
 Oracle, in the FRESH process, in this order:
   RAW (read BEFORE any snapshot/heal; snapshot() and _load_locked heal on access): the lane ledger JSON, the DemoFiller fill file, the account journal entries
       (PA._journal_read). Facts per window are asserted: fills for the killed leg == 1; receipts for the killed leg == (0 for W1/W2, 1 for W3/W4);
-      the lane's leg.done is False in the persisted ledger for the killed leg.
+      the lane's leg.done is False in the persisted ledger for the killed leg. For n=2 the earlier leg a is asserted too: raw fill 1, receipt 1 (credited in the account), lane_done False (UNBOOKED in the lane), per the reviewer's reconciliation; leg b is not asserted before its window.
   REPLAY: poll_exits again (same prices) TWICE, then the final close. After replay and again after the second replay:
     E1 each leg: exactly ONE fill (qty == leg tokens) and exactly ONE credit receipt (qty == leg tokens, proceeds - fee == fill gross - fee within the
        technical tolerance used by the code); no second sale (fill count unchanged by replays).
@@ -134,7 +135,7 @@ VERIFY = BOOT + r'''
 cash0 = float(sys.argv[2]); mint = sys.argv[3]; pid = sys.argv[4]; window = sys.argv[5]; nth = int(sys.argv[6])
 TOL = lambda x: max(1e-6, 1e-4 * abs(float(x)))
 def legs_ops(): return {k: "%s:leg:%s:%s:%s" % (GR.LANE, k, mint, pid) for k in ("a", "b", "c")}
-def facts():
+def facts(with_cash=False):
     led = raw_ledger(); pos = (led.get("positions") or {}).get(mint) or {}
     fills = raw_fills(); cr, st = raw_credits(); ops = legs_ops()
     out = {"journal_status": st, "legs": {}}
@@ -146,28 +147,82 @@ def facts():
                           "fill_qty": (fills.get(fk) or {}).get("qty_tokens"), "fill_net": ((fills.get(fk) or {}).get("gross_usd") or 0) - ((fills.get(fk) or {}).get("fee_usd") or 0) if fk in fills else None,
                           "lane_done": bool(((pos.get("legs") or {}).get(k) or {}).get("done")), "lane_realized": ((pos.get("legs") or {}).get(k) or {}).get("realized_usd")}
     out["position_open"] = bool(pos); out["tokens"] = pos.get("tokens")
+    if with_cash: out["cash"] = PA.snapshot()["cash"]    # snapshot heals: only called AFTER the raw pre-heal capture
     return out
 rawpre = facts()                       # RAW, before ANY snapshot/heal
-sell_ab(); mid1 = facts()
-sell_ab(); mid2 = facts()
-finish(); end = facts()
+sell_ab(); mid1 = facts(True)
+sell_ab(); mid2 = facts(True)
+finish(); end = facts(True)
+sell_ab(); finish(); post = facts(True)      # extra replays AFTER the position is closed
 snap = PA.snapshot(); gl = (snap["lanes"].get("grad") or {"positions": [], "open_basis": 0.0})
-print(json.dumps({"rawpre": rawpre, "after_replay1": mid1, "after_replay2": mid2, "end": end, "cash_end": snap["cash"], "cash0": cash0,
+print(json.dumps({"rawpre": rawpre, "after_replay1": mid1, "after_replay2": mid2, "end": end, "postclose": post, "cash_end": snap["cash"], "cash0": cash0,
                   "acct_open": len(gl["positions"]), "acct_basis": gl["open_basis"], "degraded": snap.get("degraded")}, default=str))
 '''
-def py(code, *args, timeout=90):
+import time, signal
+BUDGET_S = 100.0          # WHOLE-harness budget, below the 120 s wrapper limit; each child gets min(60, remaining); early stop when exhausted
+_T0 = time.time(); _STOP = {"why": None}
+def _remaining(): return BUDGET_S - (time.time() - _T0)
+def py(code, *args, timeout=60):
+    """Bounded child: own process group, killed (whole group) and reaped on timeout or any exception; never left running. The children start no descendants."""
+    rem = _remaining()
+    if rem <= 1.0:
+        _STOP["why"] = "budget_exhausted"; raise TimeoutError("harness budget exhausted")
     env = dict(os.environ, AGT_REPO_ROOT=REPO)
-    return subprocess.run([sys.executable, "-c", code] + [str(a) for a in args], capture_output=True, text=True, timeout=timeout, env=env)
+    p = subprocess.Popen([sys.executable, "-c", code] + [str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, process_group=0)
+    try:
+        out, err = p.communicate(timeout=min(timeout, rem))
+    except BaseException:
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except Exception: pass
+        try: p.wait(timeout=5)
+        except Exception: pass
+        _STOP["why"] = "child_timeout_or_error"; raise
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
 # fixture closed-form economics (copied from tests/test_grad_fixtures_remaining.py; same Q/PX1/FEE; A,B sold at 3x, C at 2x)
 Q = 998.5; FEE = 15000 / 1e9 * 100.0; PX1 = 1e-5 * 100.0
 def leg(frac, m): return frac * Q * PX1 * m - FEE
 TOTAL = leg(0.5, 3) + leg(0.25, 3) + leg(0.25, 2)
 
+def evaluate(j, tag, window, nth):
+    """PURE oracle over a captured verify result `j` (no I/O). Returns [(name, ok)]. Also used by --selfcheck negative controls on mutated captures."""
+    R = []
+    k = "ab"[nth - 1]; raw = j["rawpre"]["legs"][k]
+    if window != "W0":
+        want_receipts = 1 if window in ("W3", "W4") else 0
+        R.append(("%s RAW pre-heal: killed leg has exactly 1 journaled fill (%s)" % (tag, raw["fills"]), raw["fills"] == 1))
+        R.append(("%s RAW pre-heal: account receipts for the killed leg == %d (got %d)" % (tag, want_receipts, raw["receipts"]), raw["receipts"] == want_receipts))
+        R.append(("%s RAW pre-heal: lane leg not done in the persisted ledger" % tag, raw["lane_done"] is False))
+    for stage in ("after_replay1", "after_replay2", "end"):
+        L = j[stage]["legs"]
+        for lk in ("a", "b"):
+            lg = L[lk]
+            ok = (lg["fills"] == 1 and lg["receipts"] == 1 and len(lg["receipt_qty"]) == 1 and lg["fill_qty"] is not None
+                  and abs(float(lg["receipt_qty"][0]) - float(lg["fill_qty"])) <= max(1e-9, 1e-6 * float(lg["fill_qty"]))
+                  and abs(lg["receipt_net"][0] - lg["fill_net"]) <= TOL(lg["fill_net"]))
+            R.append(("%s %s leg %s: exactly one fill and one receipt, qty equal to fill qty, net within tolerance" % (tag, stage, lk), ok))
+    if nth == 2 and window != "W0":
+        ra = j["rawpre"]["legs"]["a"]
+        R.append(("%s RAW pre-heal n=2: leg a fill 1, receipt 1, lane_done False (credited, UNBOOKED; got %s/%s/%s)" % (tag, ra["fills"], ra["receipts"], ra["lane_done"]),
+                  ra["fills"] == 1 and ra["receipts"] == 1 and ra["lane_done"] is False))
+    R.append(("%s E4b cash invariant replay1 -> replay2 (%.6f -> %.6f)" % (tag, j["after_replay1"]["cash"], j["after_replay2"]["cash"]), abs(j["after_replay1"]["cash"] - j["after_replay2"]["cash"]) < 1e-9))
+    pc, en = j["postclose"], j["end"]
+    R.append(("%s E5 post-close replays: zero fill/receipt/cash delta" % tag,
+              abs(pc["cash"] - en["cash"]) < 1e-9 and all(pc["legs"][x]["fills"] == en["legs"][x]["fills"] and pc["legs"][x]["receipts"] == en["legs"][x]["receipts"] for x in "abc") and pc["position_open"] is False))
+    a1, a2 = j["after_replay1"]["legs"], j["after_replay2"]["legs"]
+    R.append(("%s E4 second replay changes no fill/receipt counts" % tag, all(a1[x]["fills"] == a2[x]["fills"] and a1[x]["receipts"] == a2[x]["receipts"] for x in "ab")))
+    E = j["end"]["legs"]; net_r = sum(sum(E[x]["receipt_net"]) for x in "abc")
+    R.append(("%s E2 cash delta %.6f == journal receipt net %.6f == closed-form TOTAL %.6f" % (tag, j["cash_end"] - j["cash0"], net_r, TOTAL),
+              abs((j["cash_end"] - j["cash0"]) - net_r) < 1e-5 and abs(net_r - TOTAL) < 1e-2))
+    R.append(("%s E3 position closed (open=%s), account lane consumed (open %s, basis %s), not degraded (%s)" % (tag, j["end"]["position_open"], j["acct_open"], j["acct_basis"], j["degraded"]),
+              not j["end"]["position_open"] and j["acct_open"] == 0 and abs(float(j["acct_basis"])) < 1e-9 and not j["degraded"]))
+    return R
+TOL = lambda x: max(1e-6, 1e-4 * abs(float(x)))
+
 def scenario(window, nth):
     tag = "%s/leg%d" % (window, nth)
     home = tempfile.mkdtemp(prefix="gacct_")
-    s = py(SETUP, home); 
+    s = py(SETUP, home)
     try: sj = json.loads(s.stdout.strip().splitlines()[-1])
     except Exception: print(s.stdout, s.stderr); check("%s setup produced an open position" % tag, False); return
     check("%s setup opened exactly one grad position (%s)" % (tag, sj.get("why")), sj.get("ok") and sj.get("n_pos") == 1)
@@ -177,31 +232,62 @@ def scenario(window, nth):
     v = py(VERIFY, home, sj["cash0"], sj["mint"], sj["pa_pos_id"], window, nth)
     try: j = json.loads(v.stdout.strip().splitlines()[-1])
     except Exception: print(v.stdout, v.stderr); check("%s verify produced a result" % tag, False); return
-    k = "ab"[nth - 1]; raw = j["rawpre"]["legs"][k]
-    if window != "W0":
-        want_receipts = 1 if window in ("W3", "W4") else 0
-        check("%s RAW pre-heal: killed leg has exactly 1 journaled fill (%s)" % (tag, raw["fills"]), raw["fills"] == 1)
-        check("%s RAW pre-heal: account receipts for the killed leg == %d (got %d)" % (tag, want_receipts, raw["receipts"]), raw["receipts"] == want_receipts)
-        check("%s RAW pre-heal: lane leg not done in the persisted ledger" % tag, raw["lane_done"] is False)
-    for stage in ("after_replay1", "after_replay2", "end"):
-        L = j[stage]["legs"]
-        for lk in ("a", "b"):
-            lg = L[lk]
-            check("%s %s leg %s: exactly one fill and one receipt, qty equal to fill qty, net within tolerance" % (tag, stage, lk),
-                  lg["fills"] == 1 and lg["receipts"] == 1 and abs(float(lg["receipt_qty"][0]) - float(lg["fill_qty"])) <= max(1e-9, 1e-6 * float(lg["fill_qty"]))
-                  and abs(lg["receipt_net"][0] - lg["fill_net"]) <= TOL(lg["fill_net"]))
-    a1, a2 = j["after_replay1"]["legs"], j["after_replay2"]["legs"]
-    check("%s E4 second replay changes no fill/receipt counts" % tag, all(a1[x]["fills"] == a2[x]["fills"] and a1[x]["receipts"] == a2[x]["receipts"] for x in "ab"))
-    E = j["end"]["legs"]; net_r = sum(sum(E[x]["receipt_net"]) for x in "abc")
-    check("%s E2 cash delta %.6f == journal receipt net %.6f == closed-form TOTAL %.6f" % (tag, j["cash_end"] - j["cash0"], net_r, TOTAL),
-          abs((j["cash_end"] - j["cash0"]) - net_r) < 1e-5 and abs(net_r - TOTAL) < 1e-2)
-    check("%s E3 position closed (open=%s), account lane consumed (open %s, basis %s), not degraded (%s)" % (tag, j["end"]["position_open"], j["acct_open"], j["acct_basis"], j["degraded"]),
-          not j["end"]["position_open"] and j["acct_open"] == 0 and abs(float(j["acct_basis"])) < 1e-9 and not j["degraded"])
+    print("RECORDED (not asserted) other-leg raw state %s: %s" % (tag, json.dumps(j["rawpre"]["legs"])))
+    for n, ok in evaluate(j, tag, window, nth): check(n, ok)
+
+def _good(window="W3", nth=1):
+    """Synthetic CAPTURE shaped exactly like a verify result and consistent with the oracle (no engine involved). Only the evaluator is exercised."""
+    def lg(done, rc, fills=1):
+        return {"fills": fills, "receipts": rc, "receipt_qty": [100.0] * rc, "receipt_net": [10.0] * rc, "fill_qty": 100.0, "fill_net": 10.0, "lane_done": done, "lane_realized": None}
+    full = {"a": lg(True, 1), "b": lg(True, 1), "c": lg(True, 1)}
+    for x in "abc": full[x]["receipt_net"] = [leg_n[x]]
+    raw = {"a": lg(False, 1 if window in ("W3", "W4") else 0), "b": lg(False, 0), "c": lg(False, 0)}
+    if nth == 2: raw["a"] = lg(False, 1); raw["b"] = lg(False, 1 if window in ("W3", "W4") else 0)
+    st = lambda: {"legs": json.loads(json.dumps(full)), "position_open": False, "cash": 10.0 + TOTAL}
+    return {"rawpre": {"legs": raw}, "after_replay1": st(), "after_replay2": st(), "end": st(), "postclose": st(), "cash0": 10.0, "cash_end": 10.0 + TOTAL, "acct_open": 0, "acct_basis": 0.0, "degraded": None}
+leg_n = {"a": leg(0.5, 3), "b": leg(0.25, 3), "c": leg(0.25, 2)}
+def _fix_fill_nets(j):
+    for st in ("after_replay1", "after_replay2", "end"):
+        for x in "abc": j[st]["legs"][x]["fill_net"] = j[st]["legs"][x]["receipt_net"][0] if j[st]["legs"][x]["receipt_net"] else 10.0
+    return j
+
+def selfcheck():
+    """NO child process: the evaluator alone. A good capture must pass; each MUTATION of one captured fact must make at least one assertion FAIL (oracle-negative controls)."""
+    import copy
+    g = _fix_fill_nets(_good("W3", 1)); base = evaluate(g, "ctl", "W3", 1)
+    check("CTL0 unmutated synthetic capture passes the evaluator", all(ok for _, ok in base))
+    def mut(name, fn, window="W3", nth=1):
+        j = _fix_fill_nets(_good(window, nth)); fn(j); r = evaluate(j, "ctl", window, nth)
+        check("CTL %s: evaluator REJECTS the altered capture (%d failing assertions)" % (name, sum(1 for _, ok in r if not ok)), any(not ok for _, ok in r))
+    mut("duplicate receipt after replay1 (double credit)", lambda j: j["after_replay1"]["legs"]["a"].update(receipts=2, receipt_qty=[100.0, 100.0], receipt_net=[10.0, 10.0]))
+    mut("second fill for a leg (double sale)", lambda j: j["end"]["legs"]["b"].update(fills=2))
+    mut("receipt qty differs from fill qty", lambda j: j["end"]["legs"]["a"].update(receipt_qty=[99.0]))
+    mut("receipt net differs from fill net", lambda j: j["end"]["legs"]["b"].update(fill_net=j["end"]["legs"]["b"]["receipt_net"][0] + 0.5))
+    mut("cash off by one cent after close", lambda j: j.update(cash_end=j["cash_end"] + 0.02))
+    mut("cash off from receipts (lane/credit mismatch)", lambda j: j["end"]["legs"]["c"].update(receipt_net=[j["end"]["legs"]["c"]["receipt_net"][0] + 0.5], fill_net=j["end"]["legs"]["c"]["receipt_net"][0] + 0.5))
+    mut("receipt missing for a leg (credit lost)", lambda j: j["end"]["legs"]["a"].update(receipts=0, receipt_qty=[], receipt_net=[]))
+    mut("replay2 changes the receipt count", lambda j: j["after_replay2"]["legs"]["a"].update(receipts=2, receipt_qty=[100.0, 100.0], receipt_net=[10.0, 10.0]))
+    mut("killed leg already done in the persisted ledger (raw)", lambda j: j["rawpre"]["legs"]["a"].update(lane_done=True))
+    mut("killed leg has no journaled fill (raw)", lambda j: j["rawpre"]["legs"]["a"].update(fills=0))
+    mut("W3 raw receipt count wrong (raw)", lambda j: j["rawpre"]["legs"]["a"].update(receipts=0))
+    mut("position still open at end", lambda j: j["end"].update(position_open=True))
+    mut("account lane not consumed", lambda j: j.update(acct_open=1))
+    mut("account degraded", lambda j: j.update(degraded="x"))
+    mut("n=2 leg a raw: lane already booked it", lambda j: j["rawpre"]["legs"]["a"].update(lane_done=True), window="W3", nth=2)
+    mut("n=2 leg a raw: receipt missing", lambda j: j["rawpre"]["legs"]["a"].update(receipts=0), window="W3", nth=2)
+    mut("cash moves between replay1 and replay2", lambda j: j["after_replay2"].update(cash=j["after_replay2"]["cash"] + 0.01))
+    mut("post-close replay moves cash", lambda j: j["postclose"].update(cash=j["postclose"]["cash"] + 0.01))
+    mut("post-close replay adds a receipt", lambda j: j["postclose"]["legs"]["c"].update(receipts=2))
+    mut("post-close replay reopens the position", lambda j: j["postclose"].update(position_open=True))
+    mut("W1 raw state claims a receipt exists", lambda j: j["rawpre"]["legs"]["a"].update(receipts=1), window="W1")
+    print("FAILS: %d" % len(FAILS)); return 1 if FAILS else 0
 
 def main():
     scenario("W0", 1)
     for w in ("W1", "W2", "W3", "W4"):
-        for n in (1, 2): scenario(w, n)
-    print("FAILS: %d" % len(FAILS)); return 1 if FAILS else 0
+        for n in (1, 2):
+            if FAILS or _STOP["why"]: print("EARLY STOP before %s/leg%d (fails=%d, stop=%s)" % (w, n, len(FAILS), _STOP["why"])); break
+            scenario(w, n)
+    print("elapsed %.1fs of %.0fs budget; FAILS: %d; stop=%s" % (time.time() - _T0, BUDGET_S, len(FAILS), _STOP["why"])); return 1 if (FAILS or _STOP["why"]) else 0
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(selfcheck() if "--selfcheck" in sys.argv else main())

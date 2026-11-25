@@ -335,8 +335,16 @@ def test_shadow_fusion_exception_is_ignored(tmp_path):
 
 
 def test_parse_streams():
-    streams, errors = rt.parse_streams("a=Addr1,b=Addr2")
+    # Valid specs need a 32-44 char alphanumeric address (StreamSpec).
+    addr_b = ADDR.replace("1", "2")
+    assert addr_b != ADDR and 32 <= len(ADDR) <= 44 and ADDR.isalnum()
+    streams, errors = rt.parse_streams("a=%s,b=%s" % (ADDR, addr_b))
     assert [s.key for s in streams] == ["a", "b"] and not errors
+    assert [s.address for s in streams] == [ADDR, addr_b]
+    # Negative: a short or non-alphanumeric address is reported, never kept.
+    streams, errors = rt.parse_streams("a=Addr1,b=%s,c=bad-%s" % (ADDR, ADDR))
+    assert [s.key for s in streams] == ["b"]
+    assert errors == ["bad_stream_spec:a", "bad_stream_spec:c"]
     streams, errors = rt.parse_streams("")
     assert streams == []
 

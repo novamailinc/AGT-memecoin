@@ -64,6 +64,24 @@ def main():
     ex = SimulationExecutor(jupiter=FJ({"outAmount": "2000000", "priceImpactPct": "0.004"}), book=BalanceBook(10**9), seed=7)
     res = ex.execute_swap(sim_executor.SOL_MINT, "TokenMint1111111111111111111111111111111111", 10**7)
     check("result carries price_impact_pct in percent and the derived ratio", abs(res["price_impact_pct"] - 0.4) < 1e-9 and abs(res["price_impact_ratio"] - 0.004) < 1e-12, repr((res.get("price_impact_pct"), res.get("price_impact_ratio"))))
+    check("result carries the unit stamp percent_v2", res.get("price_impact_unit") == "percent_v2", res.get("price_impact_unit"))
+    # evaluator: unit-stamped vs legacy records (engineering fixtures; trades are hand-built, not market evidence)
+    from core.qualification_evaluator import execution_quality
+    def tr(i, pct, unit):
+        t = {"id": i, "decision_ts": 0.0, "entry_ts": 1.0, "exit_ts": 2.0, "quote_entry_price": 1.0, "fill_entry_price": 1.0,
+             "quote_exit_price": 1.0, "fill_exit_price": 1.0, "price_impact_pct": pct}
+        if unit: t["price_impact_unit"] = unit
+        return t
+    eq = execution_quality([tr(1, 0.4, "percent_v2"), tr(2, 1.2, "percent_v2")], [])
+    check("evaluator: stamped trades mean/max in percent, zero legacy", abs(eq["price_impact_pct_mean"] - 0.8) < 1e-9 and eq["price_impact_pct_max"] == 1.2 and eq["price_impact_legacy_unit_trades"] == 0, eq)
+    eq = execution_quality([tr(1, 0.004, None), tr(2, 0.01, None)], [])
+    check("evaluator: all-legacy (unstamped ratio) records excluded, never read as percent; mean/max None, legacy=2", eq["price_impact_pct_mean"] is None and eq["price_impact_pct_max"] is None and eq["price_impact_legacy_unit_trades"] == 2, eq)
+    eq = execution_quality([tr(1, 0.004, None), tr(2, 0.4, "percent_v2")], [])
+    check("evaluator: mixed records use only the stamped one (0.4), legacy=1", eq["price_impact_pct_mean"] == 0.4 and eq["price_impact_pct_max"] == 0.4 and eq["price_impact_legacy_unit_trades"] == 1, eq)
+    eq = execution_quality([tr(1, 0.4, "ratio_v1")], [])
+    check("evaluator: unknown unit string is treated as legacy", eq["price_impact_pct_mean"] is None and eq["price_impact_legacy_unit_trades"] == 1, eq)
+    eq = execution_quality([], [])
+    check("evaluator: empty trade list does not raise", eq["price_impact_pct_max"] is None and eq["price_impact_legacy_unit_trades"] == 0, eq)
     print("FAILS: %d" % FAILS)
     return 1 if FAILS else 0
 

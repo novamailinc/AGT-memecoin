@@ -195,7 +195,7 @@ def main():
     eng._paper_account = _boom; T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
     eng._paper_account = real_pa
-    check("2 injected account fault: no buyback, lane record unchanged, no lane-only path", done == [] and lanepos() == lp0 and has_log("shared paper account unavailable") and not has_log("ADOPTING"), repr((done, LOGS[-3:])))
+    check("2 injected account fault: no buyback, lane record unchanged, no lane-only path", done == [] and lanepos() == lp0 and has_log("INJECTED FAULT: account unavailable") and has_log("failed:") and not has_log("ADOPTING") and not has_log("buyback blocked fail-closed"), repr((done, LOGS[-3:])))
     # (3) CRASH ADOPTION: the real account applied the add (engineering numbers, labelled) but the lane book was never written
     cost, bought = 1.0, 40000.0
     bop = "%s:buyback:%s:%s" % (eng.LANE, mint, pid)

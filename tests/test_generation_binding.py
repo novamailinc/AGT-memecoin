@@ -142,8 +142,11 @@ ok4d, why4d = PA.credit(LANE, "MINTF", 9.9, "gb:exit:F1", pos_id=pidF, qty=100.0
 check("F4d same-op retry with DIFFERENT proceeds is refused (%s)" % why4d, (not ok4d) and "parameter conflict" in why4d)
 ok4e, why4e = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=50.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
 check("F4e same-op retry with a DIFFERENT qty is refused (%s)" % why4e, not ok4e)
-ok3, why3 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id="wrong#9", qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
-check("F5 REAL binding but a DIFFERENT pos_id on the same op_id is refused for the pos_id (%s)" % why3, (not ok3) and "differs from the settled pos_id" in why3)
+ok3, why3 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F5", pos_id="wrong#9", qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")   # NEW op id: reaches the generation guard, not the retry contract
+check("F5 REAL binding, NEW op, a DIFFERENT pos_id than the proven entry op is refused for the pos_id (%s)" % why3, (not ok3) and "differs from the settled pos_id" in why3)
+_ledF5 = _bytes(PA.LEDGER_PATH)
+ok3b, why3b = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id="wrong#9", qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")   # EXISTING op: retry contract
+check("F5b EXISTING op retried under a wrong pos_id is refused by the retry contract, ledger unchanged (%s)" % why3b, (not ok3b) and "pos_id" in why3b and _bytes(PA.LEDGER_PATH) == _ledF5)
 
 # ---- G: mixed-generation replay (G2): journal has a bound credit, a restored OLDER ledger replays it
 _use(os.path.join(_home, "G"))
@@ -227,7 +230,9 @@ _lines = open(PA.JOURNAL_PATH).read().splitlines(keepends=True)
 with open(PA.JOURNAL_PATH, "w") as _f: _f.writelines(_lines[:-1] + ["{torn mid-file record\n"] + _lines[-1:])
 _jb = _bytes(PA.JOURNAL_PATH); _lb = _bytes(PA.LEDGER_PATH)
 okT2, whyT2 = PA.credit(LANE, "MINTT2", 1.1, "gb:exit:T2", pos_id=pidT2, qty=100.0, expected_account_id=bindT2, entry_op_id="gb:entry:T2")
-check("T2 NEGATIVE: MID-FILE corruption is never accepted, the retry is NOT an ack (%s)" % whyT2, (not okT2) and _bytes(PA.LEDGER_PATH) == _lb)
+_snT = PA.snapshot() or {}
+check("T2 NEGATIVE: MID-FILE corruption is never accepted: retry NOT an ack, ledger bytes unchanged, account degraded for the TORN journal (%s | %s)" % (whyT2, str(_snT.get("degraded"))[:80]),
+      (not okT2) and _bytes(PA.LEDGER_PATH) == _lb and "journal torn" in str(_snT.get("degraded")) and ("degraded" in whyT2 or "torn" in whyT2))
 check("T3 mid-file corruption leaves the journal bytes unchanged apart from a journaled degraded/refusal record (no truncation)", _bytes(PA.JOURNAL_PATH).startswith(_jb))
 
 # ---- N1: shadow restore (live ledger unreadable, .bak loaded) still stamps the generation on non-debit/credit mutation records

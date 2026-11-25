@@ -328,6 +328,11 @@ check("S1 conservation: account cash delta == sum(sim sell nets) - entry stake -
       abs((c_end - 100.0) - (_nets - 1.0 - f["total_debit_usd"])) < 1e-5)
 check("S1 conservation: lane pnl_usd == the account's cash delta (%.6f vs %.6f)" % (rec.get("pnl_usd", 0), c_end - 100.0),
       abs(rec.get("pnl_usd", 1e9) - (c_end - 100.0)) < 1e-4)
+check("S1 balance (tight): cash delta == lane realized_usd(6dp) - entry stake 1.0 (%.6f vs %.6f), and == journal nets - entry - buyback stake, both within 2e-6 (the 4dp pnl_usd above is a rounded field)"
+      % (c_end - 100.0, rec.get("realized_usd", 0) - 1.0),
+      abs((c_end - 100.0) - (rec.get("realized_usd", 1e9) - 1.0)) < 2e-6 and abs((c_end - 100.0) - (_nets - 1.0 - f["total_debit_usd"])) < 2e-6)
+check("S1 recorded buyback price is the FILL's price_usd (%r vs %r), source fill_price_usd" % (ef.get("price"), f["price_usd"]),
+      abs(float(ef.get("price") or -1) - float(f["price_usd"])) < 1e-15 and ef.get("price_source") == "fill_price_usd")
 dump("S1-end", mint, pid, "c_pre=%r c_end=%r nets=%r sell_qty=%r" % (c_pre, c_end, _nets, _sold_qty))
 from daemon.launch_scanner import close_intents as _CI
 check("S1 no close intent left open (the account settle applied)", _CI.pending("grad") == [])
@@ -406,6 +411,8 @@ dump("S5", mint, pid)
 check("S5 evidence RECOVERED from the journal via the lane intent (fill_evidence recovered, provenance with percent_v2 stamp, fill op)",
       ef.get("adopted_from_account") is True and ef.get("fill_evidence") == "recovered" and ef.get("fill_op") == list(fl.keys())[0]
       and (ef.get("provenance") or {}).get("price_impact_unit") == "percent_v2")
+check("S5 recovered adoption records the RECOVERED fill's price_usd, not the model price (%r vs fill %r)" % (ef.get("price"), f["price_usd"]),
+      abs(float(ef.get("price") or -1) - float(f["price_usd"])) < 1e-15 and ef.get("price_source") == "fill_price_usd")
 _bbq = sum(float(v.get("buyback_qty") or 0.0) for v in lp["legs"].values())
 check("S5 lane units equal the account add (legs %.6f)" % _bbq, abs(_bbq - ad["qty"]) < 1e-9 and lp.get("buyback_used") is True)
 
@@ -425,6 +432,8 @@ out = run_bb(mint, entry * 1.3); ef = (lane_pos(mint).get("entry_features") or {
 dump("S6", mint, pid)
 check("S6 adoption without evidence: booked from the account's numbers, fill_evidence says fill_missing, NO provenance claimed",
       len(out) == 1 and ef.get("adopted_from_account") is True and ef.get("fill_evidence") == "fill_missing" and "provenance" not in ef)
+check("S6 adoption without evidence records NO execution price (None, source named), never the model price (%r / %r)" % (ef.get("price"), ef.get("price_source")),
+      ef.get("price") is None and ef.get("price_source") == "unavailable_adopted_without_fill_evidence")
 
 # ---- S7: position that is not a quote-sim position stays refused (the interim always-refuse gate) ----
 mint = "BB7pump"
@@ -475,9 +484,11 @@ lp = lane_pos(mint); bq = lp.get("buyback_qty_total")
 JUP.mult = 0.05
 _real_credit = _PAm.credit
 _ncred = [0]
+_credit_ops = []
 def _credit_refuse(*a, **k):
     if str(a[3] if len(a) > 3 else k.get("op_id")).startswith("grad:close:"):
         _ncred[0] += 1
+        _credit_ops.append((str(a[3] if len(a) > 3 else k.get("op_id")), a[2] if len(a) > 2 else k.get("proceeds")))
         return (False, "declined (test)")
     return _real_credit(*a, **k)
 def _sells(m):
@@ -495,7 +506,10 @@ check("S10 refused settle: no close record for it", not [c for c in (G._read().g
 check("S10 no resale on retry (sell fills %d -> %d, legs all done)" % (s_a, s_b), s_a == s_b and s_a >= 2 and all(v.get("done") for v in lp["legs"].values()))
 check("S10 lane bankroll not advanced by the unsettled close (%r vs %r) and account cash unchanged (%r)" % (br_a, br_b, cash_a), br_a == br_b and abs(PA_cash() - cash_a) < 1e-12)
 check("S10 exactly ONE open close intent despite repeated refused retries (tries %r)" % sp.get("tries"), len(_CI.pending("grad")) == 1 and int(sp.get("tries") or 0) >= 2)
-check("S10 stable credit op: the refused op id is the same each retry (refusals %d)" % _ncred[0], _ncred[0] >= 2)
+_s10_ops = [o for o in _credit_ops if (":%s:" % mint) in o[0]]
+check("S10 stable credit op: ACTUAL refused op ids collected (%d refusals, distinct ids %r) are identical, carry this mint and pos id, amounts equal (%r)"
+      % (len(_s10_ops), sorted({o[0] for o in _s10_ops}), sorted({o[1] for o in _s10_ops})),
+      len(_s10_ops) >= 2 and len({o[0] for o in _s10_ops}) == 1 and len({o[1] for o in _s10_ops}) == 1 and pid in _s10_ops[0][0])
 dump("S10-pending", mint, pid)
 for _ in range(3):
     G.poll_exits(price_fn=prices([entry * 0.05]))
@@ -581,6 +595,16 @@ check("S13 pending refusal survives a restart: still OPEN, settlement_pending, n
       % (br0, G._read()["bankroll"], len(_rec_exits(mint)) - ex0, vc0, len(_verdict_closes(mint))),
       mint in G.open_positions() and bool(lp.get("settlement_pending")) and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
       and G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0 and len(_verdict_closes(mint)) == vc0)
+_ev13 = [e for e in _CI._read(_CI.journal_path("grad"))[0] if (e.get("mint") == mint and e.get("ev") == "intent") or e.get("ev") == "frozen"]
+_seen_frozen = set(); _reuse = 0
+for e in _CI._read(_CI.journal_path("grad"))[0]:
+    if e.get("ev") == "frozen":
+        _seen_frozen.add(e.get("intent_id"))
+    elif e.get("ev") == "intent" and e.get("intent_id") in _seen_frozen:
+        _reuse += 1
+_i13 = [e.get("intent_id") for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("mint") == mint]
+check("S13 no intent id is re-begun after it was frozen (re-used-after-frozen events: %d; intent events for this mint %d, distinct ids %d)" % (_reuse, len(_i13), len(set(_i13))),
+      _reuse == 0 and len(_i13) == len(set(_i13)))
 check("S13 restart re-drive of the refused op FROZE its intent visibly (frozen event present, never applied, amount untouched)",
       any(e.get("ev") == "frozen" for e in _e13) and not any(e.get("ev") in ("applied", "account_applied") for e in _e13))
 JUP.mult = 1.0
@@ -593,12 +617,15 @@ br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint))
 with patch.object(_PAm, "credit", _credit_refuse):
     for _ in range(3):
         G.poll_exits(price_fn=prices([entry * 0.05]))
-check("S10b during the refusal: no bankroll, recorder exit or verdict effect", G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0)
+vc14 = len(_verdict_closes(mint))
+check("S10b during the refusal: no bankroll, recorder exit or verdict effect", G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0 and vc14 == 0)
 for _ in range(3):
     G.poll_exits(price_fn=prices([entry * 0.05]))
 rec = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
 check("S10b after the settle: bankroll advanced by realized EXACTLY once (%r -> %r, realized %r), ONE recorder exit (%d)" % (br0, G._read()["bankroll"], rec[0].get("realized_usd") if rec else None, len(_rec_exits(mint)) - ex0),
       len(rec) == 1 and abs(G._read()["bankroll"] - (br0 + rec[0]["realized_usd"])) < 1e-6 and len(_rec_exits(mint)) - ex0 == 1)
+check("S10b verdict POSITIVE control: the settled close wrote exactly ONE verdict close event for the mint (was %d, now %d); the refused phases wrote none (negative checks above are therefore sensitive)" % (vc14, len(_verdict_closes(mint))),
+      len(_verdict_closes(mint)) - vc14 == 1)
 JUP.mult = 1.0
 
 os.environ.pop("AGT_EXECUTION_MODE", None)

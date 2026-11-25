@@ -1206,6 +1206,15 @@ def maybe_buyback(engine, now=None):
                             pass
                     else:
                         logger.error("tranche buyback ADOPTED without fill evidence (%s): account numbers kept, provenance unavailable", _evs)
+                # The recorded price is the FILL's own price_usd (fresh path: `filled`; adoption: the recovered fill's, set above). An
+                # adoption WITHOUT fill evidence has no known execution price (the model price is not what executed): record that explicitly
+                # instead of the model value. Nothing in the repo reads this field (checked), so it is provenance only.
+                if _adopting and _bb_fill is None:
+                    ef["buyback"]["price"] = None
+                    ef["buyback"]["price_source"] = "unavailable_adopted_without_fill_evidence"
+                else:
+                    ef["buyback"]["price"] = filled
+                    ef["buyback"]["price_source"] = "fill_price_usd"
                 if _bb_fill is not None:
                     ef["buyback"].update({"execution_source": _bb_fill.get("execution_source"), "fill_op": _fop,
                                           "fee_usd": _bb_fill.get("fee_usd"), "signature": _bb_fill.get("signature"),

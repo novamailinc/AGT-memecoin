@@ -68,6 +68,7 @@ try:
     from daemon import grad_trader_cycle as _gtc
 except Exception:
     _gtc = None
+_FLAG_ON = os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1"
 
 POLL_SECS = 5
 GT_BACKFILL_EVERY_S = 60
@@ -87,8 +88,11 @@ def main():
     state = engine.ensure_ledger()
     # BEFORE any thread (feed, armed watcher, exit poller, entry loop) can call poll_exits; no ledger I/O. No-op unless AGT_GRAD_CYCLE_ENABLED=1.
     if _gtc is not None:
-        _gtc.register(engine)
-        logger.warning("grad-raw cycle hooks: %s", _gtc.startup_report(engine))
+        if not _gtc.register(engine):
+            logger.error("grad-raw cycle hook registration FAILED: entries are refused while AGT_GRAD_CYCLE_ENABLED=1 (exits continue)")
+        logger.warning("grad-raw cycle wiring: %s", _gtc.startup_report(engine))
+    elif _FLAG_ON:
+        logger.error("grad-raw cycle flag on but grad_trader_cycle could not be imported: NO ENTRIES (exits only)")
     # Materialize the killswitch lane entry (not halted) so the lane
     # is visible in killswitch status from day one.
     try:
@@ -179,8 +183,22 @@ def main():
             try:
                 q = getattr(feed, "_q", None)
                 if q is not None and not q.empty():
-                    _raw.scan_once(engine, feed=feed, gt_rows=None,
-                                   on_items=_observe, fresh_only=True)
+                    def _fresh():
+                        return _raw.scan_once(
+                            engine, feed=feed, gt_rows=None,
+                            on_items=_observe, fresh_only=True)
+                    if _gtc is None:
+                        if _FLAG_ON:
+                            # flag on, wiring module missing: NEVER scan ungated
+                            logger.warning("grad-raw entries refused: cycle flag on, wiring missing")
+                            time.sleep(1.0)
+                            continue
+                        _fresh()
+                    else:
+                        _ran, _why, _r = _gtc.entry_scan(engine, _fresh)
+                        if not _ran:
+                            logger.warning("grad-raw entry scan skipped: %s", _why)
+                            time.sleep(0.2)
                 else:
                     time.sleep(0.1)
             except Exception:
@@ -203,25 +221,45 @@ def main():
             if now - last_gt >= GT_BACKFILL_EVERY_S:
                 last_gt = now
                 gt_rows = engine.fetch_candidates(GT_BACKFILL_PAGES)
-            res = _raw.scan_once(engine, feed=feed, gt_rows=gt_rows,
-                                 on_items=_observe)
-            # Time-only exit FIRST: the 24h stop fires on the last
-            # known price with no price read at all, so it works
-            # even when every pricing source is down.
-            closes = engine.poll_time_exits() + engine.poll_exits(_armed_price_fn)
+            def _legacy():
+                # ORIGINAL order (scan, then time-only exit FIRST, then price exits), used whenever the cycle wiring is off.
+                r = _raw.scan_once(engine, feed=feed, gt_rows=gt_rows,
+                                   on_items=_observe)
+                # Time-only exit FIRST: the 24h stop fires on the last
+                # known price with no price read at all, so it works
+                # even when every pricing source is down.
+                c = engine.poll_time_exits() + engine.poll_exits(_armed_price_fn)
+                return r, len(c)
+            if _gtc is None and _FLAG_ON:
+                # flag on, wiring missing: exits only, no entries.
+                logger.warning("grad-raw entries refused: cycle flag on, wiring missing")
+                closes = (engine.poll_time_exits()
+                          + engine.poll_exits(_armed_price_fn))
+                res = {"stream": 0, "opened": 0}
+                n_closes = len(closes)
+            elif _gtc is None:
+                res, n_closes = _legacy()
+            else:
+                # EXITS FIRST when the flag is on (main_cycle); flag off: _legacy, the original order.
+                res, n_closes, _rec = _gtc.main_cycle(
+                    engine, _armed_price_fn,
+                    lambda: _raw.scan_once(engine, feed=feed,
+                                           gt_rows=gt_rows,
+                                           on_items=_observe),
+                    _legacy)
             try:
                 _raw.maybe_confirmation_cards(engine)
             except Exception:
                 logger.exception("grad-raw confirmation cards failed")
             watcher.set_positions(
                 _aw.armed_positions(engine.open_positions()))
-            if res.get("opened") or closes:
+            if res.get("opened") or n_closes:
                 st = engine.account_state()
                 logger.warning(
                     "grad-raw-trader: %d stream, %d opened; %d closes; "
                     "cash $%.2f, %d open, state %s",
                     res.get("stream", 0), res.get("opened", 0),
-                    len(closes), st.get("bankroll", 0.0),
+                    n_closes, st.get("bankroll", 0.0),
                     st.get("n_open", 0), st.get("state"))
         except Exception:
             logger.exception("grad-raw-trader loop failed")

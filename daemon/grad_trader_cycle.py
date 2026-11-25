@@ -114,8 +114,13 @@ def _make_abort_hook(engine):
     return _hook
 
 
+_REGISTER_FAILED = {}  # lane (or "?" when the lane itself is unreadable) -> repr of the registration error; refuses entries while the flag is on
+
+
 def register(engine):
-    """Record the engine for the commit-time check, take the abort baseline, and (flag on) install the abort hook. No ledger I/O."""
+    """Record the engine for the commit-time check, take the abort baseline, and (flag on) install the abort hooks. No ledger I/O. Returns True when registration
+    completed. A failure is NEVER silent: it is latched in _REGISTER_FAILED (commit_refusal refuses entries; startup_report shows it) and False is returned."""
+    lane = "?"
     try:
         lane = str(engine.LANE)
         _ENGINES[lane] = engine
@@ -123,12 +128,15 @@ def register(engine):
         _BASELINE[lane] = c
         _HOOK_FAILED.pop(lane, None)
         _BEGIN_FAILED.pop(lane, None)
+        _REGISTER_FAILED.pop(lane, None)
         if os.environ.get(FLAG) == "1":
             engine._ABORT_HOOK = _make_abort_hook(engine)
             engine._FAILURE_BEGIN_HOOK = _make_begin_hook(engine)
             engine._FAILURE_END_HOOK = _make_end_hook(engine)
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        _REGISTER_FAILED[lane] = repr(e)[:200]
+        return False
 
 
 def startup_report(engine):
@@ -143,7 +151,7 @@ def startup_report(engine):
     except Exception as e:
         act, why = True, "fault_state_unreadable:%r" % (e,)
     return {"active": True, "mode": "on", "detail": "", "fault_active": bool(act), "why": why,
-            "registered": str(getattr(engine, "LANE", "?")) in _ENGINES, "begin_failed": bool(_BEGIN_FAILED.get(str(engine.LANE))), "hook_failed": bool(_HOOK_FAILED.get(str(engine.LANE))),
+            "registered": str(getattr(engine, "LANE", "?")) in _ENGINES, "register_failed": _REGISTER_FAILED.get(str(engine.LANE)) or _REGISTER_FAILED.get("?"), "begin_failed": bool(_BEGIN_FAILED.get(str(engine.LANE))), "hook_failed": bool(_HOOK_FAILED.get(str(engine.LANE))),
             "inflight_marker": _gc()._inflight_state(engine), "abort_baseline": _BASELINE.get(str(engine.LANE)), "entry_scan_state": _entry_state(engine)}
 
 
@@ -173,6 +181,8 @@ def commit_refusal(lane):
         named = list(known) + list(unknown)       # a lane NAMED in the env but not known to grad_cycle is still named
     except Exception as e:
         return "cycle lane selection unreadable (%r): entries blocked fail-closed" % (e,)
+    if _REGISTER_FAILED.get(lane) or _REGISTER_FAILED.get("?"):
+        return "cycle hook registration failed (%s): entries blocked fail-closed" % (_REGISTER_FAILED.get(lane) or _REGISTER_FAILED.get("?"))
     eng = _ENGINES.get(lane)
     if eng is None:
         return ("lane %s is selected in AGT_GRAD_CYCLE_LANES but this process did not register it: entries blocked" % lane) if lane in named else None

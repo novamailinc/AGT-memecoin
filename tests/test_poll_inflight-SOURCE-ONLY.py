@@ -75,6 +75,20 @@ g = fake(); t = GC.mark_inflight(g, "m", "e")
 check("I22 _marker_unchanged: gathered None but marker now present is False; gathered present but marker gone is False", GC._marker_unchanged(g, None) is False and (lambda g3: GC._marker_unchanged(g3, gathered))(fake()) is False)
 open(GC._inflight_path(g), "w").write("{x")
 check("I23 _marker_unchanged: unreadable marker is False", GC._marker_unchanged(g, gathered) is False)
+class _NoLane: pass
+bad = _NoLane(); okreg = T.register(bad)
+check("I24 register on an engine whose lane is unreadable returns False and latches the failure under '?'", okreg is False and "?" in T._REGISTER_FAILED)
+good_g = fake(); T.register(good_g)
+check("I25 with a latched registration failure, EVERY lane's commit_refusal refuses (fail closed, flag on), naming the registration failure", "registration failed" in (T.commit_refusal(good_g.LANE) or ""))
+T._REGISTER_FAILED.clear()
+class _Raises:
+    LANE = "lane_reg_boom"
+    @property
+    def _POLL_ABORTS(self): raise RuntimeError("nope")
+r_ = _Raises(); T._REGISTER_FAILED.clear()
+res_ = T.register(r_)
+check("I26 an engine whose abort counter raises on a NAMED lane: register still completes (counter unreadable becomes baseline None, refused at commit), never silent", res_ is True and T.commit_refusal("lane_reg_boom") is not None)
+T._REGISTER_FAILED.clear(); T._ENGINES.pop("lane_reg_boom", None); T._BASELINE.pop("lane_reg_boom", None)
 # clear_fault marker handling (evidence key, no_fault bypass, removal after the clear record, and the call of _marker_unchanged at commit) is WRITTEN but NOT end-to-end tested: clear_fault needs a full ledger/account fixture and its commit is disabled; only the _marker_unchanged helper is unit-tested.
 # (evidence key, no_fault bypass, removal after the clear record) is WRITTEN but has NO test here: clear_fault needs a full ledger/account fixture and its commit is disabled.
 print("FAILS: %d" % FAILS); sys.exit(1 if FAILS else 0)

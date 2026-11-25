@@ -44,6 +44,12 @@ except ImportError as e:
     _HAS_GRAD = False
     _IMPORT_ERROR = e
 
+try:
+    from daemon import grad_trader_cycle as _gtc
+except Exception:
+    _gtc = None
+_FLAG_ON = os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1"
+
 POLL_SECS = 5
 GT_BACKFILL_EVERY_S = 60
 
@@ -58,12 +64,13 @@ def main():
         logger.warning("grad module missing: %s", _IMPORT_ERROR)
         return 1
     state = _grad.ensure_ledger()
-    try:      # cycle-hook registration only, before the loop; fail-soft; no-op unless AGT_GRAD_CYCLE_ENABLED=1
-        from daemon import grad_trader_cycle as _gtc
-        _gtc.register(_grad)
-        logger.warning("grad cycle hooks: %s", _gtc.startup_report(_grad))
-    except Exception as e:
-        logger.warning("grad cycle hooks not registered: %r", e)
+    # Register BEFORE the loop (no threads here). No-op unless AGT_GRAD_CYCLE_ENABLED=1. A failure is latched in grad_trader_cycle and refuses entries.
+    if _gtc is not None:
+        if not _gtc.register(_grad):
+            logger.error("grad cycle hook registration FAILED: entries are refused while AGT_GRAD_CYCLE_ENABLED=1 (exits continue)")
+        logger.warning("grad cycle wiring: %s", _gtc.startup_report(_grad))
+    elif _FLAG_ON:
+        logger.error("grad cycle flag on but grad_trader_cycle could not be imported: NO ENTRIES (exits only)")
     # Materialize the killswitch lane entry (not halted) so the lane
     # is visible in killswitch status from day one.
     try:
@@ -84,18 +91,33 @@ def main():
             fetch_gt = now - last_gt >= GT_BACKFILL_EVERY_S
             if fetch_gt:
                 last_gt = now
-            res = _grad.scan_once(feed=feed, fetch_gt=fetch_gt)
-            # Time-only exit FIRST: the 24h stop fires on the last
-            # known price with no price read at all, so it works
-            # even when every pricing source is down.
-            closes = _grad.poll_time_exits() + _grad.poll_exits()
-            if res.get("opened") or closes:
+            def _legacy():
+                # ORIGINAL order, used whenever the cycle wiring is off.
+                r = _grad.scan_once(feed=feed, fetch_gt=fetch_gt)
+                # Time-only exit FIRST: the 24h stop fires on the last
+                # known price with no price read at all, so it works
+                # even when every pricing source is down.
+                c = _grad.poll_time_exits() + _grad.poll_exits()
+                return r, len(c)
+            if _gtc is None and _FLAG_ON:
+                logger.warning("grad entries refused: cycle flag on, wiring missing")
+                closes = _grad.poll_time_exits() + _grad.poll_exits()
+                res, n_closes = {"stream": 0, "pools": 0, "opened": 0}, len(closes)
+            elif _gtc is None:
+                res, n_closes = _legacy()
+            else:
+                # EXITS FIRST when the flag is on (main_cycle); flag off: _legacy, the original order. price_fn None = the module's own default pricing, as before.
+                res, n_closes, _rec = _gtc.main_cycle(
+                    _grad, None,
+                    lambda: _grad.scan_once(feed=feed, fetch_gt=fetch_gt),
+                    _legacy)
+            if res.get("opened") or n_closes:
                 st = _grad.account_state()
                 logger.warning(
                     "grad-trader: %d stream, %d pools, %d opened; "
                     "%d closes; cash $%.2f, %d open, state %s",
                     res.get("stream", 0), res.get("pools", 0),
-                    res.get("opened", 0), len(closes),
+                    res.get("opened", 0), n_closes,
                     st.get("bankroll", 0.0), st.get("n_open", 0),
                     st.get("state"))
         except Exception:

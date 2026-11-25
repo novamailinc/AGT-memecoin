@@ -6,7 +6,7 @@ a module). One child per scenario, rc 0 each, JSON on stdout, reached-site flag,
 LOCK ORDER enumerated (see report): lane ledger lock (grad._ledger_lock) -> [barrier] cycle FAULT lock (grad_cycle._fault_lock, leaf, reentrant per thread) -> account lock / journal I/O
 (paper_account try_debit, demo_fill _locked) inside the barrier. The abort hook runs ledger -> fault. Writers of cycle/entry-scan faults take fault only. The test checks the thread's fault-lock depth
 is empty and the lock is acquirable after EVERY scenario (no leaked lock).
-  Y0 flag OFF control: opens, no fault-lock file, guard called twice (early + re-check).   Y1 flag ON control: opens, one debit, no intent left, guard called twice.
+  Y0 flag OFF control: opens, no fault-lock file, guard called 3 times (pre-lock check at grad.py ~1203, in-lock check ~1338, barrier re-check ~1426).   Y1 flag ON control: opens, one debit, no intent left, guard called twice.
   Y2 RACE: a writer thread holds the fault lock and writes a fault AFTER the early guard passed: the re-check under the barrier refuses with the stub reason; cash unchanged, no position, no debit,
      demo intent released (not leaked), the buy fill stays journaled (replayable, uncommitted).   Y3 SENSITIVITY: barrier replaced by a no-op in the same scenario: the entry OPENS (debit happens).
   Y4 fault-lock ACQUIRE FAILURE: writer holds the lock past the 0.5 s wait: "entry commit barrier unavailable", nothing debited, intent released, lock acquirable afterwards, and a RETRY then opens with exactly one debit
@@ -33,7 +33,7 @@ def snap():
     return {"cash": ps["cash"], "n_pos": len(raw_ledger().get("positions", {})), "intents": intents(), "fills": len(raw_fills()), "credits": len(raw_credits()[0])}
 def stub(lane):
     calls.append(len(calls) + 1)
-    if scen == "Y5" and len(calls) == 2: raise RuntimeError("FIXTURE-GUARD-RAISES")
+    if scen == "Y5" and len(calls) == 3: raise RuntimeError("FIXTURE-GUARD-RAISES")
     return "FIXTURE-FAULT-PRESENT" if os.path.exists(fault_file()) else None
 EG.mandatory_entry_refusal = stub                      # the SAME qualified module object grad imports at call time
 if scen == "Y3": EG.commit_barrier = lambda engine, wait_s=None: contextlib.nullcontext()
@@ -72,13 +72,13 @@ def refused(j, why):
 def main():
     j = run("Y0")
     if j: check("Y0 flag off control: opened (%s), one position, cash down once (%s -> %s), no fault-lock file (%s), guard called %d times, lock depth empty" % (j["r"], j["s0"]["cash"], j["s1"]["cash"], j["lockfile"], j["calls"]),
-                j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"] and not j["lockfile"] and j["calls"] == 2 and j["depth_empty"] and j["s1"]["intents"] == [])
+                j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"] and not j["lockfile"] and j["calls"] == 3 and j["depth_empty"] and j["s1"]["intents"] == [])
     j = run("Y1")
-    if j: check("Y1 flag on control: opened, one position, cash down once (%s -> %s), no intent left, guard called %d times (early + re-check), lock free" % (j["s0"]["cash"], j["s1"]["cash"], j["calls"]),
-                j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"] and j["s1"]["intents"] == [] and j["calls"] == 2 and j["depth_empty"] and j["acquirable"])
+    if j: check("Y1 flag on control: opened, one position, cash down once (%s -> %s), no intent left, guard called %d times (pre-lock, in-lock, barrier re-check), lock free" % (j["s0"]["cash"], j["s1"]["cash"], j["calls"]),
+                j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"] and j["s1"]["intents"] == [] and j["calls"] == 3 and j["depth_empty"] and j["acquirable"])
     j = run("Y2")
     if j: check("Y2 RACE: re-check under the barrier refused with the stub reason (%s); cash %s == %s, no position, intent released (%s), buy fill journaled (%d fills), guard called %d times, lock free" % (j["r"], j["s1"]["cash"], j["s0"]["cash"], j["s1"]["intents"], j["s1"]["fills"], j["calls"]),
-                refused(j, "FIXTURE-FAULT-PRESENT") and j["calls"] == 2 and j["s1"]["fills"] >= 1)
+                refused(j, "FIXTURE-FAULT-PRESENT") and j["calls"] == 3 and j["s1"]["fills"] >= 1)
     j = run("Y3")
     if j: check("Y3 SENSITIVITY: barrier removed -> the same race OPENS the entry (%s) and debits once: the barrier is what refuses in Y2" % (j["r"],), j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"])
     j = run("Y4")
@@ -87,7 +87,7 @@ def main():
         check("Y4 fault-lock acquire failure: refused as barrier unavailable (%s), nothing debited, intent released, lock acquirable; retry opened with exactly one debit (cash %s -> %s)" % (j["r"], j["s0"]["cash"], (rt.get("s") or {}).get("cash")),
               refused(j, "entry commit barrier unavailable") and (rt.get("r") or [False])[0] is True and rt["s"]["n_pos"] == 1 and rt["s"]["cash"] < j["s0"]["cash"] and rt["s"]["intents"] == [])
     j = run("Y5")
-    if j: check("Y5 guard raises at the re-check: refused fail-closed (%s), same cleanup" % (j["r"],), refused(j, "unavailable at commit") and j["calls"] == 2)
+    if j: check("Y5 guard raises at the re-check (3rd call): refused fail-closed (%s), same cleanup" % (j["r"],), refused(j, "unavailable at commit") and j["calls"] == 3)
     j = run("Y6")
     if j: check("Y6 commit_barrier construction raises: refused (%s), same cleanup" % (j["r"],), refused(j, "entry commit barrier unavailable"))
     j = run("Y7")

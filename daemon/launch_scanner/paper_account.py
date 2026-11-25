@@ -760,7 +760,7 @@ def _atomic_write(path: str, data: Dict[str, Any]) -> None:
         raise
 
 
-def _journal(event: Dict[str, Any]) -> None:
+def _journal(event: Dict[str, Any], strict: bool = False) -> None:
     """Append-only event journal, written BEFORE the ledger save:
     if the process dies mid-save the money movement is still
     recoverable from the journal."""
@@ -773,7 +773,7 @@ def _journal(event: Dict[str, Any]) -> None:
             os.fsync(f.fileno())
     except Exception:
         logger.exception("paper_account: journal write failed")
-        if event.get("instance") is True:
+        if event.get("instance") is True or strict:
             raise
 
 
@@ -1758,8 +1758,11 @@ def add_to_position(lane: str, mint: str, pos_id: str, stake: float, qty: float,
         led["seq"] = int(led.get("seq") or 0) + 1
         # journal FIRST (write-ahead): a crash between the journal append and the state save is recovered by
         # replay at the next load, which applies this event exactly once (its op_id is not yet in led["ops"]).
-        _journal({"event": "debit_add", "event_id": "ev#%d" % led["seq"], "op_id": op_id, "lane": lane,
-                  "mint": mint, "pos_id": pos_id, "stake": stake, "qty": qty, "seq": led["seq"], "ts": ts})
+        try:
+            _journal({"event": "debit_add", "event_id": "ev#%d" % led["seq"], "op_id": op_id, "lane": lane,
+                      "mint": mint, "pos_id": pos_id, "stake": stake, "qty": qty, "seq": led["seq"], "ts": ts}, strict=True)
+        except Exception:
+            return False, "journal write failed (add refused fail-closed, nothing applied)"
         ok, why = _apply_add(led, lane, mint, pos_id, stake, qty)
         if not ok:
             return False, why

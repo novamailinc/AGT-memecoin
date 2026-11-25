@@ -4,8 +4,8 @@
 What is REAL: the lane's own entry (momentum_lane.consider_candidate -> PA.try_debit -> lane ledger write, so pa_pos_id/pa_account_id/pa_entry_op and the lane
 registration are written by the production code), the account generation transition (the account files are removed between processes and a new account is created by the
 real account load, so account_id changes and pos_ids repeat), the PUBLIC admission operations (PA.try_debit and the lane's consider_candidate) after a restart, and a
-file-permission fault (non-root only; account directory chmod 0555 and events.jsonl chmod 0444 so BOTH refusal recorders fail at the operating-system level during a real
-settle through L.poll_exits; permissions restored in a finally block; no mount, disk or shared-storage change). What is NOT real: the feed, tape and safety stubs.
+kernel write-failure fault (works as root; RLIMIT_FSIZE=0 set only around the real PA.credit in the child (ROOT-SAFE kernel EFBIG on BOTH refusal recorders, no chmod) during a real
+settle through L.poll_exits; limit restored in a finally; no mount, disk or shared-storage change). What is NOT real: the feed, tape and safety stubs.
 Predeclared (hand-written, UNVERIFIED):
   A  real entry opens a bound position; the registry primary and mirror exist after it.
   B  POSITIVE CONTROL matching state, fresh process: lane recovery not blocked, public lane entry admitted, direct account debit admitted.
@@ -127,36 +127,54 @@ def child_probe(order, mutant):
     else: lane(); direct()
     print("RESULT " + _json.dumps(out, default=str), flush=True)
 def child_fault():
+    """ROOT-SAFE real OS write failure: RLIMIT_FSIZE=0 (SIGXFSZ ignored) is set ONLY around the real PA.credit call, in this child only. Every real write that grows a
+    file then fails in the kernel with EFBIG (root is not exempt). No permission, mount, disk, identity or host change; the limit dies with the process and is restored in
+    a finally. Failures are OBSERVED as real OSError(EFBIG) captured from the production code's own logged exc_info and by an in-window write probe."""
+    import resource, errno, logging
     PA = fresh(); cash(PA)   # the real account load creates the NEW generation (the parent removed the old account files)
-    ad = _acct_dir(ROOTDIR); jp = os.path.join(ad, "events.jsonl"); out = {"euid": os.geteuid()}
-    if os.geteuid() == 0:
-        print("RESULT " + _json.dumps({"skipped_root": True}), flush=True); return
-    hits = {"refuse": 0}; _rg = PA._refuse_generation
+    ad = _acct_dir(ROOTDIR); out = {"euid": os.geteuid()}
+    hits = {"refuse": 0, "credit": 0}; errs = []
+    class _H(logging.Handler):
+        def emit(self, rec):
+            ei = rec.exc_info
+            if ei and isinstance(ei[1], OSError): errs.append((rec.getMessage()[:80], ei[1].errno))
+    h = _H(); lg = _logging.getLogger("daemon.launch_scanner.paper_account"); lg.addHandler(h)
+    _rg = PA._refuse_generation
     def _rg2(*a, **k):
         hits["refuse"] += 1; return _rg(*a, **k)
     PA._refuse_generation = _rg2
-    cur = {}
-    try:
-        os.chmod(jp, 0o444); os.chmod(ad, 0o555)
+    _cr = PA.credit; soft_hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    _signal.signal(_signal.SIGXFSZ, _signal.SIG_IGN)
+    def _cr2(*a, **k):
+        hits["credit"] += 1
         try:
-            fd = os.open(os.path.join(ad, "fault_probe.tmp"), os.O_WRONLY | os.O_CREAT); os.close(fd); out["create_probe_failed"] = False
-        except OSError: out["create_probe_failed"] = True
-        try:
-            with open(jp, "a") as f: f.write("")
-            out["journal_append_probe_failed"] = False
-        except OSError: out["journal_append_probe_failed"] = True
-        def _pf(chain, mint, spot_index=None):
-            pos = (L.open_positions() or {}).get(mint) or {}
-            return float(pos.get("entry_price") or 0) * 2.0
-        try: L.poll_exits(price_fn=_pf); out["poll_exc"] = None
-        except Exception as e: out["poll_exc"] = type(e).__name__
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, soft_hard[1]))
+            try:
+                with open(os.path.join(ROOTDIR, "fsize_probe.tmp"), "w") as f: f.write("x"); f.flush()
+                out["write_probe_failed"] = False
+            except OSError as e: out["write_probe_failed"] = (e.errno == errno.EFBIG)
+            return _cr(*a, **k)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, soft_hard)
+    PA.credit = _cr2
+    def _pf(chain, mint, spot_index=None):
+        pos = (L.open_positions() or {}).get(mint) or {}
+        return float(pos.get("entry_price") or 0) * 2.0
+    try: L.poll_exits(price_fn=_pf); out["poll_exc"] = None
+    except Exception as e: out["poll_exc"] = type(e).__name__
     finally:
-        os.chmod(ad, 0o755); os.chmod(jp, 0o644)
-    out["refuse_reached"] = hits["refuse"]
-    out["marker_exists"] = os.path.exists(os.path.join(ad, "unresolved_generation_refusals.jsonl"))
+        resource.setrlimit(resource.RLIMIT_FSIZE, soft_hard)
+    lg.removeHandler(h); PA.credit = _cr
+    out["credit_called"] = hits["credit"]; out["refuse_reached"] = hits["refuse"]
+    out["efbig_errors"] = sorted(set(m for m, e in errs if e == errno.EFBIG)); out["n_efbig"] = len([1 for m, e in errs if e == errno.EFBIG])
+    mp = os.path.join(ad, "unresolved_generation_refusals.jsonl")
+    out["marker_records"] = len([1 for ln in open(mp) if ln.strip()]) if os.path.exists(mp) else 0
     evs = _jl(ROOTDIR)[0]
     out["refusal_journal_records"] = len([e for e in evs if e.get("event") == "settle_generation_refused"])
     out["credit_events"] = len([e for e in evs if e.get("event") == "credit"])
+    try: r = PA.try_debit(LANE_NAME, "PostFaultMint", 1.0, 1000.0, "probe:postfault:1")
+    except Exception as e: r = (False, "EXC %s" % type(e).__name__)
+    out["postfault_direct_ok"] = bool(r[0]); out["postfault_direct_why"] = str(r[1])[:300]
     print("RESULT " + _json.dumps(out, default=str), flush=True)
 if MODE == "open": child_open(); sys.exit(0)
 if MODE == "probe": child_probe(sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""); sys.exit(0)
@@ -209,15 +227,14 @@ try:
     rootD = newroot("D"); do_open(rootD); wipe(rootD)
     rc, out, err = spawn(["fault", rootD]); fD = res(out)
     if fD is None: print("FAIL SETUP fault child (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
-    if fD.get("skipped_root"):
-        print("INFO D skipped: euid 0 (permission faults need non-root)")
-    else:
-        check("D1 the OS refused file creation and journal append during the fault window (%r)" % ({k: fD.get(k) for k in ("create_probe_failed", "journal_append_probe_failed")},), fD.get("create_probe_failed") is True and fD.get("journal_append_probe_failed") is True)
-        check("D2 the real settle reached _refuse_generation (%r)" % fD.get("refuse_reached"), (fD.get("refuse_reached") or 0) >= 1)
-        check("D3 neither recorder persisted anything: no marker file, no refusal journal record (%r)" % ({k: fD.get(k) for k in ("marker_exists", "refusal_journal_records", "credit_events")},), fD.get("marker_exists") is False and fD.get("refusal_journal_records") == 0 and fD.get("credit_events") == 0)
-        pD = probe(rootD, "direct_first")
-        check("D4 FRESH process after restored permissions: direct debit refused on persisted lane evidence (%r)" % pD["direct_why"], pD["direct_ok"] is False and NEED in pD["direct_why"] and "generation-mismatch" in pD["direct_why"])
-        check("D5 FRESH process: public lane entry refused (%r)" % pD["lane_entry_reason"], pD["lane_entry_ok"] is False)
+    check("D1 the kernel refused a growing write inside the credit window (EFBIG probe, root-safe) (%r)" % ({k: fD.get(k) for k in ("euid", "write_probe_failed")},), fD.get("write_probe_failed") is True)
+    check("D2 the real settle called credit and reached _refuse_generation (%r)" % ({k: fD.get(k) for k in ("credit_called", "refuse_reached")},), (fD.get("credit_called") or 0) >= 1 and (fD.get("refuse_reached") or 0) >= 1)
+    check("D2b the production recorders raised real OSError EFBIG (>=2: journal and marker) (%r)" % ({k: fD.get(k) for k in ("n_efbig", "efbig_errors")},), (fD.get("n_efbig") or 0) >= 2)
+    check("D3 nothing durable: no marker record, no refusal journal record, no credit event (%r)" % ({k: fD.get(k) for k in ("marker_records", "refusal_journal_records", "credit_events")},), fD.get("marker_records") == 0 and fD.get("refusal_journal_records") == 0 and fD.get("credit_events") == 0)
+    check("D3b same process, limit restored: public direct debit refused because the refusal could not be recorded (%r)" % fD.get("postfault_direct_why"), fD.get("postfault_direct_ok") is False and "could not be recorded" in str(fD.get("postfault_direct_why")))
+    pD = probe(rootD, "direct_first")
+    check("D4 FRESH process: direct debit refused on persisted lane evidence (%r)" % pD["direct_why"], pD["direct_ok"] is False and NEED in pD["direct_why"] and "generation-mismatch" in pD["direct_why"])
+    check("D5 FRESH process: public lane entry refused (%r)" % pD["lane_entry_reason"], pD["lane_entry_ok"] is False)
 except _TO as e:
     print("FAIL BUDGET %s" % e); FAILS.append("budget")
 except SystemExit:

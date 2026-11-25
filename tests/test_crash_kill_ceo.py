@@ -120,6 +120,38 @@ def fresh(start="10", max_age="60", impact="2.0", fresh_state=True):
 
 def cash(PA): return PA.snapshot()["cash"]
 
+def wfire(mint):
+    ev = {"smart_wallets": 3, "wallets": ["W0", "W1", "W2"], "wallet_groups": ["g0", "g1", "g2"], "safety": "ok",
+          "components": {"convergence_groups": 3, "sightings": 3, "sol_spent_total": 4.2, "safety_score": 80}}
+    return BUS.make_signal("solana", "smart-watcher", mint, symbol="WATCH", tier="converged", mcap=500000.0, liquidity=100000.0, evidence=ev)
+def mrun(mint):
+    return {"pool_address": "Pool" + mint[:6], "mint": mint, "symbol": "RUN", "name": "RUN", "chain": "solana",
+            "source": "gecko-trending", "lane": "lowcap", "url": "", "chg_24h_pct": 55.0, "chg_1h_pct": 8.0,
+            "vol_24h_usd": 250000.0, "liq_usd": 100000.0, "usd_market_cap": 500000.0}
+def csig(mint):
+    return BUS.make_signal(chain="solana", source="test-feed", mint=mint, symbol="TKN", score=70.0, tier="pick", mcap=500000.0, liquidity=50000.0)
+
+LANES = []
+def build(PA, CT):
+    def e_w(i):
+        r = W.consider_fire(wfire("WatchMint%037d" % i), time.time()); return bool(r[0]), r[1]
+    def e_m(i):
+        r = MO.consider_candidate(mrun("MomMint%038d" % i), time.time()); return bool(r[0]), r[1]
+    def e_c(i):
+        r = C.consider_card(csig("CeoMint%d" % i)); return bool(r[0]), r[1]
+    def e_x(i):
+        r = MI.mirror_card(chain="solana", source="test", mint="MirMint%d" % i, symbol="TKN", score=70.0, tier="pick", mcap=500000.0, liquidity=50000.0)
+        return (bool(r[0]), r[1]) if isinstance(r, tuple) else (bool(r), r)
+    def e_h(i):
+        r = CT._demo_enter(PA, "L", "ChalMint%d" % i, 1.0); return bool(r[0]), r[1]
+    def e_g(i):
+        cand = {"mint": "GradMint%dpump" % i, "symbol": "TKN", "name": "TKN / SOL", "chain": "solana", "dex": "pumpswap",
+                "created_ts": time.time() - 60.0, "pool_address": "POOL%d" % i, "reserve_usd": 6000.0, "fdv_usd": 69000.0,
+                "price_usd": 0.00007, "source": "gecko-new-pool"}
+        r = GR.consider_candidate(cand, time.time()); return bool(r[0]), r[1]
+    return [("watcher", e_w), ("momentum", e_m), ("ceo", e_c), ("mirror", e_x), ("challenge", e_h), ("grad", e_g)]
+
+
 import json as _json, signal as _signal
 def _journal(F):
     with open(F._jpath()) as fh: return _json.load(fh)["fills"]
@@ -134,7 +166,7 @@ def _die(): os.kill(os.getpid(), _signal.SIGKILL)
 
 def child_run(point):
     PA, F, CT = fresh()
-    lanes = dict(build(PA, CT)); ok, why = lanes["ceo"](1)
+    lanes = dict(build(PA, CT)); ok, why = lanes["ceo"](1)   # build() is the smoke helper (ceo entry = C.consider_card(csig(...)))
     print("ENTRY ok=%s cash=%.6f" % (ok, cash(PA)), flush=True)
     real_append = CI._append; real_ma = CI.mark_account_applied; real_ml = CI.mark_lane_applied
     if point == "pre_intent":
@@ -157,6 +189,10 @@ def child_run(point):
 
 def child_recover():
     PA, F, CT = fresh(fresh_state=False)
+    pre_ents, pre_st, _t = CI._read(CI.journal_path("ceo"))
+    pre_fills = len({k: v for k, v in _journal(F).items() if k.startswith("ceo:exit:") and v.get("status") == "filled"})
+    pre = {"pre_cash": cash(PA), "pre_status": pre_st, "pre_ev": [e.get("ev") for e in pre_ents], "pre_fills": pre_fills}
+    print("PRE " + _json.dumps(pre), flush=True)
     FakeJup.mult = 1.9
     C.poll_exits(price_fn=pf_mult(C, 1.9)); C.poll_exits(price_fn=pf_mult(C, 1.9))
     pos = (C.open_positions() or {})
@@ -177,7 +213,7 @@ def check(n, c):
     print(("PASS " if c else "FAIL ") + n, flush=True)
     if not c: FAILS.append(n)
 def spawn(args):
-    p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=100)
+    p = subprocess.run([sys.executable, "-B", os.path.abspath(__file__)] + args, capture_output=True, text=True, timeout=12)
     return p.returncode, p.stdout, p.stderr
 for point in ("pre_intent", "torn_intent", "after_credit", "pre_lane_marker"):
     root = tempfile.mkdtemp(prefix="crashkill-%s-" % point)
@@ -187,12 +223,21 @@ for point in ("pre_intent", "torn_intent", "after_credit", "pre_lane_marker"):
     check("%s: child opened the position before the kill (%s)" % (point, ec[:1]), bool(ec) and "ok=True" in ec[0])
     entry_cash = float(ec[0].split("cash=")[1]) if ec else None
     rc2, out2, err2 = spawn(["recover", root])
-    rl = [l for l in out2.splitlines() if l.startswith("RESULT ")]
-    check("%s: recovery process exited 0 with a RESULT (rc %d, stderr tail %r)" % (point, rc2, err2[-160:]), rc2 == 0 and bool(rl) and "Traceback" not in err2)
-    if not rl: continue
-    r = _json.loads(rl[0][7:])
-    print("  %s -> %s" % (point, r))
-    check("%s: leg a done after recovery %r, one sale fill per leg %r" % (point, r["a_done"], r["legs"]), r["a_done"] == [True] and len(r["legs"]) == len(set(r["legs"])) and "a" in r["legs"])
-    check("%s: cash delta since entry %.6f == journaled net proceeds %.6f (no double or lost credit)" % (point, r["cash"] - entry_cash, r["net"]), _cents(r["cash"] - entry_cash) == _cents(r["net"]))
-    check("%s: no unresolved close intent (%d) and the journal is cleanly readable (%r)" % (point, r["pending"], r["journal_status"]), r["pending"] == 0 and r["journal_status"] is None)
+    rl = [l for l in out2.splitlines() if l.startswith("RESULT ")]; pl = [l for l in out2.splitlines() if l.startswith("PRE ")]
+    check("%s: recovery process exited 0 with PRE and RESULT lines (rc %d, stderr tail %r)" % (point, rc2, err2[-160:]), rc2 == 0 and bool(rl) and bool(pl) and "Traceback" not in err2)
+    if not rl or not pl: continue
+    pre = _json.loads(pl[0][4:]); r = _json.loads(rl[0][7:])
+    print("  %s PRE %s" % (point, pre)); print("  %s RESULT %s" % (point, r))
+    # PREDECLARED durable state at the moment of the kill (read by the fresh process BEFORE it recovers anything)
+    want_ev = {"pre_intent": [], "torn_intent": [], "after_credit": ["intent"], "pre_lane_marker": ["intent", "account_applied"]}[point]
+    want_st = "torn_tail" if point == "torn_intent" else None
+    check("%s: durable state at kill: journal status %r (want %r), events %r (want %r), sale fills %d (want 1: the fill is journaled before the intent)"
+          % (point, pre["pre_status"], want_st, pre["pre_ev"], want_ev, pre["pre_fills"]), pre["pre_status"] == want_st and pre["pre_ev"] == want_ev and pre["pre_fills"] == 1)
+    credited = point in ("after_credit", "pre_lane_marker")
+    check("%s: durable account cash at kill %.6f vs entry %.6f (credit applied before the kill: %r; also proves the recovery process did not reset the account)"
+          % (point, pre["pre_cash"], entry_cash, credited), (_cents(pre["pre_cash"]) > _cents(entry_cash)) if credited else (_cents(pre["pre_cash"]) == _cents(entry_cash)))
+    check("%s: leg a done after recovery %r, one sale fill per leg %r (no resale)" % (point, r["a_done"], r["legs"]), r["a_done"] == [True] and r["legs"] == ["a"])
+    check("%s: cash delta since entry %.6f == journaled net proceeds %.6f (exactly one credit)" % (point, r["cash"] - entry_cash, r["net"]), _cents(r["cash"] - entry_cash) == _cents(r["net"]))
+    check("%s: applied-marker sequence %r == ['intent', 'account_applied', 'lane_applied'], no pending intent (%d), journal cleanly readable (%r)" % (point, r["ev"], r["pending"], r["journal_status"]),
+          r["ev"] == ["intent", "account_applied", "lane_applied"] and r["pending"] == 0 and r["journal_status"] is None)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

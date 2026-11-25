@@ -97,6 +97,9 @@ def main():
         sources._curl_bytes = lambda url, data=None, extra_headers=None, timeout=15: (serve(url) if data is None else None)
         return home, sources, tranche, pa, eg
 
+    say("INFO", "PROVENANCE NOTE: replay serves the FIRST recorded body per URL; during capture the engine's repeat of the tape URL (quote call) was REFUSED "
+        "and fell back. This is a recorded-provider-response engineering test, NOT an exact replay of the capture-time execution, NOT live-quote acceptance. "
+        "Provider price differences in the raw data are unqualified (pool, liquidity, as-of, quote asset may differ).")
     mint = hdr["picked_mints"][0] if hdr.get("picked_mints") else None
     if not mint:
         print("NOT RUN: capture has no picked mint"); return 3
@@ -140,6 +143,8 @@ def main():
     # ENGINEERING SEED (labelled): stake $2.00 fits the shared $10 cash; it is NOT an operating stake choice.
     # entry is set so the REAL captured quote sits above leg A/B targets (mult = 1.05 x LEG_B_TARGET) and the peak is
     # px/0.6 so the real quote is a >=30% retrace from peak (buyback condition and leg-C trail both see real data).
+    if okx is True:
+        print("ABORT: the lane-stake diagnostic debit was ACCEPTED (an open lot now perturbs I1-I3); exit 4"); return 4
     stake = 2.0
     entry = px / (1.05 * float(T.LEG_B_TARGET))
     tokens = stake / entry
@@ -161,7 +166,7 @@ def main():
                  "c": {"frac": T.LEG_C_FRAC, "trail": T.LEG_C_TRAIL, "peak": peak, "done": False, "exit_price": 0, "realized_usd": 0}},
         "entry_snapshot": {"liquidity": 0}}
     eng._write(d)
-    say("INFO", "FIXTURE-SEEDED state: leg A done, peak=quote/0.6, entry=quote/(1.05*LEG_B_TARGET), stake $2.00 (not market-observed); everything else real")
+    say("INFO", "SCENARIO-DERIVED from the captured quote, NOT an observed entry or peak. FIXTURE-SEEDED state: leg A done, peak=quote/0.6, entry=quote/(1.05*LEG_B_TARGET), stake $2.00 (not market-observed); everything else real")
     def acct_qty():
         sn = pa.snapshot()
         return (sum(float(x["qty"]) for l in sn["lanes"].values() for x in l["positions"] if x["mint"] == mint),
@@ -177,7 +182,9 @@ def main():
         check("I1 inventory: account qty follows lane tokens by the bought amount", abs((q1 - q0) - (t1 - t0)) <= 1e-6 * max(1.0, t1),
               "d_account=%.6f d_lane=%.6f" % (q1 - q0, t1 - t0))
         check("I2 no double use: spendable cash fell by the buyback cost", c1 <= c0 - cost + 1e-6, "dspendable=%.6f cost=%.6f" % (c1 - c0, cost))
-        check("I3 conservation: account book_value unchanged", abs(bv1 - bv0) <= 1e-6, "dbook=%.6f" % (bv1 - bv0))
+        check("I3 conservation: account book_value unchanged (CAN PASS VACUOUSLY if nothing moved; not an accounting pass on its own)", abs(bv1 - bv0) <= 1e-6, "dbook=%.6f" % (bv1 - bv0))
+        sn1 = pa.snapshot(); expo = float(sn1["cost_exposure"]); want = stake * (1.0 - float(T.LEG_A_FRAC)) + cost
+        check("I3b lane-implied exposure == account cost_exposure (unsold original basis + buyback cost)", abs(expo - want) <= 1e-4, "account=%.6f lane_implied=%.6f" % (expo, want))
     # ---- I4 lifecycle (diagnostics collected, never an early exit before this point). Real poll_exits with the engine's own quote path
     # (captured bodies, no price_fn override). If exits cannot progress with recorded inputs, I4 is reported NOT RUN, never stubbed.
     if len(done) == 1:
@@ -193,14 +200,21 @@ def main():
         say("INFO", "I4 state: lane position present=%s pending_exit=%r legs_done=%r closes %d->%d ; account open lots for mint=%d qty=%s ; unrecorded=%d"
             % (pos4 is not None, (pos4 or {}).get("pending_exit"), {k: v.get("done") for k, v in ((pos4 or {}).get("legs") or {}).items()},
                closes_before, len(closes4), len(accopen), [x["qty"] for x in accopen], len(unrecorded)))
+        try:
+            say("INFO", "I4 context: _demo_mode()=%r (exits needing the demo filler/Jupiter raise on unrecorded hosts; never stubbed)" % (eng._demo_mode(),))
+        except Exception as e:
+            say("INFO", "I4 context: _demo_mode unavailable (%s)" % type(e).__name__)
+        check("I4e open side: no lane position left with pending_exit or settlement_pending",
+              pos4 is None or not (pos4.get("pending_exit") or pos4.get("settlement_pending")),
+              repr({k: (pos4 or {}).get(k) for k in ("pending_exit", "settlement_pending")}))
         if pos4 is None and len(closes4) > closes_before:
             rec = closes4[-1]
             start = float(pa.start_balance())
             check("I4a account position fully closed (no open lot, qty 0)", not accopen, repr(accopen))
-            check("I4b lane has no pending_exit / settlement_pending after close", not rec.get("pending_exit") and not rec.get("settlement_pending"))
+            check("I4b close record carries no pending_exit/settlement_pending (VACUOUS if the fields do not exist on close records; see I4e)", not rec.get("pending_exit") and not rec.get("settlement_pending"))
             lane_pnl = float(rec.get("pnl_usd"))
             acct_pnl = float(sn["realized_pnl"])
-            check("I4c account realized PnL == lane close PnL (1e-6)", abs(acct_pnl - lane_pnl) <= 1e-6, "account=%.6f lane=%.6f" % (acct_pnl, lane_pnl))
+            check("I4c account realized PnL == lane close PnL (1e-4; _finalize rounds pnl to 4 decimals)", abs(acct_pnl - lane_pnl) <= 1e-4, "account=%.6f lane=%.6f" % (acct_pnl, lane_pnl))
             check("I4d final account cash == start + realized PnL (no cash created or lost)", abs(float(sn["cash"]) - (start + acct_pnl)) <= 1e-6,
                   "cash=%.6f start+pnl=%.6f" % (float(sn["cash"]), start + acct_pnl))
         else:

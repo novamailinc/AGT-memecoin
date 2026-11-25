@@ -158,14 +158,21 @@ def _state(entries: List[Dict[str, Any]]
     return states
 
 
+class IntentNotDurable(RuntimeError):
+    """The intent (or a freeze) could not be written to the journal. The caller MUST NOT apply the account side without a durable
+    plan: recovery can only converge an intent that exists on disk."""
+
+
 def begin(lane: str, mint: str, pos_id: Optional[str],
           settle_ops: List[Dict[str, Any]],
-          close_info: Dict[str, Any]) -> str:
+          close_info: Dict[str, Any], stable_id: bool = False) -> str:
     """Open an intent. settle_ops is the ordered list of account
     operations this close performs, each {kind: credit|write_down,
     op_id, amount?, qty?, price_kind?, reason?}; close_info carries
     what the lane ledger needs to re-book the close (realized_usd,
-    entry_notional_usd, closed_reason). Returns the intent id."""
+    entry_notional_usd, closed_reason). Returns the intent id.
+    Raises IntentNotDurable when the intent event could not be durably appended (fail closed: no account op may run without it).
+    stable_id=True keeps the deterministic id lane:mint:pos:close_ts for a caller whose retry must regenerate the SAME id."""
     intent_id = "%s:%s:%s:%d" % (lane, mint, pos_id or "legacy",
                                  int(close_info.get("close_ts")
                                      or time.time() * 1000))
@@ -173,11 +180,22 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     # same second, or two concurrent begins, would reuse an id and the new intent would read as the old terminal one. Uniqueness must not
     # depend on reading the journal (unreadable evidence would silently restore the collision) nor on a read/choose/append sequence
     # (racy across threads and processes): add a random 96-bit suffix. Ids are opaque (nothing parses them) and a begin is a new intent.
-    intent_id = "%s:%s" % (intent_id, uuid.uuid4().hex[:24])
-    _append(journal_path(lane), {
-        "ev": "intent", "intent_id": intent_id, "lane": lane,
-        "mint": mint, "pos_id": pos_id, "settle_ops": settle_ops,
-        "close_info": dict(close_info)})
+    if not stable_id:
+        intent_id = "%s:%s" % (intent_id, uuid.uuid4().hex[:24])
+    if stable_id:
+        # Idempotent re-begin of a DETERMINISTIC id (the caller's retry regenerates it): never append a second "intent" event under an id whose
+        # intent is already on disk (open, frozen or applied: the existing record, and its terminal state, stands). The journal must be read
+        # cleanly to prove that; an unreadable or torn journal fails closed rather than guessing.
+        _ents, _st, _ = _read(journal_path(lane))
+        if _st is not None:
+            raise IntentNotDurable("journal not cleanly readable (%s): cannot prove intent %s is new" % (_st, intent_id))
+        if any(e.get("ev") == "intent" and e.get("intent_id") == intent_id for e in _ents):
+            return intent_id
+    if not _append(journal_path(lane), {
+            "ev": "intent", "intent_id": intent_id, "lane": lane,
+            "mint": mint, "pos_id": pos_id, "settle_ops": settle_ops,
+            "close_info": dict(close_info)}):
+        raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
     return intent_id
 
 
@@ -194,10 +212,18 @@ def mark_lane_applied(lane: str, intent_id: str) -> None:
     _append(path, {"ev": "applied", "intent_id": intent_id})
 
 
-def freeze(lane: str, intent_id: str, why: str) -> None:
-    _append(journal_path(lane), {"ev": "frozen",
-                                 "intent_id": intent_id,
-                                 "why": why})
+def journal_writable(lane: str) -> bool:
+    """Durability pre-check for a caller that must not SELL (or book anything) unless it can later make its close intent durable: appends a
+    harmless "probe" event (no intent_id, so _state and recovery ignore it) and returns whether it was fsynced. A pass is evidence for NOW only;
+    begin() still raises IntentNotDurable if the real intent write fails."""
+    return bool(_append(journal_path(lane), {"ev": "probe", "lane": lane}))
+
+
+def freeze(lane: str, intent_id: str, why: str) -> bool:
+    """Append a terminal frozen event. Returns False when it could not be written (callers that must not proceed without it check)."""
+    return bool(_append(journal_path(lane), {"ev": "frozen",
+                                             "intent_id": intent_id,
+                                             "why": why}))
 
 
 def pending(lane: str) -> List[Dict[str, Any]]:

@@ -628,5 +628,41 @@ check("S10b verdict POSITIVE control: the settled close wrote exactly ONE verdic
       len(_verdict_closes(mint)) - vc14 == 1)
 JUP.mult = 1.0
 
+# ---- S14: FAIL CLOSED when the close intent cannot be made durable (injected at the journal append, the real _finalize and real account):
+# no account credit, no close, bankroll unbooked, position pending with why close_intent_not_durable, nothing resold; once the journal works the
+# close settles exactly once ----
+mint = "BB15pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3); JUP.mult = 0.05
+br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint)); cash0 = PA_cash()
+_real_append = _CI._append
+def _append_no_intent(path, event):
+    if event.get("ev") == "intent":
+        return False   # INJECTED journal write failure for the intent record only (named fault)
+    return _real_append(path, event)
+_calls14 = []
+def _credit_spy(*a, **k):
+    _calls14.append(str(a[3] if len(a) > 3 else k.get("op_id")))
+    return _real_credit(*a, **k)
+with patch.object(_CI, "_append", _append_no_intent), patch.object(_PAm, "credit", _credit_spy):
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+lp = lane_pos(mint); sp14 = lp.get("settlement_pending") or {}
+check("S14 intent not durable: position still OPEN with settlement_pending why close_intent_not_durable (tries %r)" % sp14.get("tries"),
+      mint in G.open_positions() and sp14.get("why") == "close_intent_not_durable" and int(sp14.get("tries") or 0) >= 2)
+check("S14 no account credit was attempted for this close (credit calls with grad:close: for the mint: %d), cash unchanged (%r vs %r)"
+      % (len([c for c in _calls14 if (":%s:" % mint) in c]), PA_cash(), cash0), not [c for c in _calls14 if (":%s:" % mint) in c] and abs(PA_cash() - cash0) < 1e-12)
+check("S14 no close record, bankroll not booked (%r vs %r), no recorder exit, no resale (legs all done)" % (G._read()["bankroll"], br0),
+      not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint] and G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0
+      and all(v.get("done") for v in lp["legs"].values()))
+check("S14 no intent for this mint is on disk (nothing to replay, nothing silently applied)",
+      not [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("mint") == mint])
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+rec = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+check("S14 journal healthy again: closes exactly once, pending cleared, bankroll +realized once (%r -> %r), flat" % (br0, G._read()["bankroll"]),
+      len(rec) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (br0 + rec[0]["realized_usd"])) < 1e-6 and acct_lot_qty(pid) < 1e-6)
+JUP.mult = 1.0
+
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

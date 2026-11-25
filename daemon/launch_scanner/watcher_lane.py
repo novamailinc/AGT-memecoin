@@ -272,12 +272,39 @@ def _intent_open(lane_suffix, pos, ops, reason):
         return None
     mint = pos["mint"]
     pa_pos_id = pos.get("pa_pos_id")
-    iid = _ci.begin(LANE, mint, pa_pos_id, ops,
-                    {"realized_usd": ops[0].get("amount") or 0.0,
-                     "closed_reason": reason,
-                     "close_ts": time.time(),
-                     "leg_suffix": lane_suffix})
+    try:
+        iid = _ci.begin(LANE, mint, pa_pos_id, ops,
+                        {"realized_usd": ops[0].get("amount") or 0.0,
+                         "closed_reason": reason,
+                         "close_ts": time.time(),
+                         "leg_suffix": lane_suffix})
+    except _ci.IntentNotDurable as _nd:
+        # FAIL CLOSED: no account op without a durable plan. Visible: error log + entries blocked. The lane's own settle is unchanged.
+        global _ENTRY_BLOCKED
+        _ENTRY_BLOCKED = True
+        logger.error("%s: close intent NOT DURABLE (%s): account op skipped, ENTRIES BLOCKED until operator resolution", LANE, _nd)
+        return False
     return (iid, pa_pos_id, mint, lane_suffix)
+
+
+def _intent_gate(pos, key):
+    """FAIL CLOSED before anything is sold or booked: when the shared account is on for this position and the close-intent journal cannot be
+    written, the leg/close is NOT executed (no sale, no lane close/bankroll/verdict, no account op). The position shows pending_exit
+    close_intent_not_durable and the exit is retried on later polls, once storage returns."""
+    if not pos.get("pa_pos_id"):
+        return True
+    _ci = _close_intents()
+    if _ci is None:
+        return True
+    try:
+        _ok = _ci.journal_writable(LANE)
+    except Exception:
+        _ok = False
+    if _ok:
+        return True
+    logger.error("watcher: close intent journal NOT writable: exit %s not executed (pending_exit close_intent_not_durable), retried next poll", key)
+    pos["pending_exit"] = {"leg": key, "why": "close_intent_not_durable", "ts": time.time()}
+    return False
 
 
 def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
@@ -304,6 +331,8 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
                            "mint": mint, "amount": gross, "qty": qty,
                            "fee": fee, "price_kind": price_kind,
                            "pos_id": pa_pos_id}], suffix)
+    if _pend is False:   # intent not durable: no account op (see _intent_open)
+        return
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
                            qty=qty, fee=fee, price_kind=price_kind)
     if not _ok and _pa.op_outcome(_op) == "orphan" \
@@ -339,6 +368,8 @@ def _pa_write_down(pos, reason):
                          [{"kind": "write_down", "op_id": _op,
                            "mint": mint, "pos_id": pa_pos_id,
                            "reason": reason}], reason)
+    if _pend is False:   # intent not durable: no account op (see _intent_open)
+        return
     _ok, _why = _pa.write_down(LANE, mint, _op, pos_id=pa_pos_id,
                                reason=reason)
     if not _ok and _pa.op_outcome(_op) == "orphan" \
@@ -1445,6 +1476,8 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     leg = pos["legs"][leg_key]
     if leg["done"]:
         return 0.0
+    if not _intent_gate(pos, leg_key):
+        return 0.0
     leg_tokens = pos["tokens"] * leg["frac"]
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
     if _sim and _pkind(reason, pkind) != "write_down_zero":
@@ -1498,6 +1531,8 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     same rule as grad.py/momentum_lane.py."""
     open_legs = [k for k in ("a", "b", "c") if not pos["legs"][k]["done"]]
     if not open_legs:
+        return 0.0
+    if not _intent_gate(pos, "remaining:%s" % "".join(open_legs)):
         return 0.0
     total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"]
                        for k in open_legs)

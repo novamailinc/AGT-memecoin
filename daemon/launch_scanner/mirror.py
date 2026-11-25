@@ -439,6 +439,26 @@ def _recover_close_intents():
     return _ENTRY_BLOCKED
 
 
+def _intent_gate(pos, key):
+    """FAIL CLOSED before anything is sold or booked: when the shared account is on for this position and the close-intent journal cannot be
+    written, the leg/close is NOT executed (no sale, no lane close/bankroll/verdict, no account op). The position shows pending_exit
+    close_intent_not_durable and the exit is retried on later polls, once storage returns."""
+    if not pos.get("pa_pos_id"):
+        return True
+    _ci = _close_intents()
+    if _ci is None:
+        return True
+    try:
+        _ok = _ci.journal_writable(pos["lane"])
+    except Exception:
+        _ok = False
+    if _ok:
+        return True
+    logger.error("mirror: close intent journal NOT writable: exit %s not executed (pending_exit close_intent_not_durable), retried next poll", key)
+    pos["pending_exit"] = {"leg": key, "why": "close_intent_not_durable", "ts": time.time()}
+    return False
+
+
 def _pa_apply(pos, suffix, kind_op, apply_fn):
     """Shared body of settle/write-down: durable intent BEFORE the account
     op, orphan convergence, pending flush registration. Failures are
@@ -453,10 +473,17 @@ def _pa_apply(pos, suffix, kind_op, apply_fn):
     _pend = None
     _ci = _close_intents()
     if _ci is not None:
-        iid = _ci.begin(lane, mint, pid, [kind_op],
-                        {"realized_usd": kind_op.get("amount") or 0.0,
-                         "closed_reason": suffix, "close_ts": time.time(),
-                         "leg_suffix": suffix})
+        try:
+            iid = _ci.begin(lane, mint, pid, [kind_op],
+                            {"realized_usd": kind_op.get("amount") or 0.0,
+                             "closed_reason": suffix, "close_ts": time.time(),
+                             "leg_suffix": suffix})
+        except _ci.IntentNotDurable as _nd:
+            # FAIL CLOSED: no account op without a durable plan. Visible: error log + entries blocked. The lane's own settle is unchanged.
+            global _ENTRY_BLOCKED
+            _ENTRY_BLOCKED = True
+            logger.error("mirror: close intent NOT DURABLE (%s): account op skipped, ENTRIES BLOCKED until operator resolution", _nd)
+            return
         _pend = (lane, iid, pid, mint, suffix)
     _ok, _why = apply_fn(_pa)
     if not _ok and _pa.op_outcome(kind_op["op_id"]) == "orphan" \
@@ -1090,6 +1117,8 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     leg = pos["legs"][leg_key]
     if leg["done"]:
         return 0.0
+    if not _intent_gate(pos, leg_key):
+        return 0.0
     leg_tokens = pos["tokens"] * leg["frac"]
     _kind = _pkind(reason, pkind)
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
@@ -1177,6 +1206,8 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
     chain = pos["chain"]
     open_legs = [k for k in ("a", "b", "c") if not pos["legs"][k]["done"]]
     if not open_legs:
+        return 0.0
+    if not _intent_gate(pos, "remaining:%s" % "".join(open_legs)):
         return 0.0
     total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"]
                        for k in open_legs)

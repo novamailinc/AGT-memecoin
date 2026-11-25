@@ -33,12 +33,46 @@ check("the new intents are OPEN and the frozen one stays terminal (pending=%r)" 
 d = ci.begin("grad", "MINT2", "grad/MINT2#1", OPS, dict(INFO))
 check("id keeps the readable base (lane:mint:pos:second) plus a suffix (%s)" % d, d.startswith("grad:MINT2:grad/MINT2#1:1795593430:") and len(d.rsplit(":", 1)[-1]) == 24)
 
-# unreadable journal evidence must NOT restore the collision: replace the journal with a directory (read and append both fail)
-import shutil
+# FAIL CLOSED: an unwritable journal (path replaced by a directory: read and append both fail) must make begin() RAISE IntentNotDurable and freeze() return
+# False, never hand back an id for an intent that is not on disk. The expected-fault logging (logger.exception inside _append) is silenced here so the
+# native log carries no traceback of an INJECTED fault (the strict parser rejects any Traceback).
+import shutil, logging
 jp = ci.journal_path("lanex"); os.makedirs(jp)
-u1 = ci.begin("lanex", "M", "p", OPS, dict(INFO)); u2 = ci.begin("lanex", "M", "p", OPS, dict(INFO))
-check("unreadable journal: ids still distinct (%s vs %s)" % (u1[-8:], u2[-8:]), u1 != u2)
+class _Cap(logging.Handler):
+    def __init__(self):
+        logging.Handler.__init__(self); self.recs = []
+    def emit(self, r):
+        self.recs.append(r)
+_cap = _Cap(); _lg = logging.getLogger(ci.logger.name); _prop = _lg.propagate; _lg.addHandler(_cap); _lg.propagate = False
+try:
+    try:
+        ci.begin("lanex", "M", "p", OPS, dict(INFO)); _raised = False
+    except ci.IntentNotDurable:
+        _raised = True
+    _fz = ci.freeze("lanex", "grad:M:p:1:abc", "x")
+finally:
+    _lg.removeHandler(_cap); _lg.propagate = _prop
+_exp = [r for r in _cap.recs if r.getMessage().startswith("close_intents: append failed") and r.exc_info and r.exc_info[0] is IsADirectoryError]
+check("the injected fault was logged EXACTLY as expected: %d records, all 'append failed' with IsADirectoryError, none other (%d total)" % (len(_exp), len(_cap.recs)), len(_exp) == 2 and len(_cap.recs) == 2)
+check("unwritable journal: begin raises IntentNotDurable (no id for a non-durable intent) and freeze returns False (%r, %r)" % (_raised, _fz), _raised is True and _fz is False)
 shutil.rmtree(jp)
+check("healthy journal again: freeze returns True and begin works", ci.freeze("lanex", "grad:M:p:1:abc", "y") is True and bool(ci.begin("lanex", "M", "p", OPS, dict(INFO))))
+
+# stable_id=True keeps the deterministic id (a caller whose retry must regenerate the SAME id): same inputs, same id, no suffix
+st1 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True); st2 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True)
+_n_int = len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent" and e.get("intent_id") == st1])
+check("stable_id=True: identical deterministic id on a retry (%s) and ONE intent event (idempotent re-begin, %d)" % (st1, _n_int), st1 == st2 and st1 == "lanes:MS:ps:1795593430" and _n_int == 1)
+ci.freeze("lanes", st1, "terminal")
+st3 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True)
+check("stable_id after a FREEZE: the frozen id is returned and NOT re-opened (no second intent event, still terminal, pending empty for it)",
+      st3 == st1 and len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent" and e.get("intent_id") == st1]) == 1 and st1 not in [x["intent_id"] for x in ci.pending("lanes")])
+# stable_id on an unreadable journal fails closed
+jp2 = ci.journal_path("lanet"); open(jp2, "w").write("{not json}\n{also not json}\n")
+try:
+    ci.begin("lanet", "MS", "ps", OPS, dict(INFO), stable_id=True); _sr = False
+except ci.IntentNotDurable:
+    _sr = True
+check("stable_id on a torn journal fails closed (raises IntentNotDurable)", _sr)
 
 # concurrency: 8 threads x 25 begins on the SAME position in the same second -> all ids distinct, every intent event recorded once
 import threading

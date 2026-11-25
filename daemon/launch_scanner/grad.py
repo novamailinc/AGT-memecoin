@@ -2083,7 +2083,7 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
                                              [{"kind": "credit", "op_id": _op, "mint": pos["mint"], "amount": gross,
                                                "qty": qty, "price_kind": kind, "pos_id": pos["pa_pos_id"]}],
                                              {"realized_usd": round(gross - fee, 6), "close_ts": int(float(pos.get("entry_ts") or 0) * 1000) + ord(str(leg_key)[-1]),   # STABLE: a retry regenerates the same intent id
-                                              "closed_reason": "tranche_leg_" + str(leg_key)})
+                                              "closed_reason": "tranche_leg_" + str(leg_key)}, stable_id=True)
                         _ci.freeze(LANE, _iid, "tranche credit refused: debited position absent from account (divergence): %s" % str(why)[:120])
                         logger.error("grad: tranche credit %s %s FROZEN: debited position absent from the account; "
                                      "ENTRIES BLOCKED until operator resolution", pos["mint"][:12], leg_key)
@@ -3199,15 +3199,29 @@ def _finalize(d, mint, pos, closed_reason):
             if _prev_sp.get("intent_id") in _open_ids and _prev_sp.get("plan_sig") == _plan_sig:
                 _iid = _prev_sp["intent_id"]   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
             else:
-                if _prev_sp.get("intent_id") in _open_ids:
-                    # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
-                    # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
-                    _ci.freeze(LANE, _prev_sp["intent_id"], "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160])
-                _iid = _ci.begin(LANE, mint, _pos_id, _plan,
-                                 {"realized_usd": realized,
-                                  "entry_notional_usd": entry_notional,
-                                  "closed_reason": closed_reason,
-                                  "close_ts": time.time()})
+                try:
+                    if _prev_sp.get("intent_id") in _open_ids:
+                        # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
+                        # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
+                        if not _ci.freeze(LANE, _prev_sp["intent_id"], "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160]):
+                            raise _ci.IntentNotDurable("superseded intent freeze not durable")
+                    _iid = _ci.begin(LANE, mint, _pos_id, _plan,
+                                     {"realized_usd": realized,
+                                      "entry_notional_usd": entry_notional,
+                                      "closed_reason": closed_reason,
+                                      "close_ts": time.time()})
+                except _ci.IntentNotDurable as _nd:
+                    # FAIL CLOSED: no durable plan, so NO account op. Position stays open, visible, nothing resold, bankroll booking undone;
+                    # an earlier open intent (if any) keeps its id/plan_sig so a later poll can still recover or reuse it.
+                    logger.error("grad: %s SETTLEMENT PENDING (close_intent_not_durable: %s): no account op without a durable plan; retried next poll", mint[:12], _nd)
+                    pos["settlement_pending"] = {"why": "close_intent_not_durable", "closed_reason": closed_reason,
+                                                 "since": _prev_sp.get("since") or time.time(), "last_try": time.time(),
+                                                 "tries": int(_prev_sp.get("tries") or 0) + 1,
+                                                 **{_k: _prev_sp[_k] for _k in ("intent_id", "plan_sig") if _prev_sp.get(_k)}}
+                    pos["pending_exit"] = {"leg": "settlement", "why": "close_intent_not_durable", "ts": time.time()}
+                    d["bankroll"] = round(float(d["bankroll"]) - realized, 6)
+                    _write(d)
+                    return None
         _ok, _why = True, ""
         for _sop in _plan:
             if _sop["kind"] == "write_down":

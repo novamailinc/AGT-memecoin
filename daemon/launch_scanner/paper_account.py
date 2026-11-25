@@ -2386,15 +2386,170 @@ def _ledger_file_status(path):
     return d, "ok"
 
 
-def restart_admission_blockers(lane, lane_ledger_path):
+def _registry_paths():
+    d = os.path.dirname(LEDGER_PATH)
+    return (os.path.join(d, "lane_registry.jsonl"),
+            os.path.join(os.path.dirname(d), "lane_registry.%s.mirror.jsonl" % os.path.basename(d)))
+
+
+def _registry_read(path):
+    """-> (records, status): ok | missing | corrupt. Never substitutes an empty registry for an unreadable one."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return [], "missing"
+    except Exception:
+        return [], "corrupt"
+    out = []
+    for ln in raw.split("\n"):
+        if not ln.strip():
+            continue
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            return [], "corrupt"
+        if not isinstance(e, dict) or not isinstance(e.get("lane"), str):
+            return [], "corrupt"
+        out.append(e)
+    return out, "ok"
+
+
+def _registry_fold(recs):
+    lanes, ids = {}, set()
+    for e in recs:
+        st = lanes.setdefault(e["lane"], {"ledger_path": None, "intent_path": None, "intent_seen": False})
+        if e.get("ledger_path"): st["ledger_path"] = e["ledger_path"]
+        if e.get("intent_path"): st["intent_path"] = e["intent_path"]
+        if e.get("intent_seen") is True: st["intent_seen"] = True
+        if isinstance(e.get("account_id"), str) and e["account_id"]: ids.add(e["account_id"])
+    return lanes, ids
+
+
+def _registry_append(rec):
+    """Append-only, fsync'd primary in the account directory, then a mirror in the PARENT directory. Returns True when the PRIMARY is durable. The mirror is a
+    second witness that the registry once existed; both on one filesystem, so whole-filesystem loss is not detectable from inside (see restart_admission_blockers)."""
+    pri, mir = _registry_paths()
+    line = (json.dumps(rec, sort_keys=True) + "\n").encode()
+    try:
+        os.makedirs(os.path.dirname(pri), exist_ok=True)
+        fd = os.open(pri, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line); os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        logger.exception("paper_account: could not write the lane registry")
+        return False
+    try:
+        fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line); os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        logger.exception("paper_account: could not write the lane registry mirror")
+    return True
+
+
+def register_lane(lane, lane_ledger_path, intent_journal_path=None):
+    """A lane records, once per process start and whenever something changed, WHERE its persisted state lives and which account generation it saw. Idempotent: no
+    record is written when the folded registry already holds the same facts. True = the registry reflects this lane (or the write is not needed); False = the
+    registry could not be written (the lane's own restart check then reports 'lane-registry-unwritable')."""
+    recs, st = _registry_read(_registry_paths()[0])
+    if st == "corrupt":
+        return False
+    lanes, ids = _registry_fold(recs)
+    cur = lanes.get(lane) or {}
+    led, lst = _ledger_file_status(LEDGER_PATH)
+    ident = led.get("account_id") if (lst == "ok" and isinstance(led.get("account_id"), str)) else None
+    seen = bool(intent_journal_path and os.path.exists(intent_journal_path))
+    if (cur.get("ledger_path") == lane_ledger_path and (not intent_journal_path or cur.get("intent_path") == intent_journal_path)
+            and (not seen or cur.get("intent_seen")) and (ident is None or ident in ids)):
+        return True
+    rec = {"lane": lane, "ledger_path": lane_ledger_path, "ts": time.time()}
+    if intent_journal_path: rec["intent_path"] = intent_journal_path; rec["intent_seen"] = seen
+    if ident: rec["account_id"] = ident
+    return _registry_append(rec)
+
+
+def register_intent_journal(lane, intent_journal_path):
+    """Called by close_intents.begin after its first durable append: records that this lane's intent journal NOW EXISTS, so a later absence is loss, not a first start."""
+    recs, st = _registry_read(_registry_paths()[0])
+    if st == "corrupt":
+        return False
+    lanes, _ids = _registry_fold(recs)
+    cur = lanes.get(lane) or {}
+    if cur.get("intent_seen") and cur.get("intent_path") == intent_journal_path:
+        return True
+    return _registry_append({"lane": lane, "intent_path": intent_journal_path, "intent_seen": True, "ts": time.time()})
+
+
+def _registry_blockers():
+    """Account-level, cross-lane admission evidence: every REGISTERED lane's persisted state judged against the CURRENT account (restart_admission_blockers per
+    lane, lifecycle included) plus intent-journal loss. [] = nothing known. A corrupt registry, or a primary registry that vanished while its mirror remains, is a
+    block. Both copies absent is indistinguishable from 'no lane ever registered' (direct account use, first start): it blocks nothing here, and each lane's
+    OWN restart check still runs against its own persisted ledger."""
+    pri, mir = _registry_paths()
+    recs, pst = _registry_read(pri)
+    mrecs, mst = _registry_read(mir)
+    if pst == "corrupt":
+        return ["lane registry unreadable (fail-closed)"]
+    if pst == "missing":
+        return ["lane registry lost (its mirror remains)"] if mst != "missing" else []
+    if mst == "missing":
+        try:
+            with open(mir, "a") as f:    # repair a missing mirror FROM the primary's own bytes
+                for e in recs: f.write(json.dumps(e, sort_keys=True) + "\n")
+                f.flush(); os.fsync(f.fileno())
+        except OSError:
+            pass
+    lanes, _ids = _registry_fold(recs)
+    out = []
+    for ln, st in sorted(lanes.items()):
+        if st.get("ledger_path"):
+            for b in restart_admission_blockers(ln, st["ledger_path"], _from_registry=True):
+                out.append("lane %s: %s" % (ln, b))
+        if st.get("intent_seen") and st.get("intent_path") and not os.path.exists(st["intent_path"]):
+            out.append("lane %s: intent-journal-lost (it existed and is gone)" % ln)
+    return out
+
+
+def orphan_lots(lane, lane_ledger_path):
+    """READ-ONLY: account open lots of this lane that NO persisted lane position references (by pa_pos_id). None = cannot judge (a ledger is unreadable)."""
+    led_d, lst = _ledger_file_status(lane_ledger_path)
+    acct, ast = _ledger_file_status(LEDGER_PATH)
+    if lst != "ok" or ast != "ok":
+        return None
+    refs = {p.get("pa_pos_id") for p in (led_d.get("positions") or {}).values() if isinstance(p, dict) and p.get("pa_pos_id")}
+    lots = (((acct.get("lanes") or {}).get(lane) or {}).get("open") or {})
+    return sorted(str(v.get("pos_id")) for v in lots.values() if isinstance(v, dict) and v.get("pos_id") and v.get("pos_id") not in refs)
+
+
+def record_orphan_lots(lane, orphans):
+    """A lane restart found account lots of its own that no persisted lane position references: that exposure has no owner. It is recorded in the durable
+    unresolved-refusal marker (evidence, never cleared by code, blocks every account admission). Returns False when any record could not be written."""
+    ok = True
+    for pid in orphans or []:
+        if not _record_unresolved("orphan-lot:%s" % pid, lane, None, pid, "account lot with no persisted lane position"):
+            ok = False
+    return ok
+
+
+def restart_admission_blockers(lane, lane_ledger_path, _from_registry=False):
     """Entry-admission evidence DERIVED FROM PERSISTED STATE in every process (never from an in-process flag or a lost marker). [] = no known unresolved exposure.
-    READ-ONLY, no lock, no lane import. Blocks (each string names why):
-      '<mint>'                       open lane position opened by the shared account with NO bound generation (legacy/unbound),
-      '<mint>@generation-mismatch'   its pa_account_id differs from the account's CURRENT generation: its settlement can only be refused,
-      '<mint>@account-identity-unavailable'  the account ledger/generation cannot be read, so the binding cannot be judged,
-      'lane-ledger-<status>'         the lane ledger is missing/unreadable/corrupt WHILE the account holds open lots for this lane (an absent lane
-                                     record is not proof of no exposure); a missing lane ledger with NO account lots for the lane is a fresh start, not a block.
-    A matching-generation position never blocks. Nothing here clears, rebinds or deletes evidence."""
+    READ-ONLY, no lock. Reasons:
+      '<mint>'                              open lane position with NO bound generation (legacy/unbound),
+      '<mint>@generation-mismatch'          its pa_account_id differs from the account's CURRENT generation,
+      '<mint>@entry-op-mismatch'            bound to the current generation, but the account has no matching debit (event, lane, mint, pos_id, account_id) for its
+                                            recorded entry op: the binding is not proven by the account,
+      '<mint>@account-identity-unavailable' the account ledger/generation cannot be read,
+      'account-state-lost ...'              the account ledger is MISSING although its WAL or the lane registry shows it existed,
+      'lane-ledger-<status>'                the lane ledger is missing/unreadable/corrupt WHILE the account holds open lots for the lane.
+    NEW INITIALIZATION vs LOST STATE: a missing account ledger counts as a fresh start only when NO prior-state witness exists: no WAL bytes, no registry record that
+    saw an account generation, and (below) no lane position bound to one. Any witness makes it lost state, never fresh. LIMIT (impossible from inside): if every file
+    on the filesystem is lost together (account ledger, WAL, registries, lane ledgers) no witness remains and it is indistinguishable from a first start; only an
+    external copy (not written by this code) could prove otherwise. A matching-generation, account-proven position never blocks."""
     out = []
     led_d, lst = _ledger_file_status(lane_ledger_path)
     acct, ast = _ledger_file_status(LEDGER_PATH)
@@ -2405,20 +2560,45 @@ def restart_admission_blockers(lane, lane_ledger_path):
             lots = len(((acct.get("lanes") or {}).get(lane) or {}).get("open") or {})
         except Exception:
             lots = None
+    elif ast == "missing":
+        try:
+            wal = os.path.exists(JOURNAL_PATH) and os.path.getsize(JOURNAL_PATH) > 0
+        except OSError:
+            wal = True
+        rrecs, rst = _registry_read(_registry_paths()[0])
+        mrecs, mst = _registry_read(_registry_paths()[1])
+        seen_ids = _registry_fold(rrecs)[1] | _registry_fold(mrecs)[1]
+        if wal or seen_ids or rst == "corrupt" or (rst == "missing" and mst != "missing"):
+            return ["account-state-lost (ledger missing; WAL %s, registry saw a generation %s)" % ("present" if wal else "absent", "yes" if seen_ids else "no")]
+        lots = 0   # no witness of prior state anywhere: a supported first start
     if lst != "ok":
         if lst == "missing" and lots == 0:
             return out
         return ["lane-ledger-%s%s" % (lst, "" if lots is not None else " (account unreadable)")] if (lots is None or lots > 0) else out
+    ops = (acct.get("ops") or {}) if ast == "ok" else {}
     for m, p in (led_d.get("positions") or {}).items():
         if not isinstance(p, dict) or not p.get("pa_pos_id") or p.get("lane", lane) != lane:
             continue
         b = p.get("pa_account_id")
         if not b:
             out.append(str(m))
+        elif ast == "missing":
+            out.append("%s@account-identity-unavailable" % m)   # a bound lane position proves an account existed; its ledger is gone
         elif ident is None:
             out.append("%s@account-identity-unavailable" % m)
         elif b != ident:
             out.append("%s@generation-mismatch" % m)
+        else:
+            r = ops.get(p.get("pa_entry_op")) if isinstance(ops, dict) else None
+            if not (isinstance(r, dict) and r.get("event") == "debit" and r.get("lane") == lane and r.get("pos_id") == p.get("pa_pos_id")
+                    and r.get("mint") == (p.get("mint") or m) and r.get("account_id") == b):
+                out.append("%s@entry-op-mismatch" % m)
+    if not _from_registry and ast == "ok":
+        _o = orphan_lots(lane, lane_ledger_path)
+        if _o is None:
+            out.append("orphan-check-unavailable")
+        else:
+            out.extend("%s@orphan-lot" % p for p in _o)
     return out
 
 
@@ -2451,17 +2631,27 @@ def _durable_probe():
     return None
 
 
+_MARKER_SEEN = [False]   # in-process latch: an unresolved-refusal marker WITH records was read once; its later disappearance is a block, not a clean state
+
+
 def _entries_blocked_by_refusal():
     if _MARKER_FAILED[0] or _journal_marker_failed():
+        _MARKER_FAILED[0] = True   # a discovered latch survives any later journal read failure, rotation or replacement in this process
         return "a generation refusal could not be recorded in the durable marker (fail-closed)"
     u = unresolved_refusals()
     if u is None:
         return "unresolved-refusal marker unreadable (fail-closed)"
+    if not u and _MARKER_SEEN[0]:
+        return "unresolved-refusal marker was read earlier in this process and is now gone or empty (fail-closed, evidence disappeared)"
     if u:
+        _MARKER_SEEN[0] = True
         return "unresolved generation refusal(s) on record (%d, first %s %s): operator reconciliation required" % (len(u), u[0].get("lane"), u[0].get("pos_id"))
     _pr = _durable_probe()
     if _pr:
         return "account directory not provably writable (fail-closed): %s" % _pr
+    _rb = _registry_blockers()
+    if _rb:
+        return "persisted lane evidence blocks admission (fail-closed): %s" % "; ".join(_rb[:4])
     return None
 
 

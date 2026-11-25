@@ -101,10 +101,29 @@ def _append(path: str, event: Dict[str, Any]) -> bool:
                 f.write(prefix + json.dumps(event) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+        if event.get("ev") == "intent" and not _register_journal(path, event.get("lane")):
+            logger.error("close_intents: intent journal %s could not be registered with the account (fail closed: caller treats the intent as not durable; a retry resumes it)", path)
+            return False
         return True
     except Exception:
         logger.exception("close_intents: append failed (%s)",
                          event.get("ev"))
+        return False
+
+
+def _register_journal(path, lane):
+    """Tell the shared account this lane's intent journal now EXISTS (so its later absence is loss, not a first start). Only when the shared account is enabled
+    (same opt-in as the lanes). True when registered or not applicable."""
+    if os.environ.get("PAPER_ACCOUNT_ENABLED") != "1" or not lane:
+        return True
+    try:
+        try:
+            from daemon.launch_scanner import paper_account as _pa
+        except ImportError:
+            import paper_account as _pa
+        return bool(_pa.register_intent_journal(str(lane), path))
+    except Exception:
+        logger.exception("close_intents: registry hook failed")
         return False
 
 

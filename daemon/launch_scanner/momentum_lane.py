@@ -241,7 +241,20 @@ def _unresolved_positions(_lane=None):
     _pa = _paper_account()
     _ln = _lane if _lane is not None else LANE
     if _pa is not None and hasattr(_pa, "restart_admission_blockers"):
-        return list(_pa.restart_admission_blockers(_ln, LEDGER_PATH))
+        _ij = None
+        try:
+            from daemon.launch_scanner import close_intents as _ci
+        except ImportError:
+            import close_intents as _ci
+        try:
+            _ij = _ci.journal_path(_ln)
+        except Exception:
+            _ij = None
+        _ok = _pa.register_lane(_ln, LEDGER_PATH, _ij)
+        _b = list(_pa.restart_admission_blockers(_ln, LEDGER_PATH))
+        if not _ok:
+            _b.append("lane-registry-unwritable")
+        return _b
     return [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("lane", _ln) == _ln and p.get("pa_pos_id") and not p.get("pa_account_id")]
 
 

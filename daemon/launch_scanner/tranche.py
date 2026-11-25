@@ -812,6 +812,25 @@ def maybe_verdict_report(engine):
 
 # ---- buyback (dip) rule -----------------------------------------------------
 
+def legacy_unreconciled_buyback(pos):
+    """READ-ONLY diagnostic: True when a position took a buyback under the pre-reconciliation code. Signature: buyback_used is set
+    and the recorded buyback exists, but no leg carries buyback_qty and no buyback_qty_total was recorded. Such a position's lane
+    "tokens" includes bought units that the shared account never received (and its legs were sized over the inflated count), so its
+    remaining legs can exceed the account lot and strand. NOTHING is mutated or healed here; a persisted owner ledger is never
+    touched by this code. Never raises."""
+    try:
+        if not (isinstance(pos, dict) and pos.get("buyback_used")):
+            return False
+        bb = (pos.get("entry_features") or {}).get("buyback")
+        if not isinstance(bb, dict):
+            return False
+        if float(pos.get("buyback_qty_total") or 0.0) > 0:
+            return False
+        return not any(float((v or {}).get("buyback_qty") or 0.0) > 0 for v in (pos.get("legs") or {}).values())
+    except Exception:
+        return False
+
+
 def _buyback_due(pos, px, filled, now):
     """Pure buyback decision. Returns (True, cost, tokens) when a
     buyback should fire, else (False, reason, 0). Inputs: the
@@ -876,6 +895,10 @@ def maybe_buyback(engine, now=None):
         positions = list(positions.values())
     for pos in positions or []:
         try:
+            if legacy_unreconciled_buyback(pos):
+                logger.error("tranche LEGACY UNRECONCILED BUYBACK %s: lane units include bought tokens the shared account never "
+                             "received; its remaining legs may strand (pending_exit account_remaining_qty_mismatch). Detected only: "
+                             "nothing healed, owner ledger untouched; operator resolution required.", str(pos.get("mint") or "?")[:16])
             mint = pos.get("mint") or ""
             chain = pos.get("chain") or CHAIN
             try:
@@ -883,6 +906,7 @@ def maybe_buyback(engine, now=None):
                 _buy_row = dict(_st_row) if isinstance(_st_row, dict) else None   # the row THIS decision read (freshness gate below)
             except Exception:
                 _buy_row = None
+            _q_req = time.time()   # observation time of THIS quote request (post-quote age gate at commit)
             quoted = engine.quote_price(chain, mint)
             if not quoted or quoted <= 0:
                 continue
@@ -937,8 +961,14 @@ def maybe_buyback(engine, now=None):
                 # account gates, provider health) with a stable op_id, and the lane book is edited only on success. A refusal leaves
                 # both books untouched. Crash recovery: if the account already applied this op_id (crash before the lane write) the
                 # applied stake/qty are ADOPTED exactly, never re-issued with fresh numbers.
-                _pa = engine._paper_account() if hasattr(engine, "_paper_account") else None
-                if _pa is not None:
+                # NO fallback: the shared account is the capital authority. mandatory_entry_refusal already refuses when it is
+                # disabled; an engine without an account interface, a None account, or an account that raises is a refusal, never a
+                # lane-only buyback.
+                _pa = engine._paper_account()
+                if _pa is None:
+                    logger.warning("tranche buyback refused: shared paper account unavailable; fail-closed")
+                    continue
+                if True:
                     if engine._is_sim(live):
                         logger.warning("tranche buyback refused: simulated-fill position (no reconciled buyback fill path); fail-closed")
                         continue
@@ -959,6 +989,22 @@ def maybe_buyback(engine, now=None):
                         _age_why = _eg.quote_age_refusal(_buy_row, _pa.max_data_age_s(), time.time())
                         if _age_why:
                             logger.warning("tranche buyback refused: %s", _age_why)
+                            continue
+                        # POST-QUOTE gate at commit (same function as the entry path): the quote request must still be inside the owner age cap.
+                        _pq = _eg.post_quote_refusal({"provenance": {"quote_requested_at": _q_req}}, None, False,
+                                                     _pa.max_data_age_s(), time.time())
+                        if _pq:
+                            logger.warning("tranche buyback refused: %s", _pq)
+                            continue
+                        # FILL-IMPACT gate: modelled slippage for this size against the owner max_price_impact_pct WHEN one is set. Unknown
+                        # liquidity cannot prove impact, so with a cap set it refuses. (Model-fill entries have no impact gate today; with no
+                        # owner cap set this adds nothing and the figure is only recorded.)
+                        _liq_now = float(getattr(engine, "_LAST_QUOTE_LIQ", 0.0) or 0.0) or float(liq or 0.0)
+                        _impact = engine._fills.slippage_pct(tokens * quoted, _liq_now) if _liq_now > 0 else None
+                        _cap_imp = _pa.max_price_impact_pct()
+                        if _cap_imp is not None and (_impact is None or _impact > float(_cap_imp)):
+                            logger.warning("tranche buyback refused: modelled impact %s%% vs owner max_price_impact_pct %s%% (or liquidity unknown); fail-closed",
+                                           _impact, _cap_imp)
                             continue
                         _ok, _why2 = _pa.add_to_position(engine.LANE, mint, _pid, cost, tokens, _bop, ts=now)
                         if not _ok:

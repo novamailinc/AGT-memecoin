@@ -994,20 +994,22 @@ for _mode in ("nonsim",):   # sim TWAP variant NOT included: its reconcile route
       restart(PAi)
       try: GR._recover_close_intents(); GR.poll_exits(price_fn=gpf(0.4))
       finally: PAi.op_receipts = _roi
-      # DIAGNOSTIC (v8, print only; no assertion, no state change): emit the hold reason / ops / receipt for the P7i path so a red or an open position is explained by the run itself.
-      try:
-          _pi = GR._read()["positions"].get(gmi) or {}; _pidi = _pi.get("pa_pos_id") or _pid0; _ropi = "%s:leg:twap_remainder:%s:%s" % (GR.LANE, gmi, _pidi)
-          _fn = getattr(GR, "_obligation_hold", None)
-          print("DIAG P7i position open=%s pa_pos_id=%s pending_exit=%r settlement_pending=%r obligation_hold=%r twap=%r" % (bool(_pi), _pidi, _pi.get("pending_exit"), _pi.get("settlement_pending"), _pi.get("obligation_hold"), _pi.get("twap")))
-          print("DIAG P7i hold(foreign_only,marker)=%r hold(default)=%r" % ((_fn(_pi, foreign_only=True, include_unknown=True) if _fn else "n/a (no gate at this commit)"), (_fn(_pi) if _fn else "n/a")))
-          print("DIAG P7i remainder op %s receipt=%r" % (_ropi, _roi([_ropi]) if _pidi else None))
-          _cid = GR._close_intents()   # the same module instance grad uses (the fixture reloads modules)
-          print("DIAG P7i frozen_for_position=%r" % (_cid.frozen_for_position("grad", gmi, _pidi),))
-          _jp = _cid.journal_path("grad")
-          print("DIAG P7i journal rows for this position: %r" % ([l[:260] for l in open(_jp).read().splitlines() if _pidi and _pidi in l][:8],))
-          print("DIAG P7i marker rows (all): %r" % ([ {k: r.get(k) for k in ("lane", "mint", "op_id", "pos_id", "reason")} for r in (PAi.unresolved_refusals() or [])][:6],))
-      except Exception as _de:
-          print("DIAG P7i probe failed: %s: %s" % (type(_de).__name__, _de))
+      # DIAGNOSTIC (v8, print only; no assertion, no state change). Each probe is independent so one failure cannot hide the others.
+      def _dg(_lbl, _f):
+          try: print("DIAG P7i %s: %r" % (_lbl, _f()))
+          except Exception as _de: print("DIAG P7i %s: probe failed %s: %s" % (_lbl, type(_de).__name__, _de))
+      _pi = (GR._read().get("positions") or {}).get(gmi) or {}; _pidi = _pi.get("pa_pos_id") or _pid0
+      _ropi = "%s:leg:twap_remainder:%s:%s" % ("grad", gmi, _pidi); _fn = getattr(GR, "_obligation_hold", None)
+      _pv = _pi or {"mint": gmi, "pa_pos_id": _pidi}   # closed at BASE: probe with the original pid/mint
+      _dg("ids mint/pid0/pid_now/open", lambda: (gmi, _pid0, _pi.get("pa_pos_id"), bool(_pi)))
+      _dg("position pending_exit/settlement_pending/obligation_hold/twap", lambda: {k: _pi.get(k) for k in ("pending_exit", "settlement_pending", "obligation_hold", "twap")})
+      _dg("hold finalize-equivalent (foreign_only=True, include_unknown='marker')", lambda: (_fn(_pv, foreign_only=True, include_unknown="marker") if _fn else "n/a (no gate at this commit)"))
+      _dg("hold default (all, include_unknown=True)", lambda: (_fn(_pv) if _fn else "n/a (no gate at this commit)"))
+      _dg("remainder op id", lambda: _ropi)
+      _dg("remainder op receipt (qty/price_kind/proceeds via real op_receipts)", lambda: _roi([_ropi]))
+      _dg("frozen_for_position", lambda: GR._close_intents().frozen_for_position("grad", gmi, _pidi))
+      _dg("journal rows matching mint OR pid (raw, 700 chars)", lambda: [l[:700] for l in open(GR._close_intents().journal_path("grad")).read().splitlines() if gmi in l or (_pidi and _pidi in l)])
+      _dg("unresolved account markers (all, with op ids)", lambda: [dict(r) for r in (PAi.unresolved_refusals() or [])][:8])
       _cl_i = [c for c in (GR._read().get("closes") or []) if c.get("pa_pos_id")]
       _tw_i = (_cl_i[-1].get("twap") or {}) if _cl_i else {}
       _remk = (_tw_i.get("remainder") or {}).get("exit_price_kind")

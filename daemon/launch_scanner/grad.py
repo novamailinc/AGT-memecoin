@@ -1038,10 +1038,18 @@ def _ei_recover():
             pos = json.loads(json.dumps(rec["pos"]))
             pos["pa_pos_id"] = pid
             d["bankroll"] = round(float(d["bankroll"]) - float(rec["stake"]), 6)
+            # DAILY-ENTRY ATTRIBUTION (explicit): the original entry incremented the counter of ITS OWN day (rec cand.entry_day, captured by _today() when the record was written)
+            # in the same write that never landed. Recovery restores exactly that and never charges a different day: same stored day -> that counter +1; entry day is today but the stored
+            # counter is another day (lazy roll not yet done) -> today's fresh counter = 1, as the original would have produced; entry day older than the stored counter's day and not
+            # today -> the original day's counter has already rolled away, nothing is added to today's counter (logged).
+            _eday = (rec.get("cand") or {}).get("entry_day")
             ed = d["entries_day"]
-            if ed.get("date") != _today():
-                ed = {"date": _today(), "count": 0}
-            ed["count"] = int(ed.get("count") or 0) + 1   # the original entry incremented this in the same write that never landed
+            if ed.get("date") == _eday:
+                ed["count"] = int(ed.get("count") or 0) + 1
+            elif _eday == _today():
+                ed = {"date": _today(), "count": 1}
+            else:
+                logger.warning("%s entry-intent adoption: entry day %s differs from the stored counter day %s and from today; no daily counter changed", LANE, _eday, ed.get("date"))
             d["entries_day"] = ed
             d["positions"][mint] = pos
             d["watchlist"].pop(mint, None)
@@ -1514,7 +1522,7 @@ def _consider_candidate(cand, now):
                     _eim = _ei() if (_demo_mode() and _ei_fill is not None) else None
                     if _eim is not None:
                         _ei_path = _eim.write_record(LEDGER_PATH, _eim.build_record(LANE, mint, _op, _stake, _qty, pos, _ei_fill,
-                                                     {"mint": mint, "pool": cand.get("pool_address"), "created_ts": cand.get("created_ts")}))
+                                                     {"mint": mint, "pool": cand.get("pool_address"), "created_ts": cand.get("created_ts"), "entry_day": _today()}))
                 except Exception as _eie:
                     try:
                         _demo_filler().release_intent(LANE, mint)

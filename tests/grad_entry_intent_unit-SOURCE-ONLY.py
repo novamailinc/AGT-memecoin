@@ -17,7 +17,7 @@ def mkpos():
 def mkfill():
     return {"qty_tokens": 998.5, "price_usd": 1e-05, "fee_usd": 0.01, "execution_source": "t"}
 def mkrec(**over):
-    r = M.build_record("grad", MINT, OP, 1.0, 998.5, mkpos(), mkfill(), {"mint": MINT})
+    r = M.build_record("grad", MINT, OP, 1.0, 998.5, mkpos(), mkfill(), {"mint": MINT, "entry_day": "2026-11-24"})
     if over:
         body = {k: v for k, v in r.items() if k != "checksum"}; body.update(over); body["checksum"] = M._sha(body); return body
     return r
@@ -40,6 +40,7 @@ p = mkpos(); del p["legs"]
 check("validate: missing required pos key refused", "missing key" in (M.validate(mkrec(pos=p), "grad") or ""))
 p = mkpos(); p["execution"]["entry_op"] = "other"
 check("validate: pos execution.entry_op != op_id refused", "entry_op" in (M.validate(mkrec(pos=p), "grad") or ""))
+check("validate: missing cand.entry_day refused (attribution unknown)", "entry_day" in (M.validate(mkrec(cand={"mint": MINT}), "grad") or ""))
 check("validate: fill sha mismatch refused", "sha256" in (M.validate(mkrec(fill_sha256="0" * 64), "grad") or ""))
 p = mkpos(); p["pa_pos_id"] = "x"
 check("validate: pos already carrying pa_pos_id refused", "pa_pos_id" in (M.validate(mkrec(pos=p), "grad") or ""))

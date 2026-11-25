@@ -147,6 +147,8 @@ def validate(rec, lane):
         return "pos execution.entry_op != op_id"
     if pos.get("pa_pos_id"):
         return "pos already carries pa_pos_id"
+    if not isinstance(((rec.get("cand") or {}).get("entry_day")), str) or not rec["cand"]["entry_day"]:
+        return "cand.entry_day missing (daily-entry attribution unknown)"
     return None
 
 def account_evidence(pa, op_id, wait_s):

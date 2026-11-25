@@ -184,14 +184,16 @@ def main():
     lp0 = copy.deepcopy(lanepos()); q0, c0, bv0 = acct_qty()
     sn_a = json.dumps(pa.snapshot(), sort_keys=True, default=str)
     # (1) NEGATIVE CONTROL that reaches the impact gate: freshness (pre-quote row), post-quote and account/lane checks pass, then the impact gate refuses
+    del LOGS[:]   # per-case log window (LOGS is cumulative otherwise)
     T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
-    check("1 refused at the fail-closed impact gate (no positive buyback on the model-fill path)", done == [] and has_log("no Jupiter quote-impact measurement on the model-fill buyback path") and has_log("buyback blocked fail-closed"), repr((done, [m for m in LOGS if "buyback" in m][-2:])))
+    check("1 refused at the fail-closed impact gate (no positive buyback on the model-fill path)", done == [] and has_log("no owner-approved max_price_impact_pct") and has_log("buyback blocked fail-closed"), repr((done, [m for m in LOGS if "buyback" in m][-2:])))
     check("1 refusal reached the gate AFTER freshness/post-quote (those refusal strings were not logged)", not any(has_log(x) for x in ("data age", "quote request time unknown", "post-quote", "refused at commit", "shared paper account unavailable", "simulated-fill position", "no account lot id", "adoption lookup failed", "identity mismatch", "refused by account", "no open leg")), repr(LOGS[-6:]))
     check("1 both books untouched by the refusal (lane record equal, account snapshot equal)", lanepos() == lp0 and json.dumps(pa.snapshot(), sort_keys=True, default=str) == sn_a)
     # (2) NAMED FAULT: the account interface raises -> refusal, never a lane-only buyback
     real_pa = eng._paper_account
     def _boom(): raise RuntimeError("INJECTED FAULT: account unavailable")
+    del LOGS[:]   # per-case log window
     eng._paper_account = _boom; T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
     eng._paper_account = real_pa
@@ -203,6 +205,7 @@ def main():
     check("3 precondition: real account add applied (ENGINEERING numbers: cost $1.00, 40000 units; not a market fill)", oka is True, repr((oka, whya)))
     qa, ca, bva = acct_qty()
     check("3 account qty rose by exactly the bought units; spendable fell by exactly the cost", abs((qa - q0) - bought) < 1e-6 and abs((c0 - ca) - cost) < 1e-6, "dq=%.6f dcash=%.6f" % (qa - q0, c0 - ca))
+    del LOGS[:]   # per-case log window
     T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
     lp = lanepos()

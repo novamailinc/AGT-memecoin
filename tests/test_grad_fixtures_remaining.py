@@ -1398,6 +1398,33 @@ _r1 = _JP.get_prices_observed(["MX"], now=1000.0); _JP._fetch_batch = lambda min
 _r2 = _JP.get_prices_observed(["MX"], now=1005.0); _dbg = ""
 check("P7zd6 real jup_price semantics (offline): the reported time is the LOCAL fetch time of the cache fill (fresh read at 1000 -> 1000; a cache hit at 1005 still reports 1000), no upstream timestamp exists in this layer (%s, %s)" % (_r1, _r2),
       _r1.get("MX") == (2.5, 1000.0) and _r2.get("MX") == (2.5, 1000.0))
+# P7zd9 (UNRUN draft): cache EXPIRED + fetch FAILED, on the same private copy of the real jup_price layer (offline, fetch replaced). A stale price must never be
+# served as if observed, a failing fetch must never raise, and a failed refetch must not overwrite the old cache entry. TTL is read from the module, not hard-coded.
+_ttl = _JP.CACHE_TTL_S; _calls = []
+def _fetch_log(res):
+    def f(mints): _calls.append(list(mints)); return dict(res)
+    return f
+def _fetch_raise(mints): _calls.append(list(mints)); raise RuntimeError("jupiter down")
+_JP._cache.clear(); _JP._fetch_batch = _fetch_log({m: 2.5 for m in ("MA",)})
+_JP.get_prices_observed(["MA"], now=1000.0); _calls.clear(); _JP._fetch_batch = _fetch_log({})
+_za = _JP.get_prices_observed(["MA"], now=1000.0 + _ttl + 1.0)
+check("P7zd9a cache expired + fetch returns nothing: the stale price is NOT served (no masquerade as observed), the fetch was attempted once (%s, calls %s)" % (_za, _calls),
+      _za == {} and _calls == [["MA"]])
+_calls.clear(); _zb = _JP.get_prices_observed(["MA"], now=1000.0 + _ttl)
+check("P7zd9b boundary: an entry exactly TTL old is still a hit (<=), reports its ORIGINAL fill time, no fetch (%s)" % (_zb,), _zb.get("MA") == (2.5, 1000.0) and _calls == [])
+_JP._fetch_batch = _fetch_raise; _calls.clear()
+try: _zc = _JP.get_prices_observed(["MA"], now=1000.0 + _ttl + 1.0); _zc_raised = False
+except Exception: _zc, _zc_raised = None, True
+check("P7zd9c cache expired + fetch RAISES: get_prices_observed never raises (a raise would abort the poll), returns no price, and the old cache entry is left untouched (%s, entry %s)" % (_zc, _JP._cache.get("MA")),
+      not _zc_raised and _zc == {} and _JP._cache.get("MA") == (2.5, 1000.0) and _calls == [["MA"]])
+_JP._cache.clear(); _JP._fetch_batch = _fetch_log({"MB": 3.0}); _JP.get_prices_observed(["MB"], now=2000.0)
+_JP._cache["MC"] = (1.5, 2000.0 - _ttl - 5.0); _JP._fetch_batch = _fetch_log({}); _calls.clear()
+_zd = _JP.get_prices_observed(["MB", "MC"], now=2000.0 + 1.0)
+check("P7zd9d mixed: the fresh mint is served from cache, the expired mint with a failing fetch is ABSENT (not stale-served); only the expired mint was fetched (%s, calls %s)" % (_zd, _calls),
+      _zd == {"MB": (3.0, 2000.0)} and _calls == [["MC"]])
+_JP._cache.clear(); _JP._cache["MZ"] = (0.0, 3000.0); _JP._fetch_batch = _fetch_log({}); _calls.clear()
+_ze = _JP.get_prices_observed(["MZ"], now=3000.0 + 1.0)
+check("P7zd9e a FRESH cached price of exactly 0 is not served (hit[0] > 0): it is refetched and, with the fetch failing, absent (%s, calls %s)" % (_ze, _calls), _ze == {} and _calls == [["MZ"]])
 # P7zd7 (UNRUN draft): the Jupiter PRICE (not only its timestamp) is an untrusted source value, validated PER MINT at the boundary (grad._validate_jup_observed).
 # A bad price must never raise, abort the poll, or become the recorded px; the reject counter must rise, and that mint falls through to the fallback route.
 class _JupBadPx:

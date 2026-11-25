@@ -250,17 +250,18 @@ def intent_status(lane: str, intent_id: str) -> Optional[str]:
     return "applied" if s_["applied"] else ("frozen" if s_["frozen"] is not None else "open")
 
 
-def mark_account_applied(lane: str, intent_id: str) -> None:
-    _append(journal_path(lane), {"ev": "account_applied",
-                                 "intent_id": intent_id})
+def mark_account_applied(lane: str, intent_id: str) -> bool:
+    """Returns False when the marker was not durably written. The intent then stays open: recovery re-applies by the idempotent op ids
+    (a lost marker never loses an account op, it only delays convergence), so callers continue but may surface the False."""
+    return bool(_append(journal_path(lane), {"ev": "account_applied", "intent_id": intent_id}))
 
 
-def mark_lane_applied(lane: str, intent_id: str) -> None:
+def mark_lane_applied(lane: str, intent_id: str) -> bool:
     path = journal_path(lane)
-    _append(path, {"ev": "lane_applied", "intent_id": intent_id})
-    # Terminal event in the same pass when both sides are durable:
-    # the account side always precedes the lane write by design.
-    _append(path, {"ev": "applied", "intent_id": intent_id})
+    ok1 = bool(_append(path, {"ev": "lane_applied", "intent_id": intent_id}))
+    # Terminal event in the same pass when both sides are durable: the account side always precedes the lane write by design.
+    # The terminal "applied" is written ONLY if the lane marker landed (a terminal state must never outrun its evidence).
+    return bool(ok1 and _append(path, {"ev": "applied", "intent_id": intent_id}))
 
 
 def journal_writable(lane: str) -> bool:

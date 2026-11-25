@@ -664,5 +664,51 @@ check("S14 journal healthy again: closes exactly once, pending cleared, bankroll
       len(rec) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (br0 + rec[0]["realized_usd"])) < 1e-6 and acct_lot_qty(pid) < 1e-6)
 JUP.mult = 1.0
 
+
+# ---- S15: REAL DemoFiller sale idempotency and the execute-before-save window (real filler, real sim executor, FakeJup quotes = canned quote fixture, engineering only) ----
+setup(); _F = FILLER[0]; _mint15 = "S15pump"; _op15 = "grad:exit:%s:a" % _mint15
+_f1 = _F.sell(_op15, _mint15, 100.0, 2.0); _n1 = len(JUP.calls)
+_f2 = _F.sell(_op15, _mint15, 100.0, 2.0)
+check("S15a real sell: a second call with the SAME op id returns the SAME journaled fill and requests/executes nothing (calls %d -> %d)" % (_n1, len(JUP.calls)),
+      _f2 == _f1 and len(JUP.calls) == _n1 and _f1.get("status") == "filled")
+# crash/save-failure window: the swap executes, then the fill cannot be saved
+setup(); _F = FILLER[0]; _op = "grad:exit:S15crash:a"; _real_save = _F._save
+def _bad_save(op_id, fill): raise RuntimeError("INJECTED: fill journal save failed after the swap executed")
+_F._save = _bad_save; _n0 = len(JUP.calls)
+try:
+    _F.sell(_op, "S15crash", 100.0, 2.0); _raised = False
+except RuntimeError:
+    _raised = True
+_nx = len(JUP.calls); _rec = _F.get_fill(_op)
+check("S15b INJECTED save failure after execute: sell raised (%r), the swap WAS requested (%d -> %d), journal holds an INFLIGHT marker (%r)" % (_raised, _n0, _nx, (_rec or {}).get("status")),
+      _raised and _nx > _n0 and (_rec or {}).get("status") == "inflight")
+_F._save = _real_save
+try:
+    _F.sell(_op, "S15crash", 100.0, 2.0); _why = None
+except DF.DemoSkip as _e:
+    _why = _e.reason
+check("S15b retry after the crash is REFUSED fail-closed (unresolved_inflight, got %r) and does NOT execute the swap again (calls %d -> %d)" % (_why, _nx, len(JUP.calls)),
+      _why == "unresolved_inflight" and len(JUP.calls) == _nx and (_F.get_fill(_op) or {}).get("status") == "inflight")
+# clean executor refusal clears the marker: a later retry may execute exactly once
+setup(); _F = FILLER[0]; _op = "grad:exit:S15refuse:a"; JUP.fail_sell = True
+try:
+    _F.sell(_op, "S15refuse", 100.0, 2.0); _w = None
+except DF.DemoSkip as _e:
+    _w = _e.reason
+_after = _F.get_fill(_op)
+JUP.fail_sell = False; _nr = len(JUP.calls)
+_ok15 = _F.sell(_op, "S15refuse", 100.0, 2.0)
+check("S15c clean refusal (%r) leaves NO inflight marker (%r) and a later retry executes once (calls +%d) to a filled record" % (_w, _after, len(JUP.calls) - _nr),
+      _w is not None and _after is None and _ok15.get("status") == "filled" and len(JUP.calls) > _nr)
+# marker unwritable: nothing executes
+setup(); _F = FILLER[0]; _n0 = len(JUP.calls)
+def _bad_mark(*a, **k): raise RuntimeError("INJECTED: inflight marker not writable")
+_F._mark_inflight = _bad_mark
+try:
+    _F.sell("grad:exit:S15nomark:a", "S15nomark", 100.0, 2.0); _r = False
+except RuntimeError:
+    _r = True
+check("S15d marker not writable: the sale raises and the executor was never reached (execute calls %d -> %d)" % (_n0, len(JUP.calls)), _r and len(JUP.calls) == _n0)
+
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

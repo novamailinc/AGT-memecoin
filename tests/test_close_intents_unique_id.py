@@ -108,6 +108,18 @@ except ci.IntentNotDurable:
     _sr = True
 check("stable_id on a torn journal fails closed (raises IntentNotDurable)", _sr)
 
+# marker failure semantics: a lost marker is reported (False), nothing terminal is written without its evidence, and the intent stays pending for recovery
+mk = ci.begin("lanem", "MM", "pm", OPS, dict(INFO))
+_ra = ci._append; ci._append = lambda path, ev: False
+try:
+    _ma = ci.mark_account_applied("lanem", mk); _ml = ci.mark_lane_applied("lanem", mk)
+finally:
+    ci._append = _ra
+check("marker appends that fail return False (%r, %r) and the intent is still PENDING for recovery (%r)" % (_ma, _ml, mk in [x["intent_id"] for x in ci.pending("lanem")]),
+      _ma is False and _ml is False and mk in [x["intent_id"] for x in ci.pending("lanem")])
+_okm = ci.mark_account_applied("lanem", mk) and ci.mark_lane_applied("lanem", mk)
+check("healthy markers return True and the intent becomes terminal (applied)", _okm is True and ci.intent_status("lanem", mk) == "applied")
+
 # concurrency: 8 threads x 25 begins on the SAME position in the same second -> all ids distinct, every intent event recorded once
 import threading
 ids = []; lk = threading.Lock()

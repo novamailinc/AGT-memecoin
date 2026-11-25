@@ -313,10 +313,27 @@ class DemoFiller:
         rec = self.get_fill(op_id)
         if rec is None:
             return None
+        if rec.get("status") == "inflight":
+            # A swap was STARTED for this op id and no fill was ever saved (crash or save failure between execute and save). The sim book is
+            # rebuilt per call, so a blind retry would execute the swap AGAIN: refuse (fail closed, visible); never guess the outcome.
+            raise DemoSkip("unresolved_inflight",
+                           {"op_id": op_id, "why": "swap started, no fill saved (crash or save failure); retry blocked, needs reconciliation"})
         if rec.get("status") == "unknown":
             raise DemoSkip("unresolved_unknown",
                            {"op_id": op_id, "why": "confirm_timeout not reconciled; retry blocked"})
         return rec
+
+    def _mark_inflight(self, op_id, side, mint):
+        """Durable BEFORE the swap executes. Raises (nothing executes) when the marker cannot be written."""
+        def f(j):
+            j["fills"].setdefault(op_id, {"status": "inflight", "op_id": op_id, "side": side, "mint": mint, "ts": self._now()})
+        self._locked(f)
+
+    def _clear_inflight(self, op_id):
+        def f(j):
+            if (j["fills"].get(op_id) or {}).get("status") == "inflight":
+                del j["fills"][op_id]
+        self._locked(f)
 
     def _skip_from(self, op_id, side, mint, exc, fx=None, ctx=None):
         det = dict(getattr(exc, "detail", {}) or {})
@@ -330,6 +347,8 @@ class DemoFiller:
             d["_ctx"] = dict(ctx, px=fx, quote={
                 "requested_at": _q.get("requested_at"), "received_at": _q.get("received_at"),
                 "slippage_bps": _q.get("slippage_bps"), "route": _route_labels(_q.get("quote"))})
+        if reason != "confirm_timeout":
+            self._clear_inflight(op_id)   # the executor refused cleanly: nothing was executed, a retry is allowed (a timeout keeps its UNKNOWN record)
         self._record_attempt(op_id, side, mint, reason, d, fx)
         raise DemoSkip(reason, d)
 
@@ -345,6 +364,7 @@ class DemoFiller:
         if amount <= 0:
             raise DemoSkip("notional_below_fee", {"notional_usd": notional_usd})
         ex = self._executor(amount + total_fee + 1)
+        self._mark_inflight(op_id, "buy", mint)
         try:
             res = ex.execute_swap(SOL_MINT, mint, amount, slippage_bps=slippage_bps,
                                   price_impact_cap_pct=float(impact_cap_pct))
@@ -366,6 +386,7 @@ class DemoFiller:
         if base_units <= 0:
             raise DemoSkip("amount_too_small", {})
         ex = self._executor(total_fee + 1, {mint: base_units})
+        self._mark_inflight(op_id, "sell", mint)
         try:
             res = ex.execute_swap(mint, SOL_MINT, base_units, slippage_bps=slippage_bps,
                                   price_impact_cap_pct=float(impact_cap_pct))
@@ -490,6 +511,8 @@ class DemoFiller:
 
     def _save(self, op_id, fill):
         def f(j):
+            if (j["fills"].get(op_id) or {}).get("status") == "inflight":
+                del j["fills"][op_id]
             j["fills"].setdefault(op_id, fill)
             return j["fills"][op_id]
         return self._locked(f)

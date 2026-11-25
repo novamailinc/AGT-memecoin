@@ -1404,32 +1404,51 @@ class _JupBadPx:
     SOURCE = "jupiter-fake"
     px = None
     def get_prices_observed(self, mints, now=None): return {m: (self.px, time.time()) for m in mints}
+# ROOT CAUSE of the first P7zd7/P7zd8 run FAIL (log draft-8772032c, grad CLOSE hard_stop_-50pct): the fixture's GR.quote_price stub returns 0.00007 (0.07x of the 0.001
+# entry), so a rejected Jupiter price fell through to a crash-level fallback quote and the position was (correctly) closed by the hard stop, leaving later classes with
+# no position. The cases below use a FRESH account/position per bad class, an explicit near-entry FALLBACK quote (so the fallback route yields a positive receipt),
+# and assert the boundary was actually visited with that mint and that exactly one reject was counted.
+_FBQ_SAVE = GR.quote_price
+def _grad_open(n_pos):
+    PAx, Fx, CTx = fresh(start="10"); go_sim(); _lx = dict(build(PAx, CTx)); _ms = []
+    for i in range(1, n_pos + 1):
+        _okx, _whx = _lx["grad"](i); assert _okx, _whx
+    _ms = sorted(GR.open_positions()); assert len(_ms) == n_pos, _ms
+    return _ms
+class _JupBadPx:
+    SOURCE = "jupiter-fake"
+    px = None
+    seen = None
+    def get_prices_observed(self, mints, now=None):
+        self.seen = list(mints); return {m: (self.px, time.time()) for m in mints}
 _jpx = _JupBadPx(); _bpx = {}
 try:
-    GR._jup = _jpx
     for _lab, _v in (("nan", float("nan")), ("inf", float("inf")), ("negative", -2.5), ("zero", 0.0), ("bool", True), ("string", "2.5"), ("none", None), ("tuple_value", (2.5, 1.0))):
-        _jpx.px = _v; _a0 = GR._POLL_ABORTS.get("count", 0); _r0 = GR._JUP_REJECTS["n"]; GR.poll_exits(price_fn=None)
-        _bpx[_lab] = ((GR.open_positions().get(_gmp, {}).get("quote_journal") or [{}])[-1], GR._POLL_ABORTS.get("count", 0) - _a0, GR._JUP_REJECTS["n"] - _r0)
-finally: GR._jup = _jsave
-check("P7zd7 a bad Jupiter PRICE (nan, inf, negative, zero, bool, string, None, nested tuple) never raises or aborts the poll, is counted as a reject (+1 per poll), and is never the recorded px (%s)" % ({k: (v[1], v[2], v[0].get("px"), v[0].get("src")) for k, v in _bpx.items()},),
-      all(v[1] == 0 and v[2] == 1 and v[0].get("src") != "jupiter-fake" and not (isinstance(v[0].get("px"), float) and (v[0]["px"] != v[0]["px"] or abs(v[0]["px"]) == float("inf") or v[0]["px"] < 0)) for v in _bpx.values()))
-# P7zd8 (UNRUN draft): MIXED good + bad in ONE poll: a bad price for one open mint must not cost the other mint its Jupiter price (per-mint isolation), and the bad
-# mint must fall through to the fallback route independently. Two real grad positions on a fresh account; fake _jup prices mint 1 well and mint 2 with a NaN.
-PAm, Fm, CTm = fresh(start="10"); go_sim(); _lm = dict(build(PAm, CTm)); _okm1, _whm1 = _lm["grad"](1); _okm2, _whm2 = _lm["grad"](2)
-assert _okm1 and _okm2, ("two grad entries needed for the mixed case", _whm1, _whm2)
-_mm = sorted(GR.open_positions()); assert len(_mm) == 2, _mm
-_good_m, _bad_m = _mm[0], _mm[1]; _gpx = float(GR.open_positions()[_good_m]["entry_price"]) * 1.1
+        _mm1 = _grad_open(1)[0]; _fbp = float(GR.open_positions()[_mm1]["entry_price"]) * 1.05
+        GR.quote_price = G.stamped_quote(GR, lambda chain, mint, spot_index=None, _p=_fbp: _p)
+        GR._jup = _jpx; _jpx.px = _v; _jpx.seen = None; _a0 = GR._POLL_ABORTS.get("count", 0); _r0 = GR._JUP_REJECTS["n"]; GR.poll_exits(price_fn=None)
+        _jr = (GR.open_positions().get(_mm1, {}).get("quote_journal") or [{}])[-1]
+        _bpx[_lab] = (_jr, GR._POLL_ABORTS.get("count", 0) - _a0, GR._JUP_REJECTS["n"] - _r0, _jpx.seen == [_mm1], _fbp, _mm1 in GR.open_positions())
+finally: GR._jup = _jsave; GR.quote_price = _FBQ_SAVE
+check("P7zd7 a bad Jupiter PRICE (nan, inf, negative, zero, bool, string, None, nested tuple), FRESH position per class: the Jupiter boundary was visited with that mint, no abort, exactly +1 reject, the recorded quote is the positive FALLBACK receipt (src ds/gt, px == injected fallback) and never the bad value (%s)" % ({k: (v[1], v[2], v[3], v[0].get("px"), v[0].get("src")) for k, v in _bpx.items()},),
+      len(_bpx) == 8 and all(v[1] == 0 and v[2] == 1 and v[3] and v[5] and v[0].get("src") == "ds/gt" and isinstance(v[0].get("px"), float) and abs(v[0]["px"] - v[4]) < 1e-12 for v in _bpx.values()))
+# P7zd8 (UNRUN draft): MIXED good + bad in ONE poll with price_fn=None (so the Jupiter route governs BOTH mints; a non-None price_fn would take precedence for every mint it prices
+# >0 and bypass Jupiter entirely, see _poll_exits quote loop). Mint 1 priced well by fake _jup, mint 2 NaN: mint 1 keeps Jupiter, mint 2 gets the positive fallback receipt.
+_mm = _grad_open(2); _good_m, _bad_m = _mm[0], _mm[1]; _gpx = float(GR.open_positions()[_good_m]["entry_price"]) * 1.1; _fbm = float(GR.open_positions()[_bad_m]["entry_price"]) * 1.05
 class _JupMixed:
     SOURCE = "jupiter-fake"
-    def get_prices_observed(self, mints, now=None): return {m: ((_gpx if m == _good_m else float("nan")), time.time()) for m in mints}
-    def get_prices(self, mints, now=None): return {}
+    seen = None
+    def get_prices_observed(self, mints, now=None):
+        self.seen = list(mints); return {m: ((_gpx if m == _good_m else float("nan")), time.time()) for m in mints}
+_jm8 = _JupMixed()
 try:
-    GR._jup = _JupMixed(); _a0 = GR._POLL_ABORTS.get("count", 0); _r0 = GR._JUP_REJECTS["n"]; GR.poll_exits(price_fn=None)
+    GR.quote_price = G.stamped_quote(GR, lambda chain, mint, spot_index=None: _fbm)
+    GR._jup = _jm8; _a0 = GR._POLL_ABORTS.get("count", 0); _r0 = GR._JUP_REJECTS["n"]; GR.poll_exits(price_fn=None)
     _jg = (GR.open_positions().get(_good_m, {}).get("quote_journal") or [{}])[-1]; _jbd = (GR.open_positions().get(_bad_m, {}).get("quote_journal") or [{}])[-1]
     _abm = GR._POLL_ABORTS.get("count", 0) - _a0; _rjm = GR._JUP_REJECTS["n"] - _r0
-finally: GR._jup = _jsave
-check("P7zd8 mixed poll: the GOOD mint keeps its Jupiter price (px %s == %s, src %s), the BAD (nan) mint is rejected alone and uses the fallback route (src %s, px %s, not nan/inf/negative), one reject counted (%s), no abort (%s)" % (_jg.get("px"), _gpx, _jg.get("src"), _jbd.get("src"), _jbd.get("px"), _rjm, _abm),
-      _abm == 0 and _rjm == 1 and _jg.get("src") == "jupiter-fake" and abs(float(_jg.get("px") or 0) - _gpx) < 1e-12 * max(1.0, _gpx) and _jbd.get("src") != "jupiter-fake" and not (isinstance(_jbd.get("px"), float) and (_jbd["px"] != _jbd["px"] or abs(_jbd["px"]) == float("inf") or _jbd["px"] < 0)))
+finally: GR._jup = _jsave; GR.quote_price = _FBQ_SAVE
+check("P7zd8 mixed poll (price_fn None, both mints through the Jupiter boundary %s): GOOD mint keeps Jupiter (px %s == %s, src %s), BAD (nan) mint is rejected alone and records the positive fallback receipt (src %s, px %s == %s), exactly one reject (%s), no abort (%s)" % (sorted(_jm8.seen or []) == _mm, _jg.get("px"), _gpx, _jg.get("src"), _jbd.get("src"), _jbd.get("px"), _fbm, _rjm, _abm),
+      sorted(_jm8.seen or []) == _mm and _abm == 0 and _rjm == 1 and _jg.get("src") == "jupiter-fake" and abs(float(_jg.get("px") or 0) - _gpx) < 1e-12 and _jbd.get("src") == "ds/gt" and abs(float(_jbd.get("px") or 0) - _fbm) < 1e-12)
 check("P7zc unavailable_gates key is present on every verdict path: TWAP %s, entry_op %s, quarantine %s, unavailable %s" % ("unavailable_gates" in _dt, "unavailable_gates" in GR.diagnose_position(_gmi) , "unavailable_gates" in _dq, "unavailable_gates" in _dm),
       all("unavailable_gates" in x for x in (_dt, _dq, _dm, _di)) and _dt["unavailable_gates"] == [] and _dm["unavailable_gates"] == ["G3", "G6"] and _dq["unavailable_gates"] in (["G3", "G6"], ["G3"], ["G6"], []))
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.

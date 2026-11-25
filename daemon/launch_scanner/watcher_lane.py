@@ -257,6 +257,20 @@ def _recover_close_intents():
 
     frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
                               lane_apply)
+    if not frozen:
+        _un = _pending_unusable()
+        if _un:
+            for _iid, _w in _un:
+                logger.error("watcher: pending intent %s has an unusable recorded op (%s): freezing, ENTRIES BLOCKED", _iid, _w)
+                _fzok = False
+                try:
+                    if _iid:
+                        _fzok = bool(_ci.freeze(LANE, _iid, "unusable recorded op: " + _w))   # best effort; the block below does not depend on this write
+                except Exception:
+                    logger.exception("watcher: could not freeze intent %s", _iid)
+                if not _fzok:
+                    logger.error("watcher: freeze event for %s NOT written; entries stay blocked from the durable record alone", _iid)
+            frozen = [str(i or "unreadable-pending") for i, _w in _un]
     if frozen:
         _ENTRY_BLOCKED = True
         logger.error("watcher: %d close intent(s) FROZEN - ledgers "
@@ -324,7 +338,7 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
                          [{"kind": "credit", "op_id": _op,
                            "mint": mint, "amount": gross, "qty": qty,
                            "fee": fee, "price_kind": price_kind,
-                           "pos_id": pa_pos_id}], suffix)
+                           "pos_id": pa_pos_id}], (pos.get("_exit_meta") or {}).get("reason") or suffix)
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
                            qty=qty, fee=fee, price_kind=price_kind)
     if not _ok and _pa.op_outcome(_op) == "orphan" \
@@ -1461,6 +1475,125 @@ def _pkind(reason, pkind=None):
     return _pk.classify_reason(
         reason, getattr(_f2, "F2_REASON", None) if _f2 else None)
 
+def _recorded_credit_op(pos, suffix):
+    """The RECORDED credit op of a still-pending (open, unfrozen, unapplied) close intent for this exact op id of this position instance, or None.
+    A process death after the account credit and before the lane write leaves exactly this record; the account side is already done at THESE amounts."""
+    _ci = _close_intents()
+    if _ci is None or not pos.get("pa_pos_id"):
+        return None
+    _op_id = "%s:%s:%s:%s" % (LANE, suffix, pos["mint"], pos["pa_pos_id"])
+    for _it in _ci.pending(LANE):
+        for _op in ((_it.get("intent") or {}).get("settle_ops") or []):
+            if _op.get("op_id") == _op_id and _op.get("kind") == "credit":
+                return dict(_op, _intent_id=_it.get("intent_id"), _close_info=dict((_it.get("intent") or {}).get("close_info") or {}))
+    return None
+
+
+def _op_defects(op, close_info, qty, suffix=None):
+    """Why a RECORDED pending credit op cannot be settled by a retry (None = usable). Pure check of durable data: non-finite/negative amount or fee, a qty
+    that is not exactly the exit qty (when qty is given), a missing price_kind, a missing close reason. Used both at the retry and by restart recognition."""
+    try:
+        _g = float(op["amount"]); _f = float(op.get("fee") or 0.0); _rq = float(op["qty"])
+    except Exception:
+        return "amount/fee/qty missing or not numeric"
+    if not (_g == _g and _f == _f and 0.0 <= _g < float("inf") and 0.0 <= _f < float("inf")):
+        return "amount or fee non-finite or negative"
+    if qty is not None and not (qty > 0 and _rq == qty):
+        return "recorded qty %r is not exactly the exit qty %r" % (op.get("qty"), qty)
+    if not op.get("price_kind"):
+        return "price_kind not recorded"
+    if not (close_info or {}).get("closed_reason"):
+        return "close reason not recorded"
+    return None
+
+
+def _pending_unusable():
+    """Restart recognition from DURABLE data only (journal + ledger): pending intents whose recorded credit op is unusable for the retry. Judged only for
+    an op of THIS watcher position instance (matching mint and pa_pos_id): a foreign or absent position is not judged here. Returns [(intent_id, why)]."""
+    _ci = _close_intents()
+    if _ci is None:
+        return []
+    out = []
+    try:
+        _pos = (_read().get("positions") or {})
+        for _it in _ci.pending(LANE):
+            _int = _it.get("intent") or {}
+            for _op in (_int.get("settle_ops") or []):
+                if _op.get("kind") != "credit":
+                    continue
+                _p = _pos.get(_op.get("mint"))
+                if not _p or not _p.get("pa_pos_id") or _p.get("pa_pos_id") != _op.get("pos_id"):
+                    continue
+                _oid = str(_op.get("op_id") or ""); _pre = "%s:" % LANE
+                _parts = _oid[len(_pre):].split(":") if _oid.startswith(_pre) else []
+                _q = None
+                if _parts and _parts[0] == "leg" and len(_parts) > 1 and _parts[1] in _p.get("legs", {}):
+                    _q = _p["tokens"] * _p["legs"][_parts[1]]["frac"]
+                elif _parts and _parts[0] == "remaining" and len(_parts) > 1:
+                    _lg = [k for k in _parts[1] if k in _p.get("legs", {})]
+                    _q = sum(_p["tokens"] * _p["legs"][k]["frac"] for k in _lg) if _lg else None
+                _w = _op_defects(_op, _int.get("close_info"), _q)
+                if _w:
+                    out.append((_it.get("intent_id"), "%s: %s" % (_oid, _w)))
+    except Exception:
+        logger.exception("watcher: pending-intent recognition failed")
+        out.append((None, "pending-intent recognition raised: blocking fail-closed"))
+    return out
+
+
+def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):
+    """(filled_exit, gross, fee, kind, fee_venue, recorded_reason) of a NON-sim (modelled-fill) exit. When a pending intent already RECORDED a credit for this
+    same op id, the retry settles EXACTLY those recorded amounts, qty, price_kind and close reason (the account credited them; a fresh live quote or a new
+    trigger reason would be a different plan). A recorded op that cannot be used (qty not exactly equal to this exit's, non-finite/negative amount or fee,
+    missing price_kind or closed_reason provenance) FREEZES that intent and BLOCKS entries (the existing freeze + entry-block contract), then refuses visibly.
+    Otherwise the live honest_exit price, as before (recorded_reason None). A write-down never reuses a credit."""
+    global _ENTRY_BLOCKED
+    _kind = _pkind(reason, pkind)
+    _fv = _exit_fee_venue(pos)
+    if _kind != "write_down_zero":
+        _rec = _recorded_credit_op(pos, suffix)
+        if _rec is not None:
+            _ci = _close_intents()
+            _rreason = (_rec.get("_close_info") or {}).get("closed_reason")
+            _dw = _op_defects(_rec, _rec.get("_close_info"), qty, suffix)
+            _g = float(_rec["amount"]) if _dw is None else None
+            _f = float(_rec.get("fee") or 0.0) if _dw is None else None
+            _okrec = _dw is None
+            if not _okrec:
+                _why = ("recorded credit op %s unusable for the retry (recorded qty %r vs exit qty %r, amount %r, fee %r, price_kind %r, closed_reason %r): "
+                        "frozen, operator resolution required" % (_rec.get("op_id"), _rec.get("qty"), qty, _rec.get("amount"), _rec.get("fee"),
+                                                                    _rec.get("price_kind"), _rreason))
+                try:
+                    _fzok = bool(_ci.freeze(LANE, _rec.get("_intent_id"), _why))
+                except Exception:
+                    logger.exception("watcher: could not freeze intent %s", _rec.get("_intent_id")); _fzok = False
+                _ENTRY_BLOCKED = True
+                if _fzok:
+                    logger.error("watcher: %s; ENTRIES BLOCKED", _why)
+                else:
+                    logger.error("watcher: %s; the freeze event was NOT written (intent stays pending); ENTRIES BLOCKED in this process and by restart recognition of the durable record", _why)
+                raise _ci.IntentNotDurable(_why)
+            if _rreason == suffix:
+                logger.warning("watcher: recorded close reason for %s is the legacy op suffix (original trigger reason NOT recorded): the retry trigger reason is used", _rec.get("op_id"))
+                _rreason = None
+            return _g / qty, _g, _f, _rec["price_kind"], _fv, _rreason
+    try:
+        filled_exit = _fills.honest_exit(
+            exit_price, qty * exit_price,
+            # F5 (2026-10-23): exit-time liquidity beats the entry
+            # snapshot — pools drain between entry and exit.
+            pos.get("last_liquidity")
+            or pos["entry_snapshot"].get("liquidity") or None)
+    except Exception:
+        filled_exit = exit_price
+    gross = qty * filled_exit
+    # A write-down is NOT a sale (design v4 Stage B): no fee is
+    # booked on units nobody bought.
+    gas_out = (0.0 if _kind == "write_down_zero"
+               else _costs.tx_cost_usd(pos["chain"], gross, venue=_fv))
+    return filled_exit, gross, gas_out, _kind, _fv, None
+
+
 def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD."""
     leg = pos["legs"][leg_key]
@@ -1488,21 +1621,9 @@ def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
         pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
         _pa_settle(pos, leg_tokens, gross, gas_out, "leg:%s" % leg_key, price_kind=_kind)
         return net
-    try:
-        leg_usd = leg_tokens * exit_price
-        filled_exit = _fills.honest_exit(
-            exit_price, leg_usd,
-            pos.get("last_liquidity")
-            or pos["entry_snapshot"].get("liquidity") or None)
-    except Exception:
-        filled_exit = exit_price
-    gross = leg_tokens * filled_exit
-    _kind = _pkind(reason, pkind)
-    # A write-down is NOT a sale (design v4 Stage B): no fee is
-    # booked on units nobody bought.
-    _fv = _exit_fee_venue(pos)
-    gas_out = (0.0 if _kind == "write_down_zero"
-               else _costs.tx_cost_usd(pos["chain"], gross, venue=_fv))
+    filled_exit, gross, gas_out, _kind, _fv, _rr = _nonsim_figures(
+        pos, leg_tokens, exit_price, reason, pkind, "leg:%s" % leg_key)
+    reason = _rr or reason   # a recorded pending credit keeps ITS close reason
     net = gross - gas_out
     leg.update(done=True, exit_price=filled_exit,
                realized_usd=round(net, 6), exit_reason=reason,
@@ -1550,21 +1671,10 @@ def _close_remaining_impl(pos, exit_price, reason, pkind=None):
         pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
         _pa_settle(pos, total_tokens, gross, gas_out, _rkey, price_kind=_kind)
         return net
-    try:
-        leg_usd = total_tokens * exit_price
-        filled_exit = _fills.honest_exit(
-            exit_price, leg_usd,
-            pos.get("last_liquidity")
-            or pos["entry_snapshot"].get("liquidity") or None)
-    except Exception:
-        filled_exit = exit_price
-    gross = total_tokens * filled_exit
-    _kind = _pkind(reason, pkind)
-    # A write-down is NOT a sale (design v4 Stage B): no fee is
-    # booked on units nobody bought.
-    _fv = _exit_fee_venue(pos)
-    gas_out = (0.0 if _kind == "write_down_zero"
-               else _costs.tx_cost_usd(pos["chain"], gross, venue=_fv))
+    filled_exit, gross, gas_out, _kind, _fv, _rr = _nonsim_figures(
+        pos, total_tokens, exit_price, reason, pkind,
+        "remaining:%s" % "".join(open_legs))
+    reason = _rr or reason   # a recorded pending credit keeps ITS close reason
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]

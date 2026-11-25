@@ -168,6 +168,19 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     intent_id = "%s:%s:%s:%d" % (lane, mint, pos_id or "legacy",
                                  int(close_info.get("close_ts")
                                      or time.time() * 1000))
+    # The base id has one-second resolution when close_ts is epoch seconds, so a freeze followed by a new begin in the same
+    # second for the same position would reuse the id and the new intent would read as the old, already terminal one. Never
+    # reuse an id that is already in the journal: add a monotonic suffix (ids are opaque, nothing parses them).
+    try:
+        _used = {e.get("intent_id") for e in _read(journal_path(lane))[0]
+                 if isinstance(e, dict) and e.get("ev") == "intent"}
+    except Exception:
+        _used = set()
+    if intent_id in _used:
+        _n = 2
+        while "%s#%d" % (intent_id, _n) in _used:
+            _n += 1
+        intent_id = "%s#%d" % (intent_id, _n)
     _append(journal_path(lane), {
         "ev": "intent", "intent_id": intent_id, "lane": lane,
         "mint": mint, "pos_id": pos_id, "settle_ops": settle_ops,

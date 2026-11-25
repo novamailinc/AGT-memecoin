@@ -47,6 +47,10 @@ def _tree(d):
     return out
 
 
+# The grad lane's OWN books are not modeled in this account-only test. account_marks drops a mark for any grad position the lane's legacy hook
+# cannot prove (the real hook imports grad.py and reads the lane ledger), so marks would never reach the gate. Register the account's real hook API
+# with "no unproven positions" for this temp account only; this does not touch the account's verdict logic under test (verify_replay).
+PA.register_legacy_hook("grad", lambda: set())
 import time as _time
 def _mk(PA_):
     """Fresh, fully bound marks for every open position (fixture-only; value = cost basis): with a position open, the gate needs a trusted

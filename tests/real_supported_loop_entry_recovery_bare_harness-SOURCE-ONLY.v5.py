@@ -182,7 +182,7 @@ def kill_phase(h, lab, ei, cyc):
           live_ok(li, cyc) and live_ok(pm, cyc, registered=False) and (ls or {}).get("ident2", {}).get("no_pkg_grad_after_script_import") is True)
     return t, ls
 
-def common_pre(lab, ei, t, r, cyc="?"):
+def common_pre(lab, ei, t, r, cyc="?", expect_recs=None):
     pid = t["pa_pos_id"]; pre = r["pre"]
     ex = r.get("extra") or {}; li = r.get("live_ident") or {}
     # legacy hook is registered lazily by grad._paper_account(); in a gated, unmanaged run (S4: no scan, no acts, empty lane) the account path is never entered, so False is the source-derived expectation there, asserted explicitly
@@ -193,8 +193,8 @@ def common_pre(lab, ei, t, r, cyc="?"):
           (lab, cyc, li.get("pkg_grad_loaded"), sorted(set(p.get("pkg_grad") for p in r["passes"])), r.get("pkg_at_boot"), li.get("GR_name"), li.get("sysmod_grad_is_GR"), li.get("registered_is_GR"), li.get("registered_lanes"), li.get("abort_hook"), li.get("begin_hook"), li.get("end_hook"), acct_path, [p["scan_calls"] for p in r["passes"]], [p["n_acts"] for p in r["passes"]], r["passes"][-1]["lane"], acct_path, li.get("legacy_hook_registered"), li.get("legacy_hook_is_GR_fn")),
           live_ok(li, cyc) and not any(p.get("pkg_grad") for p in r["passes"]) and r.get("pkg_at_boot") is False and li.get("legacy_hook_registered") is acct_path and li.get("legacy_hook_is_GR_fn") is acct_path)
     lane_ids = [x.get("pa_pos_id") for x in pre["lane"]["positions"].values()]
-    check("%s pre-restart state: killed pos_id %s held by the account (%s), NOT in the lane (%s), record present %s (expected %s)" % (lab, pid, [x["pos_id"] for x in pre["acct"]], lane_ids, pre["rec_files"], "1 file" if ei == "1" else "none"),
-          pid in [x["pos_id"] for x in pre["acct"]] and pid not in lane_ids and ((len(pre["rec_files"] or []) == 1) if ei == "1" else not pre["rec_files"]))
+    check("%s pre-restart state: killed pos_id %s held by the account (%s), NOT in the lane (%s), record present %s (expected %s)" % (lab, pid, [x["pos_id"] for x in pre["acct"]], lane_ids, pre["rec_files"], (("exactly %s" % (expect_recs,)) if expect_recs is not None else ("1 file" if ei == "1" else "none"))),
+          pid in [x["pos_id"] for x in pre["acct"]] and pid not in lane_ids and ((pre["rec_files"] == expect_recs) if expect_recs is not None else ((len(pre["rec_files"] or []) == 1) if ei == "1" else not pre["rec_files"])))
     check("%s script/module identities: blobs equal the d17f832a values and alias/identity flags all true (%s)" % (lab, (r.get("extra") or {}).get("ident2")), ident_ok(r))
     return pid
 
@@ -345,7 +345,7 @@ def t_refuse(lab, variant):
     if not r or "passes" not in r:
         check("%s restart child produced a result (rc %s)" % (lab, p.returncode), False); return
     check("%s restart child ran the real loop for 5 passes and ended by the pass counter (rc %s, loop result %s)" % (lab, p.returncode, r.get("rc")), p.returncode == 0 and r.get("rc") == "done" and len(r["passes"]) == 5)
-    pid = common_pre(lab, "1", t, r, "0"); passes = r["passes"]; a = r["after"]; calls = r["calls"]
+    pid = common_pre(lab, "1", t, r, "0", expect_recs=sorted([PLANT_NAME, gname])); passes = r["passes"]; a = r["after"]; calls = r["calls"]
     classes = [x[2] for x in r["acts"]]; fresh = [x for x in calls["cand"] if x[1] == FRESH_MINT]
     print("INFO %s MEASURED: acts %s, candidate considerations %s, lane per pass %s, final record dir %s" % (lab, [(str(x[0])[-20:], x[2], str(x[3])[:120]) for x in r["acts"]], calls["cand"], [p_["lane"] for p_ in passes], a["rec_files"]))
     check("%s REFUSAL RECOVERY: the genuine record is still adopted exactly once (class B count %d == 1) and its record file %s is removed, while the planted file %s is NOT removed (final dir %s)" % (lab, classes.count("B"), gname, PLANT_NAME, a["rec_files"]),

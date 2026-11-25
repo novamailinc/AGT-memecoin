@@ -6,7 +6,7 @@ L4 account ledger+WAL+registry deleted but a bound lane position remains = block
 L6 corrupt registry blocks; L7 lane ledger lost while the account holds lots blocks at account level; L8 position bound to the wrong entry op blocks; L9 an orphan account lot
 (no lane position) blocks the lane restart; L10 the real close_intents.begin registers its journal and its later loss blocks at account level; L11 generation mismatch blocks
 at ACCOUNT level (a lane that never called its own check); L12 FRESH PROCESS: account admission refuses on persisted evidence alone, and a fresh process on matching state
-admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring.
+admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses.
 NOT proven: lane runtime wiring (needs lane harnesses), whole-filesystem loss (no inside witness exists), journal rotation, grad closed-position witness, sim idempotency."""
 import ast, json, os, subprocess, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -166,6 +166,56 @@ PA._journal_marker_failed = lambda: True
 blocked(); PA._journal_marker_failed = _jm
 check("L13c a discovered marker_failed latch survives a later journal read result of clean", PA._MARKER_FAILED[0] is True and blocked() is not None)
 PA._MARKER_FAILED[0] = False
+
+# L16 account generation created AFTER the lane registered is recorded as a witness; its later loss (ledger AND WAL gone) is state-lost, not fresh
+d, LP = fresh("L16"); assert PA.register_lane(LANE, LP, CI.journal_path(LANE))
+_need("debit L16", PA.try_debit(LANE, "M", 1.0, 100.0, "lc:entry:L16", marks=_mk())); blocked()
+ids16 = PA._registry_fold(PA._registry_read(PA._registry_paths()[0])[0])[1]
+check("L16a the registry recorded the account generation on first admission after it was created", acct_id() in ids16)
+os.unlink(PA.LEDGER_PATH); os.unlink(PA.JOURNAL_PATH)
+w = PA.restart_admission_blockers(LANE, LP)
+check("L16b ledger and WAL both gone: state-lost via the registry witness (%r)" % w, len(w) == 1 and w[0].startswith("account-state-lost"))
+# L17 frozen unapplied intent content (real writer: begin + freeze), at ACCOUNT level; a PENDING intent alone does not block
+d, LP, pid, ID, op = good("L17")
+if os.path.exists(CI.journal_path(LANE)): os.unlink(CI.journal_path(LANE))
+iid = CI.begin(LANE, "M", pid, [{"kind": "credit", "op_id": "lc:exit:L17", "amount": 1.0, "qty": 100.0, "price_kind": "mark"}],
+               {"realized_usd": 0.0, "entry_notional_usd": 1.0, "closed_reason": "t", "close_ts": int(time.time())}, account_id=ID)
+check("L17a a PENDING intent alone does not block account admission (%r)" % blocked(), blocked() is None)
+check("L17b freeze written", CI.freeze(LANE, iid, "test freeze") is True)
+check("L17c a FROZEN unapplied intent blocks at account level (%r)" % blocked(), blocked() is not None and "frozen unapplied" in blocked())
+jl = [json.loads(x) for x in open(CI.journal_path(LANE))]
+check("L17d journal content: the intent carries its settle op and the freeze names it", jl[0]["settle_ops"][0]["op_id"] == "lc:exit:L17" and jl[1]["intent_id"] == iid)
+open(CI.journal_path(LANE), "a").write("{garbage-mid\n{\"ev\": \"x\"}\n")
+check("L17e an unreadable intent journal blocks (%r)" % blocked(), blocked() is not None and "intent journal unreadable" in blocked())
+# L18 REAL transient dual write failure in child 1, storage restored, FRESH child 2 refuses at account level
+d, LP = fresh("L18")
+child1 = '''
+import json, os, sys, time
+from daemon.launch_scanner import paper_account as PA
+''' + MK + '''
+LANE = %r
+d = %r; LP = os.path.join(d, "lane.json")
+PA.ACCOUNT_DIR = d; PA.LEDGER_PATH = os.path.join(d, "ledger.json"); PA.JOURNAL_PATH = os.path.join(d, "events.jsonl"); PA.LOCK_FILE = os.path.join(d, ".lock")
+r = PA.try_debit(LANE, "M", 1.0, 100.0, "lc:entry:L18", marks=_mk()); assert r[0] is True, r
+ID = json.load(open(PA.LEDGER_PATH))["account_id"]
+json.dump({"positions": {"M": {"lane": LANE, "mint": "M", "pa_pos_id": r[2], "pa_account_id": ID, "pa_entry_op": "lc:entry:L18"}}, "closes": []}, open(LP, "w"))
+assert PA.register_lane(LANE, LP, None)
+# lane persisted a position bound to the OLD generation; then the account is replaced (new generation) in the same dir
+_rr, _rj = PA._record_unresolved, PA._journal
+def jf(ev, strict=False):
+    if ev.get("event") == "settle_generation_refused": raise OSError("injected EIO")
+    return _rj(ev, strict)
+PA._record_unresolved = lambda *a, **k: False; PA._journal = jf
+ok, why = PA.credit(LANE, "M", 1.1, "lc:exit:L18", pos_id=r[2], qty=100.0, expected_account_id="some-other-generation", entry_op_id="lc:entry:L18")
+print(json.dumps({"ok": ok, "why": why, "pid": r[2], "id": ID}))
+''' % (LANE, d)
+p1 = subprocess.run([sys.executable, "-B", "-c", child1], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+try: c18 = json.loads(p1.stdout.strip().splitlines()[-1])
+except Exception: print("FAIL SETUP child L18: %s" % p1.stderr[-300:]); raise SystemExit(2)
+check("L18a dual-failure refusal reports NOT journaled (%s)" % c18["why"], (not c18["ok"]) and "NOT journaled" in c18["why"])
+lane_ledger(LP, {"M": mkpos("M", c18["pid"], "some-other-generation", "lc:entry:L18")})   # the lane's persisted position keeps the old binding
+b18 = run_child(d)
+check("L18b storage restored, FRESH process: account-level admission refuses on persisted lane evidence (%r)" % b18, b18 is not None and "generation-mismatch" in b18)
 # L15 static wiring
 here = os.path.join(ROOT, "daemon", "launch_scanner")
 st = {n: open(os.path.join(here, n + ".py")).read() for n in ("momentum_lane", "ceo", "watcher_lane", "grad", "mirror", "close_intents")}

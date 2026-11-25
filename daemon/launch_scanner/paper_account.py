@@ -2505,6 +2505,10 @@ def _registry_blockers():
         except OSError:
             pass
     lanes, _ids = _registry_fold(recs)
+    _led, _lst = _ledger_file_status(LEDGER_PATH)
+    if _lst == "ok" and isinstance(_led.get("account_id"), str) and _led["account_id"] and _led["account_id"] not in _ids:
+        # the registry has not yet seen this account generation (account created after the lanes registered): record it so its later loss is a witness
+        _registry_append({"lane": "_account", "account_id": _led["account_id"], "ts": time.time()})
     out = []
     for ln, st in sorted(lanes.items()):
         if st.get("ledger_path"):
@@ -2512,6 +2516,19 @@ def _registry_blockers():
                 out.append("lane %s: %s" % (ln, b))
         if st.get("intent_seen") and st.get("intent_path") and not os.path.exists(st["intent_path"]):
             out.append("lane %s: intent-journal-lost (it existed and is gone)" % ln)
+        elif st.get("intent_path"):
+            try:
+                try:
+                    from daemon.launch_scanner import close_intents as _ci
+                except ImportError:
+                    import close_intents as _ci
+                _fz, _jst = _ci.frozen_unresolved(st["intent_path"])
+                if _jst not in (None, "torn_tail", "missing"):
+                    out.append("lane %s: intent journal unreadable (%s)" % (ln, _jst))
+                elif _fz:
+                    out.append("lane %s: frozen unapplied intent(s) %s (unresolved economic obligation)" % (ln, ",".join(_fz[:3])))
+            except Exception as _e:
+                out.append("lane %s: intent journal check failed (%s)" % (ln, type(_e).__name__))
     return out
 
 

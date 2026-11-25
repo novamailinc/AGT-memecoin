@@ -235,6 +235,19 @@ def _state(entries: List[Dict[str, Any]]
     return states
 
 
+def frozen_unresolved(path: str):
+    """READ-ONLY, no lock (safe to call under the account lock): -> (intent ids that are FROZEN, unapplied and not superseded, status). status None = clean,
+    'torn_tail' = a possibly in-flight last line (not judged), anything else = journal unreadable (caller must block). A missing file returns ([], 'missing')."""
+    if not os.path.exists(path):
+        return [], "missing"
+    ents, st, _t = _read(path)
+    if st not in (None, "torn_tail"):
+        return [], st or "unreadable"
+    stt = _state(ents)
+    sup = {e.get("supersedes") for e in ents if e.get("ev") == "intent" and e.get("supersedes")}
+    return sorted(i for i, s0 in stt.items() if s0["intent"] is not None and s0["frozen"] is not None and not s0["applied"] and i not in sup), st
+
+
 class IntentNotDurable(RuntimeError):
     """The intent (or a freeze) could not be written to the journal. The caller MUST NOT apply the account side without a durable
     plan: recovery can only converge an intent that exists on disk."""

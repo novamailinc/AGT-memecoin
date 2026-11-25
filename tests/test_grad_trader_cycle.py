@@ -1,5 +1,5 @@
 """UNEXECUTED DRAFT. Tests for daemon/grad_trader_cycle (R1/R2 wiring of scripts/grad-select-trader) with a FAKE engine. No ledger beyond temp files, no
-network, no thread/process start. Script style: PASS/FAIL lines and a FAILS count. NOT covered: the running trader process, threads, kill/restart."""
+network, no child process. Two in-process worker threads (daemon=True) are started by G46 and G49 only; on a join timeout the run aborts at once (os._exit) without restoring monkeypatches. Script style: PASS/FAIL lines and a FAILS count. NOT covered: the running trader process, threads, kill/restart."""
 import fcntl, json, os, re, sys, tempfile, types
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from daemon import grad_cycle as GC
@@ -215,6 +215,9 @@ i = gsrc.index("def entry_scan("); j2 = gsrc.index("# --------------------------
 check("G43 static: entry_scan never uses scan_phase, the cycle lock or cycle.json; no post-scan flag in this source", all(x not in gsrc[i:j2] for x in ("scan_phase", "_cycle_lock_path", "_journal_path", "cycle.json")) and "POST_SCAN" not in gsrc)
 # ---- v3b: fault-state serialisation (UNEXECUTED) ----
 import threading as _th, time as _tm
+def _abort(msg):
+    # a worker may still be running with a monkeypatch in place: do NOT restore it, do not run later checks, end the process now
+    print("FAIL " + msg + " (aborting test process)"); sys.stdout.flush(); os._exit(3)
 os.environ[GC.ENV_FLAG] = "1"
 # G44 contention: another open file description holds the fault lock -> _record_fault does NOT record, reports failure, nothing written (fail closed)
 g = fake(); _t0 = GC._FAULT_LOCK_TIMEOUT_S; GC._FAULT_LOCK_TIMEOUT_S = 0.2
@@ -241,12 +244,14 @@ def _slow_read(grad):
     r = _rf(grad)
     if not _state["in_a"]:
         _state["in_a"] = True
-        tb = _th.Thread(target=lambda: _bt.setdefault("ok", GC._record_fault(g, {}, "B46"))); tb.start(); _tm.sleep(0.3); _bt["alive_midway"] = tb.is_alive(); _bt["t"] = tb
+        tb = _th.Thread(target=lambda: _bt.setdefault("ok", GC._record_fault(g, {}, "B46")), daemon=True); tb.start(); _tm.sleep(0.3); _bt["alive_midway"] = tb.is_alive(); _bt["t"] = tb
     return r
 GC._read_fault = _slow_read
 try: GC._record_fault(g, {}, "A46")
-finally: GC._read_fault = _rf
-_bt["t"].join(10); fr = GC._read_fault(g); rs = [e.get("reason") for e in fr.get("reasons", [])]
+except BaseException as _e46: _abort("G46 writer A raised %r" % (_e46,))
+_bt["t"].join(10)
+if _bt["t"].is_alive(): _abort("G46 worker thread still alive after join timeout")
+GC._read_fault = _rf; fr = GC._read_fault(g); rs = [e.get("reason") for e in fr.get("reasons", [])]
 check("G46 two fault writers: B blocks while A is mid-write and BOTH reasons survive (%s)" % rs, _bt.get("alive_midway") is True and "A46" in rs and "B46" in rs and "seed46" in rs)
 # G47 clear_fault's commit block takes the fault lock (static, as the commit is disabled): the commit section and the lock are on the same line
 gsrc2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daemon", "grad_cycle.py")).read()
@@ -262,11 +267,13 @@ g = fake(); lp = GC._fault_log_path(g); open(lp, "w").write(json.dumps({"fault_i
 _oh = GC._REPAIR_HOOK; _ct = {}
 def _pause(point):
     if point == "after_marker_before_truncate" and "t" not in _ct:
-        _ct["t"] = _th.Thread(target=lambda: _ct.setdefault("ok", GC._record_fault(g, {}, "C49"))); _ct["t"].start(); _tm.sleep(0.3); _ct["alive"] = _ct["t"].is_alive()
+        _ct["t"] = _th.Thread(target=lambda: _ct.setdefault("ok", GC._record_fault(g, {}, "C49")), daemon=True); _ct["t"].start(); _tm.sleep(0.3); _ct["alive"] = _ct["t"].is_alive()
 GC._REPAIR_HOOK = _pause
 try: rr = GC._repair_log_tail(g)
-finally: GC._REPAIR_HOOK = _oh
-_ct["t"].join(10); lines = open(lp).read().split("\n"); okj = True
+except BaseException as _e49: _abort("G49 repair raised %r" % (_e49,))
+_ct["t"].join(10)
+if _ct["t"].is_alive(): _abort("G49 worker thread still alive after join timeout")
+GC._REPAIR_HOOK = _oh; lines = open(lp).read().split("\n"); okj = True
 for ln in lines[:-1]:
     try: json.loads(ln)
     except Exception: okj = False

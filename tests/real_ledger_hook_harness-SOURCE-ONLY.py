@@ -129,17 +129,17 @@ print(json.dumps({"opened": bool(r1[0]), "s0": s0, "s1": s1, "fault_reason": (fr
 """
 CHILD_K1 = PRE2 + r"""
 r1 = open_first(); T.register(GR); force_abort(); save_baseline()
-def die_before_write(mint, err): os._exit(1)           # ABRUPT exit between the count and the fault write
+def die_before_write(mint, err): _reach("K1_before_fault_write"); os._exit(1)           # ABRUPT exit between the count and the fault write (fsynced reached-site sentinel first)
 GR._ABORT_HOOK = die_before_write
-poll_abort(); os._exit(0)
+poll_abort(); os._exit(99)                                  # reached only if the kill site was NOT hit (expected rc is 1, from the hook)
 """
 CHILD_K2 = PRE2 + r"""
 r1 = open_first(); T.register(GR); force_abort(); save_baseline()
 _h = GR._ABORT_HOOK
 def die_after(mint, err):
-    _h(mint, err); os._exit(1)                           # ABRUPT exit right after the hook returned
+    _h(mint, err); _reach("K2_after_hook"); os._exit(1)                           # ABRUPT exit right after the hook returned (sentinel written after the hook, before the exit)
 GR._ABORT_HOOK = die_after
-poll_abort(); os._exit(0)
+poll_abort(); os._exit(99)                                 # reached only if the kill site was NOT hit
 """
 
 CHILD_W1 = PRE2 + r"""
@@ -228,8 +228,8 @@ print(json.dumps({"mutant": mutant, "b_blocked_midway": b_blocked, "res": res, "
 """
 CHILD_K4 = PRE2 + r"""
 r1 = open_first(); T.register(GR)
-def dying_scan(): os._exit(1)                            # ABRUPT exit mid entry scan, entry lock held, record running
-T.entry_scan(GR, dying_scan); os._exit(0)
+def dying_scan(): _reach("K4_mid_entry_scan"); os._exit(1)                            # ABRUPT exit mid entry scan, entry lock held, record running (sentinel first)
+T.entry_scan(GR, dying_scan); os._exit(99)             # reached only if the scan callback was NOT invoked
 """
 CHILD_K4B = PRE2 + r"""
 import fcntl
@@ -280,7 +280,7 @@ def s_K0():
     check("K0 position opened first; the abort was counted once; no sale, fill or credit by the aborted poll", j["opened"] and j["s1"]["aborts"] == 1 and j["ps_fills_credits"] == [0, 0] and j["s1"]["n_pos"] == 1)
     check("K0 hook wrote a durable poll_abort_live fault and commit_refusal refuses (%s)" % j["refusal"], "poll_abort_live" in (j["fault_reasons"] or []) and bool(j["refusal"]))
 def s_K1():
-    h = newhome(); cp, j = run(CHILD_K1, h); check("K1 child exited abruptly (rc=%s, expected 1)" % cp.returncode, cp.returncode == 1)
+    h = newhome(); cp, j = run(CHILD_K1, h); check("K1 child exited abruptly (rc=%s, expected 1) AND the fsynced kill-site sentinel is present (%s)" % (cp.returncode, _reached(h, "K1_before_fault_write")), cp.returncode == 1 and _reached(h, "K1_before_fault_write"))
     cv, v = run(VERIFY, h)
     check("K1 verify ran", cv.returncode == 0 and v is not None)
     if not v: return
@@ -289,7 +289,7 @@ def s_K1():
     gap = (not v["fault_file"]) and v["refusal"] is None
     check("GAP-K1 %s: kill between count and fault write leaves NO durable fault and the fresh process does not refuse entries (documented gap, NOT protection)" % ("observed" if gap else "NOT observed (fault=%s refusal=%s)" % (v["fault_file"], v["refusal"])), True)
 def s_K2():
-    h = newhome(); cp, j = run(CHILD_K2, h); check("K2 child exited abruptly (rc=%s, expected 1)" % cp.returncode, cp.returncode == 1)
+    h = newhome(); cp, j = run(CHILD_K2, h); check("K2 child exited abruptly (rc=%s, expected 1) AND the fsynced kill-site sentinel is present (%s)" % (cp.returncode, _reached(h, "K2_after_hook")), cp.returncode == 1 and _reached(h, "K2_after_hook"))
     cv, v = run(VERIFY, h)
     check("K2 verify ran", cv.returncode == 0 and v is not None)
     if not v: return
@@ -307,7 +307,7 @@ def s_K3(kind):
     else:
         check("K3m MUTANT (commit_refusal patched to None): B DOES open the second mint (test sensitivity control; expected to differ from K3)", isinstance(j["res"].get("b"), list) and j["res"]["b"][0] is True and st["n_pos"] == 2)
 def s_K4():
-    h = newhome(); cp, j = run(CHILD_K4, h); check("K4 child exited abruptly mid entry scan (rc=%s, expected 1)" % cp.returncode, cp.returncode == 1)
+    h = newhome(); cp, j = run(CHILD_K4, h); check("K4 child exited abruptly mid entry scan (rc=%s, expected 1) AND the fsynced kill-site sentinel is present (%s)" % (cp.returncode, _reached(h, "K4_mid_entry_scan")), cp.returncode == 1 and _reached(h, "K4_mid_entry_scan"))
     cv, v = run(VERIFY_K4, h)
     check("K4 verify ran", cv.returncode == 0 and v is not None)
     if v: check("K4 fresh process: running record + free lock -> interrupted_entry_scan durable, fault active, entries refused (%s)" % v, v["check"] == [False, "interrupted_entry_scan"] and v["fault_active"] and v["entry_ok"] is False)
@@ -349,6 +349,6 @@ def main():
         if FAILS or _STOP["why"]:
             print("EARLY STOP (fails=%d, stop=%s)" % (len(FAILS), _STOP["why"])); break
         f()
-    print("elapsed %.1fs of %.0fs budget; FAILS: %d; stop=%s" % (time.time() - _T0, BUDGET_S, len(FAILS), _STOP["why"])); return 1 if (FAILS or _STOP["why"]) else 0
+    print("elapsed %.1fs of %.0fs budget; FAILS: %d; stop=%s" % (time.time() - _T0, BUDGET_S, len(FAILS), _STOP["why"])); print("RESULT: %d failures" % len(FAILS)); sys.stdout.flush(); return 1 if (FAILS or _STOP["why"]) else 0
 if __name__ == "__main__":
     sys.exit(main())

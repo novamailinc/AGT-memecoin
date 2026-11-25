@@ -13,12 +13,15 @@ TMP = tempfile.mkdtemp(prefix="gtc_")
 PF = lambda c, m, i=None: 1.0
 CLEAN = {"poll_aborts": {"count": 0}, "n_pending": 0, "n_settlement_pending": 0, "n_migration_blocked": 0}
 OK_SNAP = {"degraded": None, "lanes": {}}
+_SEQ = [0]
+def _next_id():
+    _SEQ[0] += 1; return _SEQ[0]
 def fake(demo=True, closes_t=0, closes_e=0, raise_exits=False):
     calls = []
-    g = types.SimpleNamespace(LEDGER_PATH=os.path.join(TMP, "led%d.json" % len(os.listdir(TMP))), calls=calls)
+    g = types.SimpleNamespace(LEDGER_PATH=os.path.join(TMP, "led%d.json" % _next_id()), calls=calls)
     g._demo_mode = lambda: demo
     g._POLL_ABORTS = {"count": 0}
-    g.LANE = "lane_%d" % len(os.listdir(TMP))
+    g.LANE = "lane_%d" % _SEQ[0]
     g.poll_time_exits = lambda: (calls.append("time_exits") or [1] * closes_t)
     def pe(price_fn=None):
         calls.append("exits")

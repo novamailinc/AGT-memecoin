@@ -2174,6 +2174,25 @@ def _tranche_receipt(pos, leg_key):
     return r.get(_op)
 
 
+def _legacy_unreconciled_buyback(pos):
+    """READ-ONLY diagnostic: True when a position took a buyback under the pre-reconciliation code. Signature: buyback_used is set
+    and the recorded buyback exists, but no leg carries buyback_qty and no buyback_qty_total was recorded. Such a position's lane
+    "tokens" includes bought units that the shared account never received (and its legs were sized over the inflated count), so its
+    remaining legs can exceed the account lot and strand. NOTHING is mutated or healed here (callers refuse the exit with a visible pending_exit); a persisted owner ledger is never
+    touched by this code. Never raises."""
+    try:
+        if not (isinstance(pos, dict) and pos.get("buyback_used")):
+            return False
+        bb = (pos.get("entry_features") or {}).get("buyback")
+        if not isinstance(bb, dict):
+            return False
+        if float(pos.get("buyback_qty_total") or 0.0) > 0:
+            return False
+        return not any(float((v or {}).get("buyback_qty") or 0.0) > 0 for v in (pos.get("legs") or {}).values())
+    except Exception:
+        return False
+
+
 def _leg_qty(pos, leg_key):
     """Units leg `leg_key` sells: its share of the ORIGINAL entry units (pos["tokens"] x frac) plus any units a
     reconciled buyback allocated to that leg ("buyback_qty", absent = 0). Every exit, rebuild, residue and finalize
@@ -2192,6 +2211,11 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None, receipt_kind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     leg = pos["legs"][leg_key]
     if leg["done"]:
+        return 0.0
+    if _legacy_unreconciled_buyback(pos):
+        # sized over units the shared account never received: any automatic sale would be wrong. Visible operator flag, no mutation.
+        pos["pending_exit"] = {"leg": leg_key, "why": "legacy_unreconciled_buyback", "ts": time.time()}
+        logger.error("grad %s: leg %s exit BLOCKED: legacy unreconciled buyback (operator resolution required)", str(pos.get("mint") or "?")[:16], leg_key)
         return 0.0
     leg_tokens = _leg_qty(pos, leg_key)
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
@@ -2423,6 +2447,10 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
     same rule as ceo.py/mirror.py."""
     # Any stop/time/TWAP exit path lands here: first finish lane legs whose account credit is already durable
     # (crash window), so a credited leg is never sold a second time inside the combined remainder.
+    if _legacy_unreconciled_buyback(pos):
+        pos["pending_exit"] = {"leg": "remaining", "why": "legacy_unreconciled_buyback", "ts": time.time()}
+        logger.error("grad %s: combined exit BLOCKED: legacy unreconciled buyback (operator resolution required)", str(pos.get("mint") or "?")[:16])
+        return 0.0
     _migrate_legacy_tranches(pos)
     if receipt_kind is not None and not pkind:
         pkind = receipt_kind   # reconcile of a credited TWAP remainder: the account RECEIPT's kind (never re-derived from the reason string)

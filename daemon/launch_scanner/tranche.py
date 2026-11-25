@@ -812,25 +812,6 @@ def maybe_verdict_report(engine):
 
 # ---- buyback (dip) rule -----------------------------------------------------
 
-def legacy_unreconciled_buyback(pos):
-    """READ-ONLY diagnostic: True when a position took a buyback under the pre-reconciliation code. Signature: buyback_used is set
-    and the recorded buyback exists, but no leg carries buyback_qty and no buyback_qty_total was recorded. Such a position's lane
-    "tokens" includes bought units that the shared account never received (and its legs were sized over the inflated count), so its
-    remaining legs can exceed the account lot and strand. NOTHING is mutated or healed here; a persisted owner ledger is never
-    touched by this code. Never raises."""
-    try:
-        if not (isinstance(pos, dict) and pos.get("buyback_used")):
-            return False
-        bb = (pos.get("entry_features") or {}).get("buyback")
-        if not isinstance(bb, dict):
-            return False
-        if float(pos.get("buyback_qty_total") or 0.0) > 0:
-            return False
-        return not any(float((v or {}).get("buyback_qty") or 0.0) > 0 for v in (pos.get("legs") or {}).values())
-    except Exception:
-        return False
-
-
 def _buyback_due(pos, px, filled, now):
     """Pure buyback decision. Returns (True, cost, tokens) when a
     buyback should fire, else (False, reason, 0). Inputs: the
@@ -895,7 +876,7 @@ def maybe_buyback(engine, now=None):
         positions = list(positions.values())
     for pos in positions or []:
         try:
-            if legacy_unreconciled_buyback(pos):
+            if engine._legacy_unreconciled_buyback(pos):
                 logger.error("tranche LEGACY UNRECONCILED BUYBACK %s: lane units include bought tokens the shared account never "
                              "received; its remaining legs may strand (pending_exit account_remaining_qty_mismatch). Detected only: "
                              "nothing healed, owner ledger untouched; operator resolution required.", str(pos.get("mint") or "?")[:16])

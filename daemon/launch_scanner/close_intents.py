@@ -244,6 +244,8 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     # Intent identity is ALWAYS unique (random suffix). A caller whose retry must not open a second intent for the same logical operation
     # passes stable_id=True: the deterministic base id then serves as a separate OPERATION KEY stored on the intent event, and a retry finds
     # the existing intent by that key (journal read cleanly, under a lock) and returns ITS unique id after comparing the recorded plan.
+    if stable_id and supersedes:
+        raise IntentNotDurable("stable_id and supersedes cannot be combined: refusing (no silent drop of the supersede)")
     op_key = intent_id if stable_id else None
     intent_id = "%s:%s" % (intent_id, uuid.uuid4().hex[:24])
     ev = {"ev": "intent", "intent_id": intent_id, "lane": lane, "mint": mint, "pos_id": pos_id,
@@ -258,21 +260,38 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
                 raise IntentNotDurable("journal not cleanly readable (%s): refusing to open an intent" % st)
             _ids = sorted(str(o.get("op_id")) for o in settle_ops)
             _stt = _state(ents)
-            _sup_done = {e.get("supersedes") for e in ents if e.get("ev") == "intent" and e.get("supersedes")}
-            _frozen_same = [i0 for i0, s0 in _stt.items() if s0["intent"] is not None and not s0["applied"] and s0["frozen"] is not None
-                            and s0["intent"].get("mint") == mint and s0["intent"].get("pos_id") == pos_id
-                            and sorted(str(o.get("op_id")) for o in s0["intent"].get("settle_ops") or []) == _ids and i0 not in _sup_done]
-            for iid0, st0 in _stt.items():
-                e0 = st0["intent"]
-                if (e0 is not None and not st0["applied"] and not st0["frozen"] and e0.get("mint") == mint and e0.get("pos_id") == pos_id
-                        and sorted(str(o.get("op_id")) for o in e0.get("settle_ops") or []) == _ids):
-                    # same logical operation still pending (crash before its terminal event): RESUME it, never open a second intent
-                    if json.dumps(e0.get("settle_ops"), sort_keys=True) != json.dumps(settle_ops, sort_keys=True):
-                        raise IntentNotDurable("operation %s already pending with a DIFFERENT plan" % iid0)
-                    return iid0
-            if _frozen_same and set(_frozen_same) != {supersedes}:
+
+            def _same_pos(e0):
+                return e0 is not None and e0.get("mint") == mint and e0.get("pos_id") == pos_id and e0.get("lane", lane) == lane
+
+            def _same_op(e0):
+                return _same_pos(e0) and sorted(str(o.get("op_id")) for o in e0.get("settle_ops") or []) == _ids
+            _succ = {}   # superseded intent id -> ids of intents recorded as its successors (journal ancestry)
+            for e in ents:
+                if e.get("ev") == "intent" and e.get("supersedes"):
+                    _succ.setdefault(e["supersedes"], []).append(e.get("intent_id"))
+            _pend = [i0 for i0, s0 in _stt.items() if _same_op(s0["intent"]) and not s0["applied"] and s0["frozen"] is None]
+            if _pend:
+                # same logical operation still pending (crash before its terminal event): RESUME it, never open a second intent. The caller's
+                # lineage must match the recorded one (a plain begin resumes a plain intent; supersedes=X resumes the successor of X): an unknown
+                # or foreign supersedes, or a lineage mismatch, is refused and nothing is appended.
+                iid0 = _pend[0]; e0 = _stt[iid0]["intent"]
+                if len(_pend) != 1 or (e0.get("supersedes") or None) != (supersedes or None):
+                    raise IntentNotDurable("operation already has pending intent(s) %s with recorded parent %r: supplied supersedes %r does not match, refusing"
+                                           % (",".join(sorted(_pend)), e0.get("supersedes"), supersedes))
+                if json.dumps(e0.get("settle_ops"), sort_keys=True) != json.dumps(settle_ops, sort_keys=True):
+                    raise IntentNotDurable("operation %s already pending with a DIFFERENT plan" % iid0)
+                return iid0
+            _frozen_open = [i0 for i0, s0 in _stt.items() if _same_op(s0["intent"]) and not s0["applied"] and s0["frozen"] is not None and i0 not in _succ]
+            if supersedes:
+                # explicit supersede: must name an EXISTING, FROZEN, UNAPPLIED intent of this very position that has no successor yet (an applied or
+                # already-replaced chain is never re-opened, nothing foreign is accepted), validated even when no frozen intent of this op set exists
+                s_ = _stt.get(supersedes)
+                if not (s_ and _same_pos(s_["intent"]) and s_["frozen"] is not None and not s_["applied"] and supersedes not in _succ):
+                    raise IntentNotDurable("supersedes=%s is not a frozen, unapplied, not-yet-replaced intent of this position: refusing" % supersedes)
+            if _frozen_open and set(_frozen_open) != {supersedes}:
                 raise IntentNotDurable("operation already has FROZEN intent(s) %s: a frozen intent never revives; a new intent needs an explicit supersedes=<that id>"
-                                       % ",".join(sorted(_frozen_same)))
+                                       % ",".join(sorted(_frozen_open)))
             if supersedes:
                 ev["supersedes"] = supersedes
             if not _append(journal_path(lane), ev):

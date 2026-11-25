@@ -39,8 +39,12 @@ check("a begin that names a DIFFERENT intent as supersedes is also refused", _ra
 b = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO, close_ts=1795593430.9), supersedes=a)   # explicit journaled supersede, same integer second
 _sup = [e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("intent_id") == b]
 check("explicit supersede opens a NEW intent with a different id (%s vs %s), recording supersedes=%s" % (a, b, a), a != b and len(_sup) == 1 and _sup[0].get("supersedes") == a)
-b2 = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))
-check("a plain begin of the same operation while the superseding intent is PENDING resumes it (same id, no second intent)", b2 == b)
+check("a PLAIN begin of the same operation while the superseding intent is pending is refused (lineage mismatch: its recorded parent is %s)" % a,
+      _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))))
+check("a begin naming a FOREIGN supersedes while the successor is pending is refused", _raises(lambda: ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes="grad:foreign:1")))
+b2 = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO), supersedes=a)
+check("the SAME supersedes while the successor is pending RESUMES it (same id %s, still two intent events for this op)" % b2,
+      b2 == b and len([e for e in ci._read(ci.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("pos_id") == "grad/MINT1#1" and e.get("settle_ops") == OPS]) == 2)
 # DISTINCT operations (other pos / other op ids) in the same second get distinct ids; the frozen original is not in the way of them
 c = ci.begin("grad", "MINT1", "grad/MINT1#2", OPS, dict(INFO))
 c2 = ci.begin("grad", "MINT1", "grad/MINT1#1", [{"kind": "credit", "op_id": "op-other", "amount": 1.0}], dict(INFO))
@@ -72,6 +76,47 @@ _fp = [e for e in ci._read(ci.journal_path("lanefp"))[0] if e.get("ev") == "inte
 check("4 processes concurrently superseding one frozen op: rcs %r, 2 intent events (%d), ONE new id (%d)" % ([p.returncode for p in _pp2], len(_fp), len({o[0].strip() for o in _oo})),
       all(p.returncode == 0 for p in _pp2) and len(_fp) == 2 and len({o[0].strip() for o in _oo}) == 1 and {o[0].strip() for o in _oo} == {_fp[1]["intent_id"]})
 pend = [x["intent_id"] for x in ci.pending("grad")]
+# ---- supersedes validation (nothing is appended on an invalid request) ----
+def _nint(lane): return len([e for e in ci._read(ci.journal_path(lane))[0] if e.get("ev") == "intent"])
+check("supersedes of an UNKNOWN id with NO frozen fixture at all is refused and appends nothing",
+      _raises(lambda: ci.begin("lanev1", "MV", "pv", OPS, dict(INFO), supersedes="lanev1:nope:1")) and _nint("lanev1") == 0)
+_pv = ci.begin("lanev2", "MV", "pv", OPS, dict(INFO))
+check("supersedes naming a PENDING intent is refused (only a frozen one can be superseded), nothing appended",
+      _raises(lambda: ci.begin("lanev2", "MV", "pv2", OPS, dict(INFO), supersedes=_pv)) and _nint("lanev2") == 1)
+check("INVALID supersedes while the same operation is pending is refused and appends nothing (pending resume validates first)",
+      _raises(lambda: ci.begin("lanev2", "MV", "pv", OPS, dict(INFO), supersedes="lanev2:nope:1")) and _nint("lanev2") == 1)
+ci.mark_account_applied("lanev2", _pv); ci.mark_lane_applied("lanev2", _pv)
+check("supersedes naming an APPLIED intent is refused", _raises(lambda: ci.begin("lanev2", "MV", "pv", OPS, dict(INFO), supersedes=_pv)) and _nint("lanev2") == 1)
+_fo = ci.begin("lanev3", "MV", "pv-other", OPS, dict(INFO)); ci.freeze("lanev3", _fo, "r")
+check("supersedes naming a frozen intent of ANOTHER position/op is refused (foreign), nothing appended",
+      _raises(lambda: ci.begin("lanev3", "MV", "pv-mine", OPS, dict(INFO), supersedes=_fo)) and _nint("lanev3") == 1)
+_ra = ci.begin("lanev4", "MV", "pv", OPS, dict(INFO)); ci.freeze("lanev4", _ra, "r")
+_rb = ci.begin("lanev4", "MV", "pv", OPS, dict(INFO), supersedes=_ra); ci.mark_account_applied("lanev4", _rb); ci.mark_lane_applied("lanev4", _rb)
+check("RE-supersede of the ancestor after its successor APPLIED is refused (no second successor), nothing appended",
+      _raises(lambda: ci.begin("lanev4", "MV", "pv", OPS, dict(INFO), supersedes=_ra)) and _nint("lanev4") == 2)
+check("stable_id together with supersedes is an explicit refusal (never a silent drop), nothing appended",
+      _raises(lambda: ci.begin("lanev5", "MV", "pv", OPS, dict(INFO), stable_id=True, supersedes="x")) and _nint("lanev5") == 0)
+check("supersedes of a frozen intent with a CHANGED op set (same position) is allowed and recorded (changed settle plan)",
+      bool(ci.begin("lanev3", "MV", "pv-other", [{"kind": "credit", "op_id": "op-changed", "amount": 2.0}], dict(INFO), supersedes=_fo)) and _nint("lanev3") == 2)
+
+# ---- recover_lane on a supersede chain, with canned callbacks (journal logic only; the callbacks are interface stubs, no account) ----
+_ca = ci.begin("lanerc", "MR", "pr", OPS, dict(INFO)); ci.freeze("lanerc", _ca, "account re-apply refused: earlier")
+_cb = ci.begin("lanerc", "MR", "pr", OPS, dict(INFO), supersedes=_ca)
+_fr = ci.recover_lane("lanerc", lambda op: (True, ""), lambda it: False, lambda it: True)
+check("recover_lane on a chain (frozen prior, pending successor): the prior is skipped and stays frozen, the successor is finalized to applied, nothing newly frozen (%r)" % (_fr,),
+      _fr == [] and ci.intent_status("lanerc", _ca) == "frozen" and ci.intent_status("lanerc", _cb) == "applied")
+_rp = ci.begin("lanerf", "MR", "pf", OPS, dict(INFO))
+_real_freeze = ci.freeze
+ci.freeze = lambda lane, iid, why: False      # NAMED FAULT INJECTION: the freeze append fails
+try:
+    _fr1 = ci.recover_lane("lanerf", lambda op: (False, "refused (injected)"), lambda it: False, lambda it: True)
+finally:
+    ci.freeze = _real_freeze
+check("recover_lane when the freeze itself FAILS: the intent is NOT reported frozen (%r) and stays pending/open for retry (%s)" % (_fr1, ci.intent_status("lanerf", _rp)),
+      _fr1 == [] and ci.intent_status("lanerf", _rp) == "open")
+_fr2 = ci.recover_lane("lanerf", lambda op: (False, "refused (injected)"), lambda it: False, lambda it: True)
+check("the retry with a working journal freezes it and reports it (%r, status %s)" % (_fr2, ci.intent_status("lanerf", _rp)), _fr2 == [_rp] and ci.intent_status("lanerf", _rp) == "frozen")
+
 check("the new intents are OPEN and the frozen ones stay terminal (pending=%r)" % pend, a not in pend and b not in pend and c in pend and c2 in pend)
 d = ci.begin("grad", "MINT2", "grad/MINT2#1", OPS, dict(INFO))
 check("id keeps the readable base (lane:mint:pos:second) plus a suffix (%s)" % d, d.startswith("grad:MINT2:grad/MINT2#1:1795593430:") and len(d.rsplit(":", 1)[-1]) == 24)

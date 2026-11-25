@@ -665,6 +665,56 @@ check("S14 journal healthy again: closes exactly once, pending cleared, bankroll
 JUP.mult = 1.0
 
 
+# ---- S16: SETTLE-PLAN SUPERSEDE LIVENESS (real grad poll, real journal, real account). The account refuses the close credit, so a settle intent I0 stays open
+# with its plan signature stored. NAMED STATE INJECTION: the stored plan_sig is replaced by a different value, which is exactly what a changed settle plan looks
+# like to the retry. NAMED FAULT INJECTION: the first begin() after the freeze raises IntentNotDurable. Expected: the freeze of I0 lands, begin fails (position stays
+# pending, close_intent_not_durable, still pointing at I0, no second intent); the NEXT poll recognises I0 as exactly frozen and opens its successor through
+# begin(supersedes=I0); further polls reuse that successor (no third intent); once the account accepts, the close books exactly once and I0 stays frozen. ----
+mint = "BB16pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3); JUP.mult = 0.05
+br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint))
+def _gi(m):
+    return [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("mint") == m]
+with patch.object(_PAm, "credit", _credit_refuse):
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    _i0 = (lane_pos(mint).get("settlement_pending") or {}).get("intent_id")
+    check("S16 setup: the refused settle left ONE open intent I0 (%s) with a stored plan_sig" % _i0,
+          bool(_i0) and len(_gi(mint)) == 1 and _CI.intent_status("grad", _i0) == "open" and bool((lane_pos(mint).get("settlement_pending") or {}).get("plan_sig")))
+    _d16 = G._read(); _d16["positions"][mint]["settlement_pending"]["plan_sig"] = "INJECTED-previous-plan-signature"; G._write(_d16)
+    _real_begin = _CI.begin; _bf = [0]
+    def _begin_fail_once(*a, **k):
+        if not _bf[0]:
+            _bf[0] = 1
+            raise _CI.IntentNotDurable("INJECTED: begin failed after the freeze landed")
+        return _real_begin(*a, **k)
+    with patch.object(_CI, "begin", _begin_fail_once):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    _sp1 = lane_pos(mint).get("settlement_pending") or {}
+    check("S16 freeze OK then begin fails: I0 is FROZEN, the position stays OPEN pending close_intent_not_durable still pointing at I0 (%r), no second intent (%d), nothing booked"
+          % (_sp1.get("intent_id"), len(_gi(mint))),
+          _CI.intent_status("grad", _i0) == "frozen" and mint in G.open_positions() and _sp1.get("why") == "close_intent_not_durable" and _sp1.get("intent_id") == _i0
+          and len(_gi(mint)) == 1 and G._read()["bankroll"] == br0)
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+    _gi1 = _gi(mint)
+    _sp2 = lane_pos(mint).get("settlement_pending") or {}
+    check("S16 NEXT poll recognises the exactly-frozen I0 and opens ONE successor with supersedes=I0 (intents %d, successor parent %r), position pending on the successor (%r)"
+          % (len(_gi1), _gi1[-1].get("supersedes") if len(_gi1) > 1 else None, _sp2.get("intent_id")),
+          len(_gi1) == 2 and _gi1[1].get("supersedes") == _i0 and _sp2.get("intent_id") == _gi1[1]["intent_id"] and _CI.intent_status("grad", _i0) == "frozen"
+          and _CI.intent_status("grad", _gi1[1]["intent_id"]) == "open" and mint in G.open_positions())
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    check("S16 further refused polls reuse the successor: still exactly 2 intents (%d)" % len(_gi(mint)), len(_gi(mint)) == 2)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+_rec16 = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+_gi2 = _gi(mint)
+check("S16 account accepts: closes exactly once, flat, bankroll +realized once (%r -> %r), successor APPLIED, I0 still FROZEN, still 2 intents (%d)" % (br0, G._read()["bankroll"], len(_gi2)),
+      len(_rec16) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (br0 + _rec16[0]["realized_usd"])) < 1e-6 and acct_lot_qty(pid) < 1e-6
+      and _CI.intent_status("grad", _gi2[1]["intent_id"]) == "applied" and _CI.intent_status("grad", _i0) == "frozen" and len(_gi2) == 2)
+JUP.mult = 1.0
+
 # ---- S15: REAL DemoFiller sale idempotency and the execute-before-save window (real filler, real sim executor, FakeJup quotes = canned quote fixture, engineering only) ----
 setup(); _F = FILLER[0]; _mint15 = "S15pump"; _op15 = "grad:exit:%s:a" % _mint15
 _f1 = _F.sell(_op15, _mint15, 100.0, 2.0); _n1 = len(JUP.calls)

@@ -3203,36 +3203,37 @@ def _finalize(d, mint, pos, closed_reason):
         _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
         if _ci is not None:
             try:
-                _open_ids = {x.get("intent_id") for x in _ci.pending(LANE)}
-            except Exception:
-                _open_ids = set()
-            if _prev_sp.get("intent_id") in _open_ids and _prev_sp.get("plan_sig") == _plan_sig:
-                _iid = _prev_sp["intent_id"]   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
-            else:
-                try:
-                    if _prev_sp.get("intent_id") in _open_ids:
+                _prev_id = _prev_sp.get("intent_id")
+                # the status read raises IntentNotDurable when the journal is not cleanly readable: that FAILS CLOSED below (never an empty-set fallback)
+                _prev_st = _ci.intent_status(LANE, _prev_id) if _prev_id else None
+                if _prev_st == "open" and _prev_sp.get("plan_sig") == _plan_sig:
+                    _iid = _prev_id   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
+                else:
+                    if _prev_st == "open":
                         # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
                         # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
-                        if not _ci.freeze(LANE, _prev_sp["intent_id"], "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160]):
+                        if not _ci.freeze(LANE, _prev_id, "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160]):
                             raise _ci.IntentNotDurable("superseded intent freeze not durable")
+                    # prev OPEN (frozen just above) or prev FROZEN (an earlier poll froze it and the begin then failed or was lost): the replacement
+                    # is opened, or resumed if it already landed, through the explicit supersede of exactly that intent
                     _iid = _ci.begin(LANE, mint, _pos_id, _plan,
                                      {"realized_usd": realized,
                                       "entry_notional_usd": entry_notional,
                                       "closed_reason": closed_reason,
                                       "close_ts": time.time()},
-                                     supersedes=(_prev_sp.get("intent_id") if _prev_sp.get("intent_id") in _open_ids else None))
-                except _ci.IntentNotDurable as _nd:
-                    # FAIL CLOSED: no durable plan, so NO account op. Position stays open, visible, nothing resold, bankroll booking undone;
-                    # an earlier open intent (if any) keeps its id/plan_sig so a later poll can still recover or reuse it.
-                    logger.error("grad: %s SETTLEMENT PENDING (close_intent_not_durable: %s): no account op without a durable plan; retried next poll", mint[:12], _nd)
-                    pos["settlement_pending"] = {"why": "close_intent_not_durable", "closed_reason": closed_reason,
-                                                 "since": _prev_sp.get("since") or time.time(), "last_try": time.time(),
-                                                 "tries": int(_prev_sp.get("tries") or 0) + 1,
-                                                 **{_k: _prev_sp[_k] for _k in ("intent_id", "plan_sig") if _prev_sp.get(_k)}}
-                    pos["pending_exit"] = {"leg": "settlement", "why": "close_intent_not_durable", "ts": time.time()}
-                    d["bankroll"] = round(float(d["bankroll"]) - realized, 6)
-                    _write(d)
-                    return None
+                                     supersedes=(_prev_id if _prev_st in ("open", "frozen") else None))
+            except _ci.IntentNotDurable as _nd:
+                # FAIL CLOSED: no durable plan, so NO account op. Position stays open, visible, nothing resold, bankroll booking undone;
+                # an earlier open intent (if any) keeps its id/plan_sig so a later poll can still recover or reuse it.
+                logger.error("grad: %s SETTLEMENT PENDING (close_intent_not_durable: %s): no account op without a durable plan; retried next poll", mint[:12], _nd)
+                pos["settlement_pending"] = {"why": "close_intent_not_durable", "closed_reason": closed_reason,
+                                             "since": _prev_sp.get("since") or time.time(), "last_try": time.time(),
+                                             "tries": int(_prev_sp.get("tries") or 0) + 1,
+                                             **{_k: _prev_sp[_k] for _k in ("intent_id", "plan_sig") if _prev_sp.get(_k)}}
+                pos["pending_exit"] = {"leg": "settlement", "why": "close_intent_not_durable", "ts": time.time()}
+                d["bankroll"] = round(float(d["bankroll"]) - realized, 6)
+                _write(d)
+                return None
         _ok, _why = True, ""
         for _sop in _plan:
             if _sop["kind"] == "write_down":

@@ -30,6 +30,47 @@ def check(n, c):
     print(("PASS " if c else "FAIL ") + n)
     if not c: FAILS.append(n)
 
+import logging as _logging_inj
+class _ExpectExc:
+    """Per-site capture of INTENTIONALLY injected exceptions logged (logger.exception) by the real grad poll path. Inside the with-block ONLY, grad's logger stops
+    propagating and a capture handler takes the records that carry exc_info; every ordinary record is forwarded unchanged to the ancestor handlers (warnings stay
+    visible). On exit the handler is removed and propagate restored (finally). The captured exceptions must equal `expected` EXACTLY (count, order, type name, message);
+    a missing expected or any unexpected exception FAILS the check, and unexpected exception records are re-emitted with their full traceback (still visible)."""
+    def __init__(self, label, expected):
+        self.label = label; self.expected = list(expected); self.recs = []
+    def _forward(self, rec):
+        lg = self.logger.parent
+        while lg is not None:
+            for hh in lg.handlers:
+                if rec.levelno >= hh.level: hh.handle(rec)
+            if not lg.propagate: break
+            lg = lg.parent
+    def __enter__(self):
+        outer = self
+        class _H(_logging_inj.Handler):
+            def emit(self, r):
+                if r.exc_info: outer.recs.append(r)
+                else: outer._forward(r)
+        self.logger = globals()["GR"].logger; self.h = _H(); self.prop = self.logger.propagate
+        self.logger.addHandler(self.h); self.logger.propagate = False
+        return self
+    def __exit__(self, et, ev, tb):
+        try:
+            self.logger.removeHandler(self.h)
+        finally:
+            self.logger.propagate = self.prop
+        got = [(r.exc_info[0].__name__, str(r.exc_info[1])) for r in self.recs]
+        exp = list(self.expected); unexpected = []
+        for r, k in zip(self.recs, got):
+            if k in exp: exp.remove(k)
+            else: unexpected.append(r)
+        for r in unexpected: self._forward(r)
+        # the record MESSAGE is the real poll_exits failure line for the expected exception: "grad poll_exits <mint12> failed: <exception text>"
+        msgs_ok = all(r.getMessage().startswith("grad poll_exits ") and r.getMessage().endswith(" failed: " + str(r.exc_info[1])) for r in self.recs)
+        check("%s injected-fault logs captured at this site EXACTLY as expected (count/order/exception type/text, record message prefix+suffix %s): got %r, want %r" % (self.label, msgs_ok, got, self.expected),
+              got == self.expected and not unexpected and not exp and msgs_ok)
+        return False
+
 # containment: any process/thread start is a failure (patched to raise)
 STARTS = []
 def _no(*a, **k):
@@ -1136,7 +1177,8 @@ _cl0 = GR._close_leg; _cash0 = cash(PAs); _ps0 = copy.deepcopy(GR.open_positions
 def _boom_leg(*a, **k): raise RuntimeError("synthetic poll failure")
 GR._close_leg = _boom_leg
 try:
-    _ret = GR.poll_exits(price_fn=gpf(3.5))   # b/a legs due: _close_leg raises inside the position try
+    with _ExpectExc("P7s", [("RuntimeError", "synthetic poll failure")]):
+        _ret = GR.poll_exits(price_fn=gpf(3.5))   # b/a legs due: _close_leg raises inside the position try
 finally:
     GR._close_leg = _cl0
 _pp = GR.open_positions().get(gms) or {}
@@ -1147,7 +1189,8 @@ _w0 = GR._write
 def _w_boom(dd): raise OSError("disk full")
 GR._close_leg = _boom_leg; GR._write = _w_boom
 try:
-    _ret2 = GR.poll_exits(price_fn=gpf(3.5)); _raised = False
+    with _ExpectExc("P7s2", [("RuntimeError", "synthetic poll failure")]):
+        _ret2 = GR.poll_exits(price_fn=gpf(3.5)); _raised = False
 except Exception:
     _raised = True
 finally:
@@ -1543,7 +1586,9 @@ PAu, gmu = make_legacy(); _pu0 = copy.deepcopy(GR.open_positions()[gmu]); _cl1 =
 def _mut_then_boom(pos, leg_key, *a, **k):
     pos["legs"][leg_key]["done"] = True; pos["realized_usd"] = 999.0; raise RuntimeError("boom after partial mutation")
 GR._close_leg = _mut_then_boom
-try: GR.poll_exits(price_fn=gpf(3.5))
+try:
+    with _ExpectExc("P7u", [("RuntimeError", "boom after partial mutation")]):
+        GR.poll_exits(price_fn=gpf(3.5))
 finally: GR._close_leg = _cl1
 _pu = GR.open_positions().get(gmu) or {}
 check("P7u after an exception mid-mutation the PERSISTED position has no half state (legs done %s, realized %.4f want %.4f), marker present (%s), and a later poll writes the same (reloaded)" % ([k for k, v in (_pu.get("legs") or {}).items() if v.get("done")], float(_pu.get("realized_usd") or 0), float(_pu0.get("realized_usd") or 0), (_pu.get("pending_exit") or {}).get("why")),
@@ -1576,7 +1621,9 @@ for _fm in ("read_fails", "write_fails", "position_missing"):
         if _st["armed"] and _fm == "write_fails": raise OSError("restore write failed")
         return _wr0(dd)
     GR._close_leg = _mut_boom2; GR._read = _rd_f; GR._write = _wr_f
-    try: GR.poll_exits(price_fn=gpf(3.5)); _raised = False
+    try:
+        with _ExpectExc("P7v[%s]" % _fm, [("RuntimeError", "boom2 primary")]):
+            GR.poll_exits(price_fn=gpf(3.5)); _raised = False
     except Exception: _raised = True
     finally: GR._close_leg = _cl2; GR._read = _rd0; GR._write = _wr0; GR.logger.removeHandler(_cap)
     _same = open(GR.LEDGER_PATH, "rb").read() == _st["baseline"]; _msgs = " | ".join(_cap.msgs)
@@ -1600,7 +1647,9 @@ if len(_mints) == 2:
         return _cr0(pos, px, reason, *a, **k)
     GR._close_remaining = _cr_sel
     _cashw0 = cash(PAw); _pid2 = GR.open_positions()[_m2]["pa_pos_id"]; _pid1 = GR.open_positions()[_m1]["pa_pos_id"]; _nfw0 = len(_fills_now(Fw))
-    try: GR.poll_exits(price_fn=lambda chain, mint, spot_index=None: float((GR.open_positions().get(mint) or {}).get("entry_price") or 0) * 0.3)
+    try:
+        with _ExpectExc("P7w", [("RuntimeError", "boom first position")]):
+            GR.poll_exits(price_fn=lambda chain, mint, spot_index=None: float((GR.open_positions().get(mint) or {}).get("entry_price") or 0) * 0.3)
     finally: GR._close_remaining = _cr0
     _op2 = GR.open_positions(); _led = GR._read()
     check("P7w first position fail-closed without half state (open %s, realized %.4f want %.4f, marker %s); second CLOSED normally (open %s); exactly one close record persisted (%d)" % (
@@ -1700,7 +1749,8 @@ try:
     check("P7zr1 real ledger, clean cycle: done, the scan ran (gate open), clear_fault says exactly no_fault and wrote NO clear record (%s)" % (_r1c[1].get("blocked"),),
           _r1.get("status") == "done" and _scans == [1] and _r1c[0] is False and _r1c[1].get("blocked") == ["no_fault"] and _ncl == 0)
     GR._persist_poll_failure = lambda d, mint, pos, exc: False; GR._close_leg = _boom_leg; _scans.clear(); _a0 = GR._POLL_ABORTS.get("count", 0)
-    _r2 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(2), now=time.time())
+    with _ExpectExc("P7zr2", [("RuntimeError", "injected leg-close failure")]):
+        _r2 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(2), now=time.time())
     GR._persist_poll_failure = _pf_save; GR._close_leg = _cl_save
     _r3 = _GCY.run_cycle(GR, price_fn=_good_px, scan_fn=lambda: _scans.append(3), now=time.time())
     check("P7zr2 REAL abort path: the poll aborted (count %s -> %s), the cycle recorded a durable fault, the scan was NOT called that cycle (%s) nor in the following CLEAN cycle (%s), exits ran in both (steps %s / %s)"
@@ -1738,7 +1788,9 @@ try:
             _once["credits_at_fail"] = _wal_credits(_pid4); raise OSError("injected lane write failure AFTER the account credit")
         return _wr_save(d_)
     GR._persist_poll_failure = lambda d, mint, pos, exc: False; GR._write = _write_boom; _scans.clear(); _a4 = GR._POLL_ABORTS.get("count", 0)
-    try: _r4 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(4), now=time.time())
+    try:
+        with _ExpectExc("P7zr4", [("OSError", "injected lane write failure AFTER the account credit")]):
+            _r4 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(4), now=time.time())
     finally: GR._persist_poll_failure = _pf_save; GR._write = _wr_save
     _cr1 = _wal_credits(_pid4); _ap1 = _acct_pos(_pid4); _cash1 = float(PAr._read_json(PAr.LEDGER_PATH)["cash"]); _fk1 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
     _fills1 = _fills_now(GR._demo_filler()); _newkey = sorted(_fk1 - _fk0)[0] if len(_fk1 - _fk0) == 1 else None; _fill = _fills1.get(_newkey) or {}

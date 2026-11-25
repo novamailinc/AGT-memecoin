@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SOURCE ONLY, UNEXECUTED. NEVER RUN WITHOUT main's explicit clearance for this exact blob. Isolated runtime test of the price_fn=None (LANE DEFAULT price route) path on the
 REAL grad.py engine: main_cycle with price_fn None must still price and run the exits through the engine's own default route (Jupiter v3 batch stub -> jup_prices), and the
-v2 behaviour (run_cycle with price_fn None and NO price_route) is reproduced as a negative control on the real run_cycle. Fake Jupiter/feed/fill stubs, temp HOME, no trader
+v2 behaviour (run_cycle with price_fn None and NO price_route) is reproduced as a negative control on the real run_cycle. Fake Jupiter/feed/fill stubs PLUS an explicit stub of the REAL exit-pricing seam (grad._jup.get_prices_observed returning {mint: (3x entry price, now)}, every call recorded), temp HOME, no trader
 script, no thread, no kill; both children install a socket tripwire AFTER the engine boots and report its count. Reuses the BOOT/PRE2 child programs and the bounded child runner
 of tests/real_ledger_hook_harness-SOURCE-ONLY.py (loaded as a module; import runs no scenario). 2 children, rc 0 each, JSON on stdout, a reached-site sentinel field in each.
   X4 flag ON, price_fn None, position at 3x (the stub Jupiter price): main_cycle. Expect the legs-a/b exit sales journaled BEFORE the scan (fills at scan start > before), legacy
@@ -21,6 +21,20 @@ _NET = []
 def _trip(*a, **k):
     _NET.append(1); raise OSError("network tripwire")
 _sk.socket.connect = _trip; _sk.create_connection = _trip; _sk.getaddrinfo = _trip
+# the engine's REAL pricing seam: grad._jup is jup_price; _poll_exits calls _jup.get_prices_observed(mints) -> {mint: (price, observed_ts)} (validated by _validate_jup_observed). FakeJup (the filler's
+# quote stub) does NOT price exits, so stub this explicitly: price = 3x the position's entry price, observation ts = now, and RECORD every call (mints requested).
+import daemon.launch_scanner.jup_price as _JP
+JUPCALLS = []
+def _gpo(mints, now=None):
+    JUPCALLS.append(sorted(mints or []))
+    out = {}
+    for m in (mints or []):
+        pos = GR.open_positions().get(m) or {}
+        e = float(pos.get("entry_price") or 0)
+        if e > 0: out[m] = (e * JUPMULT["m"], time.time())
+    return out
+JUPMULT = {"m": 3.0}
+_JP.get_prices_observed = _gpo; GR._jup = _JP
 EMPTY = {"stream": 0, "opened": 0, "select_rejected": 0, "select_reasons": {}}
 r1 = open_first(); T.register(GR)
 order = []
@@ -34,13 +48,13 @@ CHILD_X4 = H.PRE2 + COMMON + r"""
 FakeJup.mult = 3.0
 try: res, n, rec = T.main_cycle(GR, None, scan_fn, legacy)
 finally: FakeJup.mult = 1.0
-print(json.dumps({"reached": True, "order": order, "f0": f0, "f_end": len(raw_fills()), "n": n, "status": (rec or {}).get("status"), "exits_step": ((rec or {}).get("steps") or {}).get("exits"), "rec_text": json.dumps(rec, default=str), "net": len(_NET)}))
+print(json.dumps({"reached": True, "order": order, "f0": f0, "f_end": len(raw_fills()), "n": n, "status": (rec or {}).get("status"), "exits_step": ((rec or {}).get("steps") or {}).get("exits"), "rec_text": json.dumps(rec, default=str), "net": len(_NET), "jupcalls": JUPCALLS, "open_mints": sorted(GR.open_positions())}))
 """
 CHILD_X5 = H.PRE2 + COMMON + r"""
 FakeJup.mult = 3.0
 try: rec = GC.run_cycle(grad=GR, price_fn=None, scan_fn=scan_fn, price_route=None)
 finally: FakeJup.mult = 1.0
-print(json.dumps({"reached": True, "order": order, "f0": f0, "f_end": len(raw_fills()), "status": (rec or {}).get("status"), "rec_text": json.dumps(rec, default=str), "net": len(_NET)}))
+print(json.dumps({"reached": True, "order": order, "f0": f0, "f_end": len(raw_fills()), "status": (rec or {}).get("status"), "rec_text": json.dumps(rec, default=str), "net": len(_NET), "jupcalls": JUPCALLS}))
 """
 def main():
     h = H.newhome(); cp, j = H.run(CHILD_X4, h)
@@ -48,13 +62,13 @@ def main():
     if j:
         scans = [o for o in j["order"] if o[0] == "scan"]; leg = [o for o in j["order"] if o[0] == "legacy"]
         ex = j.get("exits_step") or {}
-        check("X4 price_fn None, flag on: exits priced via the lane default route (fills %s -> %s), scan after them %s, legacy none %s, status %s, exits step %s, no no_price_route, no network (%s)" % (j["f0"], j["f_end"], scans, leg, j["status"], ex, j["net"]),
-              j["f_end"] > j["f0"] and len(scans) == 1 and scans[0][1] > j["f0"] and leg == [] and str(j["status"]).startswith("done") and ex.get("ok") and int(ex.get("n_closed") or 0) >= 1 and "no_price_route" not in j["rec_text"] and j["net"] == 0)
+        check("X4 price_fn None, flag on: exits priced via the lane default route (fills %s -> %s), scan after them %s, legacy none %s, status %s, exits step %s, no no_price_route, no network (%s), the REAL jup pricing seam was called (%s)" % (j["f0"], j["f_end"], scans, leg, j["status"], ex, j["net"], j["jupcalls"]),
+              j["f_end"] > j["f0"] and len(scans) == 1 and scans[0][1] > j["f0"] and leg == [] and str(j["status"]).startswith("done") and ex.get("ok") and int(ex.get("n_closed") or 0) >= 1 and "no_price_route" not in j["rec_text"] and j["net"] == 0 and len(j["jupcalls"]) >= 1 and any(c for c in j["jupcalls"]) and all(set(c) <= set(j["open_mints"]) for c in j["jupcalls"]))
     h = H.newhome(); cp, j2 = H.run(CHILD_X5, h)
     check("X5 child ran (rc=%s, expected 0) and reached the site" % cp.returncode, cp.returncode == 0 and j2 is not None and j2.get("reached") is True)
     if j2:
-        check("X5 NEGATIVE CONTROL (v2 behaviour): price_route None -> no_price_route in the record, no exit sales (fills %s == %s), scan not run (%s), no network (%s)" % (j2["f_end"], j2["f0"], j2["order"], j2["net"]),
-              "no_price_route" in j2["rec_text"] and j2["f_end"] == j2["f0"] and j2["order"] == [] and j2["net"] == 0)
+        check("X5 NEGATIVE CONTROL (v2 behaviour): price_route None -> no_price_route in the record, no exit sales (fills %s == %s), scan not run (%s), no network (%s), jup pricing never called (%s)" % (j2["f_end"], j2["f0"], j2["order"], j2["net"], j2["jupcalls"]),
+              "no_price_route" in j2["rec_text"] and j2["f_end"] == j2["f0"] and j2["order"] == [] and j2["net"] == 0 and j2["jupcalls"] == [])
     print("elapsed %.1fs of %.0fs budget; FAILS: %d; stop=%s" % (H.time.time() - H._T0, H.BUDGET_S, len(FAILS), H._STOP["why"])); return 1 if (FAILS or H._STOP["why"]) else 0
 if __name__ == "__main__":
     sys.exit(main())

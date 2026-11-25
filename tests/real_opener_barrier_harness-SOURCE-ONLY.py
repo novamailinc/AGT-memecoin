@@ -12,7 +12,7 @@ is empty and the lock is acquirable after EVERY scenario (no leaked lock).
   Y4 fault-lock ACQUIRE FAILURE: writer holds the lock past the 0.5 s wait: "entry commit barrier unavailable", nothing debited, intent released, lock acquirable afterwards, and a RETRY then opens with exactly one debit
      (no lost or doubled debit/intent).   Y5 guard raises at the re-check: refused fail-closed, same cleanup.   Y6 commit_barrier construction raises: refused, same cleanup.
   Y7 try_debit refuses inside the barrier: skip with its reason, lock released, intent released.
-  Y8 same-op REPLAY: fixed candidate, refused at the barrier, fault cleared, same candidate retried: opens from the journaled fill (no second buy, same op id, same price), one debit.
+  Y8 same fill-key REPLAY: fixed candidate, refused at the barrier, fault cleared, same candidate retried: opens from the journaled fill (no second buy, same op id, same price), one debit.
   Y9 STALE replay: same as Y8 but the journaled quote is aged past max_data_age_s: the retry is refused as "quote age" (no re-quote, no debit).
 CLAIM LIMITS: one process; the demo-mode filler path only; stubbed guard (the real guard's limit checks are not what is under test); fault writer is a thread holding the real flock (a second PROCESS is not used); no kill; exits and the abort hook are not exercised here."""
 import importlib.util, json, os, sys
@@ -33,8 +33,14 @@ def intents():
 def snap():
     ps = PA.snapshot()
     return {"cash": ps["cash"], "n_pos": len(raw_ledger().get("positions", {})), "intents": intents(), "fills": len(raw_fills()), "credits": len(raw_credits()[0])}
+AH = {"t": None}
+def _acct_holder(st):
+    with PA._lock():
+        st.set(); time.sleep(1.5)
 def stub(lane):
     calls.append(len(calls) + 1)
+    if scen == "Y10" and len(calls) == 3:               # the barrier re-check: from here the next step is try_debit; the account lock is now held by another holder
+        st = threading.Event(); AH["t"] = threading.Thread(target=_acct_holder, args=(st,), daemon=True); AH["t"].start(); assert st.wait(5)
     if scen == "Y5" and len(calls) == 3: raise RuntimeError("FIXTURE-GUARD-RAISES")
     return "FIXTURE-FAULT-PRESENT" if os.path.exists(fault_file()) else None
 EG.mandatory_entry_refusal = stub                      # the SAME qualified module object grad imports at call time
@@ -44,7 +50,7 @@ if scen == "Y6":
     EG.commit_barrier = _bad
 if scen == "Y7": PA.try_debit = lambda *a, **k: (False, "FIXTURE-DEBIT-REFUSED", None)
 started = threading.Event(); hold = {"Y2": 0.3, "Y3": 0.6, "Y4": 1.5, "Y8": 0.3, "Y9": 0.3}.get(scen)
-CAND = mkcand(1)                                   # FIXED candidate: same created_ts, so the SAME op id on every attempt (Y8/Y9)
+CAND = mkcand(1)                                   # FIXED candidate: same created_ts, and the op id is LANE:entry:mint:int(created_ts*1000) (grad.py), so the journal FILL KEY SET is the observable identity; no per-attempt nonce is in this op id (the per-run nonce seen elsewhere comes from other fixtures)
 def writer():
     with GC._fault_lock(GR):
         started.set(); time.sleep(hold)
@@ -52,12 +58,17 @@ def writer():
 t = None
 if hold:
     t = threading.Thread(target=writer, daemon=True); t.start(); assert started.wait(5)
-s0 = snap(); r = GR.consider_candidate(CAND if scen in ("Y8", "Y9") else mkcand(1), time.time()); s1 = snap()
+s0 = snap(); T0A = time.monotonic(); r = GR.consider_candidate(CAND if scen in ("Y8", "Y9", "Y10") else mkcand(1), time.time()); EL = time.monotonic() - T0A; s1 = snap()
 if t: t.join(10)
 retry = None
 if scen == "Y4":
     EG.mandatory_entry_refusal = lambda lane: None
     rr = GR.consider_candidate(mkcand(1), time.time()); retry = {"r": [bool(rr[0]), str(rr[1])], "s": snap()}
+if scen == "Y10":
+    el = EL                                   # measured right after consider_candidate returned, BEFORE snap() (PA.snapshot() itself waits for the account lock)
+    AH["t"].join(10)
+    rr = GR.consider_candidate(CAND, time.time()); f2 = json.load(open(FILL_PATH))["fills"]
+    retry = {"r": [bool(rr[0]), str(rr[1])], "s": snap(), "n_fills_after": len(f2), "elapsed_first": el}
 if scen in ("Y8", "Y9"):
     os.remove(fault_file())                                    # the fault is cleared by the fixture; the stub now passes
     f1 = json.load(open(FILL_PATH))["fills"]; first_ops = sorted(f1); first_px = {k: v.get("price_usd") for k, v in f1.items()}
@@ -73,7 +84,7 @@ try:
     with GC._fault_lock(GR, 0.5): acquirable = True
 except Exception as e: acquirable = False
 print(json.dumps({"reached": True, "scen": scen, "r": [bool(r[0]), str(r[1])], "s0": s0, "s1": s1, "calls": len(calls), "depth_empty": not getattr(GC._FLT, "depth", {}), "acquirable": acquirable,
-                  "lockfile": os.path.exists(GC._fault_lock_path(GR)), "retry": retry}))
+                  "lockfile": os.path.exists(GC._fault_lock_path(GR)), "retry": retry, "writer_released": (t is None or not t.is_alive()), "main_depth_empty_note": "depth is thread-local: this is the MAIN thread; the writer thread releases its own lock, checked by writer_released"}))
 """
 def run(scen):
     h = H.newhome(); cp, j = H.run(CHILD, h, scen)
@@ -83,33 +94,40 @@ def refused(j, why):
     s0, s1 = j["s0"], j["s1"]
     return (j["r"][0] is False and why in j["r"][1] and s1["cash"] == s0["cash"] and s1["n_pos"] == s0["n_pos"] == 0 and s1["credits"] == s0["credits"]
             and j["s1"]["intents"] == [] and j["depth_empty"] and j["acquirable"])
+D = {}
+def delta(j): return round(float(j["s0"]["cash"]) - float(j["s1"]["cash"]), 9)
 def main():
     j = run("Y0")
     if j: check("Y0 flag off control: opened (%s), one position, cash down once (%s -> %s), no fault-lock file (%s), guard called %d times, lock depth empty" % (j["r"], j["s0"]["cash"], j["s1"]["cash"], j["lockfile"], j["calls"]),
                 j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"] and not j["lockfile"] and j["calls"] == 3 and j["depth_empty"] and j["s1"]["intents"] == [])
     j = run("Y1")
     if j: check("Y1 flag on control: opened, one position, cash down once (%s -> %s), no intent left, guard called %d times (pre-lock, in-lock, barrier re-check), lock free" % (j["s0"]["cash"], j["s1"]["cash"], j["calls"]),
-                j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"] and j["s1"]["intents"] == [] and j["calls"] == 3 and j["depth_empty"] and j["acquirable"])
+                j["r"][0] and j["s1"]["n_pos"] == 1 and delta(j) > 0 and j["s1"]["intents"] == [] and j["calls"] == 3 and j["depth_empty"] and j["acquirable"] and not D.update(d1=delta(j)))
     j = run("Y2")
     if j: check("Y2 RACE: re-check under the barrier refused with the stub reason (%s); cash %s == %s, no position, intent released (%s), buy fill journaled (%d fills), guard called %d times, lock free" % (j["r"], j["s1"]["cash"], j["s0"]["cash"], j["s1"]["intents"], j["s1"]["fills"], j["calls"]),
                 refused(j, "FIXTURE-FAULT-PRESENT") and j["calls"] == 3 and j["s1"]["fills"] >= 1)
     j = run("Y3")
-    if j: check("Y3 SENSITIVITY: barrier removed -> the same race OPENS the entry (%s) and debits once: the barrier is what refuses in Y2" % (j["r"],), j["r"][0] and j["s1"]["n_pos"] == 1 and j["s1"]["cash"] < j["s0"]["cash"])
+    if j: check("Y3 SENSITIVITY: barrier removed -> the same race OPENS the entry (%s) and debits once: the barrier is what refuses in Y2" % (j["r"],), j["r"][0] and j["s1"]["n_pos"] == 1 and abs(delta(j) - D.get("d1", -1)) < 1e-9)
     j = run("Y4")
     if j:
         rt = j["retry"] or {}
         check("Y4 fault-lock acquire failure: refused as barrier unavailable (%s), nothing debited, intent released, lock acquirable; retry opened with exactly one debit (cash %s -> %s)" % (j["r"], j["s0"]["cash"], (rt.get("s") or {}).get("cash")),
-              refused(j, "entry commit barrier unavailable") and (rt.get("r") or [False])[0] is True and rt["s"]["n_pos"] == 1 and rt["s"]["cash"] < j["s0"]["cash"] and rt["s"]["intents"] == [])
+              refused(j, "entry commit barrier unavailable") and (rt.get("r") or [False])[0] is True and rt["s"]["n_pos"] == 1 and abs((j["s0"]["cash"] - rt["s"]["cash"]) - D.get("d1", -1)) < 1e-9 and rt["s"]["intents"] == [])
     j = run("Y8")
     if j:
         rt = j["retry"] or {}
         check("Y8 same-op replay: refused once at the barrier (%s), then the SAME candidate retried after the fault cleared opened (%s) with NO second buy (fills %s -> %s, same op ids %s), entry price equals the journaled fill price (%s vs %s), exactly one debit (cash %s -> %s)" % (j["r"], rt.get("r"), rt.get("n_fills_before"), rt.get("n_fills_after"), rt.get("same_ops"), rt.get("entry_px"), list((rt.get("first_px") or {}).values()), j["s0"]["cash"], (rt.get("s") or {}).get("cash")),
-              refused(j, "FIXTURE-FAULT-PRESENT") and (rt.get("r") or [False])[0] is True and rt["same_ops"] and rt["n_fills_after"] == rt["n_fills_before"] and rt["entry_px"] in list(rt["first_px"].values()) and rt["s"]["n_pos"] == 1 and rt["s"]["cash"] < j["s0"]["cash"] and rt["s"]["intents"] == [])
+              refused(j, "FIXTURE-FAULT-PRESENT") and (rt.get("r") or [False])[0] is True and rt["same_ops"] and rt["n_fills_after"] == rt["n_fills_before"] and rt["entry_px"] in list(rt["first_px"].values()) and rt["s"]["n_pos"] == 1 and abs((j["s0"]["cash"] - rt["s"]["cash"]) - D.get("d1", -1)) < 1e-9 and rt["s"]["intents"] == [])
     j = run("Y9")
     if j:
         rt = j["retry"] or {}
         check("Y9 STALE replay refused: refused at the barrier (%s), then the same candidate retried with the journaled quote aged 120 s (> max_data_age_s 60) is refused as stale (%s), no position, cash unchanged (%s -> %s), no second buy (fills %s -> %s), intent released, no leaked lock" % (j["r"], rt.get("r"), j["s0"]["cash"], (rt.get("s") or {}).get("cash"), rt.get("n_fills_before"), rt.get("n_fills_after")),
               refused(j, "FIXTURE-FAULT-PRESENT") and (rt.get("r") or [True])[0] is False and "quote age" in (rt.get("r") or ["", ""])[1] and rt["s"]["n_pos"] == 0 and rt["s"]["cash"] == j["s0"]["cash"] and rt["n_fills_after"] == rt["n_fills_before"] and rt["s"]["intents"] == [])
+    j = run("Y10")
+    if j:
+        rt = j["retry"] or {}
+        check("Y10 ACCOUNT BUSY at the opener: another holder keeps the account lock 1.5 s after the barrier re-check; the debit is refused as account busy (%s) in %.2fs (< the 1.5 s hold: the ACQUIRE is bounded), nothing debited (cash %s -> %s), no position, intent released, fault lock free; after the holder released, the same candidate opens with exactly one debit (delta %s vs Y1 %s) and no second buy" % (j["r"], rt.get("elapsed_first", -1), j["s0"]["cash"], j["s1"]["cash"], (j["s0"]["cash"] - (rt.get("s") or {}).get("cash", 0)), D.get("d1")),
+              refused(j, "account busy") and rt.get("elapsed_first", 9) < 1.4 and (rt.get("r") or [False])[0] is True and abs((j["s0"]["cash"] - rt["s"]["cash"]) - D.get("d1", -1)) < 1e-9 and rt["s"]["n_pos"] == 1 and rt["s"]["intents"] == [] and j["writer_released"] is not False)
     j = run("Y5")
     if j: check("Y5 guard raises at the re-check (3rd call): refused fail-closed (%s), same cleanup" % (j["r"],), refused(j, "unavailable at commit") and j["calls"] == 3)
     j = run("Y6")

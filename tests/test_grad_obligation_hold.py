@@ -236,8 +236,13 @@ def scenario_h1(mutant):
         _leg(M, "a", 2.5)
         j1 = _jbytes(); i1 = len(_ints()); c = _closes(); cash1 = PA.snapshot()["cash"]; mk1 = len(PA.unresolved_refusals() or [])
         _stop_polls(M, 1); j2 = _jbytes(); i2 = len(_ints())
-        _stop_polls(M, 2); j3 = _jbytes()
-        out = {"intents_after_leg": i1, "intents_after_poll1": i2, "journal_grew_poll2_3": j3 != j2, "journal_grew_poll1": j2 != j1,
+        _wc = [0]; _ow = G._write
+        def _cw(*a, **k):
+            _wc[0] += 1
+            return _ow(*a, **k)
+        with patch.object(G, "_write", _cw):   # counting wrapper only; the REAL _write still runs
+            _stop_polls(M, 2); j3 = _jbytes()
+        out = {"intents_after_leg": i1, "intents_after_poll1": i2, "journal_grew_poll2_3": j3 != j2, "ledger_writes_poll2_3": _wc[0], "journal_grew_poll1": j2 != j1,
                "close_ops": [o.get("op_id") for e in _ints() for o in e.get("settle_ops") or [] if ":close:" in str(o.get("op_id"))],
                "account_cash_unchanged": PA.snapshot()["cash"] == cash1, "marker_rows_unchanged": len(PA.unresolved_refusals() or []) == mk1,
                "open": _snap(M) is not None, "new_closes": _closes() - c, "hold": dict(_hold(M)), "pending_exit": (_snap(M) or {}).get("pending_exit")}
@@ -252,6 +257,7 @@ check("H1 position stays open, nothing booked (open %r, new closes %d)" % (h1["o
 check("H1 hold kind known_frozen with the tranche op id (%r)" % (h1["hold"].get("kind"),),
       h1["hold"].get("kind") == "known_frozen" and any(":leg:a:" in o for k in h1["hold"].get("known", []) for o in k["ops"]))
 check("H1 repeated held polls append NOTHING to the journal and open no intent", not h1["journal_grew_poll2_3"] and h1["intents_after_poll1"] == 1)
+check("H1 the hold reason was PERSISTED by the first held stop poll and the repeated held polls 2-3 wrote the lane ledger zero times (hold %r, writes %d)" % (h1["hold"].get("kind"), h1["ledger_writes_poll2_3"]), bool(h1["hold"].get("kind")) and h1["ledger_writes_poll2_3"] == 0)
 check("H1 held polls changed neither the account cash nor the marker rows (%r, %r)" % (h1["account_cash_unchanged"], h1["marker_rows_unchanged"]), h1["account_cash_unchanged"] and h1["marker_rows_unchanged"])
 check("H1 the tranche diagnostic pointer is preserved (pending_exit why %r)" % ((h1["pending_exit"] or {}).get("why"),), (h1["pending_exit"] or {}).get("why") in ("tranche_credit_divergence", "tranche_credit_divergence_held"))
 h1m = scenario_h1(True)

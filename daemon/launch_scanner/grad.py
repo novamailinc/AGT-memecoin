@@ -2318,6 +2318,20 @@ def _obligation_hold(pos, foreign_only=False, include_unknown=True):
         return {"kind": "unreadable", "known": [], "marks": [], "unknown": ["hold check failed: %r" % (e,)]}
 
 
+def _hold_body_on_disk(pos):
+    """The obligation_hold diagnostic body currently PERSISTED for this position, or None when it cannot be established (unreadable/absent). Read-only: parses the ledger file
+    directly (no _read, so a corrupt file is not renamed here); the caller already holds _ledger_lock. Not process state: a restart or another writer is seen as it is on disk."""
+    try:
+        with open(LEDGER_PATH) as _f:
+            _p = (json.load(_f).get("positions") or {}).get(pos.get("mint")) or {}
+        if _p.get("pa_pos_id") != pos.get("pa_pos_id"):
+            return None
+        _h = _p.get("obligation_hold")
+        return {k: _h.get(k) for k in ("kind", "known", "marks", "unknown")} if isinstance(_h, dict) else None
+    except Exception:
+        return None
+
+
 def _note_obligation_hold(pos, hold, where):
     """Visible diagnostic only. Stored in its own key (pending_exit / settlement_pending are never overwritten), rewritten ONLY when its content changes, and it appends nothing to
     any journal, so repeated held polls add no rows. The position stays open, no leg is marked done, nothing is sold or booked."""
@@ -3164,8 +3178,10 @@ def _finalize(d, mint, pos, closed_reason):
     # refusal/terminal/retry behavior is unchanged. An unreadable source is left to the existing journal-unreadable paths (include_unknown=False), never reported as frozen.
     _oh = _obligation_hold(pos, foreign_only=True, include_unknown="marker")
     if _oh is not None:
-        if _note_obligation_hold(pos, _oh, "finalize"):
-            _write(d)   # only when the diagnostic content changed: a repeated held poll rewrites nothing
+        _note_obligation_hold(pos, _oh, "finalize")
+        _mem = pos.get("obligation_hold") or {}
+        if _hold_body_on_disk(pos) != {k: _mem.get(k) for k in ("kind", "known", "marks", "unknown")}:
+            _write(d)   # persist when the diagnostic on DISK differs from the one now held (including one set in memory earlier this poll by _close_remaining); a repeated held poll finds them equal and rewrites nothing
         return None
     # SETTLEMENT PENDING (crash-recovery / unreadable-journal state). A half-migrated position whose per-leg account
     # receipts cannot be read cannot be SETTLED: the close credits `realized - tally` and the tally is unknowable, so

@@ -240,17 +240,9 @@ for point in ("pre_intent", "torn_intent", "after_credit", "pre_lane_marker"):
           % (point, pre["pre_cash"], entry_cash, credited), (_cents(pre["pre_cash"]) > _cents(entry_cash)) if credited else (_cents(pre["pre_cash"]) == _cents(entry_cash)))
     check("%s: rows WITHOUT an intent_id are only liveness probes, before (%r) and after (%r) recovery (never lifecycle events)" % (point, pre["pre_other"], r["other"]),
           set(pre["pre_other"]) <= {"probe"} and set(r["other"]) <= {"probe"})
-    if point == "torn_intent":
-        # PREDECLARED from the call ORDER (not weakened): the recovery process polls; the first journal touch is the _intent_gate liveness probe (ceo.py 286-296), which appends
-        # onto the unterminated half line, then close_intents.begin(stable_id) reads the journal, sees it not cleanly readable and raises IntentNotDurable (close_intents.py 198-200).
-        # close_intents.recover_lane (which truncates a torn tail, 362-368) runs only from the entry path (ceo.py 1226) and _finalize (1818), neither reached by a poll that holds. So the
-        # poll must FAIL CLOSED: leg a UNDONE, exactly the one journaled fill (no resale), cash == entry (no credit), pending_exit close_intent_not_durable, the journal still reported
-        # torn_tail, no lifecycle event, no pending intent.
-        check("torn_intent: FAILS CLOSED, no convergence: leg a done %r (want [False]), fills %r (want ['a']), cash delta %.6f (want 0), hold %r (want close_intent_not_durable), journal %r (want torn_tail), lifecycle %r (want [])"
-              % (r["a_done"], r["legs"], r["cash"] - entry_cash, r["pend_why"], r["journal_status"], r["ev"]),
-              r["a_done"] == [False] and r["legs"] == ["a"] and _cents(r["cash"] - entry_cash) == 0 and r["pend_why"] == ["close_intent_not_durable"]
-              and r["journal_status"] == "torn_tail" and r["ev"] == [] and r["pending"] == 0)
-        continue
+    # ROOT-FIX contract (predeclared, same for all four kill points incl. the torn half-line): recovery runs at the START of the poll, the torn tail (if provable) is truncated
+    # before any append, a pending intent for the same leg is RESUMED (never a second intent), so the lifecycle is exactly ONE intent with the full four events, pending 0,
+    # journal cleanly readable, exactly one credit, one sale fill.
     check("%s: leg a done after recovery %r, one sale fill per leg %r (no resale)" % (point, r["a_done"], r["legs"]), r["a_done"] == [True] and r["legs"] == ["a"])
     check("%s: cash delta since entry %.6f == journaled net proceeds %.6f (exactly one credit)" % (point, r["cash"] - entry_cash, r["net"]), _cents(r["cash"] - entry_cash) == _cents(r["net"]))
     check("%s: lifecycle sequence %r == ['intent', 'account_applied', 'lane_applied', 'applied'] (terminal applied last), no pending intent (%d), journal cleanly readable (%r)" % (point, r["ev"], r["pending"], r["journal_status"]),

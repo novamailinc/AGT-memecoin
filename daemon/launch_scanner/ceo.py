@@ -210,12 +210,20 @@ def _recover_close_intents():
     its natural re-fire; a missing tranche on a closed position is
     NOT reconstructed (operator territory) - it freezes."""
     global _RECOVERY_DONE, _ENTRY_BLOCKED
-    if _RECOVERY_DONE:
-        return _ENTRY_BLOCKED
-    _RECOVERY_DONE = True
     _ci = _close_intents()
     if _ci is None:
+        _RECOVERY_DONE = True
         return False
+    if _RECOVERY_DONE:
+        # Not once-and-forget: re-run while the journal is unreadable or any intent is still pending (a torn tail that appeared later, an
+        # intent left for the natural re-close). A clean, fully-terminal journal short-circuits.
+        try:
+            if (_ci._read(_ci.journal_path(LANE))[1] is None
+                    and not _ci.pending(LANE)):
+                return _ENTRY_BLOCKED
+        except Exception:
+            pass
+    _RECOVERY_DONE = True
 
     def account_apply(op):
         _pa = _paper_account()
@@ -1910,6 +1918,8 @@ def poll_exits(price_fn=None):
 
 
 def _poll_exits(price_fn):
+    # Recover incomplete close intents (and a provable torn tail) BEFORE this poll touches the journal or the account (once per process).
+    _recover_close_intents()
     # Phase 1: snapshot (locked read). Quotes happen outside the lock.
     with _ledger_lock():
         snapshot = {m: p for m, p in _read()["positions"].items()}

@@ -77,15 +77,71 @@ def _append(path: str, event: Dict[str, Any]) -> bool:
     event["ts"] = event.get("ts") or time.time()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a") as f:
-            f.write(json.dumps(event) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        with _append_lock(path):
+            prefix = ""
+            try:
+                with open(path, "rb") as _f:
+                    _f.seek(0, 2)
+                    _size = _f.tell()
+                    if _size:
+                        _f.seek(_size - 1)
+                        _last = _f.read(1)
+                    else:
+                        _last = b"\n"
+            except FileNotFoundError:
+                _last = b"\n"
+            if _last != b"\n":
+                # Unterminated tail: appending would MERGE our record into the half line. Repair only a PROVABLE torn tail (exactly one
+                # unparseable last record, the crash-mid-append signature, truncated like recover_lane); a complete last record that merely
+                # lacks its newline gets the newline first; any other corruption is never healed and nothing is appended.
+                _e, _st, _tail = _read(path)
+                if _st is None:
+                    prefix = "\n"
+                elif _st == "torn_tail" and _tail is not None:
+                    _truncate(path, _tail)
+                    logger.error("close_intents: torn tail truncated at %s before append (%s)", _tail, path)
+                else:
+                    logger.error("close_intents: journal not cleanly readable (%s); refusing append (%s)", _st, event.get("ev"))
+                    return False
+            with open(path, "a") as f:
+                f.write(prefix + json.dumps(event) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         return True
     except Exception:
         logger.exception("close_intents: append failed (%s)",
                          event.get("ev"))
         return False
+
+
+_APPEND_TL: Dict[str, "threading.Lock"] = {}
+
+
+class _append_lock:
+    """Serializes the tail check + repair + append across threads and processes (flock on a sidecar file)."""
+    def __init__(self, path):
+        self.path = path
+        self.tl = _APPEND_TL.setdefault(path, threading.Lock())
+        self.fh = None
+
+    def __enter__(self):
+        self.tl.acquire()
+        try:
+            import fcntl
+            self.fh = open(self.path + ".append.lock", "a")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except Exception:
+            self.tl.release()
+            raise
+        return self
+
+    def __exit__(self, *a):
+        try:
+            import fcntl
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+            self.fh.close()
+        finally:
+            self.tl.release()
 
 
 def _read(path: str) -> Tuple[List[Dict[str, Any]], Optional[str],
@@ -190,8 +246,26 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     ev = {"ev": "intent", "intent_id": intent_id, "lane": lane, "mint": mint, "pos_id": pos_id,
           "settle_ops": settle_ops, "close_info": dict(close_info)}
     if op_key is None:
-        if not _append(journal_path(lane), ev):
-            raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
+        with _op_key_lock(lane):
+            ents, st, _ = _read(journal_path(lane))
+            if st == "torn_tail":
+                # the append below repairs a provable torn tail; re-read after to prove the journal is clean
+                pass
+            elif st is not None:
+                raise IntentNotDurable("journal not cleanly readable (%s): refusing to open an intent" % st)
+            _ids = sorted(str(o.get("op_id")) for o in settle_ops)
+            for iid0, st0 in _state(ents).items():
+                e0 = st0["intent"]
+                if (e0 is not None and not st0["applied"] and not st0["frozen"] and e0.get("mint") == mint and e0.get("pos_id") == pos_id
+                        and sorted(str(o.get("op_id")) for o in e0.get("settle_ops") or []) == _ids):
+                    # same logical operation still pending (crash before its terminal event): RESUME it, never open a second intent
+                    if json.dumps(e0.get("settle_ops"), sort_keys=True) != json.dumps(settle_ops, sort_keys=True):
+                        raise IntentNotDurable("operation %s already pending with a DIFFERENT plan" % iid0)
+                    return iid0
+            if not _append(journal_path(lane), ev):
+                raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
+            if _read(journal_path(lane))[1] is not None:
+                raise IntentNotDurable("journal not cleanly readable after append")
         return intent_id
     ev["op_key"] = op_key
     with _op_key_lock(lane):
@@ -271,7 +345,9 @@ def journal_writable(lane: str) -> bool:
     """Durability pre-check for a caller that must not SELL (or book anything) unless it can later make its close intent durable: appends a
     harmless "probe" event (no intent_id, so _state and recovery ignore it) and returns whether it was fsynced. A pass is evidence for NOW only;
     begin() still raises IntentNotDurable if the real intent write fails."""
-    return bool(_append(journal_path(lane), {"ev": "probe", "lane": lane}))
+    if not _append(journal_path(lane), {"ev": "probe", "lane": lane}):
+        return False
+    return _read(journal_path(lane))[1] is None
 
 
 def freeze(lane: str, intent_id: str, why: str) -> bool:
@@ -361,8 +437,12 @@ def recover_lane(
                 if st["intent"] is not None and not st["applied"]]
     if status == "torn_tail" and tail is not None:
         try:
-            _truncate(path, tail)
-            entries, status, _ = _read(path)
+            with _op_key_lock(lane), _append_lock(path):
+                # re-read under the SAME serialization as begin/_append (no concurrent truncating writers); repair only if still provable
+                entries, status, tail = _read(path)
+                if status == "torn_tail" and tail is not None:
+                    _truncate(path, tail)
+                    entries, status, _ = _read(path)
             if status is not None:
                 return [iid for iid, st in _state(entries).items()
                         if st["intent"] is not None]

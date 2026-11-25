@@ -90,7 +90,7 @@ def main():
     check("gates apply to an add (total-exposure cap 2.5)", okg is False and near(lot(pa4, L, M)["qty"], q0, 1e-12) and pa4.applied_add("g:add") is None, repr((okg, whyg)))
     h5, pa5 = env()
     ok, why, pid5 = pa5.try_debit(L, M, 2.0, 100.0, "o:open", marks=mk(pa5)); os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "0"
-    q0 = lot(pa5, L, M)["qty"] if False else 100.0
+    q0 = float(lot(pa5, L, M)["qty"])   # real lot qty (read with gates still on at-cost marks available); the add below passes marks=None because gates are off
     okg, whyg = pa5.add_to_position(L, M, pid5, 1.0, 40.0, "o:add", marks=None)
     os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"
     check("gates off -> refused 'mandatory gates off', nothing applied", okg is False and "gates off" in whyg and pa5.applied_add("o:add") is None and near(lot(pa5, L, M)["qty"], q0, 1e-12), repr((okg, whyg)))
@@ -106,19 +106,30 @@ def main():
         check("quarantined cash: add refused on SPENDABLE (not total) cash", oqa is False and "spendable" in wqa and pa6.applied_add("q:add") is None, repr((oqa, wqa)))
     else:
         say("INFO", "NOT COVERED: could not reach spendable < stake <= cash on this credit path")
-    # degraded / unreadable ledger
+    # degraded / unreadable ledger. A REAL add is applied first so applied_add has a real record to lose or keep.
     h7, pa7 = env()
     ok, why, pid7 = pa7.try_debit(L, M, 2.0, 100.0, "d:open", marks=mk(pa7))
+    okd, whyd = pa7.add_to_position(L, M, pid7, 1.0, 40.0, "d:addok", marks=mk(pa7))
+    rec_before = pa7.applied_add("d:addok")
+    check("corrupt-ledger precondition: a real add is applied and applied_add returns its record", okd is True and bool(rec_before) and near(rec_before["qty"], 40.0, 1e-12), repr((okd, whyd, rec_before)))
     open(pa7.LEDGER_PATH, "w").write("{not json")
     try:
         r = pa7.add_to_position(L, M, pid7, 1.0, 40.0, "d:add", marks=mk(pa7))
-        check("unreadable/corrupt ledger: add refused, no exception", r[0] is False, repr(r))
+        say("INFO", "corrupt ledger: add_to_position returned %r" % (r,))
+        qn = lot(pa7, L, M)
+        qty = None if qn is None else float(qn["qty"])
+        refused_ok = (r[0] is False and qty is not None and near(qty, 140.0, 1e-9) and any(w in r[1].lower() for w in ("degraded", "unreadable", "ledger")))
+        rebuilt_once = (r[0] is True and qty is not None and near(qty, 180.0, 1e-9))
+        check("corrupt ledger: add either REFUSED with a degraded/unreadable reason (lot stays 140) or REBUILT from the journal and applied exactly once (lot 180); never an exception, never a double apply", refused_ok or rebuilt_once, repr((r, qty)))
     except Exception as e:
-        check("unreadable/corrupt ledger: add refused, no exception", False, "RAISED %r (finding)" % (e,))
+        check("corrupt ledger: add either refused or rebuilt once, no exception", False, "RAISED %r (finding)" % (e,))
     try:
-        check("unreadable/corrupt ledger: applied_add is None (unknown is never proof)", pa7.applied_add("d:open") is None)
+        ra = pa7.applied_add("d:addok")
+        check("corrupt ledger: applied_add of the REAL earlier record is None while unreadable, or the exact record if the journal rebuilt it (never a different value)",
+              ra is None or (near(ra["qty"], 40.0, 1e-12) and near(ra["stake"], 1.0, 1e-12) and ra["pos_id"] == pid7), repr(ra))
+        say("INFO", "corrupt ledger: applied_add state = %s" % ("None (unknown, not proof of absence)" if ra is None else "record rebuilt from journal"))
     except Exception as e:
-        check("unreadable/corrupt ledger: applied_add is None (unknown is never proof)", False, "RAISED %r (finding)" % (e,))
+        check("corrupt ledger: applied_add does not raise", False, "RAISED %r (finding)" % (e,))
     # replay divergence: journaled debit_add for a lot that does not exist
     h8, pa8 = env()
     ok, why, pid8 = pa8.try_debit(L, M, 2.0, 100.0, "v:open", marks=mk(pa8))
@@ -127,7 +138,9 @@ def main():
         f.write(json.dumps({"event": "debit_add", "event_id": "ev#%d" % (seq + 1), "op_id": "v:ghost", "lane": L, "mint": "GHOSTpump", "pos_id": "ghost#1", "stake": 1.0, "qty": 1.0, "seq": seq + 1, "ts": 1.0}) + "\n")
     try:
         r = pa8.add_to_position(L, M, pid8, 1.0, 40.0, "v:add", marks=mk(pa8))
-        check("replay divergence (journaled add for a missing lot): account refuses, nothing applied", r[0] is False and pa8.applied_add("v:ghost") is None, repr(r))
+        why8 = r[1].lower()
+        check("replay divergence (journaled add for a missing lot): account refuses, nothing applied, and the reason names the divergence/degraded state (not an unrelated refusal)",
+              r[0] is False and pa8.applied_add("v:ghost") is None and any(w in why8 for w in ("diverg", "degraded", "replay")), repr(r))
     except Exception as e:
         check("replay divergence (journaled add for a missing lot): account refuses, nothing applied", False, "RAISED %r" % (e,))
     # fault BEFORE the journal append
@@ -160,6 +173,7 @@ def main():
     check("retry after crash: original outcome, not re-applied", okr is True and "retry" in whyr and near(lot(pa11, L, M)["qty"], 140.0, 1e-9), repr((okr, whyr)))
     ad = pa11.applied_add("k:add")
     check("adoption evidence after crash: applied_add readable", bool(ad) and near(ad["qty"], 40.0, 1e-12), repr(ad))
+    say("INFO", "TORN-TAIL / FSYNC AMBIGUITY (traced, labelled, not faked): _journal does open/write/flush/fsync in one try. If the write completed and fsync raised, the complete line IS in the journal while a strict add is reported refused; the next load REPLAYS it (money direction: applied), and the tranche adoption path (applied_add) reconciles the lane. A partial line from a failed write is a single unparseable TAIL record, which the existing torn_tail repair truncates. Neither is exercised by a check here.")
     say("INFO", "NOT COVERED (labelled): cash-split migration (_derive_buckets_locked) debit_add branch; torn-tail/torn mid-file journal with a debit_add; concurrent callers; the tranche side (adoption, legacy flag, gates) which is a separate test.")
     say("INFO", "leftover scratch homes (not deleted): %s" % ", ".join(HOMES))
     print("SUMMARY PASS=%d FAIL=%d INFO=%d" % (RES["PASS"], RES["FAIL"], RES["INFO"]))

@@ -975,6 +975,7 @@ for _mode in ("nonsim",):   # sim TWAP variant NOT included: its reconcile route
       PAi, Fi, CTi = fresh(start="10"); (go_nonsim if _mode == "nonsim" else go_sim)(); set_twap(3, 1)
       _li = dict(build(PAi, CTi)); _oki, _whyi = _li["grad"](1); assert _oki, _whyi
       gmi = list(GR.open_positions())[0]
+      _pid0 = (GR.open_positions().get(gmi) or {}).get("pa_pos_id")   # DIAG (read only): original pid kept for the probe after a close
       for _ in range(2): GR.poll_exits(price_fn=gpf(1.0))
       _rci, _rwi = PAi.credit, GR._write; _sti = {"armed": True, "credited": False}
       def _cri(*a, **k):
@@ -995,7 +996,7 @@ for _mode in ("nonsim",):   # sim TWAP variant NOT included: its reconcile route
       finally: PAi.op_receipts = _roi
       # DIAGNOSTIC (v8, print only; no assertion, no state change): emit the hold reason / ops / receipt for the P7i path so a red or an open position is explained by the run itself.
       try:
-          _pi = GR._read()["positions"].get(gmi) or {}; _pidi = _pi.get("pa_pos_id"); _ropi = "%s:leg:twap_remainder:%s:%s" % (GR.LANE, gmi, _pidi)
+          _pi = GR._read()["positions"].get(gmi) or {}; _pidi = _pi.get("pa_pos_id") or _pid0; _ropi = "%s:leg:twap_remainder:%s:%s" % (GR.LANE, gmi, _pidi)
           _fn = getattr(GR, "_obligation_hold", None)
           print("DIAG P7i position open=%s pa_pos_id=%s pending_exit=%r settlement_pending=%r obligation_hold=%r twap=%r" % (bool(_pi), _pidi, _pi.get("pending_exit"), _pi.get("settlement_pending"), _pi.get("obligation_hold"), _pi.get("twap")))
           print("DIAG P7i hold(foreign_only,marker)=%r hold(default)=%r" % ((_fn(_pi, foreign_only=True, include_unknown=True) if _fn else "n/a (no gate at this commit)"), (_fn(_pi) if _fn else "n/a")))

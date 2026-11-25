@@ -167,6 +167,34 @@ def _jbytes(): return open(CI.journal_path("grad"), "rb").read() if os.path.exis
 def _hold(mint):
     p = _snap(mint); return (p or {}).get("obligation_hold") or {}
 
+# ---- RUNNER (reviewer v3 fix): every section below is executed in its own try/except so a fixture or setup exception is a labelled
+# "FAIL <section> ERROR" (a fixture failure, NOT a product result) and the remaining sections still run (the BASE run must reach them all).
+# Top-level defs run first; each section's statements share the module globals. The section text below is also the source that is executed.
+import ast as _ast, traceback as _tb
+_SRC = open(__file__).read()
+_BS = _SRC.index("\n# ---- H0 positive control\n") + 1; _BE = _SRC.index("\n# ---- END-OF-SECTIONS\n") + 1
+_BODY = _SRC[_BS:_BE]; _OFF = _SRC[:_BS].count("\n")
+_MARK = [(i + 1, l[7:].strip()[:40]) for i, l in enumerate(_BODY.split("\n")) if l.startswith("# ---- ")]
+_TREE = _ast.parse(_BODY); _GROUPS = {}; _DEFS = []
+for _n in _TREE.body:
+    if isinstance(_n, (_ast.FunctionDef, _ast.ClassDef)):
+        _DEFS.append(_n); continue
+    _k = max([m for m in _MARK if m[0] <= _n.lineno], key=lambda m: m[0])
+    _GROUPS.setdefault(_k, []).append(_n)
+def _run(nodes, label):
+    for _n in nodes:
+        _n2 = _ast.Module(body=[_n], type_ignores=[]); _ast.increment_lineno(_n2, _OFF)
+        exec(compile(_n2, __file__, "exec"), globals())
+_run(_DEFS, "defs")
+for _k in sorted(_GROUPS):
+    try:
+        _run(_GROUPS[_k], _k[1])
+    except BaseException as _e:
+        if isinstance(_e, KeyboardInterrupt): raise
+        _l = "SECTION %s ERROR %s: %s (fixture/setup exception, not a product verdict)" % (_k[1], type(_e).__name__, str(_e)[:200])
+        print("FAIL " + _l); FAILS.append(_l); _tb.print_exc(file=sys.stdout)
+        try: _unpatch(ps)
+        except BaseException: pass
 # ---- H0 positive control
 M0 = "H0POS11pump"
 ps, ok = _enter(M0); check("H0 fixture: real entry opened", ok)
@@ -179,7 +207,7 @@ _unpatch(ps)
 def scenario_h1(mutant):
     M = "H1MUT11pump" if mutant else "H1FRZ11pump"
     ps, ok = _enter(M); _diverge(M)
-    pm = patch.object(G, "_obligation_hold", lambda *a, **k: None) if mutant else None
+    pm = patch.object(G, "_obligation_hold", lambda *a, **k: None, create=True) if mutant else None
     if pm: pm.start()
     try:
         _leg(M, "a", 2.5)
@@ -405,6 +433,7 @@ check("R5 refused replay of leg b: returned %r, leg a pointer UNCHANGED (leg %r,
       rg is False and peg.get("leg") == "a" and peg.get("intent_id") == pa0.get("intent_id") and len(_ints()) == i_before and bool((_snap(MG).get("obligation_hold") or {}).get("kind")))
 _unpatch(ps)
 
+# ---- END-OF-SECTIONS
 if FAILS:
     print("FAILS: %d" % len(FAILS))
     sys.exit(1)

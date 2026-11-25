@@ -195,6 +195,12 @@ for _k in sorted(_GROUPS):
         print("FAIL " + _l); FAILS.append(_l); _tb.print_exc(file=sys.stdout)
         try: _unpatch(ps)
         except BaseException: pass
+print("TEST-EMITTED ROOTS (provenance for post-run recovery; not archived by the launcher): %s %s" % (TMPD, os.environ["FOREX_AGENT_HOME"]))
+if FAILS:
+    print("FAILS: %d" % len(FAILS))
+    sys.exit(1)
+print("FAILS: 0")
+sys.exit(0)  # the runner above already executed every section once; the physical section text below is the runner's SOURCE and must NOT execute a second time
 # ---- H0 positive control
 M0 = "H0POS11pump"
 ps, ok = _enter(M0); check("H0 fixture: real entry opened", ok)

@@ -457,6 +457,30 @@ check("torn: op_outcome unknown on truncated/corrupt history",
       PA.op_outcome("grad:close:TORN11pump:nonexistent") == "unknown")
 _unpatch(ps)
 
+# ---- corrupt journal, NO incomplete intent anywhere: entries must still block ----
+# A corrupt journal may hide an incomplete intent; "nothing visible" is not "converged".
+ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+if os.path.exists(CI.journal_path("grad")): os.remove(CI.journal_path("grad"))   # DISCLOSED TEST SETUP: fresh journal in this test's own temp home (earlier sections left a deliberately corrupt one)
+CI.journal_writable("grad")
+_jp5 = CI.journal_path("grad")
+_ok5, _w5, _f = G.consider_candidate(_cand(mint="CTRL5pump"))
+check("corrupt-journal control: healthy journal with no intent: entry OPENS (%r) and entries are not blocked (%r)" % (_ok5, G._ENTRY_BLOCKED), _ok5 and not G._ENTRY_BLOCKED)
+_ps5, _mv5, _ms5 = ps, _mv, _ms
+_unpatch(ps)
+ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+if os.path.exists(CI.journal_path("grad")): os.remove(CI.journal_path("grad"))   # DISCLOSED TEST SETUP: fresh journal in this test's own temp home (earlier sections left a deliberately corrupt one)
+CI.journal_writable("grad")
+_jp5 = CI.journal_path("grad")
+with open(_jp5, "a") as _f5:
+    _f5.write("{not json\n" + json.dumps({"ev": "probe", "lane": "grad"}) + "\n")
+_st5 = CI._read(_jp5)[1]; _inc5 = len(CI.pending("grad"))
+_ok6, _w6, _f = G.consider_candidate(_cand(mint="CORR5pump"))
+check("corrupt journal (status %r) with %d incomplete intents visible: recovery still BLOCKS entries (entry opened %r, blocked flag %r, why %r)" % (_st5, _inc5, _ok6, G._ENTRY_BLOCKED, _w6),
+      _st5 == "torn" and _inc5 == 0 and not _ok6 and G._ENTRY_BLOCKED is True and "frozen" in str(_w6))
+_unpatch(ps)
+
 print()
 if FAILS:
     print("FAILURES:", FAILS)

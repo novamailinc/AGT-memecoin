@@ -503,6 +503,9 @@ def tranche_lane_done(d: Dict[str, Any], pos_id: Optional[str],
     return False
 
 
+JOURNAL_CORRUPT_PREFIX = "journal-corrupt:"   # sentinel id recover_lane returns for a corrupt journal with no visible incomplete intent
+
+
 def recover_lane(
     lane: str,
     account_apply: Callable[[Dict[str, Any]], Tuple[bool, str]],
@@ -533,8 +536,11 @@ def recover_lane(
     if status == "torn":
         logger.error("close_intents: %s journal corrupt; recovery "
                      "frozen", lane)
-        return [iid for iid, st in _state(entries).items()
-                if st["intent"] is not None and not st["applied"]]
+        # A corrupt journal must BLOCK entries even when no incomplete intent is visible in the readable part: the unreadable part may hold one. Never an
+        # empty list here (an empty list means "fully converged").
+        return ([iid for iid, st in _state(entries).items()
+                 if st["intent"] is not None and not st["applied"]]
+                or [JOURNAL_CORRUPT_PREFIX + lane])
     if status == "torn_tail" and tail is not None:
         try:
             with _op_key_lock(lane), _append_lock(path):
@@ -544,13 +550,15 @@ def recover_lane(
                     _truncate(path, tail)
                     entries, status, _ = _read(path)
             if status is not None:
-                return [iid for iid, st in _state(entries).items()
-                        if st["intent"] is not None]
+                return ([iid for iid, st in _state(entries).items()
+                         if st["intent"] is not None]
+                        or [JOURNAL_CORRUPT_PREFIX + lane])
         except Exception:
             logger.exception("close_intents: torn-tail truncate "
                              "failed (%s)", lane)
-            return [iid for iid, st in _state(entries).items()
-                    if st["intent"] is not None]
+            return ([iid for iid, st in _state(entries).items()
+                     if st["intent"] is not None]
+                    or [JOURNAL_CORRUPT_PREFIX + lane])
     frozen: List[str] = []
     for iid, st in _state(entries).items():
         intent = st["intent"]

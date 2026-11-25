@@ -114,5 +114,26 @@ ents, st, _ = ci._read(ci.journal_path("t4"))
 n_int = len([e for e in ents if e.get("ev") == "intent"])
 check("t4 4 procs x 20 begins+probes over a torn tail: rcs %r, journal status %r, %d intent rows (want 1: all resumed), half text gone %r" % (rcs, st, n_int, b"inten" not in raw("t4").replace(b"intent", b"")),
       rcs == [0, 0, 0, 0] and st is None and n_int == 1)
+# (5) A corrupt journal with NO incomplete intent visible must still report non-converged (so every lane blocks entries). Positive control: a healthy journal
+# with only applied intents returns [] (converged).
+ci.begin("t5", "M", "p#1", OPS, dict(INFO)); _i5 = [x["intent_id"] for x in ci.pending("t5")][0]
+ci.mark_account_applied("t5", _i5); ci.mark_lane_applied("t5", _i5)
+r_ok = ci.recover_lane("t5", lambda op: (True, "x"), lambda i: True, lambda i: True)
+check("t5 control: healthy journal, the only intent fully applied: recover_lane returns [] (%r), status %r" % (r_ok, ci._read(ci.journal_path("t5"))[1]), r_ok == [] and ci._read(ci.journal_path("t5"))[1] is None)
+good5 = json.dumps({"ev": "probe", "lane": "t5"}).encode() + b"\n"
+put("t5", raw("t5") + b"{garbage not json\n" + good5); b5 = hashlib.sha256(raw("t5")).hexdigest()
+r5a = ci.recover_lane("t5", lambda op: (True, "x"), lambda i: True, lambda i: True)
+check("t5 mid-file corruption, only an APPLIED intent visible: recover_lane returns the corrupt-journal sentinel %r (non-empty, not converged), bytes unchanged %r"
+      % (r5a, hashlib.sha256(raw("t5")).hexdigest() == b5), r5a == ["journal-corrupt:" + "t5"] and hashlib.sha256(raw("t5")).hexdigest() == b5)
+put("t5b", b"{garbage not json\n" + good5 + good5)
+r5b = ci.recover_lane("t5b", lambda op: (True, "x"), lambda i: True, lambda i: True)
+check("t5b mid-file corruption, NO intent at all in the readable part: sentinel %r" % (r5b,), r5b == ["journal-corrupt:" + "t5b"])
+# NAMED FAULT INJECTION: a provable torn tail whose truncate FAILS (no intent visible) must also stay non-converged
+put("t5c", good5 + b'{"ev": "half')
+from unittest.mock import patch as _patch5
+with _patch5.object(ci, "_truncate", side_effect=OSError("injected truncate failure")):
+    r5c = ci.recover_lane("t5c", lambda op: (True, "x"), lambda i: True, lambda i: True)
+check("t5c torn tail, truncate fails (named injection), no intent visible: sentinel %r, tail bytes still present %r" % (r5c, b"half" in raw("t5c")),
+      r5c == ["journal-corrupt:" + "t5c"] and b"half" in raw("t5c"))
 print("fails: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

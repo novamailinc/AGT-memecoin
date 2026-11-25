@@ -179,5 +179,28 @@ with open(PA.JOURNAL_PATH, "w") as f:
 r3 = PA.try_debit(LANE, "MINTG3", 1.0, 100.0, "gb:entry:G3", marks=_mk())
 check("G4 an UNBOUND credit after the first bound event is refused as mixed-generation (%r)" % (r3[:2],), r3[0] is False and "gb:exit:G" not in (json.load(open(PA.LEDGER_PATH)).get("ops") or {}))
 
+# ---- H: same-generation rollback, entry op ABSENT from the restored pair: refused (no positive evidence of the debit)
+_use(os.path.join(_home, "H"))
+_need("debit H1", PA.try_debit(LANE, "MINTH1", 1.0, 100.0, "gb:entry:H1", marks=_mk()))
+shutil.copy(PA.LEDGER_PATH, os.path.join(_home, "H.l")); shutil.copy(PA.JOURNAL_PATH, os.path.join(_home, "H.j"))
+r = _need("debit H2", PA.try_debit(LANE, "MINTH2", 1.0, 100.0, "gb:entry:H2", marks=_mk()))
+pidH2 = r[2]; bindH = PA.entry_binding(LANE, "MINTH2", "gb:entry:H2", pidH2)
+for src, dst in (("H.l", PA.LEDGER_PATH), ("H.l", PA.LEDGER_PATH + ".bak"), ("H.j", PA.JOURNAL_PATH)):
+    shutil.copy(os.path.join(_home, src), dst)
+_ledH = _bytes(PA.LEDGER_PATH)
+ok, why = PA.credit(LANE, "MINTH2", 1.1, "gb:exit:H2", pos_id=pidH2, qty=100.0, expected_account_id=bindH, entry_op_id="gb:entry:H2")
+check("H1 same-generation id but the entry op is absent after a consistent rollback: REFUSED (%s)" % why, (not ok) and _bytes(PA.LEDGER_PATH) == _ledH)
+
+# ---- M: MUTATION CONTROL. With the guard neutralised the same wrong-binding credit APPLIES, so B/C/F above are sensitive to the guard.
+_use(os.path.join(_home, "M"))
+r = _need("debit M", PA.try_debit(LANE, "MINTM", 1.0, 100.0, "gb:entry:M", marks=_mk()))
+_real_gr = PA._generation_refusal
+PA._generation_refusal = lambda *a, **k: None
+try:
+    okm, whym = PA.credit(LANE, "MINTM", 1.1, "gb:exit:M", pos_id=r[2], qty=100.0, expected_account_id="acct-WRONG", entry_op_id="gb:entry:M")
+finally:
+    PA._generation_refusal = _real_gr
+check("M1 MUTANT (guard removed) credits with a WRONG binding, proving the refusal tests are sensitive (%s)" % whym, okm is True)
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

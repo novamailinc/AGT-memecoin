@@ -47,10 +47,10 @@ def _tree(d):
     return out
 
 
-# The grad lane's OWN books are not modeled in this account-only test. account_marks drops a mark for any grad position the lane's legacy hook
-# cannot prove (the real hook imports grad.py and reads the lane ledger), so marks would never reach the gate. Register the account's real hook API
-# with "no unproven positions" for this temp account only; this does not touch the account's verdict logic under test (verify_replay).
-PA.register_legacy_hook("grad", lambda: set())
+# SYNTHETIC, NON-PRODUCTION lane name. This is an ACCOUNT-ONLY test of verify_replay: it models no grad lane books and proves nothing about grad ownership.
+# The real "grad" lane's marks are only trusted when grad.py's own legacy hook proves the position (account_marks), a production gate this test does NOT bypass:
+# a lane with no registered hook is simply not subject to a lane-side proof, so the account's own gates and marks rules run unchanged.
+LANE = "verify_fixture_lane"
 import time as _time
 def _mk(PA_):
     """Fresh, fully bound marks for every open position (fixture-only; value = cost basis): with a position open, the gate needs a trusted
@@ -76,10 +76,10 @@ def _deb(lane, mint, stake, qty, op):
 
 _pristine = os.path.join(_home, "pristine"); os.makedirs(_pristine)
 _use(_pristine)
-_r1 = _deb("grad", "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
+_r1 = _deb(LANE, "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
 check("T1a try_debit_instance returned (True, 'ok', pos_id) (%s)" % (_r1,), isinstance(_r1, tuple) and len(_r1) == 3 and _r1[0] is True and _r1[1] == "ok" and isinstance(_r1[2], str) and _r1[2])
 _led_after_debit = open(PA.LEDGER_PATH, "rb").read()      # the ledger as it stood after the debit, BEFORE the credit (for the crash-window case)
-_r2 = _need("credit k1", PA.credit("grad", "MINTA", 1.5, "grad:exit:MINTA:k1", pos_id=_r1[2], qty=100.0))
+_r2 = _need("credit k1", PA.credit(LANE, "MINTA", 1.5, "grad:exit:MINTA:k1", pos_id=_r1[2], qty=100.0))
 check("T1b the credit was accepted (%s)" % (_r2,), isinstance(_r2, tuple) and _r2[0] is True)
 _j = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip()]
 _mut = [e for e in _j if isinstance(e.get("seq"), int) and e.get("event") in PA._MUTATION_EVENTS]
@@ -167,23 +167,23 @@ check("V13 snapshot() truncates a torn tail (%d -> %d bytes): the heal that veri
 # R: a REALISTIC valid WAL: a partial sell with a fee and a VERIFIED price kind (spendable bucket), a fully closed instance, a reopened mint (second
 # instance), one open position left, a hold, and a released hold. Every call's result is asserted so a wrong API assumption fails loudly here.
 _real = os.path.join(_home, "realistic"); os.makedirs(_real); _use(_real)
-_a1 = _deb("grad", "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
-_a2 = _need("credit A", PA.credit("grad", "MINTA", 1.4, "grad:exit:MINTA:k1", pos_id=_a1[2], qty=100.0, fee=0.01, price_kind="current_price_simulated_fill"))
-_a3 = _deb("grad", "MINTA", 1.0, 80.0, "grad:entry:MINTA:2")          # the SAME mint reopened: a second instance
-_b1 = _deb("grad", "MINTB", 1.0, 50.0, "grad:entry:MINTB:1")
-_b2 = _need("partial credit B", PA.credit("grad", "MINTB", 0.6, "grad:exit:MINTB:k1", pos_id=_b1[2], qty=20.0, fee=0.01, price_kind="current_price_simulated_fill"))   # PARTIAL: B stays open
-_h1 = _need("hold 1", PA.hold_stake("grad", 0.3, "grad:hold:1", marks=_mk(PA))); _h2 = _need("hold 2", PA.hold_stake("grad", 0.2, "grad:hold:2", marks=_mk(PA))); _h3 = _need("release hold 2", PA.release_hold("grad:hold:2", "test: provider reports the tx never landed"))
+_a1 = _deb(LANE, "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
+_a2 = _need("credit A", PA.credit(LANE, "MINTA", 1.4, "grad:exit:MINTA:k1", pos_id=_a1[2], qty=100.0, fee=0.01, price_kind="current_price_simulated_fill"))
+_a3 = _deb(LANE, "MINTA", 1.0, 80.0, "grad:entry:MINTA:2")          # the SAME mint reopened: a second instance
+_b1 = _deb(LANE, "MINTB", 1.0, 50.0, "grad:entry:MINTB:1")
+_b2 = _need("partial credit B", PA.credit(LANE, "MINTB", 0.6, "grad:exit:MINTB:k1", pos_id=_b1[2], qty=20.0, fee=0.01, price_kind="current_price_simulated_fill"))   # PARTIAL: B stays open
+_h1 = _need("hold 1", PA.hold_stake(LANE, 0.3, "grad:hold:1", marks=_mk(PA))); _h2 = _need("hold 2", PA.hold_stake(LANE, 0.2, "grad:hold:2", marks=_mk(PA))); _h3 = _need("release hold 2", PA.release_hold("grad:hold:2", "test: provider reports the tx never landed"))
 _all = (_a1, _a2, _a3, _b1, _b2, _h1, _h2, _h3)
 check("R0 every real call in the realistic WAL succeeded (%s)" % [x[0] if isinstance(x, tuple) else x for x in _all], all(isinstance(x, tuple) and x[0] is True for x in _all))
 _ev = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip()]
 check("R0b the WAL holds debit, credit, hold and hold-release events (%s)" % sorted({e.get("event") for e in _ev}), {"debit", "credit"} <= {e.get("event") for e in _ev} and len([e for e in _ev if "hold" in str(e.get("event"))]) >= 2)
 _led_r = json.load(open(PA.LEDGER_PATH))
-_open_keys = sorted(((_led_r.get("lanes") or {}).get("grad") or {}).get("open", {}).keys())
+_open_keys = sorted(((_led_r.get("lanes") or {}).get(LANE) or {}).get("open", {}).keys())
 check("R0c two positions are open on the account (reopened MINTA instance and partially sold MINTB): %s" % _open_keys, len(_open_keys) == 2)
 b0 = _tree(_real); res = PA.verify_replay(); b1 = _tree(_real)
 check("R1 the realistic valid WAL replays to (True, ...) (%s)" % (res,), res[0] is True)
 check("R1b and verify_replay changed nothing (bytes, mtime, inode)", b0 == b1)
-d = _fresh_from(_real); _led = json.load(open(PA.LEDGER_PATH)); _o = _led["lanes"]["grad"]["open"]; _o.pop(sorted(_o)[0]); open(PA.LEDGER_PATH, "w").write(json.dumps(_led))
+d = _fresh_from(_real); _led = json.load(open(PA.LEDGER_PATH)); _o = _led["lanes"][LANE]["open"]; _o.pop(sorted(_o)[0]); open(PA.LEDGER_PATH, "w").write(json.dumps(_led))
 b0 = _tree(d); res = PA.verify_replay(); b1 = _tree(d)
 check("R2 dropping ONE open position key from the ledger gives (False, ...) (%s), untouched" % (res,), res[0] is False and b0 == b1)
 

@@ -195,6 +195,11 @@ def pf_for(mod):
         pos = (mod.open_positions() or {}).get(mint) or {}
         return float(pos.get("entry_price") or 0) * 2.0
     return pf
+def pf_for_mult(mod, m):
+    def pf(chain, mint, spot_index=None):
+        pos = (mod.open_positions() or {}).get(mint) or {}
+        return float(pos.get("entry_price") or 0) * m
+    return pf
 FakeJup.mult = 2.0
 for n, m in LANE_MODS:
     try: m.poll_exits(price_fn=pf_for(m))
@@ -317,6 +322,52 @@ for kind, want in (("stale", False), ("unstamped", False), ("noreuse", False), (
     r = attempt(kind)
     for n in ("watcher", "momentum", "ceo", "mirror"):
         check("quote stamp %s: %s %s (%s)" % (kind, n, "opens" if want else "refuses", r[n][1][:50]), r[n][0] is want and r[n][2])
+# ---- 1d. ceo POLL-LEVEL crash recovery through the REAL DemoFiller + REAL paper account + REAL close-intent journal (engineering test, canned FakeJup quotes).
+# INJECTED named faults at close_intents._append only. Scenario A: the sale fill lands, the durable intent write fails, the poll rolls back; the process "restarts"
+# (storage back, price REVERSED so the 2x trigger is gone): the journaled sale is settled ONCE from the journal. Scenario B: the gate fails BEFORE any sale
+# (nothing sold), the price then recovers: NOTHING is sold (a gate refusal never forces a stale sale).
+import daemon.launch_scanner.close_intents as CI
+_real_append = CI._append
+def _no_intent_only(path, event): return False if event.get("ev") == "intent" else _real_append(path, event)
+def _no_write(path, event): return False
+def _ceo_pos(PA, CT):
+    lanes = build(PA, CT); fn = dict(lanes)["ceo"]; ok, why = fn(1)
+    return ok, why, (C.open_positions() or {})
+def _ceo_sells(F): return {k: v for k, v in _journal(F).items() if k.startswith("ceo:exit:") and v.get("status") == "filled"}
+PA, F, CT = fresh(); ok, why, ps = _ceo_pos(PA, CT)
+check("1d-A setup: a ceo position is open on the real account (%s %s)" % (ok, str(why)[:40]), ok and len(ps) == 1)
+_mint = next(iter(ps)); _cash0 = cash(PA)
+FakeJup.mult = 2.0
+with __import__("unittest.mock", fromlist=["patch"]).patch.object(CI, "_append", _no_intent_only):
+    C.poll_exits(price_fn=pf_for(C))
+_p = (C.open_positions() or {}).get(_mint) or {}
+_sl = _ceo_sells(F)
+check("1d-A fault poll: the sale FILL is journaled (%d), the leg is NOT booked (done %r), cash unchanged to the cent (%.4f vs %.4f), pending_exit why %r"
+      % (len(_sl), _p.get("legs", {}).get("a", {}).get("done"), cash(PA), _cash0, (_p.get("pending_exit") or {}).get("why")),
+      len(_sl) == 1 and _p.get("legs", {}).get("a", {}).get("done") is False and _cents(cash(PA)) == _cents(_cash0)
+      and (_p.get("pending_exit") or {}).get("why") == "close_intent_not_durable")
+FakeJup.mult = 1.0   # RESTART with the price reversed: no trigger holds any more
+_nq = JUP.calls
+C.poll_exits(price_fn=pf_for_mult(C, 1.0))
+_p = (C.open_positions() or {}).get(_mint) or {}; _sl2 = _ceo_sells(F); _net = sum(v["net_proceeds_usd"] for v in _sl2.values())
+check("1d-A resume after restart/price reversal: leg a booked from the JOURNALED fill (done %r), still exactly one sale fill (%d), no new quote request (%d -> %d), cash +%.4f == journaled net %.4f"
+      % (_p.get("legs", {}).get("a", {}).get("done"), len(_sl2), _nq, JUP.calls, cash(PA) - _cash0, _net),
+      _p.get("legs", {}).get("a", {}).get("done") is True and len(_sl2) == 1 and JUP.calls == _nq and _cents(cash(PA) - _cash0) == _cents(_net)
+      and not _p.get("pending_exit"))
+_c1 = cash(PA); C.poll_exits(price_fn=pf_for_mult(C, 1.0))
+check("1d-A a further poll changes nothing (cash %.4f -> %.4f, sale fills %d)" % (_c1, cash(PA), len(_ceo_sells(F))), _cents(cash(PA)) == _cents(_c1) and len(_ceo_sells(F)) == 1)
+PA, F, CT = fresh(); ok, why, ps = _ceo_pos(PA, CT); _mint = next(iter(ps)); _cash0 = cash(PA)
+FakeJup.mult = 2.0
+with __import__("unittest.mock", fromlist=["patch"]).patch.object(CI, "_append", _no_write):
+    C.poll_exits(price_fn=pf_for(C)); C.poll_exits(price_fn=pf_for(C))
+_p = (C.open_positions() or {}).get(_mint) or {}
+check("1d-B gate failure before any sale: nothing sold (%d fills), position open with leg a not done, hold tries %r" % (len(_ceo_sells(F)), (_p.get("pending_exit") or {}).get("tries")),
+      not _ceo_sells(F) and _p.get("legs", {}).get("a", {}).get("done") is False and (_p.get("pending_exit") or {}).get("tries") == 2)
+FakeJup.mult = 1.0; _nq = JUP.calls
+C.poll_exits(price_fn=pf_for_mult(C, 1.0))
+check("1d-B storage back and price recovered below the trigger: still NOTHING sold (%d fills, quote calls %d -> %d), cash unchanged (%.4f)" % (len(_ceo_sells(F)), _nq, JUP.calls, cash(PA)),
+      not _ceo_sells(F) and JUP.calls == _nq and _cents(cash(PA)) == _cents(_cash0))
+FakeJup.mult = 1.0
 # ---- 4. committed replay returns the SAME fill and does not debit twice
 PA, F, CT = fresh()
 op = F.intent_id("L", "ReplayMint1")

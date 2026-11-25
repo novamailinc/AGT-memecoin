@@ -2324,14 +2324,82 @@ def _record_unresolved(op_id, lane, mint, pos_id, reason):
         return False
 
 
+_MF_SCAN = {"key": None, "off": 0, "found": False}   # incremental journal scan cache: the marker_failed latch is NOT bounded by a tail window
+
+
+def _journal_marker_failed():
+    """True when ANY record of the CURRENT journal file carries marker_failed. Scans incrementally (only bytes appended since the last call; a different or
+    shrunken file restarts from byte 0), so the answer covers the whole journal, never a bounded tail. An unreadable journal returns False here (its own
+    degraded/unreadable handling lives in _load_locked), exactly as the bounded version did."""
+    try:
+        st = os.stat(JOURNAL_PATH)
+    except OSError:
+        _MF_SCAN.update(key=None, off=0, found=False)
+        return False
+    key = (JOURNAL_PATH, st.st_ino)
+    if _MF_SCAN["key"] != key or st.st_size < _MF_SCAN["off"]:
+        _MF_SCAN.update(key=key, off=0, found=False)
+    if _MF_SCAN["found"]:
+        return True
+    if st.st_size == _MF_SCAN["off"]:
+        return False
+    try:
+        with open(JOURNAL_PATH, "rb") as f:
+            f.seek(_MF_SCAN["off"])
+            raw = f.read(st.st_size - _MF_SCAN["off"])
+    except OSError:
+        return False
+    cut = raw.rfind(b"\n") + 1
+    for ln in raw[:cut].splitlines():
+        if b"marker_failed" in ln:
+            try:
+                e = json.loads(ln.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("marker_failed"):
+                _MF_SCAN["found"] = True
+                break
+    _MF_SCAN["off"] += cut
+    return _MF_SCAN["found"]
+
+
+_PROBED = set()   # account directories proven writable in THIS process
+
+
+def _durable_probe():
+    """None = the account directory accepted a create+write+fsync+unlink in this process (cached per directory); else the reason it is not provably writable.
+    A failed probe is never cached. LIMIT: this proves writability at probe time only, not at every later write; each write still fails closed on its own."""
+    d = os.path.dirname(LEDGER_PATH)
+    if d in _PROBED:
+        return None
+    p = os.path.join(d, ".durability_probe.%d" % os.getpid())
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, b"probe\n"); os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.unlink(p)
+    except Exception as e:
+        try: os.unlink(p)
+        except OSError: pass
+        return "%s: %s" % (type(e).__name__, e)
+    _PROBED.add(d)
+    return None
+
+
 def _entries_blocked_by_refusal():
-    if _MARKER_FAILED[0] or any(e.get("marker_failed") for e in _recent_refusals()):
+    if _MARKER_FAILED[0] or _journal_marker_failed():
         return "a generation refusal could not be recorded in the durable marker (fail-closed)"
     u = unresolved_refusals()
     if u is None:
         return "unresolved-refusal marker unreadable (fail-closed)"
     if u:
         return "unresolved generation refusal(s) on record (%d, first %s %s): operator reconciliation required" % (len(u), u[0].get("lane"), u[0].get("pos_id"))
+    _pr = _durable_probe()
+    if _pr:
+        return "account directory not provably writable (fail-closed): %s" % _pr
     return None
 
 

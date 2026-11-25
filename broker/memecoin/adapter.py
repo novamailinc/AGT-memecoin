@@ -1816,6 +1816,7 @@ class MemecoinAdapter(BrokerAdapter):
                         "latency_move_pct": result.get("latency_move_pct"),
                         "price_impact_pct": result.get("price_impact_pct"),
                         "price_impact_unit": result.get("price_impact_unit"),
+                        "price_impact_raw": result.get("price_impact_raw"),
                     }
                     # Apply the settled swap's MEASURED SOL delta so other
                     # orders interleaved before the reconcile stay exact.
@@ -1841,6 +1842,7 @@ class MemecoinAdapter(BrokerAdapter):
                         "latency_move_pct": result.get("latency_move_pct"),
                         "price_impact_pct": result.get("price_impact_pct"),
                         "price_impact_unit": result.get("price_impact_unit"),
+                        "price_impact_raw": result.get("price_impact_raw"),
                     }
                     # out_amount is the measured net SOL delta (fee included)
                     self._balance_sol += (result["out_amount"]
@@ -1914,6 +1916,7 @@ class MemecoinAdapter(BrokerAdapter):
                                 "price_impact_pct":
                                     fill.get("price_impact_pct"),
                                 "price_impact_unit": fill.get("price_impact_unit"),
+                                "price_impact_raw": fill.get("price_impact_raw"),
                                 "request_fingerprint":
                                     self._request_fingerprint})
 
@@ -1974,6 +1977,7 @@ class MemecoinAdapter(BrokerAdapter):
                                 "price_impact_pct":
                                     fill.get("price_impact_pct"),
                                 "price_impact_unit": fill.get("price_impact_unit"),
+                                "price_impact_raw": fill.get("price_impact_raw"),
                                 "request_fingerprint":
                                     self._request_fingerprint,
                                 "realized_pnl_sol": realized,

@@ -49,10 +49,15 @@ def main():
     check("ratio 1 -> 100 percent (documented total loss)", abs(quote_price_impact_pct({"priceImpactPct": "1"}) - 100.0) < 1e-9)
     check("numeric (not string) ratio accepted", abs(quote_price_impact_pct({"priceImpactPct": 0.004}) - 0.4) < 1e-12)
     for label, q in (("missing field", {"outAmount": "1"}), ("None", {"priceImpactPct": None}), ("non-dict quote", None), ("bool", {"priceImpactPct": True}),
-                     ("text", {"priceImpactPct": "zz"}), ("NaN", {"priceImpactPct": "nan"}), ("inf", {"priceImpactPct": "inf"}),
-                     ("negative", {"priceImpactPct": "-0.01"}), ("above documented range (1.5)", {"priceImpactPct": "1.5"}),
-                     ("percent-form 5.0 contradicts the documented range", {"priceImpactPct": "5.0"})):
+                     ("text", {"priceImpactPct": "zz"}), ("NaN", {"priceImpactPct": "nan"}), ("inf", {"priceImpactPct": "inf"})):
         check("fail closed (price_impact_unknown): " + label, reason_of(q) == "price_impact_unknown", reason_of(q))
+    check("negative refused with its own reason (V1 sign undocumented)", reason_of({"priceImpactPct": "-0.01"}) == "price_impact_negative_unsupported", reason_of({"priceImpactPct": "-0.01"}))
+    check("1.5 refused with out_of_documented_range", reason_of({"priceImpactPct": "1.5"}) == "price_impact_out_of_documented_range")
+    check("percent-form 5.0 refused with out_of_documented_range", reason_of({"priceImpactPct": "5.0"}) == "price_impact_out_of_documented_range")
+    try:
+        quote_price_impact_pct({"priceImpactPct": "-0.01"})
+    except BrokerError as e:
+        check("refusal detail keeps the raw value", (e.detail or {}).get("price_impact_raw") == "-0.01", e.detail)
     # executor cap comparison in PERCENT, through the real SimulationExecutor
     check("executor: ratio 0.004 (0.4%) under cap 2.0 fills", exec_reason("0.004") == "filled", exec_reason("0.004"))
     check("executor: ratio 0.02 (2.0%) equal to cap 2.0 is NOT over cap (strict >)", exec_reason("0.02") == "filled", exec_reason("0.02"))
@@ -60,10 +65,10 @@ def main():
     check("executor: ratio 0.05 (5%) over cap 2.0 refuses (old code compared 0.05 to 2.0 and would have filled)", exec_reason("0.05") == "price_impact_over_cap", exec_reason("0.05"))
     check("executor: ratio 0.5 (50%) refuses", exec_reason("0.5") == "price_impact_over_cap", exec_reason("0.5"))
     check("executor: percent-form 0.4 is now read as 40% and refused (the unit regression this change closes)", exec_reason("0.4") == "price_impact_over_cap", exec_reason("0.4"))
-    check("executor: out-of-range 5.0 refuses price_impact_unknown", exec_reason("5.0") == "price_impact_unknown", exec_reason("5.0"))
+    check("executor: out-of-range 5.0 refuses price_impact_unknown", exec_reason("5.0") == "price_impact_out_of_documented_range", exec_reason("5.0"))
     ex = SimulationExecutor(jupiter=FJ({"outAmount": "2000000", "priceImpactPct": "0.004"}), book=BalanceBook(10**9), seed=7)
     res = ex.execute_swap(sim_executor.SOL_MINT, "TokenMint1111111111111111111111111111111111", 10**7)
-    check("result carries price_impact_pct in percent and the derived ratio", abs(res["price_impact_pct"] - 0.4) < 1e-9 and abs(res["price_impact_ratio"] - 0.004) < 1e-12, repr((res.get("price_impact_pct"), res.get("price_impact_ratio"))))
+    check("result carries price_impact_pct in percent and the RAW quote value (not recomputed)", abs(res["price_impact_pct"] - 0.4) < 1e-9 and res.get("price_impact_raw") == "0.004", repr((res.get("price_impact_pct"), res.get("price_impact_raw"))))
     check("result carries the unit stamp percent_v2", res.get("price_impact_unit") == "percent_v2", res.get("price_impact_unit"))
     # evaluator: unit-stamped vs legacy records (engineering fixtures; trades are hand-built, not market evidence)
     from core.qualification_evaluator import execution_quality
@@ -80,6 +85,11 @@ def main():
     check("evaluator: mixed records use only the stamped one (0.4), legacy=1", eq["price_impact_pct_mean"] == 0.4 and eq["price_impact_pct_max"] == 0.4 and eq["price_impact_legacy_unit_trades"] == 1, eq)
     eq = execution_quality([tr(1, 0.4, "ratio_v1")], [])
     check("evaluator: unknown unit string is treated as legacy", eq["price_impact_pct_mean"] is None and eq["price_impact_legacy_unit_trades"] == 1, eq)
+    for label, v in (("None", None), ("NaN", float("nan")), ("inf", float("inf")), ("negative", -0.1)):
+        eq = execution_quality([tr(1, v, "percent_v2")], [])
+        check("evaluator: stamped-but-invalid (%s) is NOT evaluable, counted, excluded" % label, eq["price_impact_evaluable_trades"] == 0 and eq["price_impact_stamped_invalid_trades"] == 1 and eq["price_impact_pct_max"] is None, eq)
+    eq = execution_quality([tr(1, 0.4, "percent_v2")], [])
+    check("evaluator: evaluable count reported for all-stamped", eq["price_impact_evaluable_trades"] == 1)
     eq = execution_quality([], [])
     check("evaluator: empty trade list does not raise", eq["price_impact_pct_max"] is None and eq["price_impact_legacy_unit_trades"] == 0, eq)
     print("FAILS: %d" % FAILS)

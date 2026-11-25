@@ -516,7 +516,7 @@ class SimulationExecutor:
             "priority_fee_lamports": fee_paid,
             "base_fee_lamports": BASE_FEE_LAMPORTS,
             "price_impact_pct": impact,
-            "price_impact_ratio": impact / 100.0,
+            "price_impact_raw": quote.get("priceImpactPct"),
             "price_impact_unit": "percent_v2",
             "quote_out_amount": out_expected,
             "latency_move_pct": move * 100.0,

@@ -95,12 +95,19 @@ def quote_price_impact_pct(quote: Any) -> float:
         ratio = float(raw)
     except (TypeError, ValueError):
         ratio = float("nan")
-    if not (ratio == ratio) or ratio in (float("inf"), float("-inf")) or ratio < 0.0 or ratio > 1.0:
+    if not (ratio == ratio) or ratio in (float("inf"), float("-inf")):
         raise BrokerError(
-            BROKER_UNAVAILABLE,
-            "jupiter quote priceImpactPct unparseable or outside the documented 0..1 ratio range — "
-            "refusing to trade blind",
-            detail={"reason": "price_impact_unknown"})
+            BROKER_UNAVAILABLE, "jupiter quote priceImpactPct not finite — refusing to trade blind",
+            detail={"reason": "price_impact_unknown", "price_impact_raw": str(raw)[:64]})
+    if ratio < 0.0:
+        # V1 sign semantics are NOT documented (signed language exists only for V2 /order). Conservative refusal, not a favorable-sign reading.
+        raise BrokerError(
+            BROKER_UNAVAILABLE, "jupiter quote priceImpactPct negative: V1 sign semantics undocumented — refusing",
+            detail={"reason": "price_impact_negative_unsupported", "price_impact_raw": str(raw)[:64]})
+    if ratio > 1.0:
+        raise BrokerError(
+            BROKER_UNAVAILABLE, "jupiter quote priceImpactPct above the documented 0..1 ratio range — refusing",
+            detail={"reason": "price_impact_out_of_documented_range", "price_impact_raw": str(raw)[:64]})
     return ratio * 100.0
 
 

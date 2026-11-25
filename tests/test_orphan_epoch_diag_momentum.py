@@ -333,9 +333,9 @@ for tag, mode, order in (SC if lname else ()):
         prior = [e for e in evs if e.get("event") not in ("create", "debit") and (e.get("pos_id") == pid or e.get("mint") == MINT or (_pop is not None and e.get("op_id") == _pop))]
         proof = (len(pend) == 1 and not pend[0].get("account_applied") and (pend[0].get("intent") or {}).get("pos_id") == pid and (pend[0].get("intent") or {}).get("mint") == MINT and _pop is not None and not prior and
                  len(tdeb) == 1 and bad == 0 and len(cr) == 1 and cr[0].get("account_id") == led.get("account_id") and pid in before["debit_pos_ids"] and
-                 isinstance(before["lane_ledger"], dict) and before["lane_ledger"]["pos_ids"].get(MINT) == pid and before["intent_events"] and before["intent_events"][0] == "intent" and before["intent_status"] is None
+                 isinstance(before["lane_ledger"], dict) and before["lane_ledger"]["pos_ids"].get(MINT) == pid and isinstance(before["intent_events"], list) and before["intent_events"].count("intent") == 1 and all(x in ("probe", "intent") for x in before["intent_events"]) and before["intent_status"] is None
                  and any(("%s#" % MINT2) in str(p) for p in before["debit_pos_ids"]))
-        check("%s: BEFORE injection pid-specific proof: exactly one debit for %s, journal clean, one create event whose account_id equals the ledger's, lane position pos_id equals it, intent journaled, second debit present (debits %r, account_id %s, pending intents %d, prior events for pid/mint/op %r)" % (tag, pid, before["debit_pos_ids"], str(led.get("account_id"))[:8], len(pend), [e.get("event") for e in prior]), proof)
+        check("%s: BEFORE injection pid-specific proof: exactly one debit for %s, journal clean (close-intent journal holds exactly one intent record, only probe records besides it: any other event kind fails the proof), one create event whose account_id equals the ledger's, lane position pos_id equals it, intent journaled, second debit present (debits %r, account_id %s, pending intents %d, prior events for pid/mint/op %r)" % (tag, pid, before["debit_pos_ids"], str(led.get("account_id"))[:8], len(pend), [e.get("event") for e in prior]), proof)
         if not proof: continue
         inject(root, mode)
         check("%s: INJECTION-VERIFIED the files match the label %r before recovery (%r)" % (tag, mode, {k: v for k, v in raw_state(root, lname)["files"].items()}), verify_injection(root, mode, before))
@@ -386,7 +386,7 @@ for tag, mode, order in (SC if lname else ()):
     COMPLETED["n"] += 1
     if mode == "none":
         check("%s: CONTROL converges: the real credit applied exactly once, intent terminal, no freeze, entries not blocked, cash up by the credit (class %s)" % (tag, cl),
-              cl == "CREDITED_ONCE" and r["intent_applied"] and r["frozen_open"] == 0 and not r["entry_blocked"] and delta > 0)
+              cl == "CREDITED_ONCE" and r["intent_applied"] and r["frozen_open"] == 0 and not r["entry_blocked"] and delta is not None and delta > 0)
 print("OBS no positive safe-pre-epoch (never-debited) control exists in this diagnostic; the original orphan purpose stays separate coverage. Elapsed %.1fs of the %.0fs budget." % (time.time() - T0, BUDGET_S))
 check("COMPLETE: %d of %d scenarios produced a full RESULT within the budget (lane %r derived)" % (COMPLETED["n"], len(SC), lname), lname != "" and COMPLETED["n"] == len(SC) and (time.time() - T0) < BUDGET_S + 5)
 print("FAILS: %d" % len(FAILS))

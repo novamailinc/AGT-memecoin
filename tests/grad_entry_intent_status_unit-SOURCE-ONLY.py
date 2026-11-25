@@ -40,7 +40,9 @@ finally: os.chmod(M.records_dir(L3), 0o700)
 check("status: unreadable directory is UNKNOWN, not clear", s5["state"] == "unknown" and "unreadable" in (s5["why"] or ""))
 check("status: unreadable ledger parent is UNKNOWN", M.status_readonly("/nonexistent-root-xyz/sub/grad_ledger.json")["state"] == "unknown")
 lines = M.format_status_lines(s1, False)
-check("format pending, flag off: one labeled line, says unrecovered entry NOT an ordinary cycle fault, says flag OFF here and that a trader process may differ", len(lines) == 1 and "unrecovered entry" in lines[0] and "not an ordinary cycle fault" in lines[0] and "OFF" in lines[0] and "trader process" in lines[0])
+check("format pending, flag off: one labeled line; says unresolved entry attempt that MAY be pre-debit, post-commit cleanup or unrecovered, does NOT classify, not an ordinary cycle fault, flag OFF here, trader process may differ",
+      len(lines) == 1 and "UNRESOLVED entry attempt" in lines[0] and "may be a pre-debit leftover" in lines[0] and "cleanup leftover" in lines[0] and "does not classify" in lines[0] and "not an ordinary cycle fault" in lines[0] and "OFF" in lines[0] and "trader process" in lines[0])
+check("format pending does NOT assert an unrecovered position as fact (no 'unrecovered entry' without 'may be')", "or an unrecovered entry" in lines[0] and "An unrecovered entry" not in lines[0])
 check("format pending shows recorded state even though the flag is off (not hidden)", "GradMint1pump" in lines[0])
 check("format pending, flag on: says ON", "ON" in M.format_status_lines(s1, True)[0] and "OFF" not in M.format_status_lines(s1, True)[0])
 bad = M.format_status_lines(s3, True)[0]
@@ -48,4 +50,11 @@ check("format: invalid/unreadable record labeled INVALID/UNREADABLE", "INVALID/U
 u = M.format_status_lines(s5, True)
 check("format unknown: UNKNOWN and 'not reported as clear'", len(u) == 1 and "UNKNOWN" in u[0] and "not reported as clear" in u[0])
 check("format: non-dict input is treated as no lines (the handler wraps failures separately as UNKNOWN)", M.format_status_lines(None, True) == [])
+rd = os.path.join(M.records_dir(L), "evil.json")
+import json as _j
+_j.dump({"schema": 1, "mint": "<b>X</b>\n/start http://evil.example " + "A" * 500, "op_id": "x" * 400, "lane": "grad"}, open(rd, "w"))
+se = M.status_readonly(L); ev = [r for r in se["records"] if r["file"] == "evil.json"][0]
+txt = "\n".join(M.format_status_lines(se, True))
+check("redaction: malformed mint/op_id text is NOT surfaced (None) and the record is INVALID", ev["mint"] is None and ev["op_id"] is None and ev["valid"] is False)
+check("redaction: formatted lines never contain the malformed text, markup or the long string", "evil.example" not in txt and "<b>" not in txt and "AAAA" not in txt and "xxxx" not in txt and "/start" not in txt)
 print("FAILS: %d" % len(FAILS)); sys.exit(1 if FAILS else 0)

@@ -14,7 +14,7 @@ CLASSES (see classify): A lane already holds it (unlink only); B adopt; C debit 
 D-settled proof (exact): account has the debit for the op in ledger ops AND WAL, the account position is no longer open, a settle event (credit or write_down) for that pos_id is in the WAL,
 AND the LANE ledger holds a closes record with pa_pos_id == that pos_id and mint == the record mint. Missing any one of these is E (the lane closes list is truncated to MAX_CLOSES by grad, so absence is unknown, not proof).
 """
-import hashlib, json, logging, math, os, time
+import hashlib, json, logging, math, os, re, time
 
 logger = logging.getLogger(__name__)
 SCHEMA = 1
@@ -346,7 +346,12 @@ def status_readonly(ledger_path):
             with open(p) as f:
                 r = json.load(f)
             lane_ok = isinstance(r, dict) and validate(r, r.get("lane")) is None
-            recs.append({"file": n, "op_id": (r or {}).get("op_id"), "mint": (r or {}).get("mint"), "valid": bool(lane_ok)})
+            # REDACTION: only identifier-shaped values are ever surfaced; anything else (malformed text, markup, long strings) becomes None and marks the record invalid. Record bodies are never echoed.
+            mint = (r or {}).get("mint") if isinstance(r, dict) else None
+            opid = (r or {}).get("op_id") if isinstance(r, dict) else None
+            mint_ok = isinstance(mint, str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", mint) is not None
+            op_ok = isinstance(opid, str) and re.fullmatch(r"[A-Za-z0-9:|#/._\-]{1,200}", opid) is not None
+            recs.append({"file": n, "op_id": opid if op_ok else None, "mint": mint if mint_ok else None, "valid": bool(lane_ok and mint_ok and op_ok)})
         except Exception:
             recs.append({"file": n, "op_id": None, "mint": None, "valid": False})
     if not recs and not names:
@@ -361,6 +366,6 @@ def format_status_lines(st, flag_on):
         return []
     flag = ("recovery flag in this process: ON" if flag_on else "recovery flag in this process: OFF (records are recorded state; they are processed only by a trader process with AGT_GRAD_ENTRY_INTENT_ENABLED=1)")
     if st.get("state") == "pending":
-        items = ", ".join("%s%s" % ((r.get("mint") or "?")[:12], "" if r.get("valid") else " (INVALID/UNREADABLE)") for r in st.get("records") or [])
-        return ["⚠️ Grad entry-intent: %d unresolved record(s) [%s] (%s). An unrecovered entry, not an ordinary cycle fault; %s." % (len(st.get("records") or []), items, st.get("why"), flag)]
+        items = ", ".join("%s%s" % ((r.get("mint") if isinstance(r.get("mint"), str) and re.fullmatch(r"[A-Za-z0-9]{1,64}", r.get("mint")) else "?")[:12], "" if r.get("valid") else " (INVALID/UNREADABLE)") for r in st.get("records") or [])
+        return ["⚠️ Grad entry-intent: %d record file(s) present [%s] (%s). A leftover record is evidence of an UNRESOLVED entry attempt: it may be a pre-debit leftover, a post-commit cleanup leftover, or an unrecovered entry. This view does not classify which (that needs the account and lane ledgers). It is not an ordinary cycle fault; %s." % (len(st.get("records") or []), items, st.get("why"), flag)]
     return ["⚠️ Grad entry-intent state: UNKNOWN (%s); not reported as clear. %s." % (st.get("why") or "read failed", flag)]

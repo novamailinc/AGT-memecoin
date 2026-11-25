@@ -117,7 +117,8 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
           not [e for e in CI._read(CI.journal_path(lane))[0] if e.get("mint") == pos2["mint"]])
     with patch.object(M, "_paper_account", lambda: spy2), patch.object(M, "_demo_filler", lambda: ff), patch.object(M, "_exit_fee_venue", lambda p: None):
         r_ok = M._close_leg(pos2, "a", 0.001, "leg_a_2x")
-    ev2 = [e for e in CI._read(CI.journal_path(lane))[0] if e.get("mint") == pos2["mint"]]
+    # marker events (account_applied, lane_applied, applied, frozen) carry intent_id but NO mint field, so select by the intent id's mint segment too
+    ev2 = [e for e in CI._read(CI.journal_path(lane))[0] if e.get("mint") == pos2["mint"] or (":%s:" % pos2["mint"]) in str(e.get("intent_id"))]
     check("%s retry after storage returns: SAME fill re-read (sale op ids %r, one distinct), leg done, ONE credit with the fill's gross (%r), intent journaled then account_applied (%r)"
           % (modname, len(ff.calls), [c[3] if len(c) > 3 else None for c in spy2.credits], [e.get("ev") for e in ev2]),
           r_ok > 0 and pos2["legs"]["a"]["done"] is True and len(set(ff.calls)) == 1 and len(ff.calls) == 2 and len(spy2.credits) == 1

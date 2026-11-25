@@ -2136,6 +2136,13 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
             _jfail = False; _applied = False
             _prior = pos.get("pending_exit") or {}
             _iid = _prior.get("intent_id") if _prior.get("leg") == leg_key else None
+            if _prior.get("why") != "tranche_credit_divergence" and not _iid:
+                _ohd = _obligation_hold(pos)
+                if _ohd is not None:
+                    # a refused replay under an existing hold NEVER opens an intent or freezes one: visible diagnostic only (the hold itself is already recorded by the gate paths)
+                    _note_obligation_hold(pos, _ohd, "tranche_replay:" + str(leg_key))
+                    pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_divergence_held", "detail": str(why)[:200], "ts": time.time()}
+                    return False
             if _prior.get("why") != "tranche_credit_divergence":
                 try:
                     _ci = _close_intents()
@@ -2255,6 +2262,69 @@ def _tranche_receipt(pos, leg_key):
     return r.get(_op)
 
 
+def _obligation_hold(pos, foreign_only=False, include_unknown=True):
+    """READ-ONLY position-keyed hold evidence (never appends to any journal, never mutates the account or lane books). Returns None when nothing holds this position, else
+    {"kind", "known", "marks", "unknown"} where kind is one of: "known_frozen" (a frozen, unapplied, not-superseded close intent of THIS position in the journal: a proven
+    unresolved obligation), "account_marker" (no such intent, but the account's DURABLE unresolved-refusal marker names this lane+position: a generation refusal / orphan lot that
+    nothing has resolved), "unreadable" (a source could not be read: NOT proof of a frozen obligation, reported as unknown). foreign_only=True ignores the position's OWN whole-position
+    close (op ids lane:close:mint:pos and its :wd companion), so the existing finalize refusal/retry semantics are untouched. Evidence is read from the journal and the account marker,
+    never from the lane pointers (pending_exit is overwritten by many writers). include_unknown: True = report any unreadable source; "marker" = report only an unreadable account marker; False = none."""
+    try:
+        pid = pos.get("pa_pos_id"); mint = pos.get("mint")
+        if not pid or not mint:
+            return None
+        _ci = _close_intents(); _pa = _paper_account()
+        if _ci is None and _pa is None:
+            return None
+        cp = "%s:close:%s:%s" % (LANE, mint, pid)
+        def _own(op):   # EXACT ids only: the whole-position close op and its :wd companion
+            return bool(foreign_only) and str(op) in (cp, cp + ":wd")
+        known, marks, unk = [], [], []
+        if _ci is not None:
+            fz = _ci.frozen_for_position(LANE, mint, pid)
+            if fz is None:
+                if include_unknown is True:   # "marker": the journal-unreadable case is left to the existing finalize paths (specific settlement_pending whys)
+                    unk.append("close-intent journal unreadable (not proven frozen)")
+            else:
+                for iid, why, ops in fz:
+                    if ops and all(_own(o) for o in ops):
+                        continue
+                    known.append({"intent_id": iid, "ops": list(ops), "why": str(why)[:120]})
+        if _pa is not None and hasattr(_pa, "unresolved_refusals"):
+            ur = _pa.unresolved_refusals()
+            if ur is None:
+                if include_unknown:
+                    unk.append("unresolved-refusal marker file unreadable (account-wide, not a per-position finding)")
+            else:
+                for r in ur:
+                    if not isinstance(r, dict) or r.get("lane") != LANE or r.get("pos_id") != pid or _own(r.get("op_id")):
+                        continue
+                    marks.append({"op_id": str(r.get("op_id")), "reason": str(r.get("reason"))[:120]})
+        known = sorted(known, key=lambda x: x["intent_id"]); marks = sorted(marks, key=lambda x: (x["op_id"], x["reason"]))
+        if known:
+            kind = "known_frozen"
+        elif marks:
+            kind = "account_marker"
+        elif unk and include_unknown:
+            kind = "unreadable"
+        else:
+            return None
+        return {"kind": kind, "known": known, "marks": marks, "unknown": unk if include_unknown else []}
+    except Exception as e:
+        # FAIL CLOSED: a failure inside the check itself is reported as unreadable under EVERY include_unknown mode (finalize included), never as "no hold"
+        return {"kind": "unreadable", "known": [], "marks": [], "unknown": ["hold check failed: %r" % (e,)]}
+
+
+def _note_obligation_hold(pos, hold, where):
+    """Visible diagnostic only. Stored in its own key (pending_exit / settlement_pending are never overwritten), rewritten ONLY when its content changes, and it appends nothing to
+    any journal, so repeated held polls add no rows. The position stays open, no leg is marked done, nothing is sold or booked."""
+    cur = pos.get("obligation_hold") or {}
+    body = {k: hold[k] for k in ("kind", "known", "marks", "unknown")}
+    if {k: cur.get(k) for k in body} != body:
+        pos["obligation_hold"] = dict(body, where=where, since=(cur.get("since") if cur.get("kind") == hold["kind"] and cur.get("since") else time.time()))
+        logger.error("grad %s: %s HELD by an unresolved obligation (%s): no sale, no booking, exposure stays open (operator reconciliation)", str(pos.get("mint") or "?")[:16], where, hold["kind"])
+
+
 def _legacy_unreconciled_buyback(pos):
     """READ-ONLY diagnostic: True when a position took a buyback under the pre-reconciliation code. Signature: buyback_used is set
     and the recorded buyback exists, but no leg carries buyback_qty and no buyback_qty_total was recorded. Such a position's lane
@@ -2293,6 +2363,11 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None, receipt_kind=None):
     leg = pos["legs"][leg_key]
     if leg["done"]:
         return 0.0
+    if _tranche_receipt(pos, leg_key) is None:   # an APPLIED receipt = bookkeeping replay of an already-durable credit: never held; anything else is a NEW sale
+        _oh = _obligation_hold(pos)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "leg:" + str(leg_key))
+            return 0.0
     if _legacy_unreconciled_buyback(pos):
         # sized over units the shared account never received: any automatic sale would be wrong. Visible operator flag, no mutation.
         if not (isinstance(pos.get("pending_exit"), dict) and pos["pending_exit"].get("why")):
@@ -2415,6 +2490,11 @@ def _close_twap_slice(pos, exit_price):
                                  "sold_tokens": 0.0, "sold_usd": 0.0})
     if tw["done"] >= n:
         return 0.0
+    if _tranche_receipt(pos, "twap%d" % (tw["done"] + 1)) is None:   # an applied slice receipt = bookkeeping replay, never held; otherwise a NEW slice sale
+        _oh = _obligation_hold(pos)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "twap_slice")
+            return 0.0
     slice_tokens = pos["tokens"] / n
     if (pos.get("execution") or {}).get("source") == "jupiter_quote_sim":
         _sk = "twap%d" % (tw["done"] + 1)
@@ -2534,6 +2614,19 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
             pos["pending_exit"] = {"leg": "remaining", "why": "legacy_unreconciled_buyback", "ts": time.time()}
         logger.error("grad %s: combined exit BLOCKED: legacy unreconciled buyback (operator resolution required)", str(pos.get("mint") or "?")[:16])
         return 0.0
+    _applied_remainder = False
+    if receipt_kind is not None:   # only a VALIDATED applied account receipt for the TWAP remainder is bookkeeping; the caller's reason alone never exempts
+        try:
+            _pa0 = _paper_account(); _rop = "%s:leg:twap_remainder:%s:%s" % (LANE, pos.get("mint"), pos.get("pa_pos_id"))
+            _rr = _pa0.op_receipts([_rop]) if (_pa0 is not None and pos.get("pa_pos_id")) else {}
+            _applied_remainder = (not _rr.get("_unreadable")) and _rr.get(_rop) is not None
+        except Exception:
+            _applied_remainder = False
+    if not _applied_remainder:
+        _oh = _obligation_hold(pos)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "remaining")
+            return 0.0
     _migrate_legacy_tranches(pos)
     if receipt_kind is not None and not pkind:
         pkind = receipt_kind   # reconcile of a credited TWAP remainder: the account RECEIPT's kind (never re-derived from the reason string)
@@ -3060,6 +3153,14 @@ def _finalize(d, mint, pos, closed_reason):
     trade, evaluate the pre-registered verdict. Must be called with
     _ledger_lock held; writes via _write."""
     _recover_close_intents()
+    # OBLIGATION HOLD (foreign unresolved obligations only): another frozen intent or account marker of THIS position (a tranche credit, a different op family) blocks the whole-position
+    # booking. Nothing below runs: no bankroll, no tally, no credit, no close record, no new intent. The position's own close intent/marker is excluded so the existing
+    # refusal/terminal/retry behavior is unchanged. An unreadable source is left to the existing journal-unreadable paths (include_unknown=False), never reported as frozen.
+    _oh = _obligation_hold(pos, foreign_only=True, include_unknown="marker")
+    if _oh is not None:
+        _note_obligation_hold(pos, _oh, "finalize")
+        _write(d)
+        return None
     # SETTLEMENT PENDING (crash-recovery / unreadable-journal state). A half-migrated position whose per-leg account
     # receipts cannot be read cannot be SETTLED: the close credits `realized - tally` and the tally is unknowable, so
     # booking either way would invent cash (double credit or lost cash). The ECONOMIC exit has already run (legs sold,

@@ -268,6 +268,17 @@ def _recover_close_intents():
     frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
                               lane_apply)
     if not frozen:
+        _un = _pending_unusable()
+        if _un:
+            for _iid, _w in _un:
+                logger.error("ceo: pending intent %s has an unusable recorded op (%s): freezing, ENTRIES BLOCKED", _iid, _w)
+                try:
+                    if _iid:
+                        _ci.freeze(LANE, _iid, "unusable recorded op: " + _w)   # best effort; the block below does not depend on this write
+                except Exception:
+                    logger.exception("ceo: could not freeze intent %s", _iid)
+            frozen = [str(i or "unreadable-pending") for i, _w in _un]
+    if not frozen:
         try:
             frozen = _ci.frozen_open(LANE)   # a frozen, unsuperseded intent keeps entries blocked across restarts
         except Exception:
@@ -1495,6 +1506,58 @@ def _recorded_credit_op(pos, suffix):
     return None
 
 
+def _op_defects(op, close_info, qty, suffix=None):
+    """Why a RECORDED pending credit op cannot be settled by a retry (None = usable). Pure check of durable data: non-finite/negative amount or fee, a qty
+    that is not exactly the exit qty (when qty is given), a missing price_kind, a missing close reason. Used both at the retry and by restart recognition."""
+    try:
+        _g = float(op["amount"]); _f = float(op.get("fee") or 0.0); _rq = float(op["qty"])
+    except Exception:
+        return "amount/fee/qty missing or not numeric"
+    if not (_g == _g and _f == _f and 0.0 <= _g < float("inf") and 0.0 <= _f < float("inf")):
+        return "amount or fee non-finite or negative"
+    if qty is not None and not (qty > 0 and _rq == qty):
+        return "recorded qty %r is not exactly the exit qty %r" % (op.get("qty"), qty)
+    if not op.get("price_kind"):
+        return "price_kind not recorded"
+    if not (close_info or {}).get("closed_reason"):
+        return "close reason not recorded"
+    return None
+
+
+def _pending_unusable():
+    """Restart recognition from DURABLE data only (journal + ledger): pending intents whose recorded credit op is unusable for the retry. Judged only for
+    an op of THIS ceo position instance (matching mint and pa_pos_id): a foreign or absent position is not judged here. Returns [(intent_id, why)]."""
+    _ci = _close_intents()
+    if _ci is None:
+        return []
+    out = []
+    try:
+        _pos = (_read().get("positions") or {})
+        for _it in _ci.pending(LANE):
+            _int = _it.get("intent") or {}
+            for _op in (_int.get("settle_ops") or []):
+                if _op.get("kind") != "credit":
+                    continue
+                _p = _pos.get(_op.get("mint"))
+                if not _p or not _p.get("pa_pos_id") or _p.get("pa_pos_id") != _op.get("pos_id"):
+                    continue
+                _oid = str(_op.get("op_id") or ""); _pre = "%s:" % LANE
+                _parts = _oid[len(_pre):].split(":") if _oid.startswith(_pre) else []
+                _q = None
+                if _parts and _parts[0] == "leg" and len(_parts) > 1 and _parts[1] in _p.get("legs", {}):
+                    _q = _p["tokens"] * _p["legs"][_parts[1]]["frac"]
+                elif _parts and _parts[0] == "remaining" and len(_parts) > 1:
+                    _lg = [k for k in _parts[1] if k in _p.get("legs", {})]
+                    _q = sum(_p["tokens"] * _p["legs"][k]["frac"] for k in _lg) if _lg else None
+                _w = _op_defects(_op, _int.get("close_info"), _q)
+                if _w:
+                    out.append((_it.get("intent_id"), "%s: %s" % (_oid, _w)))
+    except Exception:
+        logger.exception("ceo: pending-intent recognition failed")
+        out.append((None, "pending-intent recognition raised: blocking fail-closed"))
+    return out
+
+
 def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):
     """(filled_exit, gross, fee, kind, fee_venue, recorded_reason) of a NON-sim (modelled-fill) exit. When a pending intent already RECORDED a credit for this
     same op id, the retry settles EXACTLY those recorded amounts, qty, price_kind and close reason (the account credited them; a fresh live quote or a new
@@ -1509,12 +1572,10 @@ def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):
         if _rec is not None:
             _ci = _close_intents()
             _rreason = (_rec.get("_close_info") or {}).get("closed_reason")
-            try:
-                _g = float(_rec["amount"]); _f = float(_rec.get("fee") or 0.0); _rq = float(_rec["qty"])
-                _okrec = (_g == _g and _f == _f and 0.0 <= _g < float("inf") and 0.0 <= _f < float("inf") and qty > 0
-                          and _rq == qty and bool(_rec.get("price_kind")) and bool(_rreason))
-            except Exception:
-                _okrec = False
+            _dw = _op_defects(_rec, _rec.get("_close_info"), qty, suffix)
+            _g = float(_rec["amount"]) if _dw is None else None
+            _f = float(_rec.get("fee") or 0.0) if _dw is None else None
+            _okrec = _dw is None
             if not _okrec:
                 _why = ("recorded credit op %s unusable for the retry (recorded qty %r vs exit qty %r, amount %r, fee %r, price_kind %r, closed_reason %r): "
                         "frozen, operator resolution required" % (_rec.get("op_id"), _rec.get("qty"), qty, _rec.get("amount"), _rec.get("fee"),

@@ -90,8 +90,11 @@ def child_run(point):
     PA = fresh(); r = C.consider_card(csig(MINT))
     pos = (C.open_positions() or {}).get(MINT) or {}
     print("ENTRY ok=%s cash=%.6f nonsim=%s pa_pos_id=%s" % (bool(r[0]), cash(PA), (pos.get("execution") or {}).get("source") != "jupiter_quote_sim", bool(pos.get("pa_pos_id"))), flush=True)
-    if point == "after_credit":
+    if point in ("after_credit", "after_credit_nopk"):
         CI.mark_account_applied = lambda lane, iid: _die()
+        if point == "after_credit_nopk":   # labelled SETUP injection: the intent is journaled with NO price_kind (a real durable defect), then the real kill
+            _o = C._pa_settle
+            C._pa_settle = lambda pos, qty, gross, fee, suffix, price_kind=None: _o(pos, qty, gross, fee, suffix, None)
     elif point == "pre_lane_marker":
         CI.mark_lane_applied = lambda lane, iid: _die()
     elif point == "before_credit":
@@ -100,6 +103,7 @@ def child_run(point):
     print("CHILD SURVIVED point=%s (kill point not reached)" % point, flush=True); sys.exit(7)
 
 HITS = {"n": 0}
+FZC = {"n": 0}
 LOGS = []
 import logging as _logging
 class _H(_logging.Handler):
@@ -124,6 +128,11 @@ def _inject(kind):
             else: op["_close_info"] = {}
             return op
         C._recorded_credit_op = wrap
+    elif kind == "freeze_false":
+        def _fz(lane, iid, why):
+            FZC["n"] += 1
+            return False   # labelled injection: the freeze write FAILS (readable journal, event not durable)
+        CI.freeze = _fz
     elif kind == "foreign_pos_id":
         d = C._read(); d["positions"][MINT]["pa_pos_id"] = "foreign-pos-id-xyz"; C._write(d)   # the OPEN position is now a different instance than the pending intent's
     elif kind == "journal_corrupt":
@@ -158,7 +167,7 @@ def child_recover(mult, inject=None, try_entry=None):
            "pending": len(CI.pending("ceo")), "journal_status": st, "ev": [e.get("ev") for e in ents if e.get("intent_id")],
            "n_intents": len([e for e in ents if e.get("ev") == "intent"]), "pend_why": (pos.get("pending_exit") or {}).get("why"),
            "n_pos": len(C.open_positions() or {}), "hits": HITS["n"], "guard_logs": len(guard),
-           "frozen_open": len(CI.frozen_open("ceo")), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
+           "frozen_open": len(CI.frozen_open("ceo")), "freeze_calls": FZC["n"], "rec_logs": len([m for m in LOGS if "has an unusable recorded op" in m]), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
            "n_pos_all": len(C.open_positions() or {})}
     print("RESULT " + _json.dumps(res), flush=True)
 
@@ -270,6 +279,26 @@ if HAS_HELPER:
         print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
         check("%s: leg exit_reason %r is the RECORDED close reason %r, not the new trigger 'operator_probe_other_trigger'" % (tag, r["a_reason"], pre.get("op_reason")),
               r["a_reason"] == pre.get("op_reason") and r["a_reason"] != "operator_probe_other_trigger")
+
+# F10: durable defect + the freeze write FAILS: the block must come from DURABLE recognition (journal + ledger), not from the freeze event
+tag = "F10-durable-defect-freeze-write-fails"
+root = _tf.mkdtemp(prefix="nonsimkill-%s-" % tag)
+rc, out, err = spawn(["run", root, "after_credit_nopk", "2.0"])
+check("%s: setup child (intent journaled WITHOUT price_kind, labelled) KILLED by SIGKILL (rc %d)" % (tag, rc), rc == -_signal.SIGKILL and "SURVIVED" not in out)
+rc2, err2, pre, r = recover(root, "2.3", "freeze_false", True)
+check("%s: recovery exited 0, no Traceback (rc %d, stderr tail %r)" % (tag, rc2, err2[-200:]), rc2 == 0 and "Traceback" not in err2 and r is not None)
+if r is not None and pre is not None:
+    print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
+    check("%s: freeze was ATTEMPTED (%d calls) and NOT durable (lifecycle %r, frozen_open %d), restart recognition logged (%d)" % (tag, r["freeze_calls"], r["ev"], r["frozen_open"], r["rec_logs"]),
+          r["freeze_calls"] >= 1 and "frozen" not in r["ev"] and r["frozen_open"] == 0 and r["rec_logs"] >= 1)
+    check("%s: entries BLOCKED anyway (flag %r, entry attempt %r); no second credit (cash %.6f vs %.6f), leg a not done (%r), n_pos %d"
+          % (tag, r["entry_blocked"], r["entry_try"], r["cash"], pre["pre_cash"], r["a_done"], r["n_pos_all"]),
+          r["entry_blocked"] is True and "blocked" in str(r["entry_try"]) and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is False and r["n_pos_all"] == 1)
+    rc3, err3, pre3, r3 = recover(root, "2.3", "freeze_false", True)
+    check("%s: FRESH restart, freeze STILL failing: entries still blocked from the durable data alone (rc %d; frozen_open %r, ev %r, entry %r, cash %r)"
+          % (tag, rc3, (r3 or {}).get("frozen_open"), (r3 or {}).get("ev"), (r3 or {}).get("entry_try"), (r3 or {}).get("cash")),
+          rc3 == 0 and r3 is not None and r3["frozen_open"] == 0 and "frozen" not in r3["ev"] and "blocked" in str(r3["entry_try"])
+          and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["n_pos_all"] == 1)
 
 # journal corrupt mid-file: sentinel/entry block + hold classification read in the child
 tag = "F9-journal-corrupt"

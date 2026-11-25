@@ -170,15 +170,40 @@ def account_evidence(pa, op_id, wait_s):
     op = (led.get("ops") or {}).get(op_id)
     wal = [e for e in entries if e.get("op_id") == op_id]
     pid = (op or {}).get("pos_id") if isinstance(op, dict) else None
-    open_pos = None
-    open_key = None
-    for st in (led.get("lanes") or {}).values():
+    matches = []
+    for lname, st in (led.get("lanes") or {}).items():
         for k, p in (st.get("open") or {}).items():
             if isinstance(p, dict) and pid and p.get("pos_id") == pid:
-                open_pos = p
-                open_key = k
+                matches.append((lname, k, p))
+    open_pos, open_key, open_lane = (matches[0][2], matches[0][1], matches[0][0]) if matches else (None, None, None)
     settle = [e for e in entries if pid and e.get("pos_id") == pid and e.get("event") in ("credit", "write_down")]
-    return {"ok": True, "op": op, "wal": wal, "open_pos": open_pos, "open_key": open_key, "settle": settle}
+    return {"ok": True, "op": op, "wal": wal, "open_pos": open_pos, "open_key": open_key, "open_lane": open_lane, "open_n": len(matches), "settle": settle}
+
+def _settle_bad(settle, rec, mint, pid):
+    """Settlement WAL evidence must be bound field by field (lane, mint, pos_id, op_id), unique, non-instance, economically bounded, and contain a TERMINAL event. Returns a reason or None."""
+    seen, qsum, terminal = set(), 0.0, False
+    for e in settle:
+        if not isinstance(e, dict) or e.get("event") not in ("credit", "write_down"):
+            return "settle evidence has a non-settle event"
+        if e.get("pos_id") != pid or e.get("mint") != mint or e.get("lane") != rec.get("lane"):
+            return "settle WAL event lane/mint/pos_id differs from the record/ledger op"
+        if e.get("instance") is True:
+            return "settle WAL event is an instance lot; the lane never opens instance lots"
+        if not isinstance(e.get("op_id"), str) or not e["op_id"] or e["op_id"] in seen:
+            return "settle WAL event has no op_id or the op_id is duplicated"
+        seen.add(e["op_id"])
+        q = e.get("qty")
+        if q is not None:
+            if not (_num(q) and q > 0):
+                return "settle WAL event qty is not positive finite"
+            qsum += float(q)
+        if e["event"] == "write_down" or e.get("final") is True:
+            terminal = True
+    if not terminal:
+        return "no terminal settle event (final credit or write_down) in the WAL"
+    if qsum > float(rec["qty"]) * (1 + 1e-9) + 1e-12:
+        return "settled quantity %r exceeds the recorded entry quantity" % (qsum,)
+    return None
 
 def classify(rec, lane_d, ev):
     """Pure. -> (class, reason, pos_id_or_None). lane_d: the lane ledger dict read under the lane lock. ev: account_evidence result."""
@@ -198,6 +223,8 @@ def classify(rec, lane_d, ev):
     if kind == "debit_refused":
         if "debit_refused" not in wal_ev or "debit" in wal_ev:
             return "E", "refusal not confirmed by the WAL (or a debit also exists)", None
+        if len(wal) != 1:
+            return "E", "WAL evidence for the refused op is duplicated or conflicting (%d events)" % len(wal), None
         return "D-refused", "account refused the op (ledger and WAL agree), no debit", None
     if kind != "debit":
         return "E", "unexpected account op kind %r" % (kind,), None
@@ -206,13 +233,32 @@ def classify(rec, lane_d, ev):
     pid = op.get("pos_id")
     if not pid or not _close(op.get("stake"), rec["stake"]) or not _close(op.get("qty"), rec["qty"]):
         return "E", "account debit stake/qty/pos_id differ from the record", None
+    # EXPLICIT BINDING (no reliance on identifier shape): record -> ledger op, and ledger op -> the ONE WAL debit event, field by field.
+    if op.get("instance") is True:
+        return "E", "ledger op is an instance lot; the lane never opens instance lots", None
+    if op.get("lane") != rec.get("lane"):
+        return "E", "ledger op lane differs from the record lane", None
+    if op.get("mint") != mint:
+        return "E", "account ledger op mint differs from the record", pid
+    if len(wal) != 1:
+        return "E", "WAL evidence for the op is duplicated or conflicting (%d events)" % len(wal), pid
+    _w = wal[0]
+    for _k, _want in (("op_id", op_id), ("lane", rec.get("lane")), ("mint", mint), ("pos_id", pid)):
+        if _w.get(_k) != _want:
+            return "E", "WAL debit %s differs from the ledger/record" % _k, pid
+    if _w.get("instance") is True:
+        return "E", "WAL debit is an instance lot; the lane never opens instance lots", pid
+    if not (_num(_w.get("stake")) and _num(_w.get("qty")) and _close(_w["stake"], op.get("stake")) and _close(_w["stake"], rec["stake"]) and _close(_w["qty"], op.get("qty")) and _close(_w["qty"], rec["qty"])):
+        return "E", "WAL debit stake/qty differ from the ledger op or the record", pid
     op_pos = ev.get("open_pos")
     closes = [c for c in (lane_d.get("closes") or []) if isinstance(c, dict) and c.get("pa_pos_id") == pid and c.get("mint") == mint]
     if op_pos is not None:
         # Account schema (paper_account._apply_debit): a non-instance open position is KEYED BY MINT and carries no "mint" field; only instance positions store "mint".
         # The mint is therefore proven from (a) the ledger op record (always carries mint) AND (b) the position's own mint field when present, else its open-dict key.
-        if op.get("mint") != mint:
-            return "E", "account ledger op mint differs from the record", pid
+        if ev.get("open_n") != 1:
+            return "E", "account holds %r open positions for the pos_id (expected exactly one)" % (ev.get("open_n"),), pid
+        if ev.get("open_lane") != rec.get("lane"):
+            return "E", "account open position is in a different lane than the record", pid
         _pm = op_pos.get("mint") if "mint" in op_pos else ev.get("open_key")
         if _pm != mint or not _close(op_pos.get("qty"), rec["qty"]):
             return "E", "account open position mint/qty differ from the record", pid
@@ -225,6 +271,9 @@ def classify(rec, lane_d, ev):
         return "B", "account debit durable, position open, all fields match, lane has no record: adopt", pid
     # account position no longer open
     if ev.get("settle") and closes and lane_pos is None:
+        _bad = _settle_bad(ev["settle"], rec, mint, pid)
+        if _bad:
+            return "E", _bad, pid
         return "D-settled", "settled in the account WAL and closed in the lane closes list (pa_pos_id match)", pid
     return "E", "account position not open but no complete settle+lane-close proof", pid
 

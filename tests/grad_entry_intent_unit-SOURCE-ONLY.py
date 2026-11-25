@@ -21,8 +21,9 @@ def mkrec(**over):
     if over:
         body = {k: v for k, v in r.items() if k != "checksum"}; body.update(over); body["checksum"] = M._sha(body); return body
     return r
+WDEB = {"event": "debit", "op_id": OP, "lane": "grad", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5}
 def ev(**kw):
-    e = {"ok": True, "op": {"event": "debit", "lane": "grad", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5}, "wal": [{"event": "debit", "op_id": OP}], "open_pos": {"qty": 998.5, "pos_id": PID}, "open_key": MINT, "settle": []}
+    e = {"ok": True, "op": {"event": "debit", "lane": "grad", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5}, "wal": [WDEB], "open_pos": {"qty": 998.5, "pos_id": PID}, "open_key": MINT, "open_lane": "grad", "open_n": 1, "settle": []}
     e.update(kw); return e
 def lane(pos=None, closes=None, dead=None):
     return {"positions": ({MINT: pos} if pos else {}), "closes": closes or [], "dead_mints": dead or {}}
@@ -66,10 +67,45 @@ check("classify E: open position key is another mint (schema-faithful, no mint f
 check("classify E: ledger op mint differs", cls(R, lane(), ev(op={"event": "debit", "lane": "grad", "mint": "OtherMint", "pos_id": PID, "stake": 1.0, "qty": 998.5})) == "E")
 check("classify E: ledger op carries no mint (unproven)", cls(R, lane(), ev(op={"event": "debit", "pos_id": PID, "stake": 1.0, "qty": 998.5})) == "E")
 check("classify B/E: instance-style position with its own mint field is compared too", cls(R, lane(), ev(open_pos={"mint": MINT, "instance": True, "qty": 998.5, "pos_id": PID})) == "B" and cls(R, lane(), ev(open_pos={"mint": "OtherMint", "instance": True, "qty": 998.5, "pos_id": PID})) == "E")
+def w(**kw): d = dict(WDEB); d.update(kw); return d
+check("bind E: ledger op lane differs from the record lane", cls(R, lane(), ev(op={"event": "debit", "lane": "other", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5})) == "E")
+check("bind E: ledger op has no lane", cls(R, lane(), ev(op={"event": "debit", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5})) == "E")
+check("bind E: ledger op is an instance lot", cls(R, lane(), ev(op={"event": "debit", "lane": "grad", "mint": MINT, "pos_id": PID, "stake": 1.0, "qty": 998.5, "instance": True})) == "E")
+for k, v in (("op_id", "grad:entry:Other:1:1"), ("lane", "other"), ("mint", "OtherMint"), ("pos_id", "grad/GradMint1pump#2"), ("stake", 2.0), ("qty", 5.0)):
+    check("bind E: WAL debit %s differs from ledger/record" % k, cls(R, lane(), ev(wal=[w(**{k: v})])) == "E")
+check("bind E: WAL debit without a stake", cls(R, lane(), ev(wal=[{kk: vv for kk, vv in WDEB.items() if kk != "stake"}])) == "E")
+check("bind E: WAL debit is an instance lot", cls(R, lane(), ev(wal=[w(instance=True)])) == "E")
+check("bind E: duplicate identical WAL debit events refused", cls(R, lane(), ev(wal=[w(), w()])) == "E")
+check("bind E: conflicting WAL events for the same op (debit + refusal)", cls(R, lane(), ev(wal=[w(), {"event": "debit_refused", "op_id": OP}])) == "E")
+check("bind E: duplicate WAL refusal events refused", cls(R, lane(), ev(op={"event": "debit_refused"}, wal=[{"event": "debit_refused", "op_id": OP}] * 2, open_pos=None)) == "E")
+check("bind E: account holds TWO open positions for the pos_id", cls(R, lane(), ev(open_n=2)) == "E")
+check("bind E: open position is in another lane", cls(R, lane(), ev(open_lane="other")) == "E")
+check("bind E: open_n/open_lane absent (older evidence shape) refused", cls(R, lane(), {k: v for k, v in ev().items() if k not in ("open_n", "open_lane")}) == "E")
+check("bind E: record lane differs from ledger lane (record side)", cls(dict(R, lane="other"), lane(), ev()) == "E")
+check("bind: schema-faithful happy path still B after all bindings", cls(R, lane(), ev()) == "B")
 check("classify E: account open qty differs", cls(R, lane(), ev(open_pos={"mint": MINT, "qty": 5.0, "pos_id": PID})) == "E")
 check("classify E: account holds it but the lane has a closes record for it", cls(R, lane(closes=[{"mint": MINT, "pa_pos_id": PID}]), ev()) == "E")
 check("classify E: account holds it but mint is in dead_mints", cls(R, lane(dead={MINT: 1}), ev()) == "E")
-settled = dict(open_pos=None, settle=[{"event": "credit", "pos_id": PID}])
+SET = {"event": "credit", "op_id": "s1", "lane": "grad", "mint": MINT, "pos_id": PID, "qty": None, "final": True}
+settled = dict(open_pos=None, settle=[SET])
+check("bind E: D-settled still needs the same bindings (WAL stake differs)", cls(R, lane(closes=[{"mint": MINT, "pa_pos_id": PID}]), ev(**dict(settled, wal=[w(stake=2.0)]))) == "E")
+CL = lane(closes=[{"mint": MINT, "pa_pos_id": PID}])
+def sd(sets): return cls(R, CL, ev(open_pos=None, settle=sets))
+check("settle D-settled: schema-faithful terminal credit (qty None, final) -> D-settled", sd([SET]) == "D-settled")
+check("settle D-settled: partial credit then terminal credit, qty sum == record qty", sd([dict(SET, op_id="s0", qty=400.0, final=False), dict(SET, qty=598.5)]) == "D-settled")
+check("settle D-settled: write_down terminal event", sd([{"event": "write_down", "op_id": "w1", "lane": "grad", "mint": MINT, "pos_id": PID, "qty": 998.5}]) == "D-settled")
+check("settle E: lane differs", sd([dict(SET, lane="other")]) == "E")
+check("settle E: lane missing", sd([{k: v for k, v in SET.items() if k != "lane"}]) == "E")
+check("settle E: mint differs", sd([dict(SET, mint="OtherMint")]) == "E")
+check("settle E: pos_id differs", sd([dict(SET, pos_id="grad/GradMint1pump#9")]) == "E")
+check("settle E: instance lot", sd([dict(SET, instance=True)]) == "E")
+check("settle E: duplicated op_id", sd([SET, dict(SET)]) == "E")
+check("settle E: missing op_id", sd([{k: v for k, v in SET.items() if k != "op_id"}]) == "E")
+check("settle E: only a non-final partial credit (not terminal)", sd([dict(SET, qty=400.0, final=False)]) == "E")
+check("settle E: settled qty exceeds the record qty", sd([dict(SET, op_id="s0", qty=999.0, final=False), dict(SET, qty=10.0)]) == "E")
+check("settle E: non-positive qty", sd([dict(SET, qty=-1.0)]) == "E")
+check("settle E: non-settle event in the settle list", sd([{"event": "debit", "op_id": "x", "lane": "grad", "mint": MINT, "pos_id": PID}, SET]) == "E")
+check("duplicate positions across lane dictionaries freeze (open_n 2 with the second in another lane)", cls(R, lane(), ev(open_n=2, open_lane="grad")) == "E")
 check("classify D-settled: not open + WAL settle + lane closes record (pa_pos_id+mint)", cls(R, lane(closes=[{"mint": MINT, "pa_pos_id": PID}]), ev(**settled)) == "D-settled")
 check("classify E: settled in account but NO lane closes record (unreconciled)", cls(R, lane(), ev(**settled)) == "E")
 check("classify E: closed in lane but NO WAL settle event", cls(R, lane(closes=[{"mint": MINT, "pa_pos_id": PID}]), ev(open_pos=None)) == "E")

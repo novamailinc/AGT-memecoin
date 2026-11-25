@@ -779,12 +779,17 @@ check("S17c kind change on the SAME op id: the booked write-down (outcome %r) is
 # S17d: an UNREADABLE account journal cannot prove a dropped op was not applied -> refused. NAMED FAULT INJECTION, SCOPED: only a call made DIRECTLY from
 # grad._finalize (the dropped-op guard site) sees the torn status; every other reader (buyback applied-add, snapshot) passes through unchanged, so the guard
 # under test is the one that fires. Reachability is asserted by a hit counter on that exact site, and a pass-through control with the SAME crafted state proceeds.
-import sys as _sys17
+import sys as _sys17, logging as _lg17
+class _Cap17(_lg17.Handler):
+    def __init__(self): super().__init__(); self.msgs = []
+    def emit(self, r): self.msgs.append(r.getMessage())
 def _scoped_jr(fault, hits):
+    # Intercepts _journal_read ONLY when the IMMEDIATE caller is grad._finalize (module grad, function _finalize); every other caller, and the real read when
+    # not faulting, is delegated to the real paper_account function unchanged.
     _real = _PAm._journal_read
     def _jr(*a, **k):
         _f = _sys17._getframe(1)
-        if _f.f_code.co_name == "_finalize" and _f.f_code.co_filename.endswith("grad.py"):
+        if _f.f_code.co_name == "_finalize" and _f.f_globals.get("__name__") == G.__name__:
             hits.append(1)
             if fault:
                 return ([], "torn", None)
@@ -799,18 +804,27 @@ def _s17d_setup(mint):
                     {"realized_usd": 1.0, "close_ts": 1795600780.0, "closed_reason": "crafted"}, supersedes=_ir)
     _point(mint, _i2)
     return pid, entry, _i2
-mint = "BB22pump"; pid, entry, _i2 = _s17d_setup(mint); _n22 = len(_gi2(mint)); _h = []
-with patch.object(_PAm, "_journal_read", _scoped_jr(True, _h)):
-    G.poll_exits(price_fn=prices([entry * 0.05]))
-check("S17d unreadable account journal AT THE DROPPED-OP GUARD (guard site reached: %d hit(s) from grad._finalize): refused, pending why %r, no new intent %d -> %d, crafted intent %s, position open"
-      % (len(_h), (lane_pos(mint).get("settlement_pending") or {}).get("why"), _n22, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
-      len(_h) >= 1 and len(_gi2(mint)) == _n22 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
-      and (lane_pos(mint).get("settlement_pending") or {}).get("why") == "close_intent_not_durable")
-mint = "BB23pump"; pid, entry, _i2 = _s17d_setup(mint); _n23 = len(_gi2(mint)); _h = []
-with patch.object(_PAm, "_journal_read", _scoped_jr(False, _h)):
-    G.poll_exits(price_fn=prices([entry * 0.05]))
-check("S17d control: SAME crafted state, same scoped wrapper but NO fault (guard site reached: %d hit(s)): the change is NOT refused (intents %d -> %d)" % (len(_h), _n23, len(_gi2(mint))),
-      len(_h) >= 1 and len(_gi2(mint)) > _n23)
+def _s17d_run(mint, fault):
+    pid, entry, _i2 = _s17d_setup(mint); _n = len(_gi2(mint)); _h = []; _cap = _Cap17(); _root = _lg17.getLogger(); _root.addHandler(_cap)
+    try:
+        with patch.object(_PAm, "_journal_read", _scoped_jr(fault, _h)):
+            G.poll_exits(price_fn=prices([entry * 0.05]))
+    finally:
+        _root.removeHandler(_cap)
+    return pid, _i2, _n, _h, _cap.msgs
+mint = "BB22pump"; pid, _i2, _n22, _h, _msgs = _s17d_run(mint, True)
+_why = (lane_pos(mint).get("settlement_pending") or {}).get("why")
+_hit = [m for m in _msgs if "account journal unreadable: cannot prove the dropped op(s)" in m and "close_intent_not_durable" in m]
+check("S17d unreadable account journal AT THE DROPPED-OP GUARD (exactly %d intercept from grad._finalize; guard log lines %d; pending why %r, not buyback_applied_add_unreadable; no new intent %d -> %d, crafted intent %s, position open)"
+      % (len(_h), len(_hit), _why, _n22, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
+      len(_h) == 1 and len(_hit) == 1 and _why == "close_intent_not_durable" and _why != "buyback_applied_add_unreadable"
+      and not [m for m in _msgs if "buyback_applied_add_unreadable" in m]
+      and len(_gi2(mint)) == _n22 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions())
+mint = "BB23pump"; pid, _i2, _n23, _h, _msgs = _s17d_run(mint, False)
+_ev = [e for e in _gi2(mint)]
+check("S17d control: SAME crafted state with the IDENTICAL wrapper installed but delegating to the real read (exactly %d intercept, so the wrapper is neutral): crafted intent %s, successor recorded (intents %d -> %d), no guard log lines (%d)"
+      % (len(_h), _CI.intent_status("grad", _i2), _n23, len(_ev), len([m for m in _msgs if "account journal unreadable" in m])),
+      len(_h) == 1 and _CI.intent_status("grad", _i2) == "frozen" and len(_ev) > _n23 and not [m for m in _msgs if "account journal unreadable" in m])
 
 def _to_successor(m):
     pid_, entry_, i0_ = _refused_setup(m)

@@ -67,9 +67,29 @@ def main():
     s.check_token = lambda chain, mint, timeout=10: {"passed": False, "fails": ["mint authority live"]}
     ok, why, rep, transient = eng._safety_ok(M)
     check("a failed safety report refuses the entry", ok is False and "mint authority" in why)
+    # SYNTHETIC report shapes (test-only, not recorded data). The live lane now also requires typed authority status.
+    _SYN = {"token2022_extensions": [], "mint_authority_status": "revoked", "freeze_authority_status": "revoked"}
+    _EVD = [{"method": m, "kind": "ok", "decision_usable": True, "attempts": []}
+            for m in ("getAccountInfo", "getTokenLargestAccounts", "getMultipleAccounts")]
+    s.check_token = lambda chain, mint, timeout=10: {"passed": True, "fails": [], "flags": [], "unknown": False,
+                                                    "acquisition_evidence": _EVD, "instant": dict(_SYN)}
+    ok, why, rep, transient = eng._safety_ok(M)
+    check("a passing safety report with typed revoked authorities is the only pass", ok is True)
     s.check_token = lambda chain, mint, timeout=10: {"passed": True, "fails": []}
     ok, why, rep, transient = eng._safety_ok(M)
-    check("a passing safety report is the only pass", ok is True)
+    check("a passing report without typed authority evidence is refused", ok is False)
+    s.check_token = lambda chain, mint, timeout=10: {"passed": True, "fails": [], "flags": [],
+                                                    "unknown": False, "acquisition_evidence": _EVD, "instant": dict(_SYN, mint_authority_status="set")}
+    ok, why, rep, transient = eng._safety_ok(M)
+    check("a set mint authority is refused", ok is False and "mint_authority_status" in why)
+    s.check_token = lambda chain, mint, timeout=10: {"passed": True, "fails": [], "flags": [],
+                                                    "unknown": False, "acquisition_evidence": _EVD, "instant": dict(_SYN, freeze_authority_status="unavailable")}
+    ok, why, rep, transient = eng._safety_ok(M)
+    check("an unavailable freeze authority is refused", ok is False and "freeze_authority_status" in why)
+    s.check_token = lambda chain, mint, timeout=10: {"passed": True, "fails": [], "flags": ["LP lock unverified (instant path)"],
+                                                    "unknown": False, "acquisition_evidence": _EVD, "instant": dict(_SYN)}
+    ok, why, rep, transient = eng._safety_ok(M)
+    check("an unaccepted flag is refused with the empty default policy", ok is False)
 
     # -- veto is fail closed (grad._veto_ok alone fails OPEN on an engine exception) ----
     v = _Ns()

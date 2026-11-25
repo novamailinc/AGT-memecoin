@@ -214,10 +214,17 @@ def read_safety(mint, now=None):
         rep = s.get("report")
         if not isinstance(rep, dict) or rep.get("unknown"):
             return None
-        if now - float(s.get("ts") or 0) > SAFETY_FRESH_S:
+        ts = float(s.get("ts") or 0)
+        age = now - ts
+        # Same existing window. Written as a positive test so NaN, infinite and future-dated stamps fall through to
+        # the live check instead of passing the old "age > window" comparison.
+        if not (0.0 <= age <= SAFETY_FRESH_S):
             return None
         out = dict(rep)
         out["source"] = "dossier:" + str(rep.get("source") or "")
+        # Provenance only: LOCAL dossier store time, not an upstream observation time. No new threshold.
+        out["safety_ts"] = ts
+        out["safety_ts_kind"] = "dossier_local_store_time"
         return out
     except Exception:
         return None

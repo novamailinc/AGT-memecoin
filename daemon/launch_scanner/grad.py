@@ -2136,12 +2136,15 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
             _jfail = False; _applied = False
             _prior = pos.get("pending_exit") or {}
             _iid = _prior.get("intent_id") if _prior.get("leg") == leg_key else None
-            if _prior.get("why") != "tranche_credit_divergence" and not _iid:
+            if not _iid:   # includes a prior pointer of ANOTHER leg (the pre-existing code would overwrite it, losing its intent_id)
                 _ohd = _obligation_hold(pos)
                 if _ohd is not None:
                     # a refused replay under an existing hold NEVER opens an intent or freezes one: visible diagnostic only (the hold itself is already recorded by the gate paths)
                     _note_obligation_hold(pos, _ohd, "tranche_replay:" + str(leg_key))
-                    pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_divergence_held", "detail": str(why)[:200], "ts": time.time()}
+                    _pe0 = pos.get("pending_exit")
+                    if not (isinstance(_pe0, dict) and _pe0.get("why")) or _pe0.get("leg") == leg_key:
+                        # only an EMPTY pointer or this leg's own pointer is rewritten; another leg's pointer (and its intent_id) is NEVER clobbered (diagnostic then lives in obligation_hold only)
+                        pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_divergence_held", "detail": str(why)[:200], "ts": time.time()}
                     return False
             if _prior.get("why") != "tranche_credit_divergence":
                 try:
@@ -2320,9 +2323,11 @@ def _note_obligation_hold(pos, hold, where):
     any journal, so repeated held polls add no rows. The position stays open, no leg is marked done, nothing is sold or booked."""
     cur = pos.get("obligation_hold") or {}
     body = {k: hold[k] for k in ("kind", "known", "marks", "unknown")}
-    if {k: cur.get(k) for k in body} != body:
+    changed = {k: cur.get(k) for k in body} != body
+    if changed:
         pos["obligation_hold"] = dict(body, where=where, since=(cur.get("since") if cur.get("kind") == hold["kind"] and cur.get("since") else time.time()))
         logger.error("grad %s: %s HELD by an unresolved obligation (%s): no sale, no booking, exposure stays open (operator reconciliation)", str(pos.get("mint") or "?")[:16], where, hold["kind"])
+    return changed
 
 
 def _legacy_unreconciled_buyback(pos):
@@ -2486,15 +2491,16 @@ def _close_twap_slice(pos, exit_price):
         n = 0
     if n <= 0:
         return 0.0
+    _done0 = int(((pos.get("twap") or {}).get("done")) or 0)
+    if _done0 < n and _tranche_receipt(pos, "twap%d" % (_done0 + 1)) is None:   # an applied slice receipt = bookkeeping replay, never held; otherwise a NEW slice sale
+        _oh = _obligation_hold(pos)   # BEFORE any mutation of the position (no twap block is created by a held call)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "twap_slice")
+            return 0.0
     tw = pos.setdefault("twap", {"slices": n, "done": 0,
                                  "sold_tokens": 0.0, "sold_usd": 0.0})
     if tw["done"] >= n:
         return 0.0
-    if _tranche_receipt(pos, "twap%d" % (tw["done"] + 1)) is None:   # an applied slice receipt = bookkeeping replay, never held; otherwise a NEW slice sale
-        _oh = _obligation_hold(pos)
-        if _oh is not None:
-            _note_obligation_hold(pos, _oh, "twap_slice")
-            return 0.0
     slice_tokens = pos["tokens"] / n
     if (pos.get("execution") or {}).get("source") == "jupiter_quote_sim":
         _sk = "twap%d" % (tw["done"] + 1)
@@ -3158,8 +3164,8 @@ def _finalize(d, mint, pos, closed_reason):
     # refusal/terminal/retry behavior is unchanged. An unreadable source is left to the existing journal-unreadable paths (include_unknown=False), never reported as frozen.
     _oh = _obligation_hold(pos, foreign_only=True, include_unknown="marker")
     if _oh is not None:
-        _note_obligation_hold(pos, _oh, "finalize")
-        _write(d)
+        if _note_obligation_hold(pos, _oh, "finalize"):
+            _write(d)   # only when the diagnostic content changed: a repeated held poll rewrites nothing
         return None
     # SETTLEMENT PENDING (crash-recovery / unreadable-journal state). A half-migrated position whose per-leg account
     # receipts cannot be read cannot be SETTLED: the close credits `realized - tally` and the tally is unknowable, so

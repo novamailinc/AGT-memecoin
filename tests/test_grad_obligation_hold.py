@@ -138,13 +138,15 @@ def _snap(mint):
     return G._read()["positions"].get(mint)
 def _jevents():
     return _events()
+_CUR = [None]
 def _ints():
-    return [e for e in _jevents() if e.get("ev") == "intent"]
+    return [e for e in _jevents() if e.get("ev") == "intent" and (_CUR[0] is None or e.get("mint") == _CUR[0])]   # per-mint: other scenarios' intents never count
 def _stop_polls(mint, n=1, mult=0.3):
     ent = float(G._read()["positions"][mint]["entry_price"])
     for _ in range(n):
         G.poll_exits(price_fn=lambda chain, m, si=None: ent * mult)
 def _enter(mint):
+    _CUR[0] = mint
     ps, _mv, _ms = _fresh(); G._ENTRY_BLOCKED = False
     o, w, _f = G.consider_candidate(_cand(mint=mint))
     return ps, o
@@ -181,11 +183,12 @@ def scenario_h1(mutant):
     if pm: pm.start()
     try:
         _leg(M, "a", 2.5)
-        j1 = _jbytes(); i1 = len(_ints()); c = _closes()
+        j1 = _jbytes(); i1 = len(_ints()); c = _closes(); cash1 = PA.snapshot()["cash"]; mk1 = len(PA.unresolved_refusals() or [])
         _stop_polls(M, 1); j2 = _jbytes(); i2 = len(_ints())
         _stop_polls(M, 2); j3 = _jbytes()
         out = {"intents_after_leg": i1, "intents_after_poll1": i2, "journal_grew_poll2_3": j3 != j2, "journal_grew_poll1": j2 != j1,
                "close_ops": [o.get("op_id") for e in _ints() for o in e.get("settle_ops") or [] if ":close:" in str(o.get("op_id"))],
+               "account_cash_unchanged": PA.snapshot()["cash"] == cash1, "marker_rows_unchanged": len(PA.unresolved_refusals() or []) == mk1,
                "open": _snap(M) is not None, "new_closes": _closes() - c, "hold": dict(_hold(M)), "pending_exit": (_snap(M) or {}).get("pending_exit")}
     finally:
         if pm: pm.stop()
@@ -198,9 +201,11 @@ check("H1 position stays open, nothing booked (open %r, new closes %d)" % (h1["o
 check("H1 hold kind known_frozen with the tranche op id (%r)" % (h1["hold"].get("kind"),),
       h1["hold"].get("kind") == "known_frozen" and any(":leg:a:" in o for k in h1["hold"].get("known", []) for o in k["ops"]))
 check("H1 repeated held polls append NOTHING to the journal and open no intent", not h1["journal_grew_poll2_3"] and h1["intents_after_poll1"] == 1)
+check("H1 held polls changed neither the account cash nor the marker rows (%r, %r)" % (h1["account_cash_unchanged"], h1["marker_rows_unchanged"]), h1["account_cash_unchanged"] and h1["marker_rows_unchanged"])
 check("H1 the tranche diagnostic pointer is preserved (pending_exit why %r)" % ((h1["pending_exit"] or {}).get("why"),), (h1["pending_exit"] or {}).get("why") in ("tranche_credit_divergence", "tranche_credit_divergence_held"))
 h1m = scenario_h1(True)
 print("  OBSERVED H1M (labelled MUTANT: gate disabled):", {k: v for k, v in h1m.items() if k != "pending_exit"})
+# NOTE: H1M disables the WHOLE gate (aggregate mutant): it shows the gate as a whole is causal for this fixture, not that each gate site is separately necessary.
 check("H1M MUTANT differs from the fixed run in an observed field (close ops / new closes / open) so the gate is causal", (h1m["close_ops"], h1m["new_closes"], h1m["open"]) != (h1["close_ops"], h1["new_closes"], h1["open"]))
 
 # ---- H2 stale-generation tranche refusal (account marker, NO journal intent)
@@ -212,17 +217,21 @@ mk = [r for r in (PA.unresolved_refusals() or []) if r.get("pos_id") == (_snap(M
 i_pre = len(_ints())
 check("H2 setup: tranche generation refusal recorded the durable marker and journaled NO intent (why %r, markers %d, intents %d)" % (pe2.get("why"), len(mk), i_pre),
       pe2.get("why") == "tranche_credit_generation_refused" and len(mk) >= 1 and i_pre == 0)
-c = _closes(); jb = _jbytes(); _stop_polls(M2, 3)
+c = _closes(); jb = _jbytes(); cash2 = PA.snapshot()["cash"]; mk2 = len(PA.unresolved_refusals() or []); _stop_polls(M2, 3)
 h2 = _hold(M2)
 check("H2 stop polls: position open, no booking, hold kind account_marker (kind %r, open %r, new closes %d)" % (h2.get("kind"), _snap(M2) is not None, _closes() - c),
       _snap(M2) is not None and _closes() == c and h2.get("kind") == "account_marker")
-check("H2 held polls opened no intent and appended nothing to the journal", len(_ints()) == i_pre and _jbytes() == jb)
+check("H2 held polls opened no intent, appended nothing to the journal, left the account cash and marker rows unchanged", len(_ints()) == i_pre and _jbytes() == jb and PA.snapshot()["cash"] == cash2 and len(PA.unresolved_refusals() or []) == mk2)
 _unpatch(ps)
 
 # ---- H3 own-close exclusion: a refused whole-position close keeps its EXISTING semantics
 M3 = "H3OWN111pump"
 ps, ok = _enter(M3); _wipe_generation(); c = _closes(); _stop_polls(M3, 2)
 p3 = _snap(M3) or {}
+_cp3 = "grad:close:%s:%s" % (M3, p3.get("pa_pos_id"))
+_m3 = [r.get("op_id") for r in (PA.unresolved_refusals() or []) if r.get("pos_id") == p3.get("pa_pos_id")]
+check("H3 isolation: every marker row of this position is the position's OWN close op (%r), so the absence of obligation_hold is the own-id exclusion at work, not an absent marker" % (_m3,),
+      len(_m3) >= 1 and all(o in (_cp3, _cp3 + ":wd") for o in _m3))
 check("H3 refused whole-position close: position open, settlement_pending set (%r), NOT reported as a foreign obligation_hold (%r), nothing booked"
       % ((p3.get("settlement_pending") or {}).get("why"), p3.get("obligation_hold")),
       bool(p3) and bool(p3.get("settlement_pending")) and not p3.get("obligation_hold") and _closes() == c)
@@ -263,6 +272,8 @@ _iid7 = CI.begin("grad", M7, pid7, [{"kind": "credit", "op_id": _cp7 + ":extra",
                                        "expected_account_id": p7.get("pa_account_id"), "entry_op_id": p7.get("pa_entry_op")}],
                  {"realized_usd": 0.0, "close_ts": 1, "closed_reason": "labelled_fixture"}, stable_id=True, account_id=p7.get("pa_account_id"))
 CI.freeze("grad", _iid7, "labelled fixture: frozen intent with an op id that only shares the close-op prefix")
+_fz7 = CI.frozen_for_position("grad", M7, pid7)
+check("E4 setup: the hand-built intent is frozen for this position with the prefix-only op id (%r)" % (_fz7,), bool(_fz7) and _fz7[0][0] == _iid7 and _fz7[0][2] == [_cp7 + ":extra"])
 c = _closes(); _stop_polls(M7, 1)
 check("E4 prefix-only op id is NOT own: finalize held (kind %r, open %r, new closes %d)" % (_hold(M7).get("kind"), _snap(M7) is not None, _closes() - c),
       _hold(M7).get("kind") == "known_frozen" and _snap(M7) is not None and _closes() == c)
@@ -288,7 +299,8 @@ try:
         d = G._read(); pos = d["positions"][M9]; r9 = G._close_twap_slice(pos, pos["entry_price"] * 2.0); done9 = (pos.get("twap") or {}).get("done"); G._write(d)
 finally:
     G.TWAP_SLICES = _sv
-check("E6 TWAP slice sale held (returned %r, slices done %r, hold %r)" % (r9, done9, _hold(M9).get("kind")), r9 == 0.0 and not done9 and _hold(M9).get("kind") == "account_marker")
+check("E6 TWAP slice sale held and the position was NOT mutated (returned %r, twap block present %r, hold %r)" % (r9, "twap" in (_snap(M9) or {}), _hold(M9).get("kind")),
+      r9 == 0.0 and "twap" not in (_snap(M9) or {}) and _hold(M9).get("kind") == "account_marker")
 _unpatch(ps)
 
 def _persist_off_leg(mint, key, mult):
@@ -363,6 +375,34 @@ i_before = len(_ints()); c = _closes(); _stop_polls(ME, 2)
 check("R4 after the lane pointers were dropped, a stop poll is still held from the JOURNAL (kind %r, intents %d -> %d, open %r, new closes %d)"
       % (_hold(ME).get("kind"), i_before, len(_ints()), _snap(ME) is not None, _closes() - c),
       _hold(ME).get("kind") == "known_frozen" and len(_ints()) == i_before and _snap(ME) is not None and _closes() == c)
+_unpatch(ps)
+
+# ---- E7 finalize fails closed DIRECTLY with all legs done (labelled injected reader failure in the REAL journal reader)
+MF = "E7DONE11pump"
+ps, ok = _enter(MF); _leg(MF, "a", 2.5); _leg(MF, "b", 3.5); _leg(MF, "c", 1.0)
+check("E7 setup: all three legs done", all(_snap(MF)["legs"][k]["done"] for k in "abc"))
+bk = G._read()["bankroll"]; c = _closes()
+with patch.object(CI, "frozen_for_position", _boom):
+    _stop_polls(MF, 2, mult=1.0)
+check("E7 helper failure with all legs done: finalize held as unreadable, nothing booked (kind %r, bankroll unchanged %r, new closes %d)" % (_hold(MF).get("kind"), G._read()["bankroll"] == bk, _closes() - c),
+      _hold(MF).get("kind") == "unreadable" and _snap(MF) is not None and G._read()["bankroll"] == bk and _closes() == c)
+_unpatch(ps)
+
+# ---- R5 a refused replay of ANOTHER leg never clobbers a frozen leg's pointer (direct call of the REAL _tranche_credit; labelled fault injection at the account API)
+MG = "R5PTRKP1pump"
+ps, ok = _enter(MG); _diverge(MG); _leg(MG, "a", 2.5)
+pa0 = dict((_snap(MG) or {}).get("pending_exit") or {})
+check("R5 setup: leg a pointer carries the frozen tranche intent id (%r)" % (pa0.get("intent_id"),), pa0.get("leg") == "a" and bool(pa0.get("intent_id")) and pa0.get("why") == "tranche_credit_divergence")
+i_before = len(_ints())
+with G._ledger_lock():
+    d = G._read(); posg = d["positions"][MG]
+    with patch.object(PA, "credit", lambda *a, **k: (False, "position not held (labelled injected refusal)")), \
+         patch.object(PA, "op_outcome", lambda *a, **k: "orphan"), patch.object(PA, "pos_ever_existed", lambda *a, **k: True):
+        rg = G._tranche_credit(posg, "b", 1.0, 1.0, 0.0, None)
+    peg = dict(posg.get("pending_exit") or {}); G._write(d)
+check("R5 refused replay of leg b: returned %r, leg a pointer UNCHANGED (leg %r, intent %r), no new intent (%d -> %d), diagnostic recorded in obligation_hold (%r)"
+      % (rg, peg.get("leg"), peg.get("intent_id"), i_before, len(_ints()), (_snap(MG).get("obligation_hold") or {}).get("kind")),
+      rg is False and peg.get("leg") == "a" and peg.get("intent_id") == pa0.get("intent_id") and len(_ints()) == i_before and bool((_snap(MG).get("obligation_hold") or {}).get("kind")))
 _unpatch(ps)
 
 if FAILS:

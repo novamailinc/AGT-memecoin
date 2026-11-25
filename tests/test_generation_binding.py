@@ -99,5 +99,22 @@ check("D1 new debit refused with ledger missing and WAL present (%r)" % (r,), r[
 check("D2 no ledger regenerated", not os.path.exists(PA.LEDGER_PATH))
 check("D3 no new create event", len(_creates()) == n_create)
 
+# ---- E: thread-local capture hygiene
+import threading
+_use(os.path.join(_home, "E"))
+r = _need("debit E", PA.try_debit(LANE, "MINTE", 1.0, 100.0, "gb:entry:E", marks=_mk()))
+pidE = r[2]
+check("E1 capture present right after the debit", bool(PA.entry_binding(LANE, "MINTE", "gb:entry:E", pidE)))
+_bad = PA.try_debit(LANE, "MINTE2", -1.0, 100.0, "gb:entry:E2", marks=_mk())
+check("E2 a FAILED debit attempt clears the previous capture (%r)" % (_bad[:2],), _bad[0] is False and PA.entry_binding(LANE, "MINTE", "gb:entry:E", pidE) is None)
+r = _need("debit E again", PA.try_debit(LANE, "MINTE3", 1.0, 100.0, "gb:entry:E3", marks=_mk()))
+check("E3 non-matching op_id or pos_id gives None", PA.entry_binding(LANE, "MINTE3", "gb:entry:E3", "wrong#1") is None and PA.entry_binding(LANE, "MINTE3", "gb:entry:EX", r[2]) is None)
+_box = []
+_t = threading.Thread(target=lambda: _box.append(PA.entry_binding(LANE, "MINTE3", "gb:entry:E3", r[2])))
+_t.start(); _t.join()
+check("E4 another thread never sees this thread's capture", _box == [None])
+_rt = PA.try_debit(LANE, "MINTE3", 1.0, 100.0, "gb:entry:E3", marks=_mk())
+check("E5 retry of the applied op re-captures the ORIGINAL stored account_id (%r)" % (_rt[:2],), _rt[0] is True and PA.entry_binding(LANE, "MINTE3", "gb:entry:E3", r[2]) == json.load(open(PA.LEDGER_PATH))["account_id"])
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

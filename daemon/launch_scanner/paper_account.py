@@ -1608,6 +1608,7 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
     taking the lock; a position it cannot price blocks further
     entries fail-closed.
     """
+    _TL.debit = None   # stale-capture guard: cleared on EVERY attempt (refusal, exception, busy), set only by a successful debit/retry below
     if not _valid_amount(stake) or stake <= 0:
         return False, "stake must be a positive finite number", None
     if not _valid_amount(qty) or qty <= 0:
@@ -2202,24 +2203,6 @@ def debit_binding(op_id: str, pos_id: str) -> Optional[str]:
 def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Optional[str]:
     """Binding for a position this thread just debited: the atomic debit-time capture only (no fallback re-read)."""
     return debit_binding(entry_op_id, pos_id)
-
-
-def entry_binding_proof(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Optional[str]:
-    """RECOVERY-ONLY (adoption of a durable entry intent, no debit in this process): read-back proof of the generation under the lock. The
-    account generation a just-debited position belongs to, read back under the account lock and ONLY when the exact entry op, pos_id,
-    lane/mint, the clean journal and the single create identity all prove it (the same proof settlement uses). A regenerated or rolled-back
-    account cannot return a binding for an op it never held. None = unproven (the caller must treat the entry as an uncertain partial
-    execution, never as bound)."""
-    if not (isinstance(entry_op_id, str) and entry_op_id and isinstance(pos_id, str) and pos_id):
-        return None
-    with _lock():
-        led, healthy, degraded = _load_locked()
-        if led is None or not healthy or degraded:
-            return None
-        ident = led.get("account_id")
-        if _generation_refusal(led, ident, entry_op_id, lane, mint, pos_id) is not None:
-            return None
-        return ident
 
 
 def _refuse_generation(op_id, lane, mint, pos_id, reason):

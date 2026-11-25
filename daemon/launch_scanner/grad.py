@@ -1051,13 +1051,12 @@ def _ei_recover():
                 raise RuntimeError("lane already holds the mint")
             pos = json.loads(json.dumps(rec["pos"]))
             pos["pa_pos_id"] = pid
-            # RECOVERY adoption: no debit in this process, so the binding is a read-back PROOF (exact entry op + pos_id + single create identity,
-            # under the account lock). Unproven stays UNBOUND: settlements refuse/freeze and entries block (no automatic rebinding).
+            # RECOVERY adoption: no debit happened in this process and no read-back can prove the ORIGINAL generation (a regenerated account may
+            # reuse the entry op and pos_id). So the position is stored visibly UNBOUND: settlements refuse/freeze, entries block, no rebinding.
             pos["pa_entry_op"] = rec["op_id"]
-            pos["pa_account_id"] = _pa.entry_binding_proof(LANE, mint, rec["op_id"], pid) if _pa is not None else None
-            if not pos["pa_account_id"]:
-                pos["pa_binding_failed"] = True
-                _block_entries()
+            pos["pa_account_id"] = None
+            pos["pa_binding_failed"] = True
+            _block_entries()
             d["bankroll"] = round(float(d["bankroll"]) - float(rec["stake"]), 6)
             # DAILY-ENTRY ATTRIBUTION (explicit): the original entry incremented the counter of ITS OWN day (rec cand.entry_day, captured by _today() when the record was written)
             # in the same write that never landed. Recovery restores exactly that and never charges a different day: same stored day -> that counter +1; entry day is today but the stored

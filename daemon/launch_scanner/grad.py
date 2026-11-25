@@ -333,6 +333,16 @@ def _block_entries():
     _ENTRY_BLOCKED = True
 
 
+def _unresolved_positions(_lane=None):
+    """Restart/entry admission evidence from PERSISTED state (shared account generation vs the lane ledger, lane ledger availability). Falls back to the
+    unbound-only scan when the shared account is disabled. See paper_account.restart_admission_blockers."""
+    _pa = _paper_account()
+    _ln = _lane if _lane is not None else LANE
+    if _pa is not None and hasattr(_pa, "restart_admission_blockers"):
+        return list(_pa.restart_admission_blockers(_ln, LEDGER_PATH))
+    return [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("lane", _ln) == _ln and p.get("pa_pos_id") and not p.get("pa_account_id")]
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process, before
     this process's first new close. The account side re-applies
@@ -349,7 +359,7 @@ def _recover_close_intents():
         # Close-intent journal OFF: no intent exists to freeze (none is claimed). The unbound-position block does not depend on it: it is derived from the
         # persisted lane ledger in every process, so entries stay blocked while any account-opened position has no bound generation.
         try:
-            _unb0 = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+            _unb0 = _unresolved_positions()
         except Exception:
             _unb0 = ["unreadable-lane-ledger"]
         if _unb0:
@@ -414,7 +424,7 @@ def _recover_close_intents():
     frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
                               lane_apply)
     try:
-        _unb = [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("pa_pos_id") and not p.get("pa_account_id")]
+        _unb = _unresolved_positions()
     except Exception:
         _unb = ["unreadable-lane-ledger"]
     if _unb:

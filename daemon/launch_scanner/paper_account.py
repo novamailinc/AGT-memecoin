@@ -778,6 +778,10 @@ def _journal(event: Dict[str, Any], strict: bool = False) -> None:
             os.fsync(f.fileno())
     except Exception:
         logger.exception("paper_account: journal write failed")
+        try:
+            _PROBED.clear(); _MF_SCAN.update(key=None, off=0, found=False)   # a successful earlier probe or scan proves nothing after a failed write
+        except NameError:
+            pass
         if event.get("instance") is True or strict:
             raise
 
@@ -2321,6 +2325,7 @@ def _record_unresolved(op_id, lane, mint, pos_id, reason):
         return True
     except Exception:
         logger.exception("paper_account: could not write the unresolved-refusal marker")
+        _PROBED.clear()
         return False
 
 
@@ -2363,6 +2368,60 @@ def _journal_marker_failed():
     return _MF_SCAN["found"]
 
 
+def _ledger_file_status(path):
+    """READ-ONLY (data, status): ok | missing | unreadable | corrupt. Never substitutes an empty ledger, takes no lock, writes nothing."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, "missing"
+    except Exception:
+        return None, "unreadable"
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None, "corrupt"
+    if not (isinstance(d, dict) and isinstance(d.get("positions", {}), dict)):
+        return None, "corrupt"
+    return d, "ok"
+
+
+def restart_admission_blockers(lane, lane_ledger_path):
+    """Entry-admission evidence DERIVED FROM PERSISTED STATE in every process (never from an in-process flag or a lost marker). [] = no known unresolved exposure.
+    READ-ONLY, no lock, no lane import. Blocks (each string names why):
+      '<mint>'                       open lane position opened by the shared account with NO bound generation (legacy/unbound),
+      '<mint>@generation-mismatch'   its pa_account_id differs from the account's CURRENT generation: its settlement can only be refused,
+      '<mint>@account-identity-unavailable'  the account ledger/generation cannot be read, so the binding cannot be judged,
+      'lane-ledger-<status>'         the lane ledger is missing/unreadable/corrupt WHILE the account holds open lots for this lane (an absent lane
+                                     record is not proof of no exposure); a missing lane ledger with NO account lots for the lane is a fresh start, not a block.
+    A matching-generation position never blocks. Nothing here clears, rebinds or deletes evidence."""
+    out = []
+    led_d, lst = _ledger_file_status(lane_ledger_path)
+    acct, ast = _ledger_file_status(LEDGER_PATH)
+    ident = acct.get("account_id") if (ast == "ok" and isinstance(acct.get("account_id"), str) and acct.get("account_id")) else None
+    lots = None
+    if ast == "ok":
+        try:
+            lots = len(((acct.get("lanes") or {}).get(lane) or {}).get("open") or {})
+        except Exception:
+            lots = None
+    if lst != "ok":
+        if lst == "missing" and lots == 0:
+            return out
+        return ["lane-ledger-%s%s" % (lst, "" if lots is not None else " (account unreadable)")] if (lots is None or lots > 0) else out
+    for m, p in (led_d.get("positions") or {}).items():
+        if not isinstance(p, dict) or not p.get("pa_pos_id") or p.get("lane", lane) != lane:
+            continue
+        b = p.get("pa_account_id")
+        if not b:
+            out.append(str(m))
+        elif ident is None:
+            out.append("%s@account-identity-unavailable" % m)
+        elif b != ident:
+            out.append("%s@generation-mismatch" % m)
+    return out
+
+
 _PROBED = set()   # account directories proven writable in THIS process
 
 
@@ -2381,6 +2440,9 @@ def _durable_probe():
         finally:
             os.close(fd)
         os.unlink(p)
+        for _ex in (JOURNAL_PATH, LEDGER_PATH, _unresolved_path()):   # EXISTING files can be unwritable while the directory still accepts a new file
+            if os.path.exists(_ex):
+                os.close(os.open(_ex, os.O_WRONLY | os.O_APPEND))
     except Exception as e:
         try: os.unlink(p)
         except OSError: pass
@@ -2412,7 +2474,13 @@ def _refuse_generation(op_id, lane, mint, pos_id, reason):
         # FAIL CLOSED: the marker file could not be written. Block entries in this process and journal the refusal WITH marker_failed (never deduped), so the
         # block is re-derived from the journal tail in every later process too.
         _MARKER_FAILED[0] = True
-        _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason, "marker_failed": True})
+        try:
+            _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason, "marker_failed": True}, strict=True)
+        except Exception:
+            _PROBED.clear(); _MF_SCAN.update(key=None, off=0, found=False)
+            logger.error("paper_account: generation refusal for %s could be recorded NEITHER in the marker NOR in the journal; only the in-process block exists", pos_id)
+            return False, ("generation refused: %s (NOT journaled and NOT recorded in the marker: nothing durable exists; entries blocked in this process only, "
+                           "restart admission must be re-derived from lane persisted state)" % reason)
         return False, "generation refused: %s (journaled, nothing applied; durable marker unwritable: entries blocked)" % reason
     if any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in _recent_refusals()):
         return False, "generation refused: %s (already journaled, nothing applied)" % reason   # retry of the same refusal: no unbounded growth

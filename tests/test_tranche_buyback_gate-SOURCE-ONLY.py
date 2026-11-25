@@ -103,18 +103,16 @@ for modname in ("tranche", "tranche_protect"):
             check("%s F7 flag off: buyback as before, no fault-lock file created" % modname, len(out) == 1 and not os.path.exists(gc._fault_lock_path(e)))
         finally:
             os.environ["AGT_GRAD_CYCLE_ENABLED"] = "1"
-        e = fresh(); eg.mandatory_entry_refusal = stub(None); old = gc._FAULT_LOCK_TIMEOUT_S; gc._FAULT_LOCK_TIMEOUT_S = 0.3
+        e = fresh(); eg.mandatory_entry_refusal = stub(None)
         started = threading.Event()
         def holder():
-            gc._FAULT_LOCK_TIMEOUT_S = 5.0
-            with gc._fault_lock(e): started.set(); time.sleep(1.2)
-        gc._FAULT_LOCK_TIMEOUT_S = 5.0
-        t = threading.Thread(target=holder, daemon=True); t.start(); assert started.wait(5); gc._FAULT_LOCK_TIMEOUT_S = 0.3
-        b = copy.deepcopy(e.d); out = m.maybe_buyback(e); t.join(5); gc._FAULT_LOCK_TIMEOUT_S = old
+            with gc._fault_lock(e): started.set(); time.sleep(1.5)                  # held PAST the buyback's own bounded wait (entry_guard.ENTRY_FAULT_WAIT_S, 0.5 s); the module-global 5 s retry window is NOT what bounds the buyback, so it is not patched
+        t = threading.Thread(target=holder, daemon=True); t.start(); assert started.wait(5)
+        b = copy.deepcopy(e.d); t0 = time.monotonic(); out = m.maybe_buyback(e); el = time.monotonic() - t0; t.join(5)
         with gc._fault_lock(e): freed = True
-        check("%s F8 fault lock held past the retry window: nothing written, failure logged, lock free afterwards" % modname, out == [] and e.d == b and e.writes == 0 and logged("buyback") and freed)
+        check("%s F8 fault lock held past the buyback's bounded wait (%.2fs, ENTRY_FAULT_WAIT_S=%s): nothing written, failure logged, lock free afterwards" % (modname, el, eg.ENTRY_FAULT_WAIT_S), out == [] and e.d == b and e.writes == 0 and logged("buyback") and freed and el < 1.2)
         e = fresh()
-        eg.commit_barrier = lambda engine: __import__("contextlib").nullcontext()
+        eg.commit_barrier = lambda engine, wait_s=None: __import__("contextlib").nullcontext()   # same 2-argument call shape production uses (engine, ENTRY_FAULT_WAIT_S)
         try: out, b = race(e)
         finally: eg.commit_barrier = real_barrier
         check("%s F9 SENSITIVITY: barrier removed -> the F4 scenario executes the buyback (the barrier is what refuses)" % modname, len(out) == 1 and e.d != b)

@@ -186,8 +186,8 @@ def main():
     # (1) NEGATIVE CONTROL that reaches the impact gate: freshness (pre-quote row), post-quote and account/lane checks pass, then the impact gate refuses
     T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
-    check("1 refused at the fail-closed impact gate (no positive buyback on the model-fill path)", done == [] and has_log("buyback blocked fail-closed"), repr((done, [m for m in LOGS if "buyback" in m][-2:])))
-    check("1 refusal reached the gate AFTER freshness/post-quote (those refusal strings were not logged)", not has_log("data age") and not has_log("quote request time unknown") and not has_log("post-quote"))
+    check("1 refused at the fail-closed impact gate (no positive buyback on the model-fill path)", done == [] and has_log("no Jupiter quote-impact measurement on the model-fill buyback path") and has_log("buyback blocked fail-closed"), repr((done, [m for m in LOGS if "buyback" in m][-2:])))
+    check("1 refusal reached the gate AFTER freshness/post-quote (those refusal strings were not logged)", not any(has_log(x) for x in ("data age", "quote request time unknown", "post-quote", "refused at commit", "shared paper account unavailable", "simulated-fill position", "no account lot id", "adoption lookup failed", "identity mismatch", "refused by account", "no open leg")), repr(LOGS[-6:]))
     check("1 both books untouched by the refusal (lane record equal, account snapshot equal)", lanepos() == lp0 and json.dumps(pa.snapshot(), sort_keys=True, default=str) == sn_a)
     # (2) NAMED FAULT: the account interface raises -> refusal, never a lane-only buyback
     real_pa = eng._paper_account
@@ -195,7 +195,7 @@ def main():
     eng._paper_account = _boom; T._LAST_BUYBACK_CHECK = 0.0
     done = T.maybe_buyback(eng, time.time())
     eng._paper_account = real_pa
-    check("2 injected account fault: no buyback, lane record unchanged, no lane-only path", done == [] and lanepos() == lp0 and has_log("tranche buyback") , repr(done))
+    check("2 injected account fault: no buyback, lane record unchanged, no lane-only path", done == [] and lanepos() == lp0 and has_log("shared paper account unavailable") and not has_log("ADOPTING"), repr((done, LOGS[-3:])))
     # (3) CRASH ADOPTION: the real account applied the add (engineering numbers, labelled) but the lane book was never written
     cost, bought = 1.0, 40000.0
     bop = "%s:buyback:%s:%s" % (eng.LANE, mint, pid)
@@ -240,7 +240,11 @@ def main():
     check("4 _close_remaining HELD with the visible flag, returned 0", r2 == 0.0 and pe2.get("why") == "legacy_unreconciled_buyback", repr(pe2))
     after_leg = copy.deepcopy(leg); after_leg.pop("pending_exit", None)
     check("4 nothing else mutated (lane fields equal apart from pending_exit; account snapshot equal)", after_leg == before_leg and json.dumps(pa.snapshot(), sort_keys=True, default=str) == sn_c)
-    say("INFO", "NOT COVERED (labelled): a positive model-fill buyback (blocked by design until a real Jupiter quote-impact measure exists), exits/close lifecycle after a buyback (Jupiter marks unrecorded), sim-fill positions, entry path.")
+    # (4b) a PRE-EXISTING pending_exit reason is preserved (not overwritten) by the legacy hold; no repair
+    leg3 = copy.deepcopy(before_leg); leg3["pending_exit"] = {"leg": "b", "why": "account_remaining_qty_mismatch", "ts": 1.0}
+    r3 = eng._close_leg(leg3, "b", px, "engineering-test"); r4 = eng._close_remaining(copy.deepcopy(leg3), px, "engineering-test")
+    check("4b legacy hold keeps an existing pending_exit reason (not overwritten), returns 0, nothing else changed", r3 == 0.0 and r4 == 0.0 and leg3["pending_exit"] == {"leg": "b", "why": "account_remaining_qty_mismatch", "ts": 1.0} and {k: v for k, v in leg3.items() if k != "pending_exit"} == {k: v for k, v in before_leg.items() if k != "pending_exit"}, repr(leg3.get("pending_exit")))
+    say("INFO", "NOT COVERED (labelled): the pre-fire adoption lookup fault (applied_add raising), quote_age(None), the account refusal paths of add_to_position on the real engine, a positive model-fill buyback (blocked by design until a real Jupiter quote-impact measure exists), exits/close lifecycle after a buyback (Jupiter marks unrecorded), sim-fill positions, entry path.")
     say("INFO", "unrecorded-request count (raised/None, never faked)=%d hosts=%s" % (len(unrecorded), sorted(set(unrecorded))))
     say("INFO", "limits = TEST-ENGINEERING fixture (not policy); replay clock = capture t0 + elapsed; seeded state SCENARIO-DERIVED")
     print("SUMMARY PASS=%d FAIL=%d INFO=%d" % (RES["PASS"], RES["FAIL"], RES["INFO"]))

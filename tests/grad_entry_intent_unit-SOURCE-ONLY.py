@@ -127,10 +127,15 @@ for i in range(M.MAX_PER_PASS + 2):
     r = mkrec(op_id="grad:entry:%s:%d:1" % (MINT, i), pos=dict(mkpos(), execution={"entry_op": "grad:entry:%s:%d:1" % (MINT, i)})); M.write_record(Lb, r)
 cb = Cb({"ok": False, "why": "x"}); why, acts = run(Lb, cb)
 check("recover_pass: backlog beyond the per-pass bound keeps entries blocked, records kept", why is not None and len(M.scan(Lb)[0]) == M.MAX_PER_PASS + 2)
-Ld = home(); os.makedirs(M.records_dir(Ld)); os.chmod(M.records_dir(Ld), 0)
+Ld = home(); os.makedirs(M.records_dir(Ld))
+_real_ld = os.listdir
+def _deny(path=".", *a, **k):
+    if str(path) == M.records_dir(Ld): raise PermissionError("simulated unreadable entry-intent directory")
+    return _real_ld(path, *a, **k)
+M.os.listdir = _deny
 try:
     why, acts = run(Ld, Cb(ev()))
-finally: os.chmod(M.records_dir(Ld), 0o700)
+finally: M.os.listdir = _real_ld
 check("recover_pass: unreadable directory blocks entries (state unknown)", why is not None and "unreadable" in why)
 cb = Cb(ev()); cb.read_lane = lambda: (_ for _ in ()).throw(RuntimeError("lane read boom")); Lr = home(); M.write_record(Lr, R); why, acts = run(Lr, cb)
 check("recover_pass: an internal failure is a BLOCK reason, never an exception to the caller", why is not None)

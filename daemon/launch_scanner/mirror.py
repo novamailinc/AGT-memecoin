@@ -38,6 +38,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 import urllib.request
 
@@ -396,13 +397,20 @@ def _recover_close_intents():
             _pa = _paper_account()
             if _pa is None:
                 return False, "paper account disabled"
+            if not (isinstance(op.get("mint"), str) and op.get("mint") and isinstance(op.get("pos_id"), str) and op.get("pos_id")
+                    and isinstance(op.get("op_id"), str) and op.get("op_id")):
+                return False, "recorded op lacks mint/pos_id/op_id, NOT applied"
             if op.get("kind") == "write_down":
+                if not (isinstance(op.get("reason"), str) and op.get("reason").strip()):
+                    return False, "recorded write_down op has no recorded reason, NOT applied (no reason is invented)"
                 ok, why = _pa.write_down(
                     lane, op.get("mint"), op.get("op_id"),
                     pos_id=op.get("pos_id"), qty=op.get("qty"),
-                    reason=op.get("reason") or "recovered")
+                    reason=op.get("reason"))
+            elif op.get("kind") != "credit":
+                return False, "recorded op kind %r is not supported, NOT applied" % (op.get("kind"),)
             else:
-                _dw = _op_defects(op, {"closed_reason": "n/a"}, None)   # amount/fee/qty/price_kind only: the close reason is judged with the intent
+                _dw = _op_defects(op, None, None, need_reason=False)   # amount/fee/qty/price_kind only: the close reason is judged with the intent by the gate
                 if _dw:
                     return False, "recorded credit op unusable, NOT applied: " + _dw
                 ok, why = _pa.credit(
@@ -432,25 +440,28 @@ def _recover_close_intents():
                 return None
             return False
 
-        # PRE-APPLY VALIDATION: shared recovery applies a recorded credit to the account BEFORE the lane could look at it, so a defective recorded
-        # op (amount/fee/qty/price_kind/close reason) would mutate the simulated account first and be frozen only afterwards. Judge the DURABLE
-        # records first; an unusable one is frozen and entries blocked, and recover_lane (which would apply ops) is NOT run for this lane.
-        _un = _pending_unusable(lane)
-        if _un:
-            for _iid, _w in _un:
-                logger.error("mirror %s: pending intent %s has an unusable recorded op (%s): NOT applied to the account, freezing, ENTRIES BLOCKED", lane, _iid, _w)
-                _fzok = False
-                try:
-                    if _iid:
-                        _fzok = bool(_ci.freeze(lane, _iid, "unusable recorded op: " + _w))   # best effort; the block below does not depend on this write
-                except Exception:
-                    logger.exception("mirror %s: could not freeze intent %s", lane, _iid)
-                if not _fzok:
-                    logger.error("mirror %s: freeze event for %s NOT written; entries stay blocked from the durable record alone", lane, _iid)
-            frozen = [str(i or "unreadable-pending") for i, _w in _un]
+        # PRE-APPLY GATE (bb53): judge every pending intent of this lane from durable data BEFORE shared recovery can apply any op. Identified invalid
+        # intents are frozen (valid siblings still converge); a hold-class finding blocks entries and leaves recovery for the lane unrun (nothing mutated).
+        _holds, _bad = _gate_lane(lane, _ci)
+        _fzfail = False
+        for _iid, _w in _bad:
+            logger.error("mirror %s: pending intent %s rejected by the gate (%s): NOT applied to the account, freezing, ENTRIES BLOCKED", lane, _iid, _w)
+            _fzok = False
+            try:
+                if _iid:
+                    _fzok = bool(_ci.freeze(lane, _iid, "gate: " + _w))
+            except Exception:
+                logger.exception("mirror %s: could not freeze intent %s", lane, _iid)
+            if not _fzok:
+                _fzfail = True
+                logger.error("mirror %s: freeze event for %s NOT written; entries stay blocked and shared recovery is NOT run for this lane", lane, _iid)
+        for _iid, _w in _holds:
+            logger.error("mirror %s: HOLD (nothing appended, nothing applied) intent %s: %s ENTRIES BLOCKED", lane, _iid, _w)
+        _gated = [str(i or "unreadable-pending") for i, _w in _bad] + [str(i or "unreadable-pending") for i, _w in _holds]
+        if _holds or _fzfail:
+            frozen = _gated
         else:
-            frozen = _ci.recover_lane(lane, account_apply, lane_has_close,
-                                      lane_apply)
+            frozen = list(_ci.recover_lane(lane, account_apply, lane_has_close, lane_apply) or []) + _gated
         if frozen:
             _ENTRY_BLOCKED = True
             logger.error("mirror %s: %d close intent(s) FROZEN - ledgers "
@@ -1140,7 +1151,7 @@ def _recorded_credit_op(pos, suffix):
     return None
 
 
-def _op_defects(op, close_info, qty, suffix=None):
+def _op_defects(op, close_info, qty, suffix=None, need_reason=True):
     """Why a RECORDED pending credit op cannot be settled (None = usable). Pure check of durable data: non-finite/negative amount or fee, a qty that is
     not exactly the exit qty (when qty is given), a missing price_kind, a missing close reason. Used at the retry, by restart recognition and
     BEFORE shared recovery applies the op to the account."""
@@ -1154,7 +1165,7 @@ def _op_defects(op, close_info, qty, suffix=None):
         return "recorded qty %r is not exactly the exit qty %r" % (op.get("qty"), qty)
     if not op.get("price_kind"):
         return "price_kind not recorded"
-    if not (close_info or {}).get("closed_reason"):
+    if need_reason and not (close_info or {}).get("closed_reason"):
         return "close reason not recorded"
     return None
 
@@ -1194,6 +1205,162 @@ def _pending_unusable(lane):
         logger.exception("mirror %s: pending-intent recognition failed", lane)
         out.append((None, "pending-intent recognition raised: blocking fail-closed"))
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# PRE-APPLY GATE (bb53, MIRROR LANE ONLY; the other lanes and shared close_intents are NOT changed). One lane-side owner. Before shared recovery
+# applies ANY op of ANY pending intent of this lane, every pending intent is judged from DURABLE data with READ-ONLY readers:
+#   freeze  = identified invalid intent (field/identity defect, unsupported/missing kind, op id not exactly the expected id, lane cannot identify the
+#             position instance): journal freeze, entries blocked, NO account op of that intent is applied. Valid siblings still converge.
+#   hold    = non-mutating: mint/pos_id missing (unidentifiable, never wildcard-matched), ledger missing/unreadable/corrupt, account-marker versus
+#             account-outcome inconsistency, recognition raised. Nothing is appended or applied, entries blocked, shared recovery is NOT run for the lane.
+# No compensation, no liquidation, no ledger rewrite, no legacy migration and no economic policy is chosen here.
+_GATE_STATS = {"ok": 0, "freeze": 0, "hold": 0}
+_GATE_LEG = ("leg:a", "leg:b", "leg:c")
+
+
+def _read_status():
+    """READ-ONLY ledger read with an EXPLICIT status (data, status): ok | missing | unreadable | corrupt. Never substitutes an empty ledger, takes no
+    lock, creates and writes nothing. (The bare _read above keeps its empty fallback for the writers; an empty fallback is NOT evidence of absence.)"""
+    try:
+        with open(LEDGER_PATH) as _f:
+            _raw = _f.read()
+    except FileNotFoundError:
+        return None, "missing"
+    except Exception:
+        return None, "unreadable"
+    try:
+        _d = json.loads(_raw)
+    except Exception:
+        return None, "corrupt"
+    if not (isinstance(_d, dict) and isinstance(_d.get("positions", {}), dict) and isinstance(_d.get("closes", []), list)):
+        return None, "corrupt"
+    return _d, "ok"
+
+
+def _expected_op_id(lane, kind, suffix, mint, pid):
+    """The exact op id the lane writes for this kind (see _pa_settle / _pa_write_down): built from intent fields, never parsed. None = unsupported."""
+    if kind == "credit" and (suffix in _GATE_LEG or (isinstance(suffix, str) and re.match(r"^remaining:[abc]{1,3}$", suffix))):
+        return "%s:%s:%s:%s" % (lane, suffix, mint, pid)
+    if kind == "write_down":
+        return "%s:writedown:%s:%s" % (lane, mint, pid)
+    return None
+
+
+def _identify_instance(d, lane, mint, pid):
+    """PURE instance evidence from an ok ledger dict: 'open_same' (open position of this lane/mint with exactly this pa_pos_id), 'closed_same' (a lane close
+    record carrying exactly this pa_pos_id and mint; a full close proves the instance, whichever leg op is outstanding), else None. Never matches on a
+    missing id. The close list is capped (MAX_CLOSES): absence of a close record is not proof the instance never existed, it only means THIS lane cannot identify it."""
+    if not (isinstance(mint, str) and mint and isinstance(pid, str) and pid):
+        return None
+    _p = (d.get("positions") or {}).get(mint)
+    if isinstance(_p, dict) and _p.get("pa_pos_id") == pid and _p.get("lane", lane) == lane:
+        return "open_same"
+    for _r in (d.get("closes") or []):
+        if isinstance(_r, dict) and _r.get("pa_pos_id") == pid and _r.get("mint") == mint and _r.get("lane", lane) == lane:
+            return "closed_same"
+    return None
+
+
+def _outcome_diag(op_ids):
+    """Account evidence per op id (read-only): credited | orphan | unknown. 'unknown' means no applied/orphan record was FOUND (not applied, a hard refusal,
+    or an unreadable account journal): op_outcome cannot tell those apart, so it is never reported as proof of 'not applied'."""
+    _pa = _paper_account()
+    out = {}
+    for _o in op_ids:
+        try:
+            _r = _pa.op_outcome(_o) if _pa is not None else "unknown"
+        except Exception:
+            _r = "unknown"
+        out[_o] = {"applied": "credited", "orphan": "orphan"}.get(_r, "unknown")
+    return out
+
+
+def _gate_intent(lane, it, d, status):
+    """-> (verdict, why, diag) for one pending intent; verdict ok | freeze | hold. READ-ONLY."""
+    _int = it.get("intent") if isinstance(it.get("intent"), dict) else None
+    if _int is None:
+        return "hold", "intent record unreadable", {}
+    mint = _int.get("mint"); pid = _int.get("pos_id")
+    if not (isinstance(mint, str) and mint and isinstance(pid, str) and pid):
+        return "hold", "mint/pos_id missing: position unidentifiable (no wildcard match, nothing applied, no automatic migration)", {}
+    if _int.get("lane") != lane:
+        return "freeze", "intent lane %r is not this lane" % (_int.get("lane"),), {}
+    if not pid.startswith("%s/%s#" % (lane, mint)):
+        return "freeze", "pos_id %r is not an account instance of %s/%s" % (pid, lane, mint), {}
+    _ops = _int.get("settle_ops")
+    if not (isinstance(_ops, list) and _ops):
+        return "freeze", "settle_ops missing or empty", {}
+    _suffix = (_int.get("close_info") or {}).get("leg_suffix") if isinstance(_int.get("close_info"), dict) else None
+    _seen = set(); _probs = []
+    for _i, _op in enumerate(_ops):
+        if not isinstance(_op, dict):
+            _probs.append("op[%d] is not a record" % _i); continue
+        _k = _op.get("kind")
+        _exp = _expected_op_id(lane, _k, _suffix, mint, pid)
+        if _exp is None:
+            _probs.append("op[%d] kind %r (leg suffix %r) is missing or unsupported" % (_i, _k, _suffix)); continue
+        if _op.get("op_id") != _exp:
+            _probs.append("op[%d] op_id %r is not the expected %r" % (_i, _op.get("op_id"), _exp))
+        if _op.get("op_id") in _seen:
+            _probs.append("op[%d] duplicate op_id" % _i)
+        _seen.add(_op.get("op_id"))
+        if _op.get("mint") != mint or _op.get("pos_id") != pid:
+            _probs.append("op[%d] mint/pos_id %r/%r differ from the intent %r/%r" % (_i, _op.get("mint"), _op.get("pos_id"), mint, pid))
+        if _k == "credit":
+            _w = _op_defects(_op, _int.get("close_info"), None)
+            if _w:
+                _probs.append("op[%d] %s" % (_i, _w))
+        elif _k == "write_down":
+            if not (isinstance(_op.get("reason"), str) and _op.get("reason").strip()):
+                _probs.append("op[%d] write_down has no recorded reason" % _i)
+    _ids = [o.get("op_id") for o in _ops if isinstance(o, dict) and isinstance(o.get("op_id"), str)]
+    _diag = _outcome_diag(_ids)
+    _dtxt = ", ".join("%s=%s" % (k, v) for k, v in sorted(_diag.items())) or "no op ids"
+    if _probs:
+        return "freeze", "invalid recorded intent, NOTHING of it applied: %s [account evidence: %s]" % ("; ".join(_probs), _dtxt), _diag
+    if status != "ok":
+        return "hold", "lane ledger %s: position instance cannot be judged (a missing/unreadable ledger is NOT an empty ledger) [account evidence: %s]" % (status, _dtxt), _diag
+    _inst = _identify_instance(d, lane, mint, pid)
+    if _inst is None:
+        return "freeze", "lane cannot identify this position instance %s (absent or another instance): NOT applied by this gate [account evidence: %s]" % (pid, _dtxt), _diag
+    if it.get("account_applied") and any(v == "unknown" for v in _diag.values()):
+        return "hold", "account_applied marker present but account outcome not proven (%s): marker and outcome disagree" % _dtxt, _diag
+    if not it.get("account_applied") and any(v == "credited" for v in _diag.values()):
+        logger.warning("mirror %s: intent %s credit-before-mark: account evidence %s, instance %s identified; converges by marker only (idempotent op ids)", lane, it.get("intent_id"), _dtxt, _inst)
+    return "ok", "instance %s identified [account evidence: %s]" % (_inst, _dtxt), _diag
+
+
+def _gate_lane(lane, _ci):
+    """-> (holds, bad): holds = [(intent_id|None, why)] non-mutating; bad = [(intent_id, why)] to freeze. READ-ONLY."""
+    holds, bad = [], []
+    try:
+        _pend = _ci.pending(lane)
+    except Exception as _e:
+        return [(None, "pending journal read raised %r" % (_e,))], []
+    if not _pend:
+        return holds, bad
+    _d, _st = _read_status()
+    _seen = set()
+    for _it in _pend:
+        _iid = _it.get("intent_id")
+        try:
+            _v, _w, _dg = _gate_intent(lane, _it, _d, _st)
+        except Exception as _e:
+            _v, _w = "hold", "gate raised %r" % (_e,)
+        _GATE_STATS[_v] += 1
+        logger.error("mirror %s: GATE verdict=%s intent=%s: %s", lane, _v, _iid, _w) if _v != "ok" else logger.info("mirror %s: GATE verdict=ok intent=%s: %s", lane, _iid, _w)
+        if _v == "hold":
+            holds.append((_iid, _w))
+        elif _v == "freeze":
+            bad.append((_iid, _w)); _seen.add(_iid)
+    for _iid, _w in _pending_unusable(lane):   # qty-versus-position and other defects of the existing recognition (judged from the same durable data)
+        if _iid is None:
+            holds.append((None, _w))
+        elif _iid not in _seen:
+            bad.append((_iid, "unusable recorded op: " + _w)); _seen.add(_iid)
+            _GATE_STATS["freeze"] += 1
+    return holds, bad
 
 
 def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):

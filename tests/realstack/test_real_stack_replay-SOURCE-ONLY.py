@@ -133,26 +133,35 @@ def main():
     check("precondition: real quote path returns a price from captured bodies", px and px > 0, "px=%r unrecorded=%d" % (px, len(unrecorded)))
     if not (px and px > 0):
         print("NOT RUN: no quote from capture"); return 3
-    stake, entry = 25.0, px * 0.9
+    # INTEGRATION FACT (diagnostic, not an assertion, not a stake choice): the tranche lane's own stake constant vs the shared account cash.
+    okx, whyx, _ = pa.try_debit(eng.LANE, "RSFACT25pump", float(T.NOTIONAL_USD), 1.0, "rs:fact:lane-stake")
+    say("INFO", "INTEGRATION FACT: lane stake constant $%.2f vs shared account start cash $%.2f -> real try_debit at the lane stake: ok=%s why=%r"
+        % (float(T.NOTIONAL_USD), float(pa.start_balance()), okx, whyx))
+    # ENGINEERING SEED (labelled): stake $2.00 fits the shared $10 cash; it is NOT an operating stake choice.
+    # entry is set so the REAL captured quote sits above leg A/B targets (mult = 1.05 x LEG_B_TARGET) and the peak is
+    # px/0.6 so the real quote is a >=30% retrace from peak (buyback condition and leg-C trail both see real data).
+    stake = 2.0
+    entry = px / (1.05 * float(T.LEG_B_TARGET))
     tokens = stake / entry
     ok, why, pid = pa.try_debit(eng.LANE, mint, stake, tokens, "rs:seed:open")
     check("precondition: real try_debit seeds the shared-account position", ok is True, repr((ok, why)))
     legqty = T.LEG_A_FRAC * tokens
-    gross = round(legqty * px * 1.5, 6)
+    peak = px / 0.6
+    gross = round(legqty * peak, 6)   # FIXTURE: leg A banked at the seeded peak; proceeds cover the buyback cost as the rule requires
     okc, whyc = pa.credit(eng.LANE, mint, gross, "rs:seed:legA", pos_id=pid, qty=legqty, fee=0.0,
                           price_kind="current_price_simulated_fill")   # the spendable kind a real sim leg credits with
     check("precondition: real credit of leg A", okc is True, repr((okc, whyc)))
     d = eng._read()
     d["positions"][mint] = {"mint": mint, "symbol": "RS", "chain": "solana", "lane": eng.LANE, "status": "open",
-        "entry_ts": time.time(), "entry_price": entry, "quoted_price": entry, "peak_price": px * 2.0, "notional_usd": stake,
+        "entry_ts": time.time(), "entry_price": entry, "quoted_price": entry, "peak_price": px / 0.6, "notional_usd": stake,
         "tokens": tokens, "realized_usd": gross, "pa_pos_id": pid, "tranche_credit": True,
         "tranche_credited": {"net": gross, "qty": legqty}, "gas_in_usd": 0.0,
-        "legs": {"a": {"frac": T.LEG_A_FRAC, "target": T.LEG_A_TARGET, "done": True, "exit_price": px, "realized_usd": gross},
+        "legs": {"a": {"frac": T.LEG_A_FRAC, "target": T.LEG_A_TARGET, "done": True, "exit_price": peak, "realized_usd": gross},
                  "b": {"frac": T.LEG_B_FRAC, "target": T.LEG_B_TARGET, "done": False, "exit_price": 0, "realized_usd": 0},
-                 "c": {"frac": T.LEG_C_FRAC, "trail": T.LEG_C_TRAIL, "peak": px, "done": False, "exit_price": 0, "realized_usd": 0}},
+                 "c": {"frac": T.LEG_C_FRAC, "trail": T.LEG_C_TRAIL, "peak": peak, "done": False, "exit_price": 0, "realized_usd": 0}},
         "entry_snapshot": {"liquidity": 0}}
     eng._write(d)
-    say("INFO", "FIXTURE-SEEDED state: leg A done, peak=2x quote, entry=0.9x quote (not market-observed); everything else real")
+    say("INFO", "FIXTURE-SEEDED state: leg A done, peak=quote/0.6, entry=quote/(1.05*LEG_B_TARGET), stake $2.00 (not market-observed); everything else real")
     def acct_qty():
         sn = pa.snapshot()
         return (sum(float(x["qty"]) for l in sn["lanes"].values() for x in l["positions"] if x["mint"] == mint),
@@ -169,10 +178,38 @@ def main():
               "d_account=%.6f d_lane=%.6f" % (q1 - q0, t1 - t0))
         check("I2 no double use: spendable cash fell by the buyback cost", c1 <= c0 - cost + 1e-6, "dspendable=%.6f cost=%.6f" % (c1 - c0, cost))
         check("I3 conservation: account book_value unchanged", abs(bv1 - bv0) <= 1e-6, "dbook=%.6f" % (bv1 - bv0))
+    # ---- I4 lifecycle (diagnostics collected, never an early exit before this point). Real poll_exits with the engine's own quote path
+    # (captured bodies, no price_fn override). If exits cannot progress with recorded inputs, I4 is reported NOT RUN, never stubbed.
+    if len(done) == 1:
+        closes_before = len(eng._read().get("closes") or [])
+        for _ in range(3):
+            try:
+                eng.poll_exits()
+            except Exception as e:
+                say("INFO", "poll_exits raised %s" % type(e).__name__)
+        d4 = eng._read(); pos4 = d4["positions"].get(mint); closes4 = d4.get("closes") or []
+        sn = pa.snapshot()
+        accopen = [x for l in sn["lanes"].values() for x in l["positions"] if x["mint"] == mint]
+        say("INFO", "I4 state: lane position present=%s pending_exit=%r legs_done=%r closes %d->%d ; account open lots for mint=%d qty=%s ; unrecorded=%d"
+            % (pos4 is not None, (pos4 or {}).get("pending_exit"), {k: v.get("done") for k, v in ((pos4 or {}).get("legs") or {}).items()},
+               closes_before, len(closes4), len(accopen), [x["qty"] for x in accopen], len(unrecorded)))
+        if pos4 is None and len(closes4) > closes_before:
+            rec = closes4[-1]
+            start = float(pa.start_balance())
+            check("I4a account position fully closed (no open lot, qty 0)", not accopen, repr(accopen))
+            check("I4b lane has no pending_exit / settlement_pending after close", not rec.get("pending_exit") and not rec.get("settlement_pending"))
+            lane_pnl = float(rec.get("pnl_usd"))
+            acct_pnl = float(sn["realized_pnl"])
+            check("I4c account realized PnL == lane close PnL (1e-6)", abs(acct_pnl - lane_pnl) <= 1e-6, "account=%.6f lane=%.6f" % (acct_pnl, lane_pnl))
+            check("I4d final account cash == start + realized PnL (no cash created or lost)", abs(float(sn["cash"]) - (start + acct_pnl)) <= 1e-6,
+                  "cash=%.6f start+pnl=%.6f" % (float(sn["cash"]), start + acct_pnl))
+        else:
+            say("INFO", "I4 NOT RUN TO CLOSE: lane position still open or no close with recorded inputs (see I4 state line); not stubbed")
+            RES["NOTRUN"] = RES.get("NOTRUN", 0) + 1
     say("INFO", "unrecorded-request count (raised/None, never faked)=%d hosts=%s" % (len(unrecorded), sorted(set(unrecorded))))
     say("INFO", "limits = TEST-ENGINEERING fixture (not policy); replay clock = capture t0 + elapsed; ledger timestamps carry replay time")
-    print("SUMMARY PASS=%d FAIL=%d INFO=%d" % (RES["PASS"], RES["FAIL"], RES["INFO"]))
-    return 0 if RES["FAIL"] == 0 else 1
+    print("SUMMARY PASS=%d FAIL=%d INFO=%d I4_NOT_RUN=%d" % (RES["PASS"], RES["FAIL"], RES["INFO"], RES.get("NOTRUN", 0)))
+    return 1 if RES["FAIL"] else (3 if RES.get("NOTRUN") else 0)
 
 
 if __name__ == "__main__":

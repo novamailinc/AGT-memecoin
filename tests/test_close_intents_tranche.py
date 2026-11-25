@@ -378,9 +378,19 @@ for lane, mod, enter in DRIVERS:
     # A mid-file corrupt record makes history UNKNOWN: with an
     # incomplete intent outstanding, recovery must freeze it (no
     # re-application against suspect history) and block the entry.
+    # TEST EDIT (disclosed, BB38): healthy control so "torn blocks" is not vacuous because of a stale ghost freeze. On the clean journal (ghost cleared, orphan applied) there are
+    # NO frozen unapplied blockers, a fresh recovery pass does not block, and a normal entry is admitted BEFORE the corruption is introduced.
+    _e_h, _s_h, _t_h = CI._read(CI.journal_path(lane))
+    _succ_h = {e.get("supersedes") for e in _e_h if e.get("ev") == "intent" and e.get("supersedes")}
+    _blk_h = [i for i, x in CI._state(_e_h).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in _succ_h]
+    mod._RECOVERY_DONE = False
+    _blocked_h = mod._recover_close_intents()
+    check(PFX + "torn control: before any corruption no frozen blockers (%r) and recovery does not block (returned %r, flag %r, journal status %r)" % (_blk_h, _blocked_h, mod._ENTRY_BLOCKED, _s_h),
+          _blk_h == [] and _blocked_h is False and mod._ENTRY_BLOCKED is False and _s_h is None)
     mint = "Torn%s11111111111111111111111111111111" % lane
     opened, why, _f = enter(mint)
     check(PFX + "fixture: torn-test entry opened", opened)
+    check(PFX + "torn control: the healthy entry was admitted with entries not blocked (opened %r, why %r, flag %r)" % (opened, why, mod._ENTRY_BLOCKED), opened is True and mod._ENTRY_BLOCKED is False)
     jp = CI.journal_path(lane)
     CI.begin(lane, mint, "torn-pos-0",
              [{"kind": "credit", "op_id": "%s:leg:a:%s:torn-pos-0"

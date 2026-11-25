@@ -1,4 +1,7 @@
-"""REAL-STACK TRANCHE HARNESS (SOURCE ONLY, WRITTEN NOT RUN).
+"""REAL-STACK REPLAY HARNESS rev2 (SOURCE ONLY, WRITTEN NOT RUN). NO entry-path claim: safety/veto/filler inputs are not captured,
+so _consider_candidate is NOT driven here. Covers (1) real freshness guard functions on a REAL captured tape row with a TIGHT
+env cap, (2) buyback accounting ASSERTIONS on a fixture-seeded position through the real quote path and real account.
+Fixture items are labeled: seeded position/ledger state, TEST-ENGINEERING limits, tight test caps (not policy), replay clock.
 Real code: tranche.make_engine() (grad.py engine), real paper_account (scratch HOME), real entry_guard,
 real commit_barrier, real sources.py parsing. The ONLY substituted layer is the HTTP byte transport
 (sources._curl_bytes), which serves ACTUAL provider response bodies recorded by capture_public.py.
@@ -7,13 +10,14 @@ qualification. Limits used are TEST-ENGINEERING limits (tests/_guard_fixture.LIM
 Exit: 0 all checks pass; 1 a check failed; 3 NOT RUN (no/invalid real data or no qualifying candidate);
 4 setup refused. Exit 3 is never a pass.
 Usage: test_real_stack_replay-SOURCE-ONLY.py CAPTURE.jsonl"""
-import base64, hashlib, json, os, sys, tempfile, time, logging
+import base64, hashlib, io, json, os, sys, tempfile, time, logging
+import urllib.request
 from urllib.parse import urlsplit
 
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, "tests"))
-ALLOW = {"api.dexscreener.com", "api.geckoterminal.com", "price.jup.ag", "lite-api.jup.ag", "api.jup.ag"}
+ALLOW = {"api.dexscreener.com", "api.geckoterminal.com"}
 RES = {"PASS": 0, "FAIL": 0, "INFO": 0}
 
 
@@ -41,11 +45,13 @@ def load_capture(path):
         print("NOT RUN: header request count mismatch"); sys.exit(3)
     table = {}
     for r in recs:
+        if r.get("over_cap") or r.get("status") != 200:
+            continue    # recorded failure: kept as provenance, never served (the engine then sees None, as it did live)
         body = base64.b64decode(r["body_b64"])
         if hashlib.sha256(body).hexdigest() != r["body_sha256"]:
             print("NOT RUN: body hash mismatch for %s" % urlsplit(r["url"]).hostname); sys.exit(3)
-        if urlsplit(r["url"]).hostname not in ALLOW or r["status"] != 200:
-            print("NOT RUN: non-allowlisted host or non-200 record"); sys.exit(3)
+        if urlsplit(r["url"]).hostname not in ALLOW:
+            print("NOT RUN: non-allowlisted host record"); sys.exit(3)
         table.setdefault(r["url"], body)
     return h, table
 
@@ -54,109 +60,112 @@ def main():
     if len(sys.argv) != 2:
         print("usage: CAPTURE.jsonl"); return 4
     hdr, table = load_capture(sys.argv[1])
-    say("INFO", "provenance: head=%s providers=%s requests=%d t0_utc=%.0f data=REAL-CAPTURED-REPLAY"
-        % (hdr["repo_head"], ",".join(hdr["providers"]), hdr["n_requests"], hdr["t0_utc"]))
-    T0 = float(hdr["t0_utc"]); wall0 = time.time()
-    _real_time = time.time
+    say("INFO", "provenance: head=%s providers=%s requests=%d t0_utc=%.0f data=REAL-CAPTURED-REPLAY coverage=%s first-body-per-URL"
+        % (hdr["repo_head"], ",".join(hdr["providers"]), hdr["n_requests"], hdr["t0_utc"], hdr.get("coverage")))
+    T0 = float(hdr["t0_utc"]); wall0 = time.time(); _real_time = time.time
     unrecorded = []
-
-    # explicit replay clock: engine sees capture time + real elapsed. Gates and ages are NOT loosened.
-    time.time = lambda: T0 + (_real_time() - wall0)
+    time.time = lambda: T0 + (_real_time() - wall0)   # explicit replay clock (capture time + real elapsed); gates NOT touched
     import _guard_fixture as GF
     GF.block_network()
 
-    def fresh_env(enabled=True, gates=True, drop=None):
+    class _R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def serve(url):
+        if url in table:
+            return table[url]
+        unrecorded.append(urlsplit(url).hostname); return None
+
+    def urlopen_replay(req, data=None, timeout=None, **kw):
+        url = req if isinstance(req, str) else req.full_url
+        b = serve(url) if (data is None and (isinstance(req, str) or req.data is None)) else None
+        if b is None:
+            raise OSError("replay: URL not in capture (never fabricated)")
+        return _R(b)
+    urllib.request.urlopen = urlopen_replay
+
+    def fresh_env(extra=None):
         home = tempfile.mkdtemp(prefix="realstack-")
         os.environ["FOREX_AGENT_HOME"] = home
-        for k in [k for k in os.environ if k.startswith("PAPER_ACCOUNT_") or k.startswith("AGT_")]:
+        for k in [k for k in os.environ if k.startswith(("PAPER_ACCOUNT_", "AGT_"))]:
             del os.environ[k]
-        if enabled:
-            os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
-        if gates:
-            GF.set_env()
-        if drop:
-            os.environ.pop(drop, None)
-        for m in [m for m in sys.modules if m.startswith("daemon") or m in ("sources", "tranche", "grad", "paper_account", "entry_guard")]:
+        os.environ["PAPER_ACCOUNT_ENABLED"] = "1"; GF.set_env(); os.environ.update(extra or {})
+        for m in [m for m in sys.modules if m.startswith("daemon")]:
             del sys.modules[m]
         from daemon.launch_scanner import sources, tranche, paper_account as pa, entry_guard as eg
-
-        def replay(url, data=None, extra_headers=None, timeout=15):
-            if data is None and url in table:
-                return table[url]
-            unrecorded.append(urlsplit(url).hostname); return None
-        sources._curl_bytes = replay
+        sources._curl_bytes = lambda url, data=None, extra_headers=None, timeout=15: (serve(url) if data is None else None)
         return home, sources, tranche, pa, eg
 
-    def candidate(eng):
-        cs = eng.fetch_candidates()
-        for c in cs:
-            if eng.is_graduation_candidate(c, time.time()) is not None and c["mint"] in hdr["picked_mints"]:
-                return c
-        return None
+    mint = hdr["picked_mints"][0] if hdr.get("picked_mints") else None
+    if not mint:
+        print("NOT RUN: capture has no picked mint"); return 3
 
-    # ---- positive path
+    # ---- (1) freshness: real guard functions, REAL captured tape row, TIGHT test cap (30 s; test value, not policy)
+    home, S, T, pa, eg = fresh_env({"PAPER_ACCOUNT_MAX_DATA_AGE_S": "30"})
+    check("fixture note: tight test cap resolves to 30 (TEST value; min(env, owner) rule)", pa.max_data_age_s() == 30.0, repr(pa.max_data_age_s()))
+    row = (S.tape_batch_stats([mint], chain="solana") or {}).get(mint)
+    if not row:
+        print("NOT RUN: capture has no tape row for the picked mint"); return 3
+    base = float(row.get("source_asof") or row.get("fetched_at"))
+    say("INFO", "real tape row stamps: source_asof=%r fetched_at=%r received_at=%r tape_source=%r"
+        % (row.get("source_asof"), row.get("fetched_at"), row.get("received_at"), row.get("tape_source")))
+    check("fresh control: real row, now=base+5s, cap 30 -> None", eg.quote_age_refusal(row, pa.max_data_age_s(), base + 5.0) is None)
+    r = eg.quote_age_refusal(row, pa.max_data_age_s(), base + 100.0)
+    check("stale control: same real row, now=base+100s -> refused (age)", bool(r) and "exceeds max_data_age_s" in r, repr(r))
+    r = eg.quote_age_refusal(row, pa.max_data_age_s(), base - 50.0)
+    check("future-dated control -> refused", bool(r) and "future" in r, repr(r))
+    fill = {"provenance": {"quote_requested_at": base}}
+    check("post_quote fresh (now=base+5) -> None", eg.post_quote_refusal(fill, None, False, 30.0, base + 5.0) is None)
+    r = eg.post_quote_refusal(fill, None, False, 30.0, base + 100.0)
+    check("post_quote stale (now=base+100) -> refused", bool(r) and "exceeds" in r, repr(r))
+
+    # ---- (2) buyback accounting on a FIXTURE-SEEDED position, real quote path (captured bodies), real account.
+    # PREDECLARED rule R1 (lane-follow; derived from entry_guard comment "a buyback buys tokens: it is an entry" and
+    # unrouted_opener_refusal "every entry reserves through paper_account"; NOT yet confirmed by main/owner):
+    #   I1 account position qty after == before + (lane tokens after - lane tokens before)
+    #   I2 documented tranche.py rule: cash is NOT debited at buyback (settles at finalize); account cash unchanged. (tranche.py header, "Bookkeeping note")
+    # exit 1 here means a product finding UNDER R1 (not a harness gap), provided the preconditions below pass.
     home, S, T, pa, eg = fresh_env()
     eng = T.make_engine(); eng.ensure_ledger()
-    check("guard positive: mandatory_entry_refusal is None with account+gates+limits on",
-          eg.mandatory_entry_refusal(eng.LANE) is None)
-    cand = candidate(eng)
-    if cand is None:
-        print("NOT RUN: no qualifying real graduation candidate in capture"); return 3
-    before = pa.snapshot()
-    res = eng._consider_candidate(cand, time.time())
-    say("INFO", "positive entry result=%r" % (res,))
-    snap = pa.snapshot()
-    opened = bool(res and res[0] is True) if isinstance(res, tuple) else bool(res)
-    if not opened:
-        say("INFO", "entry refused by REAL path (reason above); reported, not forced")
-    check("positive: real entry opened and account cash debited by the stake", opened and snap and before and
-          float(snap["cash"]) < float(before["cash"]), "cash %s -> %s" % (before and before["cash"], snap and snap["cash"]))
-    d = eng._read(); pos = d["positions"].get(cand["mint"])
-    check("positive: lane position carries a shared-account pos id", bool(pos and pos.get("pa_pos_id")))
-
-    # ---- negative controls: same real candidate, each must reach the GUARD (reason text), not an earlier exit
-    cases = [("account not enabled", dict(enabled=False), "not enabled"),
-             ("gates off", dict(gates=False), "risk gates are off"),
-             ("drawdown limit unset", dict(drop="PAPER_ACCOUNT_MAX_DRAWDOWN_PCT"), "max_drawdown_pct")]
-    for name, kw, needle in cases:
-        h2, S2, T2, pa2, eg2 = fresh_env(**kw)
-        e2 = T2.make_engine(); e2.ensure_ledger()
-        c2 = candidate(e2)
-        r2 = e2._consider_candidate(c2, time.time()) if c2 else None
-        ok = isinstance(r2, tuple) and r2[0] is False and needle in str(r2[1]) and "mandatory entry guard" in str(r2[1])
-        check("negative control (%s): refused AT the guard" % name, ok, "result=%r" % (r2,))
-        s2 = pa2.snapshot()
-        check("negative control (%s): no position in lane ledger, no account debit" % name,
-              not e2._read()["positions"] and (s2 is None or not any(l["positions"] for l in s2["lanes"].values())))
-
-    # ---- scenario-derived probe (NOT market data): buyback vs shared account. INFO only, no assertion of design.
-    home, S, T, pa, eg = fresh_env()
-    eng = T.make_engine(); eng.ensure_ledger()
-    cand = candidate(eng)
-    r = eng._consider_candidate(cand, time.time()) if cand else None
-    pos = eng._read()["positions"].get(cand["mint"]) if cand else None
-    if not (pos and pos.get("pa_pos_id")):
-        say("INFO", "buyback probe not reached: no real entry (%r)" % (r,))
-    else:
-        pre = pa.snapshot()
-        d = eng._read(); p = d["positions"][cand["mint"]]
-        gross = round(0.25 * float(p["tokens"]) * float(p["entry_price"]) * 2.0, 6)
-        p["legs"]["a"].update(done=True, exit_price=2 * float(p["entry_price"]), realized_usd=gross)
-        p["realized_usd"] = gross; p["peak_price"] = 2.0 * float(p["entry_price"]) * 1.0
-        eng._write(d)
-        say("INFO", "SCENARIO-DERIVED ledger state (leg A marked done, peak=2x entry); real maybe_buyback follows")
-        T._LAST_BUYBACK_CHECK = 0.0
-        done = T.maybe_buyback(eng, time.time())
-        post = pa.snapshot(); lp = eng._read()["positions"].get(cand["mint"]) or {}
-        accpos = [x for l in (post or {"lanes": {}})["lanes"].values() for x in l["positions"] if x["mint"] == cand["mint"]]
-        say("INFO", "buyback executed=%d lane tokens=%s realized_usd=%s | account cash %s -> %s ; account qty=%s"
-            % (len(done), lp.get("tokens"), lp.get("realized_usd"), pre["cash"], post["cash"],
-               accpos[0]["qty"] if accpos else None))
-        if done:
-            say("INFO", "DISCREPANCY=%s (lane tokens vs account qty; account cash change vs buyback cost)"
-                % ("YES" if (accpos and abs(float(accpos[0]["qty"]) - float(lp.get("tokens") or 0)) > 1e-9)
-                   or post["cash"] == pre["cash"] else "NO"))
-    say("INFO", "unrecorded-request count (served None, never faked)=%d hosts=%s" % (len(unrecorded), sorted(set(unrecorded))))
+    px = eng.quote_price("solana", mint)
+    check("precondition: real quote path returns a price from captured bodies", px and px > 0, "px=%r unrecorded=%d" % (px, len(unrecorded)))
+    if not (px and px > 0):
+        print("NOT RUN: no quote from capture"); return 3
+    stake, entry = 25.0, px * 0.9
+    tokens = stake / entry
+    ok, why, pid = pa.try_debit(eng.LANE, mint, stake, tokens, "rs:seed:open")
+    check("precondition: real try_debit seeds the shared-account position", ok is True, repr((ok, why)))
+    legqty = T.LEG_A_FRAC * tokens
+    gross = round(legqty * px * 1.5, 6)
+    okc, whyc = pa.credit(eng.LANE, mint, gross, "rs:seed:legA", pos_id=pid, qty=legqty, fee=0.0)
+    check("precondition: real credit of leg A", okc is True, repr((okc, whyc)))
+    d = eng._read()
+    d["positions"][mint] = {"mint": mint, "symbol": "RS", "chain": "solana", "lane": eng.LANE, "status": "open",
+        "entry_ts": time.time(), "entry_price": entry, "quoted_price": entry, "peak_price": px * 2.0, "notional_usd": stake,
+        "tokens": tokens, "realized_usd": gross, "pa_pos_id": pid, "tranche_credit": True,
+        "tranche_credited": {"net": gross, "qty": legqty}, "gas_in_usd": 0.0,
+        "legs": {"a": {"frac": T.LEG_A_FRAC, "target": T.LEG_A_TARGET, "done": True, "exit_price": px, "realized_usd": gross},
+                 "b": {"frac": T.LEG_B_FRAC, "target": T.LEG_B_TARGET, "done": False, "exit_price": 0, "realized_usd": 0},
+                 "c": {"frac": T.LEG_C_FRAC, "trail": T.LEG_C_TRAIL, "peak": px, "done": False, "exit_price": 0, "realized_usd": 0}},
+        "entry_snapshot": {"liquidity": 0}}
+    eng._write(d)
+    say("INFO", "FIXTURE-SEEDED state: leg A done, peak=2x quote, entry=0.9x quote (not market-observed); everything else real")
+    def acct_qty():
+        sn = pa.snapshot()
+        return sum(float(x["qty"]) for l in sn["lanes"].values() for x in l["positions"] if x["mint"] == mint), float(sn["cash"])
+    q0, c0 = acct_qty(); t0 = float(eng._read()["positions"][mint]["tokens"])
+    T._LAST_BUYBACK_CHECK = 0.0
+    done = T.maybe_buyback(eng, time.time())
+    check("precondition: real maybe_buyback executed (so the invariants below are measured, not skipped)", len(done) == 1, repr(done))
+    if len(done) == 1:
+        q1, c1 = acct_qty(); t1 = float(eng._read()["positions"][mint]["tokens"])
+        say("INFO", "lane tokens %.6f -> %.6f ; account qty %.6f -> %.6f ; account cash %.6f -> %.6f" % (t0, t1, q0, q1, c0, c1))
+        check("I1 (R1) account qty follows lane tokens by the bought amount", abs((q1 - q0) - (t1 - t0)) <= 1e-6 * max(1.0, t1),
+              "d_account=%.6f d_lane=%.6f" % (q1 - q0, t1 - t0))
+        check("I2 (tranche.py documented rule) account cash unchanged at buyback", abs(c1 - c0) <= 1e-9, "dcash=%.9f" % (c1 - c0))
+    say("INFO", "unrecorded-request count (raised/None, never faked)=%d hosts=%s" % (len(unrecorded), sorted(set(unrecorded))))
+    say("INFO", "limits = TEST-ENGINEERING fixture (not policy); replay clock = capture t0 + elapsed; ledger timestamps carry replay time")
     print("SUMMARY PASS=%d FAIL=%d INFO=%d" % (RES["PASS"], RES["FAIL"], RES["INFO"]))
     return 0 if RES["FAIL"] == 0 else 1
 

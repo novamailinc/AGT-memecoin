@@ -887,6 +887,18 @@ def maybe_buyback(engine, now=None):
             if not fire:
                 continue
             with engine._ledger_lock():
+                # Commit-time mandatory entry gate INSIDE the ledger lock (a buyback buys tokens: it is an entry). Closes the window where a fault latched after any precheck. Fault files only, no lock taken. Refusal is visible; exits unaffected.
+                try:
+                    try:
+                        from daemon.launch_scanner import entry_guard as _eg
+                    except ImportError:
+                        import entry_guard as _eg
+                    _why = _eg.mandatory_entry_refusal(engine.LANE)
+                except Exception as _e:
+                    _why = "entry guard unavailable (%r)" % (_e,)
+                if _why:
+                    logger.warning("tranche buyback refused at commit: %s", _why)
+                    continue
                 d = engine._read()
                 live = d["positions"].get(mint)
                 if live is None or live.get("buyback_used"):

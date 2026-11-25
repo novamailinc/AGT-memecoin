@@ -1646,6 +1646,7 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         if rec is not None:
             if bool(rec.get("instance")) != instance:
                 return False, "op_id instance ownership conflict", None
+            _TL.debit = (op_id, rec["pos_id"], rec.get("account_id"))
             return True, "ok (retry of applied op)", rec["pos_id"]
         cash = float(led["cash"])
         spendable = float(led.get("cash_spendable", 0.0))
@@ -1701,6 +1702,8 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                   "cash_after": led["cash"],
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
+        # ATOMIC original identity: captured under the SAME lock hold that wrote the debit, before any later load can see a different generation.
+        _TL.debit = (op_id, pid, led.get("account_id"))
         return True, "ok", pid
 
 
@@ -2184,8 +2187,26 @@ def _generation_refusal(led, expected, entry_op_id, lane, mint, pos_id):
     return None
 
 
+_TL = threading.local()
+
+
+def debit_binding(op_id: str, pos_id: str) -> Optional[str]:
+    """The account_id recorded by THIS thread's most recent debit under the lock that wrote it (new debit or retry of an applied op), only
+    when op_id and pos_id match. No later re-read: a wiped/regenerated account cannot rebind an old position. None = unproven."""
+    rec = getattr(_TL, "debit", None)
+    if rec and rec[0] == op_id and rec[1] == pos_id and isinstance(rec[2], str) and rec[2]:
+        return rec[2]
+    return None
+
+
 def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Optional[str]:
-    """The account generation a just-debited position belongs to, read back under the account lock and ONLY when the exact entry op, pos_id,
+    """Binding for a position this thread just debited: the atomic debit-time capture only (no fallback re-read)."""
+    return debit_binding(entry_op_id, pos_id)
+
+
+def entry_binding_proof(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Optional[str]:
+    """RECOVERY-ONLY (adoption of a durable entry intent, no debit in this process): read-back proof of the generation under the lock. The
+    account generation a just-debited position belongs to, read back under the account lock and ONLY when the exact entry op, pos_id,
     lane/mint, the clean journal and the single create identity all prove it (the same proof settlement uses). A regenerated or rolled-back
     account cannot return a binding for an op it never held. None = unproven (the caller must treat the entry as an uncertain partial
     execution, never as bound)."""

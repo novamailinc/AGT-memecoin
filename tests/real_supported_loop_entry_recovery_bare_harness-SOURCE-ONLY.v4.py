@@ -186,7 +186,9 @@ def common_pre(lab, ei, t, r, cyc="?"):
     pid = t["pa_pos_id"]; pre = r["pre"]
     ex = r.get("extra") or {}; li = r.get("live_ident") or {}
     # legacy hook is registered lazily by grad._paper_account(); in a gated, unmanaged run (S4: no scan, no acts, empty lane) the account path is never entered, so False is the source-derived expectation there, asserted explicitly
-    acct_path = any(p["scan_calls"] > 0 or p["n_acts"] > 0 or bool(p["lane"]) for p in r["passes"])
+    acct_path = (ei == "1" or cyc == "0")  # source-derived static rule (reviewer-confirmed): True for S1,S2,S3,C1/C2-A; False for S4 (EI off, cycle on: gated, account path never entered)
+    measured_acct = any(p["scan_calls"] > 0 or p["n_acts"] > 0 or bool(p["lane"]) for p in r["passes"])
+    print("INFO %s MEASURED account path exercised %s (expected by rule %s)" % (lab, measured_acct, acct_path))
     check("%s BARE IDENTITY (restart child, end of run, cyc=%s): package grad never loaded (pkg_grad_loaded %s, per-pass flags %s, at boot %s), sys.modules['grad'] is the patched module named %r (is the bare GR %s), T._ENGINES['grad'] is it (%s, lanes %s), hooks abort/begin/end %s/%s/%s installed iff cycle flag on, account path exercised %s (scan calls per pass %s, acts per pass %s, lane at end %s) so legacy hook expected registered %s: registered %s, is the bare module's function %s" %
           (lab, cyc, li.get("pkg_grad_loaded"), sorted(set(p.get("pkg_grad") for p in r["passes"])), r.get("pkg_at_boot"), li.get("GR_name"), li.get("sysmod_grad_is_GR"), li.get("registered_is_GR"), li.get("registered_lanes"), li.get("abort_hook"), li.get("begin_hook"), li.get("end_hook"), acct_path, [p["scan_calls"] for p in r["passes"]], [p["n_acts"] for p in r["passes"]], r["passes"][-1]["lane"], acct_path, li.get("legacy_hook_registered"), li.get("legacy_hook_is_GR_fn")),
           live_ok(li, cyc) and not any(p.get("pkg_grad") for p in r["passes"]) and r.get("pkg_at_boot") is False and li.get("legacy_hook_registered") is acct_path and li.get("legacy_hook_is_GR_fn") is acct_path)

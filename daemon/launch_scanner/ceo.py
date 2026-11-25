@@ -281,11 +281,6 @@ def _recover_close_intents():
                 if not _fzok:
                     logger.error("ceo: freeze event for %s NOT written; entries stay blocked from the durable record alone", _iid)
             frozen = [str(i or "unreadable-pending") for i, _w in _un]
-    if not frozen:
-        try:
-            frozen = _ci.frozen_open(LANE)   # a frozen, unsuperseded intent keeps entries blocked across restarts
-        except Exception:
-            frozen = [_ci.JOURNAL_CORRUPT_PREFIX + LANE]
     if frozen:
         _ENTRY_BLOCKED = True
         logger.error("ceo: %d close intent(s) FROZEN - ledgers "

@@ -102,6 +102,11 @@ def child_run(point):
     C.poll_exits(price_fn=pf_mult(KILL_MULT))
     print("CHILD SURVIVED point=%s (kill point not reached)" % point, flush=True); sys.exit(7)
 
+def _frozen_open_n():
+    ents, st, _t = CI._read(CI.journal_path("ceo"))
+    if st == "torn": return 0
+    succ = {e.get("supersedes") for e in ents if e.get("ev") == "intent" and e.get("supersedes")}
+    return len([i for i, x in CI._state(ents).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in succ])
 HITS = {"n": 0}
 FZC = {"n": 0}
 LOGS = []
@@ -170,7 +175,7 @@ def child_recover(mult, inject=None, try_entry=None):
            "pending": len(CI.pending("ceo")), "journal_status": st, "ev": [e.get("ev") for e in ents if e.get("intent_id")],
            "n_intents": len([e for e in ents if e.get("ev") == "intent"]), "pend_why": (pos.get("pending_exit") or {}).get("why"),
            "n_pos": len(C.open_positions() or {}), "hits": HITS["n"], "guard_logs": len(guard),
-           "frozen_open": len(CI.frozen_open("ceo")), "freeze_calls": FZC["n"], "rec_logs": len([m for m in LOGS if "has an unusable recorded op" in m]), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
+           "frozen_open": _frozen_open_n(), "freeze_calls": FZC["n"], "rec_logs": len([m for m in LOGS if "has an unusable recorded op" in m]), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
            "n_pos_all": len(C.open_positions() or {}), "entry_first": et_first,
            "fz_logs": len([m for m in LOGS if "freeze event for" in m or "freeze event was NOT written" in m])}
     print("RESULT " + _json.dumps(res), flush=True)

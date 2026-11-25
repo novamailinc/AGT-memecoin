@@ -2473,6 +2473,36 @@ def _registry_view():
     return pr + [e for e in mr if json.dumps(e, sort_keys=True) not in seen], "ok"
 
 
+def _mirror_sync():
+    """Make the MIRROR contain every complete record of the PRIMARY (append-only, order kept, de-duplicated by exact line). Runs under the mirror lock and re-reads
+    both copies INSIDE it, so it never acts on a stale snapshot and never overwrites records another registrant just wrote. Lock order: the primary lock is never held
+    here (no nesting, no deadlock). Does nothing when the primary is missing/corrupt (a lost primary is evidence, never rebuilt from the mirror) or the mirror is
+    corrupt mid-file (not repaired by code). Returns True when the mirror holds all primary records afterwards."""
+    pri, mir = _registry_paths()
+    try:
+        os.makedirs(os.path.dirname(mir), exist_ok=True)
+        with _reg_lock(mir):
+            pr, ps = _registry_read(pri)
+            if ps not in ("ok", "torn_tail"):
+                return False
+            mr, ms = _registry_read(mir)
+            if ms == "corrupt":
+                return False
+            have = {json.dumps(e, sort_keys=True) for e in mr}
+            missing = [e for e in pr if json.dumps(e, sort_keys=True) not in have]
+            if missing:
+                _nl_fix(mir)
+                fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.write(fd, "".join(json.dumps(e, sort_keys=True) + "\n" for e in missing).encode()); os.fsync(fd)
+                finally:
+                    os.close(fd)
+            return True
+    except Exception:
+        logger.exception("paper_account: lane registry mirror sync failed")
+        return False
+
+
 def _registry_append(rec):
     """Append-only, fsync'd primary in the account directory, then a mirror in the PARENT directory. Returns True when the PRIMARY is durable. The mirror is a
     second witness that the registry once existed; both on one filesystem, so whole-filesystem loss is not detectable from inside (see restart_admission_blockers)."""
@@ -2489,15 +2519,7 @@ def _registry_append(rec):
     except Exception:
         logger.exception("paper_account: could not write the lane registry")
         return False
-    try:
-        with _reg_lock(mir):
-            fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            try:
-                os.write(fd, _nl_fix(mir) + line); os.fsync(fd)
-            finally:
-                os.close(fd)
-    except Exception:
-        logger.exception("paper_account: could not write the lane registry mirror")
+    _mirror_sync()   # copies THIS record and any earlier primary record the mirror lacks (a missing/lagging mirror is never left with only the newest record)
     return True
 
 
@@ -2547,16 +2569,7 @@ def _registry_blockers():
         return ["lane registry lost (its mirror remains)"]
     if vst == "empty":
         return []
-    if _registry_read(mir)[1] == "missing":
-        pr = _registry_read(pri)[0]
-        try:
-            with _reg_lock(mir):
-                if not os.path.exists(mir):   # re-checked under the mirror lock: never overwrite a copy a concurrent registrant just created
-                    with open(mir, "a") as f:    # repair a missing mirror FROM the primary's own complete records
-                        for e in pr: f.write(json.dumps(e, sort_keys=True) + "\n")
-                        f.flush(); os.fsync(f.fileno())
-        except OSError:
-            pass
+    _mirror_sync()
     lanes, _ids = _registry_fold(recs)
     _led, _lst = _ledger_file_status(LEDGER_PATH)
     if _lst == "ok" and isinstance(_led.get("account_id"), str) and _led["account_id"] and _led["account_id"] not in _ids:

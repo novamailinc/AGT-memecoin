@@ -6,7 +6,7 @@ L4 account ledger+WAL+registry deleted but a bound lane position remains = block
 L6 corrupt registry blocks; L7 lane ledger lost while the account holds lots blocks at account level; L8 position bound to the wrong entry op blocks; L9 an orphan account lot
 (no lane position) blocks the lane restart; L10 the real close_intents.begin registers its journal and its later loss blocks at account level; L11 generation mismatch blocks
 at ACCOUNT level (a lane that never called its own check); L12 FRESH PROCESS: account admission refuses on persisted evidence alone, and a fresh process on matching state
-admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses; L19 register-after-primary-loss refuses and the mirror keeps both lanes; L20 torn registry tail tolerated and repaired; L21 a torn intent-journal tail is never read as clean; L22 registry lock serialises appends (blocked while held, mutant sensitivity); L23 six concurrent registrants on a torn tail keep every record.
+admits; L13 the marker latch survives marker deletion and a journal read failure in-process; L14 MUTANT (registry check disabled) admits L11 so it is sensitive; L15 static wiring; L16 an account generation created after lane registration is recorded as a witness (ledger+WAL loss then = state-lost); L17 real begin+freeze: pending alone admits, frozen-unapplied and unreadable intent journals block at account level; L18 real dual-write failure in a child, storage restored, fresh child refuses; L19 register-after-primary-loss refuses and the mirror keeps both lanes; L20 torn registry tail tolerated and repaired; L21 a torn intent-journal tail is never read as clean; L22 registry lock serialises appends (blocked while held, mutant sensitivity); L23 six concurrent registrants on a torn tail keep every record; L24 a vanished mirror is rebuilt with ALL primary records, not only the newest; L25 a lagging mirror is completed; L26 a torn mirror tail is trimmed; L27 mutant sensitivity.
 NOT proven: lane runtime wiring (needs lane harnesses), whole-filesystem loss (no inside witness exists), journal rotation, grad closed-position witness, sim idempotency."""
 import ast, json, os, subprocess, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -281,6 +281,35 @@ rcs = [q.wait(timeout=60) for q in procs]
 vw, vs = PA._registry_view(); ln23 = PA._registry_fold(vw)[0]
 check("L23 six concurrent registrants on one torn tail: all rc 0, registry parses ok, original lane and all six recorded (%r)" % (rcs,),
       rcs == [0] * 6 and vs == "ok" and PA._registry_read(PA._registry_paths()[0])[1] == "ok" and LANE in ln23 and all(("%s_p%d" % (LANE, i)) in ln23 for i in range(6)))
+
+def lane_names(path):
+    return set(PA._registry_fold(PA._registry_read(path)[0])[0])
+# L24 a MISSING mirror followed by a new registration must not leave the mirror with only the newest record (the stale/incomplete mirror defect)
+d, LP, pid, ID, op = good("L24")
+LANE_B = LANE + "_b"; LPB = os.path.join(d, "laneb.json"); lane_ledger(LPB, {})
+os.unlink(PA._registry_paths()[1])
+check("L24a registering another lane after the mirror vanished succeeds", PA.register_lane(LANE_B, LPB, None) is True)
+check("L24b the rebuilt mirror holds BOTH lanes, not only the newest (%r)" % sorted(lane_names(PA._registry_paths()[1])), {LANE, LANE_B} <= lane_names(PA._registry_paths()[1]))
+os.unlink(PA._registry_paths()[0])
+check("L24c primary then lost: the loss block holds and the mirror still carries both lanes (%r)" % blocked(), blocked() == "persisted lane evidence blocks admission (fail-closed): lane registry lost (its mirror remains)" and {LANE, LANE_B} <= lane_names(PA._registry_paths()[1]))
+# L25 a LAGGING mirror (crash between the primary and mirror writes) is completed by the next admission check
+d, LP, pid, ID, op = good("L25")
+_m = open(PA._registry_paths()[1]).read().splitlines(True)
+open(PA._registry_paths()[1], "w").write("".join(_m[:-1]))
+before = len(PA._registry_read(PA._registry_paths()[1])[0]); total = len(PA._registry_read(PA._registry_paths()[0])[0])
+check("L25a fixture: mirror lags the primary (%d < %d)" % (before, total), before < total)
+check("L25b admission check stays open on matching state and completes the mirror", blocked() is None and len(PA._registry_read(PA._registry_paths()[1])[0]) == total)
+# L26 torn MIRROR tail is trimmed and completed, never corrupt
+d, LP, pid, ID, op = good("L26")
+open(PA._registry_paths()[1], "a").write('{"lane": "tor')
+check("L26a mirror with torn tail reads as torn_tail, not corrupt", PA._registry_read(PA._registry_paths()[1])[1] == "torn_tail")
+PA._mirror_sync(); LANE_C = LANE + "_c"
+check("L26b a registration afterwards leaves a clean mirror holding every primary record", PA.register_lane(LANE_C, LP, None) is True and PA._registry_read(PA._registry_paths()[1])[1] == "ok" and {LANE, LANE_C} <= lane_names(PA._registry_paths()[1]))
+# L27 MUTANT: sync off => the L24 defect reappears (so L24b is sensitive)
+d, LP, pid, ID, op = good("L27"); _ms = PA._mirror_sync
+os.unlink(PA._registry_paths()[1]); PA._mirror_sync = lambda: True
+PA.register_lane(LANE + "_d", LP, None); PA._mirror_sync = _ms
+check("L27 MUTANT (mirror sync off): the mirror lacks the first lane after rebuild, so L24b is sensitive (%r)" % sorted(lane_names(PA._registry_paths()[1])), LANE not in lane_names(PA._registry_paths()[1]))
 # L15 static wiring
 here = os.path.join(ROOT, "daemon", "launch_scanner")
 st = {n: open(os.path.join(here, n + ".py")).read() for n in ("momentum_lane", "ceo", "watcher_lane", "grad", "mirror", "close_intents")}

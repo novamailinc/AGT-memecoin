@@ -134,6 +134,12 @@ def r3():
     p, r = run(h, POLL, "p1", "1", "now", 1.0); b, a = r["before"], r["after"]
     check("R3 class A ran %s: record unlinked, same single lane position, one debit, bankroll decremented ONCE, entries_day unchanged from before recovery (%s)" % ([x[2] for x in r["acts"]], a["entries_day"]),
           [x[2] for x in r["acts"]] == ["A"] and a["rec_files"] == [] and a["lane"] == b["lane"] and len(debits(a["j"])) == 1 and a["bankroll"] == b["bankroll"] and a["entries_day"] == b["entries_day"] and a["entries_day"]["count"] == 1)
+def _join_ok(a):
+    """Account rows and lane positions joined on the VERIFIED position id (account positions carry no mint field): the two id sets are equal, each id appears once, and tokens == account qty per id."""
+    rows = a["acct"]; ids = [x.get("pos_id") for x in rows]; lp = list(a["lane"]["positions"].values()); lids = [x.get("pa_pos_id") for x in lp]
+    if None in ids or None in lids or len(set(ids)) != len(ids) or len(set(lids)) != len(lids) or set(ids) != set(lids): return False
+    q = {x["pos_id"]: x.get("qty") for x in rows}
+    return all(abs(float(q[x["pa_pos_id"]]) - float(x["tokens"])) < 1e-9 for x in lp)
 def r7(future=False):
     lab = "R8" if future else "R7"; h = B.newhome(); p0, r0 = run(h, OPEN1, "o1", "1")
     check("%s setup: first entry opened normally, counter populated %s" % (lab, r0["after"]["entries_day"]), p0.returncode == 0 and r0["ok"] is True and r0["after"]["entries_day"].get("count") == 1)
@@ -143,12 +149,12 @@ def r7(future=False):
     lp = a["lane"]["positions"]; st = debits(a["j"])
     check("%s ADOPTED second position: classes %s, lane mints %s, GradMint2pump pa_pos_id == killed %s, tokens == account qty for BOTH, record dir empty" % (lab, [x[2] for x in r["acts"]], sorted(lp), pid),
           p.returncode == 0 and [x[2] for x in r["acts"]] == ["B"] and sorted(lp) == ["GradMint1pump", "GradMint2pump"] and lp["GradMint2pump"]["pa_pos_id"] == pid and len(a["acct"]) == 2 and a["rec_files"] == []
-          and all(abs(float(x["qty"]) - float(lp[x["mint"]]["tokens"])) < 1e-9 for x in a["acct"]))
+          and _join_ok(a))
     check("%s two debits %s, cash %s == 10 - sum, bankroll %s == start %s - sum" % (lab, st, a["j"]["cash"], a["bankroll"], a["bankroll_start"]),
           len(st) == 2 and abs(float(a["j"]["cash"]) - (10.0 - sum(st))) < 1e-5 and abs(float(a["bankroll"]) - (float(a["bankroll_start"]) - sum(st))) < 1e-5)
     exp_date = b["entries_day"].get("date")
     check("%s daily counter %s == {date %s, count 2}%s" % (lab, a["entries_day"], exp_date, " (recovery process pretends a LATER day, stored counter day == the original entry day: still charged to that day)" if future else " (same day)"),
-          a["entries_day"] == {"date": exp_date, "count": 2} and (future or exp_date == time.strftime("%Y-%m-%d", time.gmtime())))
+          bool(exp_date) and exp_date != "2099-01-01" and a["entries_day"] == {"date": exp_date, "count": 2} and (future or exp_date == time.strftime("%Y-%m-%d", time.gmtime())))
 def r4():
     h = B.newhome(); t = kill_phase(h, KA, "1", "R4"); pid = t["pa_pos_id"]
     pe = B.spawn(ENTER, h, "e1", "1", 1, "barrier"); pp = B.spawn(POLLB, h, "p1", "1", "now", 1.0)
@@ -182,7 +188,12 @@ def r6():
     check("R6b flag off + kill A + poll_exits: orphan NOT recovered (lane %s, account open %d, no dir %s): baseline behavior unchanged" % (a["lane"]["positions"], len(a["acct"]), a["rec_files"]), a["lane"]["positions"] == {} and len(a["acct"]) == 1 and a["rec_files"] is None)
 def main():
     try:
-        for n, f in (("R1", r1), ("R1x", lambda: r1(True)), ("R2", r2), ("R3", r3), ("R4", r4), ("R5", r5), ("R6", r6), ("R7", r7), ("R8", lambda: r7(True))): B.scen(n, f)
+        import traceback
+        def safe(n, f):
+            try: B.scen(n, f)
+            except Exception as e:  # an unexpected exception in one scenario is a FAIL for that scenario; the rest still run and the summary and reaping checks always print
+                check("%s aborted with an uncaught exception: %s: %s" % (n, type(e).__name__, str(e)[:160]), False); print("INFO traceback %s: %s" % (n, traceback.format_exc().strip().splitlines()[-3:]))
+        for n, f in (("R1", r1), ("R1x", lambda: r1(True)), ("R2", r2), ("R3", r3), ("R4", r4), ("R5", r5), ("R6", r6), ("R7", r7), ("R8", lambda: r7(True))): safe(n, f)
     finally: B.reap_all()
     alive = [p.pid for p in B.KIDS if p.poll() is None]
     check("all children reaped (still alive: %s), total %d children spawned" % (alive, len(B.KIDS)), not alive)

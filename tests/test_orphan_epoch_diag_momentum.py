@@ -331,10 +331,17 @@ for tag, mode, order in (SC if lname else ()):
         pend = CI.pending(lname)   # env of this scratch root was set by raw_state above
         _pop = ((pend[0].get("intent") or {}).get("settle_ops") or [{}])[0].get("op_id") if len(pend) == 1 else None
         prior = [e for e in evs if e.get("event") not in ("create", "debit") and (e.get("pos_id") == pid or e.get("mint") == MINT or (_pop is not None and e.get("op_id") == _pop))]
-        proof = (len(pend) == 1 and not pend[0].get("account_applied") and (pend[0].get("intent") or {}).get("pos_id") == pid and (pend[0].get("intent") or {}).get("mint") == MINT and _pop is not None and not prior and
-                 len(tdeb) == 1 and bad == 0 and len(cr) == 1 and cr[0].get("account_id") == led.get("account_id") and pid in before["debit_pos_ids"] and
-                 isinstance(before["lane_ledger"], dict) and before["lane_ledger"]["pos_ids"].get(MINT) == pid and isinstance(before["intent_events"], list) and before["intent_events"].count("intent") == 1 and all(x in ("probe", "intent") for x in before["intent_events"]) and before["intent_status"] is None
-                 and any(("%s#" % MINT2) in str(p) for p in before["debit_pos_ids"]))
+        _it = (pend[0].get("intent") or {}) if len(pend) == 1 else {}
+        _ie = before["intent_events"]
+        clauses = [("one_pending_intent", len(pend) == 1), ("not_account_applied", len(pend) == 1 and not pend[0].get("account_applied")),
+                   ("intent_pos_id_is_target", _it.get("pos_id") == pid), ("intent_mint_is_target", _it.get("mint") == MINT), ("settle_op_id_present", _pop is not None),
+                   ("no_prior_settle_or_other_event_for_pid_mint_op", not prior), ("exactly_one_target_debit", len(tdeb) == 1), ("account_journal_clean", bad == 0),
+                   ("exactly_one_create", len(cr) == 1), ("create_account_id_equals_ledger", len(cr) == 1 and cr[0].get("account_id") == led.get("account_id")),
+                   ("target_pid_in_debit_pos_ids", pid in before["debit_pos_ids"]), ("lane_position_pa_pos_id_equals_pid", isinstance(before["lane_ledger"], dict) and before["lane_ledger"]["pos_ids"].get(MINT) == pid),
+                   ("intent_journal_exactly_one_intent", isinstance(_ie, list) and _ie.count("intent") == 1), ("intent_journal_only_probe_or_intent", isinstance(_ie, list) and all(x in ("probe", "intent") for x in _ie)),
+                   ("intent_journal_status_clean", before["intent_status"] is None), ("second_debit_present", any(("%s#" % MINT2) in str(x) for x in before["debit_pos_ids"]))]
+        proof = all(v for _k, v in clauses)
+        print("  PROOF-CLAUSES %s %s" % (tag, " ".join("%s=%s" % (k, v) for k, v in clauses)), flush=True)
         check("%s: BEFORE injection pid-specific proof: exactly one debit for %s, journal clean (close-intent journal holds exactly one intent record, only probe records besides it: any other event kind fails the proof), one create event whose account_id equals the ledger's, lane position pos_id equals it, intent journaled, second debit present (debits %r, account_id %s, pending intents %d, prior events for pid/mint/op %r)" % (tag, pid, before["debit_pos_ids"], str(led.get("account_id"))[:8], len(pend), [e.get("event") for e in prior]), proof)
         if not proof: continue
         inject(root, mode)

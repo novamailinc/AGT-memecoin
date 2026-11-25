@@ -1284,7 +1284,7 @@ def _guard_close(impl, pos, key, *args, resume=None):
     close_intent_not_durable is visible, and the next poll re-runs the exit. The sale is NOT repeated: the exit fill op id is deterministic
     ("<lane>:exit:<mint>:<key>") and the filler returns the already-journaled fill for an existing op id (demo_fill _existing), so the retry
     re-reads the same fill and only the intent write is retried."""
-    _snap = copy.deepcopy(pos); _pe0 = copy.deepcopy(pos.get("pending_exit"))
+    _snap = copy.deepcopy(pos); _pe0 = copy.deepcopy(pos.get("pending_exit")); _live_legs = pos.get("legs"); _live_leg = {k: v for k, v in (_live_legs or {}).items()}
     try:
         _ret = impl(*args)
         _stamp_resume(pos, resume)
@@ -1293,7 +1293,12 @@ def _guard_close(impl, pos, key, *args, resume=None):
         _ci = _close_intents()
         if _ci is None or not isinstance(_e, _ci.IntentNotDurable):
             raise
-        pos.clear(); pos.update(_snap)   # EVERY field of the position is restored (legs, realized, pending_exit, quote journal, peaks, ...)
+        pos.clear(); pos.update(_snap)
+        # keep the ORIGINAL leg dict objects (the poll loop may hold aliases such as la/lb/lc): restore them in place, then re-attach them
+        for _k, _lv in _live_leg.items():
+            _lv.clear(); _lv.update(pos["legs"][_k]); pos["legs"][_k] = _lv
+        if _live_legs is not None:
+            _live_legs.clear(); _live_legs.update(pos["legs"]); pos["legs"] = _live_legs   # EVERY field of the position is restored (legs, realized, pending_exit, quote journal, peaks, ...)
         logger.error("close intent NOT DURABLE (%s): exit %s rolled back in memory (nothing persisted, no account op), retried next poll", _e, key)
         _pe = dict(_pe0) if isinstance(_pe0, dict) else {}
         if _pe0:   # a pre-existing pending exit is kept in full; its own identity moves under "prior" (nothing is overwritten)

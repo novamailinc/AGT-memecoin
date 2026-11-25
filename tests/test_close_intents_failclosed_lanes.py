@@ -96,10 +96,13 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
     pos2 = mkpos("FR" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":
         pos2["lane"] = "mirror"
+    _alias_a = pos2["legs"]["a"]; _alias_legs = pos2["legs"]
     with patch.object(M, "_paper_account", lambda: spy2), patch.object(M, "_demo_filler", lambda: ff), patch.object(M, "_exit_fee_venue", lambda p: None), \
          patch.object(CI, "_append", _no_intent_only):
         r_fail = M._close_leg(pos2, "a", 0.001, "leg_a_2x")
     pe2 = pos2.get("pending_exit") or {}
+    check("%s rollback keeps the ORIGINAL leg dict objects (aliases held by the poll loop stay valid and show not-done)" % modname,
+          pos2["legs"]["a"] is _alias_a and _alias_a["done"] is False and pos2["legs"] is _alias_legs)
     check("%s race: exit rolled back in memory (leg a done=%r, realized %r), NO account credit (%d), pending_exit %r, sale called %d time(s)"
           % (modname, pos2["legs"]["a"]["done"], pos2["realized_usd"], len(spy2.credits), pe2.get("why"), len(ff.calls)),
           r_fail == 0.0 and pos2["legs"]["a"]["done"] is False and pos2["realized_usd"] == 0.0 and not spy2.credits

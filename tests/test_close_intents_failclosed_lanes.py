@@ -128,7 +128,7 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
          patch.object(CI, "_append", _no_intent_only):
         M._close_leg(pos5, "a", 0.001, "leg_a_2x")
     pe5 = pos5.get("pending_exit") or {}
-    _fl5 = ff5.fills.get("%s:exit:%s:a" % (lane, pos5["mint"])) or {}
+    _fl5 = ff5.fills.get(M._exit_op(pos5, "a")) or {}
     check("%s hold keeps pre-existing pending fields (prior %r, peak_price %r), counts tries (%r) and the sale fill carries the exit reason in its own record (%r)"
           % (modname, (pe5.get("prior") or {}).get("custom_field"), pos5.get("peak_price"), pe5.get("tries"), (_fl5.get("intent") or {}).get("reason")),
           (pe5.get("prior") or {}).get("custom_field") == 42 and pos5.get("peak_price") == 7.0 and pe5.get("tries") == 1
@@ -144,7 +144,7 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
     check("%s resume with nothing pending/journaled is a no-op (None)" % modname, M._resume_pending_exit(pos5r) is None)
     # CRASH BEFORE the hold was persisted: the position on disk shows leg a open with NO pending_exit at all, the sale fill is in the journal
     ff6 = _FakeFiller(); spy6 = _SpyAccount(); spy6.max_price_impact_pct = lambda: 50.0
-    pos6 = mkpos("FG" + modname[:3], lm); _op6 = "%s:exit:%s:a" % (lane, pos6["mint"])
+    pos6 = mkpos("FG" + modname[:3], lm); _op6 = M._exit_op(pos6, "a")
     ff6.fills[_op6] = {"status": "filled", "price_usd": 0.001, "gross_usd": 0.1, "fee_usd": 0.001, "execution_source": "canned_fixture",
                        "signature": "fixture-sig", "provenance": {"fixture": True}, "intent": {"reason": "leg_a_2x", "pkind": None, "key": "a"}}
     with patch.object(M, "_paper_account", lambda: spy6), patch.object(M, "_demo_filler", lambda: ff6), patch.object(M, "_exit_fee_venue", lambda p: None):
@@ -166,12 +166,41 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
           and pos7["legs"]["a"]["done"] is False and not spy7.credits)
     # an INFLIGHT sale claim is never re-executed by resume: held, visible, counted
     ff8 = _FakeFiller(); spy8 = _SpyAccount(); spy8.max_price_impact_pct = lambda: 50.0
-    pos8 = mkpos("FI" + modname[:3], lm); ff8.fills["%s:exit:%s:a" % (lane, pos8["mint"])] = {"status": "inflight"}
+    pos8 = mkpos("FI" + modname[:3], lm); ff8.fills[M._exit_op(pos8, "a")] = {"status": "inflight"}
     with patch.object(M, "_paper_account", lambda: spy8), patch.object(M, "_demo_filler", lambda: ff8):
         _r8 = M._resume_pending_exit(pos8); _r8b = M._resume_pending_exit(pos8)
     check("%s inflight claim: resume holds (%r, %r), no sale call (%d), why %r, tries %r" % (modname, _r8, _r8b, len(ff8.calls), (pos8.get("pending_exit") or {}).get("why"),
           (pos8.get("pending_exit") or {}).get("tries")),
           _r8 == "held" and _r8b == "held" and not ff8.calls and pos8["pending_exit"]["why"] == "unresolved_inflight" and pos8["pending_exit"]["tries"] == 2)
+    # POSITION GENERATIONS: a journaled exit fill of an OLDER position (same lane and mint, other pa_pos_id) is never adopted, and the new generation sells fresh
+    ffg = _FakeFiller(); spyg = _SpyAccount(); spyg.max_price_impact_pct = lambda: 50.0
+    posg_old = mkpos("FN" + modname[:3], lm); posg_old["pa_pos_id"] = "lane/FN#1"
+    posg = mkpos("FN" + modname[:3], lm); posg["pa_pos_id"] = "lane/FN#2"
+    ffg.fills[M._exit_op(posg_old, "a")] = {"status": "filled", "price_usd": 9.0, "gross_usd": 900.0, "fee_usd": 1.0, "execution_source": "canned_fixture",
+                                            "signature": "old-gen", "provenance": {}, "intent": {"reason": "old_reason"}}
+    with patch.object(M, "_paper_account", lambda: spyg), patch.object(M, "_demo_filler", lambda: ffg), patch.object(M, "_exit_fee_venue", lambda p: None):
+        _rg = M._resume_pending_exit(posg)
+        _ng = M._close_leg(posg, "a", 0.001, "leg_a_2x")
+    check("%s generations: the older position's fill is not adopted by resume (%r), the new generation sells under ITS OWN op id (%r != %r) and credits its own fill (gross %r)"
+          % (modname, _rg, M._exit_op(posg, "a"), M._exit_op(posg_old, "a"), spyg.credits[0][2] if spyg.credits else None),
+          _rg is None and M._exit_op(posg, "a") != M._exit_op(posg_old, "a") and len(spyg.credits) == 1 and abs(float(spyg.credits[0][2]) - 0.1) < 1e-12 and _ng > 0)
+    # COMBINED REMAINDER goes through the sale too (mirror previously modelled it): one fill under the remainder key, one credit with the fill's gross
+    ffr = _FakeFiller(); spyr = _SpyAccount(); spyr.max_price_impact_pct = lambda: 50.0
+    posr = mkpos("FM" + modname[:3], lm)
+    with patch.object(M, "_paper_account", lambda: spyr), patch.object(M, "_demo_filler", lambda: ffr), patch.object(M, "_exit_fee_venue", lambda p: None):
+        _nr = M._close_remaining(posr, 0.0005, "hard_stop_-50pct")
+    check("%s combined remainder is SOLD through the filler (calls %r), all legs done %r, ONE credit of the fill gross (%r), exit_execution recorded %r"
+          % (modname, ffr.calls, all(v["done"] for v in posr["legs"].values()), [c[2] for c in spyr.credits], posr["legs"]["a"].get("exit_execution", {}).get("source")),
+          ffr.calls == [M._exit_op(posr, "remaining:abc")] and all(v["done"] for v in posr["legs"].values()) and len(spyr.credits) == 1
+          and abs(float(spyr.credits[0][2]) - 0.1) < 1e-12 and posr["legs"]["a"].get("exit_execution", {}).get("source") == "canned_fixture" and _nr > 0)
+    # an UNREADABLE fill journal fails closed: held, no sale
+    class _BadJournal(_FakeFiller):
+        def get_fill(self, op_id): raise OSError("INJECTED: fill journal unreadable")
+    ffu = _BadJournal(); posu = mkpos("FJ" + modname[:3], lm)
+    with patch.object(M, "_paper_account", lambda: spyr), patch.object(M, "_demo_filler", lambda: ffu):
+        _ru = M._resume_pending_exit(posu)
+    check("%s unreadable fill journal: resume holds (%r, why %r), no sale (%d)" % (modname, _ru, (posu.get("pending_exit") or {}).get("why"), len(ffu.calls)),
+          _ru == "held" and posu["pending_exit"]["why"] == "unresolved_fill_journal" and not ffu.calls)
     # an exception that is NOT IntentNotDurable still propagates (the rollback is narrow, never a blanket catch)
     pos3 = mkpos("FX" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":

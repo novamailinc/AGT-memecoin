@@ -1105,6 +1105,34 @@ def _exit_fee_venue(pos):
     return v or None
 
 
+def _demo_sell(pos, qty, key):
+    """Sell through the quote sim (shared by the leg exit and the combined remainder). Returns (fill, cap, cap_src) or None (the exit stays PENDING
+    with diagnostics; nothing invented)."""
+    _df = _demo_filler()
+    _pa_m = _paper_account()
+    if _df is None or _pa_m is None:
+        pos["pending_exit"] = {"leg": key, "why": "filler unavailable", "ts": time.time()}
+        return None
+    try:
+        _cap = _pa_m.max_price_impact_pct()
+    except Exception:
+        _cap = None
+    _cap_src = "owner_max_price_impact_pct"
+    try:
+        _capv = float(_cap) if _cap is not None else 0.0
+    except (TypeError, ValueError):
+        _capv = 0.0
+    if not (_capv > 0):
+        _capv, _cap_src = _EXIT_IMPACT_CAP_PCT, "fallback_unset_or_invalid"
+    try:
+        _fill = _df.sell(_exit_op(pos, key), pos["mint"], qty, _capv, meta=_sell_meta(pos))
+    except _demo.DemoSkip as _e:
+        _hold_not_durable(pos, key, _e.reason, detail=_e.detail)
+        logger.warning("mirror demo exit pending %s %s: %s", pos["mint"][:12], key, _e.reason)
+        return None
+    return _fill, _capv, _cap_src
+
+
 def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     chain = pos["chain"]
@@ -1119,30 +1147,10 @@ def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
     if _sim and _kind != "write_down_zero":
         # DEMO: the sale goes through the quote simulation. A failed quote leaves
         # the leg PENDING (no invented proceeds); the next poll retries.
-        _df = _demo_filler()
-        _pa_m = _paper_account()
-        if _df is None or _pa_m is None:
-            pos["pending_exit"] = {"leg": leg_key, "why": "filler unavailable", "ts": time.time()}
+        _r = _demo_sell(pos, leg_tokens, leg_key)
+        if _r is None:
             return 0.0
-        try:
-            _cap = _pa_m.max_price_impact_pct()
-        except Exception:
-            _cap = None
-        _cap_src = "owner_max_price_impact_pct"
-        try:
-            _capv = float(_cap) if _cap is not None else 0.0
-        except (TypeError, ValueError):
-            _capv = 0.0
-        if not (_capv > 0):
-            _capv, _cap_src = _EXIT_IMPACT_CAP_PCT, "fallback_unset_or_invalid"
-        _cap = _capv
-        try:
-            _fill = _df.sell("%s:exit:%s:%s" % (pos["lane"], pos["mint"], leg_key),
-                             pos["mint"], leg_tokens, _cap, meta=_sell_meta(pos))
-        except _demo.DemoSkip as _e:
-            _hold_not_durable(pos, leg_key, _e.reason, detail=_e.detail)
-            logger.warning("mirror demo exit pending %s %s: %s", pos["mint"][:12], leg_key, _e.reason)
-            return 0.0
+        _fill, _cap, _cap_src = _r
         pos.pop("pending_exit", None)
         filled_exit = _fill["price_usd"]
         gross = _fill["gross_usd"]
@@ -1204,6 +1212,29 @@ def _close_remaining_impl(pos, exit_price, reason, pkind=None):
         return 0.0
     total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"]
                        for k in open_legs)
+    _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
+    if _sim and _pkind(reason, pkind) != "write_down_zero":
+        # DEMO: the combined remainder is SOLD through the quote simulation exactly like a leg (one fill, one tx cost), never modelled at a price.
+        _rkey = "remaining:%s" % "".join(open_legs)
+        _r = _demo_sell(pos, total_tokens, _rkey)
+        if _r is None:
+            return 0.0
+        _fill, _cap, _cap_src = _r
+        pos.pop("pending_exit", None)
+        _kind = _pkind(reason, pkind)
+        _fv = _exit_fee_venue(pos)
+        filled_exit, gross, gas_out = _fill["price_usd"], _fill["gross_usd"], _fill["fee_usd"]
+        net = gross - gas_out
+        for key in open_legs:
+            leg = pos["legs"][key]
+            share = (pos["tokens"] * leg["frac"]) / total_tokens if total_tokens else 0
+            leg.update(done=True, exit_price=filled_exit, realized_usd=round(net * share, 6), exit_reason=reason,
+                       exit_price_kind=_kind, fee_venue=_fv or "none",
+                       exit_execution={"source": _fill["execution_source"], "signature": _fill["signature"], "synthetic_signature": True,
+                                       "effective_impact_cap_pct": _cap, "impact_cap_source": _cap_src, "provenance": _fill["provenance"]})
+        pos["realized_usd"] = round(pos["realized_usd"] + net, 6)
+        _pa_settle(pos, total_tokens, gross, gas_out, _rkey, price_kind=_kind)
+        return net
     try:
         leg_usd = total_tokens * exit_price
         filled_exit = _fills.honest_exit(
@@ -1310,6 +1341,15 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
                         meta={"reason": reason, "pkind": pkind})
 
 
+def _exit_op(pos, key):
+    """Deterministic sale op id of THIS position generation: lane:exit:mint:key plus the account position instance id. Without the instance id a
+    re-entry of the same mint (after the cooldown) would replay the previous generation's journaled exit fill (the filler returns an existing op id)."""
+    _o = "%s:exit:%s:%s" % (pos["lane"], pos["mint"], key)
+    if pos.get("pa_pos_id"):
+        _o += ":%s" % pos["pa_pos_id"]
+    return _o
+
+
 def _sell_meta(pos):
     """Exit reason/kind recorded INSIDE the journaled fill (atomic with it) so a later resume knows what the sale was for."""
     _m = pos.get("_exit_meta") or {}
@@ -1359,13 +1399,18 @@ def _resume_pending_exit(pos):
     _open = [k for k in ("a", "b", "c") if not (pos["legs"].get(k) or {}).get("done")]
     if not _open:
         return None
-    _lane = pos.get("lane") or globals().get("LANE")
     _cands = [("remaining", "remaining:%s" % "".join(_open))] + [("leg", k) for k in _open]
     for _kind, _key in _cands:
         try:
-            _rec = _df.get_fill("%s:exit:%s:%s" % (_lane, pos["mint"], _key))
+            _rec = _df.get_fill(_exit_op(pos, _key))
         except Exception:
-            return None
+            # FAIL CLOSED: an unreadable fill journal cannot prove that no sale landed, so no other exit may be evaluated for this position
+            pos["_exit_meta"] = {"reason": "fill_journal_unreadable", "key": _key}
+            try:
+                _hold_not_durable(pos, _key, "unresolved_fill_journal")
+            finally:
+                pos.pop("_exit_meta", None)
+            return "held"
         if not _rec:
             continue
         if _rec.get("status") == "inflight":

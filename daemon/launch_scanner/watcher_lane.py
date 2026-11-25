@@ -666,7 +666,7 @@ def _demo_sell(pos, leg_tokens, key):
         return None
     cap, src = _exit_cap()
     try:
-        return _df.sell("%s:exit:%s:%s" % (LANE, pos["mint"], key), pos["mint"], leg_tokens,
+        return _df.sell(_exit_op(pos, key), pos["mint"], leg_tokens,
                         cap, meta=_sell_meta(pos)), cap, src
     except _demo.DemoSkip as e:
         _hold_not_durable(pos, key, e.reason, detail=e.detail)
@@ -1736,6 +1736,15 @@ def _close_remaining(pos, exit_price, reason, pkind=None):
                         meta={"reason": reason, "pkind": pkind})
 
 
+def _exit_op(pos, key):
+    """Deterministic sale op id of THIS position generation: lane:exit:mint:key plus the account position instance id. Without the instance id a
+    re-entry of the same mint (after the cooldown) would replay the previous generation's journaled exit fill (the filler returns an existing op id)."""
+    _o = "%s:exit:%s:%s" % (LANE, pos["mint"], key)
+    if pos.get("pa_pos_id"):
+        _o += ":%s" % pos["pa_pos_id"]
+    return _o
+
+
 def _sell_meta(pos):
     """Exit reason/kind recorded INSIDE the journaled fill (atomic with it) so a later resume knows what the sale was for."""
     _m = pos.get("_exit_meta") or {}
@@ -1785,13 +1794,18 @@ def _resume_pending_exit(pos):
     _open = [k for k in ("a", "b", "c") if not (pos["legs"].get(k) or {}).get("done")]
     if not _open:
         return None
-    _lane = pos.get("lane") or globals().get("LANE")
     _cands = [("remaining", "remaining:%s" % "".join(_open))] + [("leg", k) for k in _open]
     for _kind, _key in _cands:
         try:
-            _rec = _df.get_fill("%s:exit:%s:%s" % (_lane, pos["mint"], _key))
+            _rec = _df.get_fill(_exit_op(pos, _key))
         except Exception:
-            return None
+            # FAIL CLOSED: an unreadable fill journal cannot prove that no sale landed, so no other exit may be evaluated for this position
+            pos["_exit_meta"] = {"reason": "fill_journal_unreadable", "key": _key}
+            try:
+                _hold_not_durable(pos, _key, "unresolved_fill_journal")
+            finally:
+                pos.pop("_exit_meta", None)
+            return "held"
         if not _rec:
             continue
         if _rec.get("status") == "inflight":

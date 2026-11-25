@@ -272,11 +272,14 @@ def _recover_close_intents():
         if _un:
             for _iid, _w in _un:
                 logger.error("ceo: pending intent %s has an unusable recorded op (%s): freezing, ENTRIES BLOCKED", _iid, _w)
+                _fzok = False
                 try:
                     if _iid:
-                        _ci.freeze(LANE, _iid, "unusable recorded op: " + _w)   # best effort; the block below does not depend on this write
+                        _fzok = bool(_ci.freeze(LANE, _iid, "unusable recorded op: " + _w))   # best effort; the block below does not depend on this write
                 except Exception:
                     logger.exception("ceo: could not freeze intent %s", _iid)
+                if not _fzok:
+                    logger.error("ceo: freeze event for %s NOT written; entries stay blocked from the durable record alone", _iid)
             frozen = [str(i or "unreadable-pending") for i, _w in _un]
     if not frozen:
         try:
@@ -1581,11 +1584,14 @@ def _nonsim_figures(pos, qty, exit_price, reason, pkind, suffix):
                         "frozen, operator resolution required" % (_rec.get("op_id"), _rec.get("qty"), qty, _rec.get("amount"), _rec.get("fee"),
                                                                     _rec.get("price_kind"), _rreason))
                 try:
-                    _ci.freeze(LANE, _rec.get("_intent_id"), _why)
+                    _fzok = bool(_ci.freeze(LANE, _rec.get("_intent_id"), _why))
                 except Exception:
-                    logger.exception("ceo: could not freeze intent %s", _rec.get("_intent_id"))
+                    logger.exception("ceo: could not freeze intent %s", _rec.get("_intent_id")); _fzok = False
                 _ENTRY_BLOCKED = True
-                logger.error("ceo: %s; ENTRIES BLOCKED", _why)
+                if _fzok:
+                    logger.error("ceo: %s; ENTRIES BLOCKED", _why)
+                else:
+                    logger.error("ceo: %s; the freeze event was NOT written (intent stays pending); ENTRIES BLOCKED in this process and by restart recognition of the durable record", _why)
                 raise _ci.IntentNotDurable(_why)
             if _rreason == suffix:
                 logger.warning("ceo: recorded close reason for %s is the legacy op suffix (original trigger reason NOT recorded): the retry trigger reason is used", _rec.get("op_id"))

@@ -153,6 +153,9 @@ def child_recover(mult, inject=None, try_entry=None):
     if inject == "different_trigger":
         _orig = C._close_leg   # labelled: the retry fires under a DIFFERENT trigger reason than the recorded one
         C._close_leg = lambda pos, k, px, reason, pkind=None: _orig(pos, k, px, "operator_probe_other_trigger", pkind)
+    et_first = None
+    if try_entry == "tryfirst":   # a NEW entry is attempted BEFORE any exit retry runs in this fresh process
+        et_first = repr(C.consider_card(csig("CeoMint2")))[:300]; try_entry = None
     for _ in range(3):
         C.poll_exits(price_fn=pf_mult(float(mult)))
     pos = (C.open_positions() or {}).get(MINT) or {}
@@ -168,7 +171,8 @@ def child_recover(mult, inject=None, try_entry=None):
            "n_intents": len([e for e in ents if e.get("ev") == "intent"]), "pend_why": (pos.get("pending_exit") or {}).get("why"),
            "n_pos": len(C.open_positions() or {}), "hits": HITS["n"], "guard_logs": len(guard),
            "frozen_open": len(CI.frozen_open("ceo")), "freeze_calls": FZC["n"], "rec_logs": len([m for m in LOGS if "has an unusable recorded op" in m]), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
-           "n_pos_all": len(C.open_positions() or {})}
+           "n_pos_all": len(C.open_positions() or {}), "entry_first": et_first,
+           "fz_logs": len([m for m in LOGS if "freeze event for" in m or "freeze event was NOT written" in m])}
     print("RESULT " + _json.dumps(res), flush=True)
 
 def child_recover_kill(mult):
@@ -193,7 +197,7 @@ def spawn(args):
 FOUR = ["intent", "account_applied", "lane_applied", "applied"]
 HAS_HELPER = None
 def recover(root, mult, inject=None, try_entry=False):
-    rc, out, err = spawn(["recover", root, str(mult), inject or "-"] + (["try"] if try_entry else []))
+    rc, out, err = spawn(["recover", root, str(mult), inject or "-"] + ([try_entry if isinstance(try_entry, str) else "try"] if try_entry else []))
     rl = [l for l in out.splitlines() if l.startswith("RESULT ")]; pl = [l for l in out.splitlines() if l.startswith("PRE ")]
     return rc, err, (_json.loads(pl[0][4:]) if pl else None), (_json.loads(rl[0][7:]) if rl else None)
 SCEN = (("S1", "after_credit", "2.0", "2.3", "leg", False), ("S2", "pre_lane_marker", "2.0", "2.3", "leg", False), ("S3-control", "after_credit", "2.0", "2.0", "leg", False),
@@ -220,14 +224,16 @@ for tag, point, kmult, mult, kind, kill2 in SCEN:
              pre["op_id"], pre["op_amount"], pre["op_fee"], pre.get("op_qty"), pre.get("op_reason")),
           pre["pre_status"] is None and (pre["pre_ev"] == want_ev if want_ev else pre["pre_ev"][:1] == ["intent"])
           and ((_cents(pre["pre_cash"]) > _cents(entry_cash)) if credited else (_cents(pre["pre_cash"]) == _cents(entry_cash)))
-          and pre["op_amount"] is not None and str(pre["op_id"]).startswith("ceo:%s:" % ("leg:a" if kind == "leg" else "remaining"))
-          and bool(pre.get("op_reason")) and pre.get("op_reason") != ("leg:a" if kind == "leg" else None) and not str(pre.get("op_reason")).startswith(("leg:", "remaining:")))
+          and pre["op_amount"] is not None and str(pre["op_id"]).startswith("ceo:%s:" % ("leg:a" if kind == "leg" else "remaining")))
+    check("%s: PROVENANCE (separate from the causal checks): the durable intent records a real trigger reason %r, not the op suffix" % (tag, pre.get("op_reason")),
+          bool(pre.get("op_reason")) and not str(pre.get("op_reason")).startswith(("leg:", "remaining:")))
     rec_net = round(float(pre["op_amount"]) - float(pre["op_fee"] or 0.0), 6)
     if kind == "leg":
         check("%s: retry at %sx: leg a done %r, pending_exit %r (no hold loop)" % (tag, mult, r["a_done"], r["pend_why"]), r["a_done"] is True and not r["pend_why"])
-        check("%s: credit booked ONCE at the RECORDED amounts: cash delta since entry %.6f == recorded net %.6f, lane leg realized %r == recorded net, leg exit_reason %r == recorded close reason %r"
-              % (tag, r["cash"] - entry_cash, rec_net, r["a_realized"], r["a_reason"], pre.get("op_reason")),
-              _cents(r["cash"] - entry_cash) == _cents(rec_net) and r["a_realized"] is not None and abs(float(r["a_realized"]) - rec_net) < 1e-6 and r["a_reason"] == pre.get("op_reason"))
+        check("%s: credit booked ONCE at the RECORDED amounts: cash delta since entry %.6f == recorded net %.6f, lane leg realized %r == recorded net"
+              % (tag, r["cash"] - entry_cash, rec_net, r["a_realized"]),
+              _cents(r["cash"] - entry_cash) == _cents(rec_net) and r["a_realized"] is not None and abs(float(r["a_realized"]) - rec_net) < 1e-6)
+        check("%s: PROVENANCE (separate): leg exit_reason %r == recorded close reason %r" % (tag, r["a_reason"], pre.get("op_reason")), r["a_reason"] == pre.get("op_reason"))
         done_ok = r["a_done"] is True
     else:
         check("%s: retry at %sx: the remaining close finished, position closed (n_pos %d), pending_exit %r (no hold loop)" % (tag, mult, r["n_pos"], r["pend_why"]), r["n_pos"] == 0 and not r["pend_why"])
@@ -299,6 +305,16 @@ if r is not None and pre is not None:
           % (tag, rc3, (r3 or {}).get("frozen_open"), (r3 or {}).get("ev"), (r3 or {}).get("entry_try"), (r3 or {}).get("cash")),
           rc3 == 0 and r3 is not None and r3["frozen_open"] == 0 and "frozen" not in r3["ev"] and "blocked" in str(r3["entry_try"])
           and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["n_pos_all"] == 1)
+    check("%s: that fresh restart HIT the recognition (rec_logs %r >= 1) and the failed freeze was logged truthfully (freeze_calls %r >= 1, fz_logs %r >= 1)"
+          % (tag, (r3 or {}).get("rec_logs"), (r3 or {}).get("freeze_calls"), (r3 or {}).get("fz_logs")),
+          r3 is not None and r3["rec_logs"] >= 1 and r3["freeze_calls"] >= 1 and r3["fz_logs"] >= 1)
+    # F11: ordering: in a fresh process the entry is attempted BEFORE any exit retry
+    tag = "F11-entry-attempted-BEFORE-first-exit-retry"
+    rc4, err4, pre4, r4 = recover(root, "2.3", "freeze_false", "tryfirst")
+    check("%s: refused BEFORE any exit poll (entry %r), then no credit/close (cash %r vs %r, leg a done %r, n_pos %r), recognition hit (%r)"
+          % (tag, (r4 or {}).get("entry_first"), (r4 or {}).get("cash"), pre["pre_cash"], (r4 or {}).get("a_done"), (r4 or {}).get("n_pos_all"), (r4 or {}).get("rec_logs")),
+          rc4 == 0 and r4 is not None and "blocked" in str(r4["entry_first"]) and _cents(r4["cash"]) == _cents(pre["pre_cash"]) and r4["a_done"] is False
+          and r4["n_pos_all"] == 1 and r4["rec_logs"] >= 1)
 
 # journal corrupt mid-file: sentinel/entry block + hold classification read in the child
 tag = "F9-journal-corrupt"

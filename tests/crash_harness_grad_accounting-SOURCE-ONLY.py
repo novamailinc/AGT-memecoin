@@ -134,13 +134,15 @@ print("CHILD_COMPLETED_WITHOUT_EXIT")
 VERIFY = BOOT + r'''
 cash0 = float(sys.argv[2]); mint = sys.argv[3]; pid = sys.argv[4]; window = sys.argv[5]; nth = int(sys.argv[6])
 TOL = lambda x: max(1e-6, 1e-4 * abs(float(x)))
+_p0 = (raw_ledger().get("positions") or {}).get(mint) or {}
+FK = {k: GR._fill_key(_p0, k) for k in ("a", "b", "c")} if _p0 else {}     # fixed from the PRE-replay ledger: the closed position leaves the ledger, but its fill keys must stay addressable
 def legs_ops(): return {k: "%s:leg:%s:%s:%s" % (GR.LANE, k, mint, pid) for k in ("a", "b", "c")}
 def facts(with_cash=False):
     led = raw_ledger(); pos = (led.get("positions") or {}).get(mint) or {}
     fills = raw_fills(); cr, st = raw_credits(); ops = legs_ops()
     out = {"journal_status": st, "legs": {}}
     for k, op in ops.items():
-        fk = GR._fill_key(pos, k) if pos else None
+        fk = FK.get(k)
         rcs = [e for e in cr if e.get("op_id") == op]
         out["legs"][k] = {"fills": 1 if (fk in fills) else 0, "receipts": len(rcs), "receipt_qty": [e.get("qty") for e in rcs],
                           "receipt_net": [float(e.get("proceeds") or 0) - float(e.get("fee") or 0) for e in rcs],
@@ -284,9 +286,12 @@ def selfcheck():
 
 def main():
     scenario("W0", 1)
+    stop = False
     for w in ("W1", "W2", "W3", "W4"):
         for n in (1, 2):
-            if FAILS or _STOP["why"]: print("EARLY STOP before %s/leg%d (fails=%d, stop=%s)" % (w, n, len(FAILS), _STOP["why"])); break
+            if stop or FAILS or _STOP["why"]:
+                if not stop: print("EARLY STOP before %s/leg%d (fails=%d, stop=%s)" % (w, n, len(FAILS), _STOP["why"]))
+                stop = True; continue
             scenario(w, n)
     print("elapsed %.1fs of %.0fs budget; FAILS: %d; stop=%s" % (time.time() - _T0, BUDGET_S, len(FAILS), _STOP["why"])); return 1 if (FAILS or _STOP["why"]) else 0
 if __name__ == "__main__":

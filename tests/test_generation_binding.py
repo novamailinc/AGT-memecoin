@@ -304,5 +304,23 @@ with open(_mp, "a") as _f: _f.write("{garbage\n")
 okG, whyG, _x = PA.try_debit(LANE, "MINTU3", 1.0, 100.0, "gb:entry:U3", marks=_mk())
 check("U4 an UNREADABLE marker blocks entries fail-closed (%s)" % whyG, (not okG) and PA.unresolved_refusals() is None)
 
+# ---- V: marker write failure fails CLOSED, in this process and (from the journal) in the next
+_use(os.path.join(_home, "V"))
+r = _need("debit V", PA.try_debit(LANE, "MINTV", 1.0, 100.0, "gb:entry:V", marks=_mk()))
+pidV = r[2]
+PA._MARKER_FAILED[0] = False
+_real_rec = PA._record_unresolved
+PA._record_unresolved = lambda *a, **k: False   # LABELLED fault injection: the marker file cannot be written
+try:
+    okV, whyV = PA.credit(LANE, "MINTV", 1.1, "gb:exit:V", pos_id=pidV, qty=100.0, expected_account_id="some-other-generation", entry_op_id="gb:entry:V")
+finally:
+    PA._record_unresolved = _real_rec
+check("V1 refusal still refused and reports the marker as unwritable (%s)" % whyV, (not okV) and "unwritable" in whyV and PA.unresolved_refusals() == [])
+okV2, whyV2, _x = PA.try_debit(LANE, "MINTV2", 1.0, 100.0, "gb:entry:V2", marks=_mk())
+check("V2 entries are blocked in-process although no marker file exists (%s)" % whyV2, (not okV2) and "could not be recorded" in whyV2)
+PA._MARKER_FAILED[0] = False   # emulate a restart: only the journal remains
+okV3, whyV3, _x = PA.try_debit(LANE, "MINTV3", 1.0, 100.0, "gb:entry:V3", marks=_mk())
+check("V3 after a simulated restart the block is re-derived from the journal (%s)" % whyV3, (not okV3) and "could not be recorded" in whyV3)
+
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

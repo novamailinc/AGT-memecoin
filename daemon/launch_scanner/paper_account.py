@@ -2319,6 +2319,8 @@ def _record_unresolved(op_id, lane, mint, pos_id, reason):
 
 
 def _entries_blocked_by_refusal():
+    if _MARKER_FAILED[0] or any(e.get("marker_failed") for e in _recent_refusals()):
+        return "a generation refusal could not be recorded in the durable marker (fail-closed)"
     u = unresolved_refusals()
     if u is None:
         return "unresolved-refusal marker unreadable (fail-closed)"
@@ -2327,8 +2329,17 @@ def _entries_blocked_by_refusal():
     return None
 
 
+_MARKER_FAILED = [False]   # in-process: a refusal whose durable marker could not be written; blocks entries until restart AND is stamped into the journal event
+
+
 def _refuse_generation(op_id, lane, mint, pos_id, reason):
-    _record_unresolved(op_id, lane, mint, pos_id, reason)
+    _mok = _record_unresolved(op_id, lane, mint, pos_id, reason)
+    if not _mok:
+        # FAIL CLOSED: the marker file could not be written. Block entries in this process and journal the refusal WITH marker_failed (never deduped), so the
+        # block is re-derived from the journal tail in every later process too.
+        _MARKER_FAILED[0] = True
+        _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason, "marker_failed": True})
+        return False, "generation refused: %s (journaled, nothing applied; durable marker unwritable: entries blocked)" % reason
     if any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in _recent_refusals()):
         return False, "generation refused: %s (already journaled, nothing applied)" % reason   # retry of the same refusal: no unbounded growth
     _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason})

@@ -133,11 +133,19 @@ check("F3 five identical refusals add exactly ONE journal record (%d -> %d)" % (
 # G6 exact same-op retry after the credit applied returns the recorded outcome
 ok, why = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
 ok2, why2 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
-check("F4 same-op retry WITH the matching binding is answered from the recorded op (%s / %s)" % (why, why2), ok and ok2)
+check("F4 same-op retry WITH the matching binding and identical economics is answered from the recorded op (%s / %s)" % (why, why2), ok and ok2)
 ok4, why4 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id="acct-WRONG", entry_op_id="gb:entry:F")
 check("F4b same-op retry with a WRONG binding is refused even though the op exists (%s)" % why4, not ok4)
-ok5, why5 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0)
-check("F4c same-op retry with NO binding on a lot with no stored economics is refused (%s)" % why5, not ok5)
+ok4c, why4c = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0)
+check("F4c same-op retry with NO binding is refused, never an ack (%s)" % why4c, not ok4c)
+ok4d, why4d = PA.credit(LANE, "MINTF", 9.9, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
+check("F4d same-op retry with DIFFERENT proceeds is refused (%s)" % why4d, (not ok4d) and "parameter conflict" in why4d)
+ok4e, why4e = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=50.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
+check("F4e same-op retry with a DIFFERENT qty is refused (%s)" % why4e, not ok4e)
+_ledF2 = _bytes(PA.LEDGER_PATH)
+with open(PA.JOURNAL_PATH, "a") as _f: _f.write("{torn record\n")
+ok4f, why4f = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id=pidF, qty=100.0, expected_account_id=bindF, entry_op_id="gb:entry:F")
+check("F4f same-op retry with a torn journal is NOT answered as success (%s)" % why4f, not ok4f)
 ok3, why3 = PA.credit(LANE, "MINTF", 1.1, "gb:exit:F1", pos_id="wrong#9", qty=100.0, expected_account_id=None, entry_op_id=None)
 check("F5 same op_id with a DIFFERENT pos_id is not a retry: refused (%s)" % why3, not ok3)
 
@@ -202,5 +210,8 @@ finally:
     PA._generation_refusal = _real_gr
 check("M1 MUTANT (guard removed) credits with a WRONG binding, proving the refusal tests are sensitive (%s)" % whym, okm is True)
 
+# ---- C2: new generation closed under the IDENTICAL op id; the stale old-generation intent retries it (A1)
+ok, why = PA.credit(LANE, "MINTC", 1.1, "gb:exit:C", pos_id=pid1, qty=100.0, expected_account_id=old_bind, entry_op_id="gb:entry:C")
+check("C5 stale OLD-generation retry of an op id the NEW generation already applied is REFUSED, not acked (%s)" % why, not ok)
 print("RESULT: %d failure(s)" % len(FAILS))
 sys.exit(1 if FAILS else 0)

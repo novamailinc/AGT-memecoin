@@ -766,6 +766,11 @@ def _journal(event: Dict[str, Any], strict: bool = False) -> None:
     recoverable from the journal."""
     event = dict(event)
     event["ts"] = event.get("ts") or time.time()
+    if event.get("event") in _MUTATION_EVENTS and "account_id" not in event:
+        # Every mutation record names the generation that wrote it (callers hold the account lock; the ledger's account_id is immutable for its life).
+        _lg = _read_json(LEDGER_PATH)
+        if isinstance(_lg, dict) and isinstance(_lg.get("account_id"), str):
+            event["account_id"] = _lg["account_id"]
     try:
         with open(JOURNAL_PATH, "a") as f:
             f.write(json.dumps(event) + "\n")
@@ -1056,9 +1061,9 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         return led, None
     pending.sort(key=lambda t: t[0])
     replayed = 0
-    # LEGACY POLICY (engineering safety, owner decision pending): a debit/credit/write_down WITHOUT an account_id is replayable only if it precedes the
-    # first generation-bound event in the journal; once any bound event exists, an unbound one is a divergence (an operator restore of one file).
-    _bound_seqs = [e.get("seq") for e in entries if isinstance(e.get("account_id"), str) and e.get("event") in ("debit", "credit", "write_down")
+    # LEGACY POLICY (engineering safety, owner decision pending): a mutation event (any kind in _MUTATION_EVENTS) WITHOUT an account_id is replayable only if it precedes the
+    # first generation-bound mutation event in the journal; once any bound event exists, an unbound one is a divergence (an operator restore of one file).
+    _bound_seqs = [e.get("seq") for e in entries if isinstance(e.get("account_id"), str) and e.get("event") in _MUTATION_EVENTS
                    and isinstance(e.get("seq"), int)]
     _first_bound = min(_bound_seqs) if _bound_seqs else None
     for ev_seq, ev in pending:
@@ -1070,7 +1075,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
             # GENERATION SAFETY: a mutation journaled under another account generation must never be replayed into this ledger.
             return led, ("replay divergence: %s %s journaled under account generation %s, ledger is %s"
                          % (kind, op_id, str(ev.get("account_id"))[:8], str(led.get("account_id"))[:8]))
-        if (kind in ("debit", "credit", "write_down") and not isinstance(ev.get("account_id"), str) and isinstance(led.get("account_id"), str)
+        if (kind in _MUTATION_EVENTS and not isinstance(ev.get("account_id"), str) and isinstance(led.get("account_id"), str)
                 and _first_bound is not None and ev_seq > _first_bound):
             return led, ("replay divergence: %s %s carries no account generation after the first generation-bound event (mixed-generation journal)"
                          % (kind, op_id))
@@ -2219,38 +2224,46 @@ def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Option
     return debit_binding(entry_op_id, pos_id)
 
 
-def _applied_same_generation(led, op_id, event, lane, mint, pos_id, expected=None, econ=None):
-    """EXACT same-op retry of a mutation THIS ledger generation already applied. All must hold: the op is stored with THIS ledger's account_id and the same
-    event/lane/mint/pos_id; a SUPPLIED expected generation equals the ledger's (a wrong binding never bypasses just because the op exists); every economic
-    argument the op stored equals the retry's (`econ`); and when the op stored NO economics (non-instance lots) the caller must have supplied the matching
-    generation (otherwise the full proof decides). Answering from the recorded op mutates nothing. Legacy ops (no account_id) and other generations are NOT accepted."""
-    op = (led.get("ops") or {}).get(op_id)
+def _retry_contract_refusal(led, op_id, event, lane, mint, pos_id, econ):
+    """EXACT-retry contract for an op_id THIS ledger already applied. The caller has ALREADY passed _generation_refusal (supplied generation == ledger id, clean
+    journal, single create, entry op proven) under the same lock. Here the single WAL event for the op_id must be the same event/lane/mint/pos_id/account_id
+    and every economic argument must equal the journaled one. Anything else (no event, several events, any mismatch) is a refusal, never an ack."""
+    entries, jst, _t = _journal_read()
+    if jst is not None:
+        return "journal not clean (%s)" % jst
     ident = led.get("account_id")
-    if not (isinstance(op, dict) and isinstance(ident, str) and ident and op.get("account_id") == ident and op.get("event") == event
-            and op.get("lane") == lane and op.get("mint") == mint and isinstance(pos_id, str) and pos_id and op.get("pos_id") == pos_id):
-        return False
-    if expected is not None and expected != ident:
-        return False
-    stored = {k: op.get(k) for k in (econ or {}) if op.get(k) is not None}
-    if any(stored[k] != (econ or {})[k] for k in stored):
-        return False
-    return bool(stored) or expected == ident
+    evs = [e for e in entries if e.get("op_id") == op_id and e.get("event") == event]
+    if len(evs) != 1:
+        return "retry of op %s: %d journal %s event(s), expected exactly one" % (op_id, len(evs), event)
+    ev = evs[0]
+    for k, v in (("lane", lane), ("mint", mint), ("pos_id", pos_id), ("account_id", ident)):
+        if ev.get(k) != v:
+            return "retry of op %s conflicts with the journaled %s" % (op_id, k)
+    for k, v in (econ or {}).items():
+        if ev.get(k) != v:
+            return "retry of op %s parameter conflict on %s" % (op_id, k)
+    return None
 
 
-def _last_journal_record():
+def _recent_refusals(window=262144):
+    """Refusal records in the last `window` bytes of the journal (bounded read; ignores a partial first line)."""
     try:
         with open(JOURNAL_PATH, "rb") as f:
-            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 4096))
-            lines = [l for l in f.read().splitlines() if l.strip()]
-        return json.loads(lines[-1].decode("utf-8", "replace")) if lines else None
-    except (OSError, ValueError):
-        return None
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - window))
+            raw = f.read().splitlines()
+        if size > window and raw: raw = raw[1:]
+        out = []
+        for l in raw:
+            try: e = json.loads(l.decode("utf-8", "replace"))
+            except ValueError: continue
+            if isinstance(e, dict) and e.get("event") == "settle_generation_refused": out.append(e)
+        return out
+    except OSError:
+        return []
 
 
 def _refuse_generation(op_id, lane, mint, pos_id, reason):
-    _last = _last_journal_record()
-    if (isinstance(_last, dict) and _last.get("event") == "settle_generation_refused" and _last.get("op_id") == op_id
-            and _last.get("pos_id") == pos_id and _last.get("reason") == reason):
+    if any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in _recent_refusals()):
         return False, "generation refused: %s (already journaled, nothing applied)" % reason   # retry of the same refusal: no unbounded growth
     _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason})
     return False, "generation refused: %s (journaled, nothing applied)" % reason
@@ -2320,7 +2333,9 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                       "reason": degraded})
             return False, ("account degraded: %s (journaled for "
                            "manual reconciliation)" % degraded)
-        _grf = None if _applied_same_generation(led, op_id, "credit", lane, mint, pos_id, expected_account_id, {"proceeds": proceeds, "fee": fee, "qty": qty, "price_kind": price_kind}) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+        _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+        if _grf is None and op_id in (led.get("ops") or {}):
+            _grf = _retry_contract_refusal(led, op_id, "credit", lane, mint, pos_id, {"proceeds": proceeds, "fee": fee, "qty": qty, "price_kind": price_kind})
         if _grf is not None:
             return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         rec, conflict = _op_lookup(led, op_id, "credit", lane, mint,
@@ -2477,7 +2492,9 @@ def write_down(lane: str, mint: str, op_id: str,
         if led is None:
             return False, "ledger unreadable"
         if degraded is None:
-            _grf = None if _applied_same_generation(led, op_id, "write_down", lane, mint, pos_id, expected_account_id, {"qty": qty, "reason": reason}) else _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+            _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+            if _grf is None and op_id in (led.get("ops") or {}):
+                _grf = _retry_contract_refusal(led, op_id, "write_down", lane, mint, pos_id, {"qty": qty, "reason": reason})
             if _grf is not None:
                 return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         prior = led["ops"].get(op_id)

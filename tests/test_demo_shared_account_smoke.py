@@ -368,6 +368,25 @@ C.poll_exits(price_fn=pf_for_mult(C, 1.9))
 check("1d-B storage back and price recovered below the trigger: still NOTHING sold (%d fills, quote calls %d -> %d), cash unchanged (%.4f)" % (len(_ceo_sells(F)), _nq, JUP.calls, cash(PA)),
       not _ceo_sells(F) and JUP.calls == _nq and _cents(cash(PA)) == _cents(_cash0))
 FakeJup.mult = 1.0
+# ---- 1e. ceo distinct-leg price reversal after a leg-A fault. Same scenario as 1d-A, restarted at different prices. Expectation per price (peak 2.0x, trail floor 0.70 x peak = 1.40x):
+#   1.9x: nothing else fires. 1.4x and 1.0x: leg A is booked ONCE from the journaled fill and leg C sells as its OWN distinct fill on the trail. 1.41x: trail does not fire.
+def _reversal(mult):
+    PA, F, CT = fresh(); ok, why, ps = _ceo_pos(PA, CT); mint = next(iter(ps)); c0 = cash(PA)
+    FakeJup.mult = 2.0
+    with __import__("unittest.mock", fromlist=["patch"]).patch.object(CI, "_append", _no_intent_only):
+        C.poll_exits(price_fn=pf_for(C))
+    FakeJup.mult = mult
+    C.poll_exits(price_fn=pf_for_mult(C, mult)); C.poll_exits(price_fn=pf_for_mult(C, mult))
+    p = (C.open_positions() or {}).get(mint) or {}; sl = _ceo_sells(F)
+    FakeJup.mult = 1.0
+    return p, sl, cash(PA) - c0
+for _m, _legs in ((1.9, ["a"]), (1.41, ["a"]), (1.4, ["a", "c"]), (1.0, ["a", "c"])):
+    _p, _sl, _dc = _reversal(_m)
+    _got = sorted(k.split(":")[3] for k in _sl); _net = sum(v["net_proceeds_usd"] for v in _sl.values())
+    check("1e reversal to %.2fx after a leg-A fault: sale fills by leg %r (want %r, each exactly once), leg a done %r, no pending_exit %r, cash +%.4f == sum of journaled nets %.4f"
+          % (_m, _got, _legs, _p.get("legs", {}).get("a", {}).get("done"), not _p.get("pending_exit"), _dc, _net),
+          _got == _legs and _p.get("legs", {}).get("a", {}).get("done") is True and not _p.get("pending_exit") and _cents(_dc) == _cents(_net)
+          and (("c" in _legs) == bool(_p.get("legs", {}).get("c", {}).get("done"))))
 # ---- 4. committed replay returns the SAME fill and does not debit twice
 PA, F, CT = fresh()
 op = F.intent_id("L", "ReplayMint1")

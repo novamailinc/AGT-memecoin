@@ -16,6 +16,8 @@ Semantics, stated so nothing is implied:
   until an operator calls reset_cursor(reason) (source only, no caller): the replay is then a deliberate act. Same for an unreadable cursor.
 * Items drained but not yet used by the lane when the process dies are LOST (at-most-once, cursor written before drain() returns). This is chosen over
   replay because a replayed graduation is a stale entry; it is a stated data-loss window, not hidden.
+* The cursor also stores the spool IDENTITY (inode + sha1 of the first complete line). A spool that was truncated and regrown PAST the old offset (or
+  rotated/replaced) would otherwise be read from the middle of a line: the identity mismatch goes inert with "spool_identity_changed" instead.
 * ERRORS SURFACE: any I/O or cursor fault writes a durable `<cursor>.status.json` ({"error", "since", "count", "last_ts"}) and health() returns it; an
   empty feed with health ok is genuinely empty. grad_cycle copies health() into the cycle journal's scan step. A successful drain clears the status.
 * Only items with source == "pumpportal-migration" are spooled (what grad_raw.migration_to_candidate accepts); the writer refuses anything else.
@@ -132,18 +134,53 @@ class SpoolFeed:
                 self._stats["cursor_unreadable"] += 1
             return None
 
+    def _ident(self):
+        """(inode, sha1 of the first COMPLETE line) of the spool, or None when it has no complete first line yet. The writer only appends, so a
+        change means rotation, truncation-and-regrow or replacement: the byte offset no longer refers to the same bytes."""
+        try:
+            import hashlib  # noqa: PLC0415
+            st = os.stat(self.path)
+            with open(self.path, "rb") as fh:
+                first = fh.readline()
+            if not first.endswith(b"\n"):
+                return None
+            return {"ino": st.st_ino, "head": hashlib.sha1(first).hexdigest()}
+        except Exception:
+            return None
+
+    def _stored_ident(self):
+        try:
+            with open(self.cursor_path) as fh:
+                v = json.load(fh).get("ident")
+            return v if isinstance(v, dict) else None
+        except Exception:
+            return None
+
     def drain(self):
         """Items past the cursor (oldest first, at most max_items). Never raises. An unreadable cursor yields NOTHING (fail closed: no guessing a
-        position) and is counted; it does not reset itself."""
+        position) and is counted; it does not reset itself. Identity is taken from the OPENED handle (fstat + the first line read from that same handle)
+        and re-checked against the path after the read, so a rotation between the stat and the read cannot slip through."""
         try:
             off = self._cursor()
             if off is None:
                 self._set_error("cursor_unreadable"); return []
-            size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
-            if size < off:
-                self._set_error("spool_shorter_than_cursor", "size %d < cursor %d" % (size, off)); return []
+            if not os.path.exists(self.path):
+                if off > 0:
+                    self._set_error("spool_shorter_than_cursor", "spool missing, cursor %d" % off)
+                return []
+            import hashlib  # noqa: PLC0415
+            old_id = self._stored_ident()
             out, pos = [], off
             with open(self.path, "rb") as fh:
+                st = os.fstat(fh.fileno()); size = st.st_size
+                first = fh.readline()
+                cur_id = {"ino": st.st_ino, "head": hashlib.sha1(first).hexdigest()} if first.endswith(b"\n") else None
+                if size < off:
+                    self._set_error("spool_shorter_than_cursor", "size %d < cursor %d" % (size, off)); return []
+                if old_id is None and off > 0:
+                    self._set_error("cursor_missing_identity", "offset %d with no stored spool identity" % off); return []   # cannot prove it is the same spool
+                if old_id is not None and cur_id != old_id:
+                    self._set_error("spool_identity_changed", "stored %s now %s" % (old_id, cur_id)); return []     # truncate-and-regrow / rotation / replacement
                 fh.seek(off)
                 while len(out) < self.max_items:
                     line = fh.readline()
@@ -158,8 +195,13 @@ class SpoolFeed:
                         out.append(item)
                     except Exception:
                         self._stats["skipped_corrupt"] += 1
-            if pos != off or size < off:
-                _atomic(self.cursor_path, {"offset": pos})
+            try:
+                if os.stat(self.path).st_ino != st.st_ino:
+                    self._set_error("spool_identity_changed", "rotated while reading"); return []      # nothing consumed, cursor untouched
+            except Exception:
+                self._set_error("spool_identity_changed", "spool vanished while reading"); return []
+            if pos != off or (old_id is None and cur_id is not None):
+                _atomic(self.cursor_path, dict({"offset": pos}, **({"ident": cur_id} if cur_id is not None else {})))
             self._stats["read"] += len(out)
             self._clear_error()
             return out

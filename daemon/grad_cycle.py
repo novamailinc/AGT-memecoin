@@ -108,6 +108,58 @@ CLEAR_COMMIT_ENABLED = False   # clear_fault GATHERS evidence but never commits 
                                # not atomic against the lane poll, the account writers and the fill journal (no common lock exists). No caller exists.
 
 
+_TORN_TAIL = "__fault_log_torn_tail__"
+
+
+def _log_tail_torn(grad):
+    try:
+        with open(_fault_log_path(grad), "rb") as fh:
+            data = fh.read()
+        return bool(data) and not data.endswith(b"\n")
+    except Exception:
+        return False
+
+
+def _REPAIR_HOOK(point):
+    """Test seam only (no-op): lets a test raise at a crash point inside the repair."""
+    return None
+
+
+def _repair_log_tail(grad):
+    """Called before every fault-log append (the caller holds the cycle lock). A log not ending in a newline would make the next append
+    concatenate onto the torn fragment and poison the whole log forever. The fragment is PRESERVED in <log>.torn-tails.jsonl, the log is
+    truncated back to its last newline, and a MARKER fault with its own fault_id is appended: the unknown fault stays ACTIVE until a clear record
+    names it. Returns True when the log is append-safe."""
+    path = _fault_log_path(grad)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+    if not data or data.endswith(b"\n"):
+        return True
+    import uuid  # noqa: PLC0415
+    cut = data.rfind(b"\n") + 1
+    frag = data[cut:]
+    try:
+        with open(path + ".torn-tails.jsonl", "a") as th:
+            th.write(json.dumps({"ts": time.time(), "fragment": frag.decode("utf-8", "replace")[:2000], "bytes": len(frag)}) + "\n"); th.flush(); os.fsync(th.fileno())
+        mark = (json.dumps({"fault_id": "torn_tail_" + uuid.uuid4().hex, "since": time.time(),
+                            "entry": {"reason": "fault_log_torn_tail_repaired", "fragment_bytes": len(frag)}}) + "\n").encode()
+        with open(path, "r+b") as fh:
+            # CRASH ORDER: the marker is written OVER the fragment and fsynced FIRST, then the file is cut to cut+len(marker). A kill between the
+            # two leaves the marker followed by leftover fragment bytes with no newline: that reads as a torn tail again (still ACTIVE).
+            # Truncating first would leave a clean log and lose the unknown fault.
+            fh.seek(cut); fh.write(mark); fh.flush(); os.fsync(fh.fileno())
+            _REPAIR_HOOK("after_marker_before_truncate")
+            fh.truncate(cut + len(mark)); fh.flush(); os.fsync(fh.fileno())
+        return True
+    except Exception:
+        return False
+
+
 def _open_logged_faults(grad):
     """fault_ids in the append-only fault log with no clear record naming them. None = a log line or the log is unreadable."""
     ids = []
@@ -118,7 +170,9 @@ def _open_logged_faults(grad):
                 except Exception:
                     if line.endswith("\n"):
                         return None            # a COMPLETE unparseable line is damage
-                    # a final line without its newline is a crash mid-append: tolerated (the fault is still in the fault FILE or the next append)
+                    # a final line without its newline is a crash mid-append: the fault it carried is UNKNOWN (it may exist nowhere else when the fault
+                    # file write also failed). It is an ACTIVE sentinel, never clean, and is repaired (preserved + a marker fault) by the next append.
+                    ids.append(_TORN_TAIL)
     except FileNotFoundError:
         return []
     except Exception:
@@ -168,6 +222,8 @@ def _record_fault(grad, out, reason, **detail):
     except Exception as e:
         written = False; out["fault_write_failure"] = repr(e)[:200]
     try:      # append-only log: survives deletion of the fault file; active = a logged fault_id with no clear record naming it
+        if not _repair_log_tail(grad):
+            raise OSError("fault log tail could not be repaired")
         with open(_fault_log_path(grad), "a") as fh:
             fh.write(json.dumps({"fault_id": rec["fault_id"], "since": rec["since"], "entry": entry}, default=str) + "\n"); fh.flush(); os.fsync(fh.fileno())
         written = written or None
@@ -201,13 +257,16 @@ def _account_op_index(pa):
         return None
     if status:
         return None
-    debits, settled = {}, set()
+    debits, settled, refused, dups = {}, set(), set(), set()
     for e in entries:
+        if e.get("event") == "debit_refused" and e.get("op_id"):
+            refused.add(e["op_id"])
         if e.get("event") == "debit" and e.get("op_id"):
+            if e["op_id"] in debits: dups.add(e["op_id"])          # two debits for ONE op id: the index would keep only the last pos_id
             debits[e["op_id"]] = e.get("pos_id")
         elif e.get("event") == "credit" and e.get("final") is True and e.get("pos_id"):
             settled.add(e["pos_id"])
-    return {"debits": debits, "settled": settled}
+    return {"debits": debits, "settled": settled, "refused": refused, "dups": dups}
 
 
 def _fills_ownership(grad, jj, d, acct):
@@ -230,9 +289,24 @@ def _fills_ownership(grad, jj, d, acct):
         per_mint.setdefault(r.get("mint"), set()).add(str(r.get("pa_pos_id") or r.get("entry_op") or id(r)))
     bad, notes = [], {"entry_refused_no_debit": 0, "entry_settled_on_account_unowned": 0}
     fills = jj.get("fills") or {}
-    for k in (jj.get("intents") or {}):
-        if str(k).startswith(lane + "|"):
-            bad.append("open_entry_intent:%s" % k)
+    for k, op in (jj.get("intents") or {}).items():
+        if not str(k).startswith(lane + "|"):
+            continue
+        # classified from the account WAL read-only (never filler._intent_state, which calls _load_locked): a DemoSkip entry leaves its intent open BY DESIGN
+        if acct is None:
+            bad.append("open_entry_intent_unclassifiable:%s" % k); continue
+        if op in acct["dups"]:
+            bad.append("op_has_multiple_debits:%s" % op); continue
+        if op not in acct["debits"] and op not in acct["refused"]:
+            notes["intent_fresh_no_account_event"] = notes.get("intent_fresh_no_account_event", 0) + 1; continue
+        if op in acct["refused"]:
+            notes["intent_stale_refused"] = notes.get("intent_stale_refused", 0) + 1; continue
+        pid = acct["debits"].get(op)
+        if pid is not None and (str(pid) in pids or str(op) in entry_ops):
+            notes["intent_resume_owned_by_lane"] = notes.get("intent_resume_owned_by_lane", 0) + 1; continue
+        if pid is not None and pid in acct["settled"]:
+            notes["intent_stale_settled"] = notes.get("intent_stale_settled", 0) + 1; continue
+        bad.append("open_entry_intent_debited_unowned:%s" % k)
     for k in fills:
         if not isinstance(k, str):
             bad.append("fill_key_not_string"); continue
@@ -245,6 +319,8 @@ def _fills_ownership(grad, jj, d, acct):
                 continue
             if acct is None:
                 bad.append("entry_fill_unclassifiable_account_journal_unreadable:%s" % k); continue
+            if k in acct["dups"]:
+                bad.append("op_has_multiple_debits:%s" % k); continue
             if k not in acct["debits"]:
                 notes["entry_refused_no_debit"] += 1; continue
             pid = acct["debits"][k]
@@ -295,6 +371,12 @@ def clear_fault(grad, account=None, operator_note=""):
     lock = getattr(grad, "_ledger_lock", None)
     if lock is None:
         return False, dict(ev, blocked=["no_ledger_lock"])
+    pa = account if account is not None else grad._paper_account()
+    # RAW account evidence FIRST: pa.snapshot() (also used by _fingerprint) runs _load_locked, which truncates a torn WAL tail, restores .bak and
+    # reconciles the ledger to the WAL, so after it the crash-window states verify_replay exists to see are already healed.
+    pre_consistency = _journal_internal_consistency(pa, None) if pa is not None else (None, "no_account")
+    pre_index = _account_op_index(pa) if pa is not None else None
+    ev["account_evidence_order"] = "verify_replay_and_wal_index_read_BEFORE_snapshot_heal"
     fp0 = _fingerprint(grad, account)
     f = _read_fault(grad)
     ev["fault_record"] = "none" if f is None else ("unreadable" if f.get("unreadable") else "present")
@@ -306,6 +388,7 @@ def clear_fault(grad, account=None, operator_note=""):
     if f is None and not _lg:
         return False, dict(ev, blocked=["no_fault"])
     bad = []
+    if _lg and _TORN_TAIL in _lg: bad.append("fault_log_torn_tail")
     j = _read_journal(grad)
     ev["journal_status"] = (j or {}).get("status") if j and not j.get("unreadable") else ("unreadable" if j else "none")
     if ev["journal_status"] == "running": bad.append("cycle_running_or_interrupted")
@@ -330,7 +413,6 @@ def clear_fault(grad, account=None, operator_note=""):
         op = d.get("positions") or {}
     except Exception as e:
         op = None; bad.append("lane_state_unreadable:%r" % (e,))
-    pa = account if account is not None else grad._paper_account()
     try: snap = pa.snapshot() if pa is not None else None
     except Exception: snap = None
     if not snap or snap.get("degraded"):
@@ -356,14 +438,15 @@ def clear_fault(grad, account=None, operator_note=""):
         if any((not isinstance(v, dict)) or not v.get("lane") for v in holds.values()): bad.append("account_holds_unknown_lane")
         hl = [k for k, v in holds.items() if isinstance(v, dict) and v.get("lane") == lane]
         if hl: bad.append("account_holds_for_lane:%d" % len(hl))
-        ok_c, det = _journal_internal_consistency(pa, snap)
+        ok_c, det = pre_consistency
         ev["account_journal_internal_consistency"] = det
+        if ok_c is False: ev["account_consistency_note"] = "a False pre-heal verdict may be a ledger BEHIND the WAL (crash window; an account reload heals it) rather than corruption"
         if ok_c is not True: bad.append("account_journal_consistency_%s" % ("failed" if ok_c is False else "unevaluable"))
     try:
         jj = grad._demo_filler()._locked(lambda j_: json.loads(json.dumps({"fills": j_.get("fills") or {}, "intents": j_.get("intents") or {}}, default=str)))
         ev["fill_journal"] = "ok:%d" % len(jj["fills"])
         if d is not None:
-            own, notes = _fills_ownership(grad, jj, d, _account_op_index(pa) if pa is not None else None)
+            own, notes = _fills_ownership(grad, jj, d, pre_index)
             ev["fill_ownership_notes"] = notes
             if own: bad.append("fill_ownership:%s" % own[:5])
     except Exception as e:
@@ -461,6 +544,8 @@ def _run_cycle_inner(grad=None, price_fn=None, scan_fn=None, now=None, price_rou
     aborts0 = _abort_count(grad)
     prior = _read_journal(grad)
     fault_written = True
+    if _log_tail_torn(grad) and not _repair_log_tail(grad):
+        fault_written = _record_fault(grad, out, "fault_log_torn_tail_unrepairable") and fault_written
     if prior and prior.get("unreadable"):
         fault_written = _record_fault(grad, out, "cycle_journal_unreadable", detail=prior.get("unreadable"))
     elif prior and prior.get("status") == "running":
@@ -515,7 +600,8 @@ def _run_cycle_inner(grad=None, price_fn=None, scan_fn=None, now=None, price_rou
                 out["steps"]["scan"] = {"ok": False, "error": repr(e)[:200]}
     out["status"] = "done"
     if fault_written:
-        _write_journal(grad, out, out)
+        # a DEFERRED cycle is not finished until scan_phase completes: the journal stays "running" (phase awaiting_scan) so a kill in between is seen
+        _write_journal(grad, dict(out, status="running", phase="awaiting_scan") if out.get("scan_deferred") else out, out)
     return out
 
 
@@ -548,7 +634,11 @@ def run_cycle(grad=None, price_fn=None, scan_fn=None, now=None, price_route=None
 
 def scan_phase(grad, scan_fn, rec):
     """Second phase of a deferred cycle: runs the entry scan for ONE lane, after every lane's exit phase. Takes the same per-ledger cycle lock, re-checks
-    the scan gate NOW (fault, markers, account) and whether an abort happened since the exit phase ended. Never raises; exits are not involved."""
+    the scan gate NOW (fault, markers, account) and whether an abort happened since the exit phase ended. Never raises; exits are not involved.
+    EVERY path after the lock is taken finalizes the journal with a truthful status ("done" when the scan ran; "done_scan_skipped" when refused; a
+    failed final write is recorded in rec["journal_final_write_failure"] and the journal then stays running, fail closed). When the lock cannot be
+    taken the journal is left as the exit phase wrote it (running/awaiting_scan): the next cycle reports it as interrupted (fail closed, possibly
+    spurious, stated)."""
     import fcntl  # noqa: PLC0415
     if not rec.get("scan_deferred") or scan_fn is None:
         return rec
@@ -558,21 +648,29 @@ def scan_phase(grad, scan_fn, rec):
     except Exception as e:
         rec["scan_skipped"] = "busy_or_lock_failure:%r" % (e,); return rec
     try:
-        now_ab = _abort_count(grad)
-        if now_ab is None or (rec.get("aborts_end") is not None and now_ab > int(rec["aborts_end"])):
-            _record_fault(grad, rec, "abort_between_exit_phase_and_scan", aborts_end=rec.get("aborts_end"), aborts_now=now_ab)
-            rec["scan_skipped"] = "abort_before_scan"
-        else:
-            ok, why = scan_gate(grad)
-            if not ok:
-                rec["scan_skipped"] = why
+        try:
+            now_ab = _abort_count(grad)
+            if now_ab is None or (rec.get("aborts_end") is not None and now_ab > int(rec["aborts_end"])):
+                _record_fault(grad, rec, "abort_between_exit_phase_and_scan", aborts_end=rec.get("aborts_end"), aborts_now=now_ab)
+                rec["scan_skipped"] = "abort_before_scan"
             else:
-                try:
-                    _res = scan_fn(); rec.setdefault("steps", {})["scan"] = {"ok": True, "feed_health": (_res or {}).get("feed_health") if isinstance(_res, dict) else None}
-                except Exception as e:
-                    rec.setdefault("steps", {})["scan"] = {"ok": False, "error": repr(e)[:200]}
-        try: _atomic(_journal_path(grad), dict(rec))
-        except Exception: pass
+                ok, why = scan_gate(grad)
+                if not ok:
+                    rec["scan_skipped"] = why
+                elif not _write_journal(grad, dict(rec, status="running", phase="scan"), rec):
+                    rec["scan_skipped"] = "scan_intent_not_durable"      # no durable "running" scan record: the entry crash window would be invisible
+                else:
+                    try:
+                        _res = scan_fn(); rec.setdefault("steps", {})["scan"] = {"ok": True, "feed_health": (_res or {}).get("feed_health") if isinstance(_res, dict) else None}
+                    except Exception as e:
+                        rec.setdefault("steps", {})["scan"] = {"ok": False, "error": repr(e)[:200]}
+        except Exception as e:
+            rec["scan_skipped"] = "scan_phase_exception:%r" % (e,)
+        rec["status"] = "done_scan_skipped" if rec.get("scan_skipped") else "done"
+        try:
+            _atomic(_journal_path(grad), dict(rec))
+        except Exception as e:
+            rec["journal_final_write_failure"] = repr(e)[:200]
         return rec
     finally:
         try: lk.close()
@@ -626,6 +724,9 @@ def status(grad, max_age_s, now=None):
         return {"state": "interrupted", "last": j}
     if j.get("degraded"):
         return {"state": "degraded", "why": j["degraded"], "last": j}
+    _fh = (((j.get("steps") or {}).get("scan") or {}).get("feed_health"))
+    if _fh:
+        return {"state": "feed_error", "why": (_fh or {}).get("error"), "feed_health": _fh, "last": j}      # the lane is inert on a durable feed error: not "ok"
     if j.get("scan_skipped"):
         return {"state": "scan_skipped", "why": j["scan_skipped"], "last": j}
     return {"state": "ok", "last": j}

@@ -97,8 +97,11 @@ for label, mut, key in (
     ("the fill journal holds an exit fill that no lane position or close owns", lambda g: g.fills.__setitem__("grad:exit:MINTX:k1", {}), "fill_ownership"),
     ("the account's OWN genesis replay reports a divergence", lambda g: g.replay.__setitem__("reason", "cash mismatch vs journal"), "account_journal_consistency_failed"),
     ("the account replay cannot run (unevaluable)", lambda g: g.replay.__setitem__("none", "ledger_file_unreadable_or_missing"), "account_journal_consistency_unevaluable"),
+    ("account WAL is TORN: verify_replay says journal_status:torn (None)", lambda g: g.replay.__setitem__("none", "journal_status:torn"), "account_journal_consistency_unevaluable"),
+    ("account WAL has a sequence hole: verify_replay says journal_seq_violation (None)", lambda g: g.replay.__setitem__("none", "journal_seq_violation"), "account_journal_consistency_unevaluable"),
+    ("the account module has NO verify_replay (refuse, never fall back to the mutating loader)", lambda g: delattr(g.pa, "verify_replay"), "account_journal_consistency_unevaluable"),
     ("an ENTRY fill has an account debit (still open on the account) and no lane owner", lambda g: (g.fills.__setitem__("grad:entry:MINTY:123", {}), g.entries.append({"event": "debit", "op_id": "grad:entry:MINTY:123", "pos_id": "PX"})), "fill_ownership"),
-    ("an open entry intent exists for the lane", lambda g: setattr(g, "_demo_filler", lambda: types.SimpleNamespace(_locked=lambda fn: fn({"fills": g.fills, "intents": {"grad|MINTZ": {}}}))), "fill_ownership"),
+    ("an open entry intent whose op is DEBITED on the account, still open, with no lane owner", lambda g: (g.entries.append({"event": "debit", "op_id": "grad:entry:MINTZ:9:1", "pos_id": "PZ"}), setattr(g, "_demo_filler", lambda: types.SimpleNamespace(_locked=lambda fn: fn({"fills": g.fills, "intents": {"grad|MINTZ": "grad:entry:MINTZ:9:1"}})))), "fill_ownership"),
     ("the account journal is unreadable while an entry fill needs classifying", lambda g: (g.fills.__setitem__("grad:entry:MINTY:123", {}), setattr(g.pa, "_journal_read", lambda: ([], "torn", None))), "fill_ownership"),
     ("the fill journal has a key of an unknown kind for this lane", lambda g: g.fills.__setitem__("grad:weird:MINTY:1", {}), "fill_ownership"),
     ("an exit fill names an instance (pa_pos_id suffix) no position owns", lambda g: (g.state["closes"].append({"mint": "M2", "pa_pos_id": "P2"}), g.fills.__setitem__("grad:exit:M2:k:P9", {})), "fill_ownership"),
@@ -189,6 +192,100 @@ _pa = ga.poll_exits
 def _slow_scan_then_abort(): order.append("A_scan"); gb.ab["poll_aborts"]["count"] += 1; return {}
 recs = GC.run_all([("A", ga, _slow_scan_then_abort), ("B", gb, lambda: (order.append("B_scan") or {}))])
 check("C16 an abort that happens between lane B's exit phase and its scan is faulted and B's scan is refused (%s, %s)" % (recs["B"].get("scan_skipped"), order), recs["B"]["scan_skipped"] == "abort_before_scan" and "B_scan" not in order and GC.fault_active(gb)[0])
+GC.CLEAR_COMMIT_ENABLED = True
+g = rich(); abort_once(g)
+g._demo_filler = lambda: types.SimpleNamespace(_locked=lambda fn: fn({"fills": g.fills, "intents": {"grad|MA": "grad:entry:MA:1:1", "grad|MB": "grad:entry:MB:2:2"}}))
+g.entries.append({"event": "debit_refused", "op_id": "grad:entry:MB:2:2"})
+okd, evd = GC.clear_fault(g)
+check("C10y routine DemoSkip leftovers do NOT block: an intent with no account event (fresh) and one with a durable debit_refused (stale) are benign and counted (%s %s)" % (evd.get("blocked"), evd.get("fill_ownership_notes")),
+      okd and evd["fill_ownership_notes"].get("intent_fresh_no_account_event") == 1 and evd["fill_ownership_notes"].get("intent_stale_refused") == 1)
+g = rich(); abort_once(g); g._demo_filler = lambda: types.SimpleNamespace(_locked=lambda fn: fn({"fills": g.fills, "intents": {"grad|MA": "grad:entry:MA:1:1"}}))
+g.pa._journal_read = lambda: ([], "torn", None)
+okd2, evd2 = GC.clear_fault(g)
+check("C10y2 an intent cannot be classified when the account WAL is unreadable: blocks (%s)" % (evd2.get("blocked"),), (not okd2) and any("open_entry_intent_unclassifiable" in str(b) for b in evd2["blocked"]))
+# raw account evidence is read BEFORE snapshot() (which heals on access)
+g = rich(); abort_once(g); order_ = []
+_vr = g.pa.verify_replay; _sn = g.pa.snapshot; _jr = g.pa._journal_read
+g.pa.verify_replay = lambda: (order_.append("verify_replay") or _vr()); g.pa.snapshot = lambda: (order_.append("snapshot") or _sn()); g.pa._journal_read = lambda: (order_.append("wal_index") or _jr())
+okz, evz = GC.clear_fault(g)
+check("C10z verify_replay and the WAL index are read BEFORE any snapshot() (%s)" % order_[:4], order_.index("verify_replay") < order_.index("snapshot") and order_.index("wal_index") < order_.index("snapshot") and evz.get("account_evidence_order", "").startswith("verify_replay"))
+# torn fault-log tail: second append must not poison the log
+g = rich(); abort_once(g)
+with open(g.LEDGER_PATH + ".cycle-fault-log.jsonl", "a") as fh: fh.write('{"fault_id": "frag')
+os.remove(g.LEDGER_PATH + ".cycle-fault.json"); GC._MEM.clear()
+okt, evt = GC.clear_fault(g)
+check("C10w2 a torn tail is an ACTIVE unknown: the clear is blocked with fault_log_torn_tail (%s)" % (evt.get("blocked"),), (not okt) and "fault_log_torn_tail" in evt["blocked"])
+GC._record_fault(g, {}, "second_fault_after_torn_tail")
+_ids = GC._open_logged_faults(g)
+check("C10w3 the NEXT append repairs the tail first: the log stays parseable, the fragment is preserved, and a marker fault keeps the unknown ACTIVE (%s)" % (_ids,),
+      _ids is not None and GC._TORN_TAIL not in _ids and any(str(i).startswith("torn_tail_") for i in _ids) and len(_ids) >= 2 and "frag" in open(g.LEDGER_PATH + ".cycle-fault-log.jsonl.torn-tails.jsonl").read() and GC.fault_active(g)[0])
+# deferred cycle: the journal stays running until the scan completes; the scan itself has a durable running record
+GC.CLEAR_COMMIT_ENABLED = False
+g = rich(); seen_ = {}
+rec_ = GC.run_cycle(g, scan_fn=lambda: (seen_.update(during=dict(GC._read_journal(g))) or {}), price_route="lane_default", defer_scan=True)
+j_after_exits = dict(GC._read_journal(g))
+GC.scan_phase(g, lambda: (seen_.update(during=dict(GC._read_journal(g))) or {}), rec_)
+j_end = dict(GC._read_journal(g))
+check("C17 deferred: journal is running/awaiting_scan after the exits, running/scan DURING the scan, done after (%s, %s, %s)" % (j_after_exits.get("status"), (seen_.get("during") or {}).get("status"), j_end.get("status")),
+      j_after_exits.get("status") == "running" and j_after_exits.get("phase") == "awaiting_scan" and (seen_.get("during") or {}).get("status") == "running" and (seen_["during"]).get("phase") == "scan" and j_end.get("status") == "done")
+g = rich(); ran_ = []
+rec_ = GC.run_cycle(g, scan_fn=lambda: ran_.append(1), price_route="lane_default", defer_scan=True)
+_ws = GC._write_journal; GC._write_journal = lambda grad, r, out: False
+try: GC.scan_phase(g, lambda: ran_.append(1), rec_)
+finally: GC._write_journal = _ws
+check("C17b if the scan's running record cannot be made durable the scan is REFUSED (%s)" % (rec_.get("scan_skipped"),), rec_.get("scan_skipped") == "scan_intent_not_durable" and ran_ == [])
+GC.CLEAR_COMMIT_ENABLED = True
+# torn tail with NO new fault: the next cycle repairs it (no deadlock), the marker is named by the clear, and the fault is then inactive
+g = rich(); abort_once(g)
+with open(g.LEDGER_PATH + ".cycle-fault-log.jsonl", "a") as fh: fh.write('{"fault_id": "frag2')
+GC._MEM.clear(); cyc(g)
+_idsr = GC._open_logged_faults(g)
+check("C10w4 a torn tail with no new fault is repaired by the next cycle itself (%s)" % (_idsr,), _idsr is not None and GC._TORN_TAIL not in _idsr and any(str(i).startswith("torn_tail_") for i in _idsr))
+okc, evc = GC.clear_fault(g)
+_cl = GC._clear_records(g)
+check("C10w5 the clear NAMES the torn_tail marker id and the fault is inactive afterwards (%s %s)" % (okc, evc.get("blocked")), okc and any(str(i).startswith("torn_tail_") for r_ in _cl for i in (r_.get("fault_ids") or [])) and not GC.fault_active(g)[0])
+# crash INSIDE the repair, after the marker is written but before the truncate: the unknown must stay active
+g = rich(); abort_once(g)
+os.remove(g.LEDGER_PATH + ".cycle-fault.json"); GC._MEM.clear()
+with open(g.LEDGER_PATH + ".cycle-fault-log.jsonl", "a") as fh: fh.write('{"fault_id": "frag3-' + "x" * 300)      # the fragment is LONGER than the marker
+def _boom(point): raise RuntimeError("kill at " + point)
+_hk = GC._REPAIR_HOOK; GC._REPAIR_HOOK = _boom
+try: GC._repair_log_tail(g)
+except Exception: pass
+GC._REPAIR_HOOK = _hk
+check("C10w6 a crash after the marker write and before the truncate leaves the unknown ACTIVE (not a clean log): (%s)" % (GC.fault_active(g),), GC.fault_active(g)[0] and "no_fault" not in (GC.clear_fault(g)[1].get("blocked") or []))
+GC.CLEAR_COMMIT_ENABLED = False
+# every scan_phase exit path finalizes truthfully
+g = rich(); rec_ = GC.run_cycle(g, scan_fn=lambda: {}, price_route="lane_default", defer_scan=True)
+g.ab["poll_aborts"]["count"] += 1
+GC.scan_phase(g, lambda: {}, rec_)
+check("C17c an abort between phases: journal finalized as done_scan_skipped (not a crash look-alike) (%s)" % (GC._read_journal(g).get("status"),), GC._read_journal(g).get("status") == "done_scan_skipped" and rec_["scan_skipped"] == "abort_before_scan")
+g = rich(); rec_ = GC.run_cycle(g, scan_fn=lambda: {}, price_route="lane_default", defer_scan=True)
+_sg = GC.scan_gate; GC.scan_gate = lambda grad, account=None: (_ for _ in ()).throw(RuntimeError("gate boom"))
+try: GC.scan_phase(g, lambda: {}, rec_)
+finally: GC.scan_gate = _sg
+check("C17d an exception inside scan_phase is contained and finalizes the journal (%s, %s)" % (rec_.get("scan_skipped"), GC._read_journal(g).get("status")), str(rec_.get("scan_skipped")).startswith("scan_phase_exception") and GC._read_journal(g).get("status") == "done_scan_skipped")
+g = rich(); rec_ = GC.run_cycle(g, scan_fn=lambda: {}, price_route="lane_default", defer_scan=True)
+_at = GC._atomic; GC._atomic = lambda p, r: (_ for _ in ()).throw(OSError("disk full"))
+try: GC.scan_phase(g, lambda: {}, rec_)
+finally: GC._atomic = _at
+check("C17e a failed FINAL journal write is recorded, and the journal stays running (fail closed) (%s)" % (rec_.get("journal_final_write_failure"),), rec_.get("journal_final_write_failure") and GC._read_journal(g).get("status") == "running")
+GC.CLEAR_COMMIT_ENABLED = True
+g = rich(); abort_once(g); g.fills["grad:entry:MD:7"] = {}
+g.entries.extend([{"event": "debit", "op_id": "grad:entry:MD:7", "pos_id": "P1"}, {"event": "debit", "op_id": "grad:entry:MD:7", "pos_id": "P2"}])
+okm, evm = GC.clear_fault(g)
+check("C10v2 two debits for ONE op id block (the index must not keep only the last) (%s)" % (evm.get("blocked"),), (not okm) and "op_has_multiple_debits" in str(evm.get("blocked")))
+GC.CLEAR_COMMIT_ENABLED = False
+# a refused (done_scan_skipped) deferred cycle is NOT a crash signal: the next cycle runs clean, no interrupted_prior_cycle fault
+g = rich(); rec_ = GC.run_cycle(g, scan_fn=lambda: {}, price_route="lane_default", defer_scan=True)
+_sg2 = GC.scan_gate; GC.scan_gate = lambda grad, account=None: (False, "test_gate_refusal")
+try: GC.scan_phase(g, lambda: {}, rec_)
+finally: GC.scan_gate = _sg2
+_jst = GC._read_journal(g).get("status"); GC._MEM.clear(); r_next = cyc(g)
+check("C17f a done_scan_skipped journal (%s) does NOT fault the next cycle (only running does) (%s %s)" % (_jst, r_next.get("status"), r_next.get("scan_skipped")), _jst == "done_scan_skipped" and r_next["status"] == "done" and not os.path.exists(g.LEDGER_PATH + ".cycle-fault.json"))
+g = rich(); GC._write_journal(g, {"status": "done", "ts": GC.time.time(), "steps": {"scan": {"ok": True, "feed_health": {"error": "cursor_unreadable"}}}}, {})
+st_ = GC.status(g, 3600)
+check("C17g a durable feed error is surfaced by status() as feed_error, never ok (%s)" % (st_.get("state"),), st_.get("state") == "feed_error")
 GC._MEM.clear()
 g = fake(dict(CLEAN, n_pending=1), snap=OK_SNAP); r3 = GC.run_cycle(g, scan_fn=lambda: g.calls.append("scan"), price_route="lane_default")
 check("C11 an unresolved pending_exit keeps the scan refused across cycles (durable gate, not the in-memory counter): %s" % r3["scan_skipped"], "scan" not in g.calls and "n_pending" in str(r3["scan_skipped"]))

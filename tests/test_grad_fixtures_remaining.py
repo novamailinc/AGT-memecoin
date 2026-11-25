@@ -1633,6 +1633,49 @@ try:
     _cl = _GCY.clear_fault(GR); _bl = _cl[1].get("blocked") or []
     check("P7zr3 real ledger, real legacy position: clear_fault refuses and the ONLY reasons are the position verdict and the disabled commit switch (no false orphan, no fill-ownership, no cash/replay, no marker reason): %s" % (_bl,),
           (not _cl[0]) and all(b.startswith("position:") or b == "commit_disabled_no_common_writer_lock" for b in _bl) and any(b.startswith("position:") for b in _bl) and not _GCY._clear_records(GR))
+    # P7zr4 POST-CREDIT crash window (source only, unrun): the fill is journaled and the account CREDIT is applied (inside _close_leg), then the lane
+    # write FAILS (GR._write raises once) and the failure state cannot be restored. Replay identity is proven per OPERATION, not by aggregate cash:
+    #   - at the failing write the account WAL ALREADY holds the credit for this position (so the failure really is post-credit);
+    #   - after a later CLEAN cycle at a DIFFERENT price (a re-quote would change proceeds/qty) the WAL credit events for the position are IDENTICAL
+    #     (same count, same values), the account position qty fell exactly once, the exit fill key count did not change, leg a is done on the
+    #     persisted lane ledger, and the latched poll_abort fault and the refused scans remain after convergence;
+    #   - PAr.verify_replay() is read BEFORE any snapshot() after the converging cycle and its verdict is asserted (not guessed).
+    # Still an in-process fresh-state replay: NOT a kill/restart proof.
+    def _wal_credits(pid_): return [dict(e) for e in PAr._journal_read()[0] if e.get("event") == "credit" and str(e.get("pos_id")) == str(pid_)]
+    def _acct_qty(pid_):
+        for _p in (((PAr.snapshot().get("lanes") or {}).get("grad") or {}).get("positions") or []):
+            if str(_p.get("pos_id")) == str(pid_): return _p.get("qty")
+        return None
+    _pid4 = GR.open_positions()[_gmr].get("pa_pos_id"); _q0 = _acct_qty(_pid4); _cr0 = _wal_credits(_pid4)
+    _fk0 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}; _cash0 = float(PAr.snapshot().get("cash"))
+    _wr_save = GR._write; _once = {"n": 0, "credits_at_fail": None}
+    def _write_boom(d_):
+        _once["n"] += 1
+        if _once["n"] == 1:
+            _once["credits_at_fail"] = _wal_credits(_pid4); raise OSError("injected lane write failure AFTER the account credit")
+        return _wr_save(d_)
+    GR._persist_poll_failure = lambda d, mint, pos, exc: False; GR._write = _write_boom; _scans.clear(); _a4 = GR._POLL_ABORTS.get("count", 0)
+    try: _r4 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(4), now=time.time())
+    finally: GR._persist_poll_failure = _pf_save; GR._write = _wr_save
+    _cr1 = _wal_credits(_pid4); _cash1 = float(PAr.snapshot().get("cash")); _q1 = _acct_qty(_pid4); _fk1 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
+    _hi2_px = lambda c, m, i: _epr * 2.6      # DIFFERENT price: a re-quote instead of a replay of the journaled fill would change proceeds and qty
+    _r5 = _GCY.run_cycle(GR, price_fn=_hi2_px, scan_fn=lambda: _scans.append(5), now=time.time())     # clean cycle, seam removed
+    _vr5 = PAr.verify_replay()                                                                          # BEFORE any snapshot() (which heals on access)
+    _cr2 = _wal_credits(_pid4); _cash2 = float(PAr.snapshot().get("cash")); _q2 = _acct_qty(_pid4); _fk2 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
+    _lg = GR._read().get("positions", {}).get(_gmr) or {}; _la = ((_lg.get("legs") or {}).get("a") or {})
+    _flt = _GCY._read_fault(GR) or {}
+    check("P7zr4a the injected failure is POST-credit: at the failing write the account WAL already held a credit for the position (%d before, %d at failure), and the poll aborted (count %s -> %s)"
+          % (len(_cr0), len(_once["credits_at_fail"] or []), _a4, GR._POLL_ABORTS.get("count")),
+          _once["credits_at_fail"] is not None and len(_once["credits_at_fail"]) == len(_cr0) + 1 and GR._POLL_ABORTS.get("count", 0) == _a4 + 1)
+    check("P7zr4b credit exactly once so far: cash %.6f -> %.6f, exactly one new exit fill key (%s), account qty %s -> %s" % (_cash0, _cash1, sorted(_fk1 - _fk0), _q0, _q1),
+          _cash1 > _cash0 and len(_fk1 - _fk0) == 1 and len(_cr1) == len(_cr0) + 1 and _q0 is not None and _q1 is not None and float(_q1) < float(_q0))
+    check("P7zr4c REPLAY IDENTITY at a different price (x2.6 vs x2.5): the WAL credit events for the position are IDENTICAL (%d vs %d), cash unchanged (%.6f), account qty unchanged once (%s), exit fill keys unchanged, leg a done on the lane ledger (%s)"
+          % (len(_cr1), len(_cr2), _cash2, _q2, _la.get("done")),
+          _cr2 == _cr1 and abs(_cash2 - _cash1) < 1e-9 and _q2 == _q1 and _fk2 == _fk1 and _la.get("done") is True)
+    check("P7zr4d the latched poll_abort fault REMAINS after convergence and the scan stayed refused in both cycles (scans %s, fault reasons %s, scan_skipped %s)"
+          % (_scans, [x.get("reason") for x in (_flt.get("reasons") or [])], _r5.get("scan_skipped")),
+          _scans == [] and _GCY.fault_active(GR)[0] and any(x.get("reason") == "poll_abort" for x in (_flt.get("reasons") or [])) and str(_r5.get("scan_skipped", "")).startswith("unresolved_fault"))
+    check("P7zr4e verify_replay on the RAW account after the converging cycle, before any heal, gives a definite verdict (not None): %s" % (_vr5,), _vr5[0] in (True, False))
 finally:
     for _k, _v in _env_save.items():
         if _v is None: os.environ.pop(_k, None)

@@ -1297,7 +1297,7 @@ def _derive_buckets_locked(led: Dict[str, Any],
 
 
 def verify_replay() -> Tuple[Optional[bool], str]:
-    """READ-ONLY check (writes nothing: no torn-tail truncation, no ledger creation, no .bak restore, no reconcile). Replays the WAL from genesis
+    """READ-ONLY check on an EXISTING account (no financial writes: no torn-tail truncation, no ledger creation, no .bak restore, no reconcile, and no directory or lock-file creation: a virgin path returns (None, account_dir_or_lock_file_missing_not_created); it holds the exclusive account flock during the read phase; _derive_buckets_locked logs a WARNING). Replays the WAL from genesis
     on a deepcopy of the stored ledger file and compares: cash total, cash_spendable, cash_estimated, assumed_sold keys and the per-lane open
     position key sets (the first two are checked inside _derive_buckets_locked, the rest here). NOT checked, because the replay keeps them local:
     holds, pending_sol, per-position qty/basis. Returns (True, why) only on a full match of those; (False, reason) on a divergence; (None, reason)
@@ -1305,6 +1305,9 @@ def verify_replay() -> Tuple[Optional[bool], str]:
     conservation."""
     import copy
     try:
+        # never CREATE anything: _lock() would makedirs the account dir and O_CREAT the lock file on a virgin path
+        if not (os.path.isdir(ACCOUNT_DIR) and os.path.isfile(LOCK_FILE)):
+            return None, "account_dir_or_lock_file_missing_not_created"
         with _lock():
             entries, jstatus, _off = _journal_read()
             if jstatus is not None:

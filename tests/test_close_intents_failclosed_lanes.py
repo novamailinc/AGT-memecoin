@@ -8,7 +8,8 @@ Contract under test (per lane):
      unchanged, no _pa_settle call, pending_exit why close_intent_not_durable (visible, retried next poll).
   2. storage back          -> the same call proceeds (the gate passes and the leg is executed through the lane's own path is NOT exercised here:
      only the gate/begin contract is; full lane exits are covered by their own suites).
-  3. the narrow race (probe ok, real intent write fails): _intent_open returns False, ENTRIES BLOCKED, and _pa_settle makes NO account credit.
+  3. the race (probe ok, real intent write fails AFTER the sale fill): the exit is rolled back in memory, no account credit, nothing persisted,
+     pending_exit close_intent_not_durable; the retry re-reads the same journaled fill and settles once.
 Run: python3 -B tests/test_close_intents_failclosed_lanes.py
 """
 import importlib, os, sys, tempfile, time
@@ -43,7 +44,13 @@ class _SpyAccount:
     def op_outcome(self, *a, **k): return None
     def pos_ever_existed(self, *a, **k): return True
 
-def mkpos(mint):
+def mkpos(mint, lane=None):
+    p = mkpos0(mint)
+    if lane:
+        p["lane"] = lane
+    return p
+
+def mkpos0(mint):
     return {"mint": mint, "chain": "solana", "pa_pos_id": "lane/%s#1" % mint, "tokens": 300.0, "realized_usd": 0.0,
             "execution": {"source": "jupiter_quote_sim"}, "entry_snapshot": {},
             "legs": {k: {"done": False, "frac": 1.0 / 3.0} for k in ("a", "b", "c")}}
@@ -70,20 +77,70 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
     check("%s: no account credit or write-down reached the account spy (%d/%d)" % (modname, len(spy.credits), len(spy.writedowns)), not spy.credits and not spy.writedowns)
     # the gate itself passes again once storage returns, and leaves no intent behind
     with patch.object(M, "_paper_account", lambda: spy):
-        _g = M._intent_gate(mkpos("FCok" + modname[:3]), "a")
+        _g = M._intent_gate(mkpos("FCok" + modname[:3], "mirror" if modname == "mirror" else None), "a")
     check("%s: storage back -> the gate passes and the journal holds no intent (probe only)" % modname,
           _g is True and not [e for e in CI._read(CI.journal_path(lane))[0] if e.get("ev") == "intent"])
-    # the narrow race: gate passes (probe ok) but the real intent write fails -> no account credit, entries blocked
-    spy2 = _SpyAccount(); pos2 = mkpos("FR" + modname[:3]); pos2["pa_pos_id"] = "lane/%s#1" % pos2["mint"]
-    M._ENTRY_BLOCKED = False
-    with patch.object(M, "_paper_account", lambda: spy2), patch.object(CI, "_append", _no_intent_only):
-        if modname == "mirror":
-            M._pa_settle(pos2, 100.0, 1.0, 0.01, "leg:a")
-        else:
-            M._pa_settle(pos2, 100.0, 1.0, 0.01, "leg:a")
-    check("%s: race (probe ok, intent write fails): NO account credit (%d) and ENTRIES BLOCKED (%r)" % (modname, len(spy2.credits), M._ENTRY_BLOCKED),
-          not spy2.credits and M._ENTRY_BLOCKED is True)
-    M._ENTRY_BLOCKED = False
+    # THE RACE (probe ok, the real intent write fails AFTER the sale fill): the exit is rolled back in memory, NO account op, nothing persisted;
+    # the retry re-reads the SAME journaled fill (deterministic exit op id, filler returns the existing fill) and only the intent write is retried.
+    # The sale itself is a CANNED fill object returned by a fake filler (engineering fixture: the point is the journal/rollback/retry contract, not execution).
+    class _FakeFiller:
+        def __init__(self):
+            self.fills = {}; self.calls = []
+        def sell(self, op_id, mint, qty, cap, *a, **k):
+            self.calls.append(op_id)
+            if op_id not in self.fills:
+                self.fills[op_id] = {"price_usd": 0.001, "gross_usd": 0.1, "fee_usd": 0.001, "execution_source": "canned_fixture",
+                                     "signature": "fixture-sig", "provenance": {"fixture": True}}
+            return self.fills[op_id]
+    ff = _FakeFiller(); spy2 = _SpyAccount(); spy2.max_price_impact_pct = lambda: 50.0
+    pos2 = mkpos("FR" + modname[:3], "mirror" if modname == "mirror" else None)
+    if modname == "mirror":
+        pos2["lane"] = "mirror"
+    with patch.object(M, "_paper_account", lambda: spy2), patch.object(M, "_demo_filler", lambda: ff), patch.object(M, "_exit_fee_venue", lambda p: None), \
+         patch.object(CI, "_append", _no_intent_only):
+        r_fail = M._close_leg(pos2, "a", 0.001, "leg_a_2x")
+    pe2 = pos2.get("pending_exit") or {}
+    check("%s race: exit rolled back in memory (leg a done=%r, realized %r), NO account credit (%d), pending_exit %r, sale called %d time(s)"
+          % (modname, pos2["legs"]["a"]["done"], pos2["realized_usd"], len(spy2.credits), pe2.get("why"), len(ff.calls)),
+          r_fail == 0.0 and pos2["legs"]["a"]["done"] is False and pos2["realized_usd"] == 0.0 and not spy2.credits
+          and pe2.get("why") == "close_intent_not_durable" and len(ff.calls) == 1)
+    check("%s race: nothing durable was written for the failed attempt (no intent event for this mint)" % modname,
+          not [e for e in CI._read(CI.journal_path(lane))[0] if e.get("mint") == pos2["mint"]])
+    with patch.object(M, "_paper_account", lambda: spy2), patch.object(M, "_demo_filler", lambda: ff), patch.object(M, "_exit_fee_venue", lambda p: None):
+        r_ok = M._close_leg(pos2, "a", 0.001, "leg_a_2x")
+    ev2 = [e for e in CI._read(CI.journal_path(lane))[0] if e.get("mint") == pos2["mint"]]
+    check("%s retry after storage returns: SAME fill re-read (sale op ids %r, one distinct), leg done, ONE credit with the fill's gross (%r), intent journaled then account_applied (%r)"
+          % (modname, len(ff.calls), [c[3] if len(c) > 3 else None for c in spy2.credits], [e.get("ev") for e in ev2]),
+          r_ok > 0 and pos2["legs"]["a"]["done"] is True and len(set(ff.calls)) == 1 and len(ff.calls) == 2 and len(spy2.credits) == 1
+          and abs(float(spy2.credits[0][2]) - 0.1) < 1e-12 and [e.get("ev") for e in ev2][:2] == ["intent", "account_applied"])
+    # an exception that is NOT IntentNotDurable still propagates (the rollback is narrow, never a blanket catch)
+    pos3 = mkpos("FX" + modname[:3], "mirror" if modname == "mirror" else None)
+    if modname == "mirror":
+        pos3["lane"] = "mirror"
+    class _Boom(Exception):
+        pass
+    def _boom_filler():
+        raise _Boom("x")
+    with patch.object(M, "_paper_account", lambda: spy2), patch.object(M, "_demo_filler", _boom_filler), patch.object(M, "_exit_fee_venue", lambda p: None):
+        try:
+            M._close_leg(pos3, "a", 0.001, "leg_a_2x"); _prop = False
+        except _Boom:
+            _prop = True
+    check("%s: an unrelated exception still propagates out of the guarded close (rollback is narrow)" % modname, _prop)
+
+    # _finalize must NEVER book a close for a position with a leg still pending (the 0.0 return of a held exit cannot drop the position)
+    pos4 = mkpos("FF" + modname[:3], "mirror" if modname == "mirror" else None)
+    pos4["symbol"] = "T"; pos4["source"] = "t"; pos4["entry_ts"] = 1.0; pos4["entry_price"] = 0.001; pos4["entry_features"] = {}
+    d4 = {"positions": {pos4["mint"]: pos4}, "closes": [], "bankroll": 10.0, "state": "running"}
+    wr = []
+    with patch.object(M, "_write", lambda dd: wr.append(1)), patch.object(M, "_recover_close_intents", lambda: None):
+        rec4 = M._finalize(d4, pos4["mint"], pos4, "ladder_complete")
+    check("%s: _finalize with legs not done books nothing (rec %r, still open %r, closes %d, bankroll %r, pending_exit %r)"
+          % (modname, rec4, pos4["mint"] in d4["positions"], len(d4["closes"]), d4["bankroll"], (pos4.get("pending_exit") or {}).get("why")),
+          rec4 is None and pos4["mint"] in d4["positions"] and not d4["closes"] and d4["bankroll"] == 10.0 and (pos4.get("pending_exit") or {}).get("why"))
+    cl4 = []
+    M._append_close(cl4, rec4); M._append_close(cl4, {"x": 1})
+    check("%s: _append_close skips None and keeps a real record" % modname, cl4 == [{"x": 1}])
 
 print("fails: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

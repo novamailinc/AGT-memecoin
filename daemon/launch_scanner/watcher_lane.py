@@ -77,6 +77,7 @@ touches real money, keys, or the user's lanes.
 Free-only: DexScreener/GeckoTerminal public endpoints + safety
 via the existing modules.
 """
+import copy
 import json
 import logging
 import os
@@ -272,18 +273,11 @@ def _intent_open(lane_suffix, pos, ops, reason):
         return None
     mint = pos["mint"]
     pa_pos_id = pos.get("pa_pos_id")
-    try:
-        iid = _ci.begin(LANE, mint, pa_pos_id, ops,
-                        {"realized_usd": ops[0].get("amount") or 0.0,
-                         "closed_reason": reason,
-                         "close_ts": time.time(),
-                         "leg_suffix": lane_suffix})
-    except _ci.IntentNotDurable as _nd:
-        # FAIL CLOSED: no account op without a durable plan. Visible: error log + entries blocked. The lane's own settle is unchanged.
-        global _ENTRY_BLOCKED
-        _ENTRY_BLOCKED = True
-        logger.error("%s: close intent NOT DURABLE (%s): account op skipped, ENTRIES BLOCKED until operator resolution", LANE, _nd)
-        return False
+    iid = _ci.begin(LANE, mint, pa_pos_id, ops,
+                    {"realized_usd": ops[0].get("amount") or 0.0,
+                     "closed_reason": reason,
+                     "close_ts": time.time(),
+                     "leg_suffix": lane_suffix})
     return (iid, pa_pos_id, mint, lane_suffix)
 
 
@@ -331,8 +325,6 @@ def _pa_settle(pos, qty, gross, fee, suffix, price_kind=None):
                            "mint": mint, "amount": gross, "qty": qty,
                            "fee": fee, "price_kind": price_kind,
                            "pos_id": pa_pos_id}], suffix)
-    if _pend is False:   # intent not durable: no account op (see _intent_open)
-        return
     _ok, _why = _pa.credit(LANE, mint, gross, _op, pos_id=pa_pos_id,
                            qty=qty, fee=fee, price_kind=price_kind)
     if not _ok and _pa.op_outcome(_op) == "orphan" \
@@ -368,8 +360,6 @@ def _pa_write_down(pos, reason):
                          [{"kind": "write_down", "op_id": _op,
                            "mint": mint, "pos_id": pa_pos_id,
                            "reason": reason}], reason)
-    if _pend is False:   # intent not durable: no account op (see _intent_open)
-        return
     _ok, _why = _pa.write_down(LANE, mint, _op, pos_id=pa_pos_id,
                                reason=reason)
     if not _ok and _pa.op_outcome(_op) == "orphan" \
@@ -1471,7 +1461,7 @@ def _pkind(reason, pkind=None):
     return _pk.classify_reason(
         reason, getattr(_f2, "F2_REASON", None) if _f2 else None)
 
-def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
+def _close_leg_impl(pos, leg_key, exit_price, reason, pkind=None):
     """Close one leg at an honest exit. Returns realized USD."""
     leg = pos["legs"][leg_key]
     if leg["done"]:
@@ -1526,7 +1516,7 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
     return net
 
 
-def _close_remaining(pos, exit_price, reason, pkind=None):
+def _close_remaining_impl(pos, exit_price, reason, pkind=None):
     """Close all remaining legs as ONE combined exit (one tx cost) —
     same rule as grad.py/momentum_lane.py."""
     open_legs = [k for k in ("a", "b", "c") if not pos["legs"][k]["done"]]
@@ -1708,11 +1698,55 @@ def _verdict_check(d):
     return halt
 
 
+
+def _guard_close(impl, pos, key, *args):
+    """Run one leg/close implementation; if the close intent could not be made durable (begin raised IntentNotDurable AFTER the sale fill), UNDO the
+    in-memory leg/realized changes and report nothing done: no account op ran (begin precedes it), the lane persists nothing, pending_exit
+    close_intent_not_durable is visible, and the next poll re-runs the exit. The sale is NOT repeated: the exit fill op id is deterministic
+    ("<lane>:exit:<mint>:<key>") and the filler returns the already-journaled fill for an existing op id (demo_fill _existing), so the retry
+    re-reads the same fill and only the intent write is retried."""
+    _legs0 = copy.deepcopy(pos["legs"]); _rz0 = pos.get("realized_usd"); _pe0 = copy.deepcopy(pos.get("pending_exit"))
+    try:
+        return impl(*args)
+    except Exception as _e:
+        _ci = _close_intents()
+        if _ci is None or not isinstance(_e, _ci.IntentNotDurable):
+            raise
+        pos["legs"] = _legs0
+        if _rz0 is not None:
+            pos["realized_usd"] = _rz0
+        if _pe0 is None:
+            pos.pop("pending_exit", None)
+        logger.error("close intent NOT DURABLE (%s): exit %s rolled back in memory (nothing persisted, no account op), retried next poll", _e, key)
+        pos["pending_exit"] = {"leg": key, "why": "close_intent_not_durable", "ts": time.time()}
+        return 0.0
+
+
+def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
+    return _guard_close(_close_leg_impl, pos, leg_key, pos, leg_key, exit_price, reason, pkind)
+
+
+def _close_remaining(pos, exit_price, reason, pkind=None):
+    return _guard_close(_close_remaining_impl, pos, "remaining", pos, exit_price, reason, pkind)
+
+
+def _append_close(closes, rec):
+    """_finalize returns None when a position is held open (legs not done); only real close records are collected."""
+    if rec is not None:
+        closes.append(rec)
+
+
 def _finalize(d, mint, pos, closed_reason):
     """Move an open position to closes, settle cash, record the lane
     trade, evaluate the pre-registered verdict, append to the
     tamper-evident verdict ledger. Lock held by caller."""
     _recover_close_intents()
+    if not all((v or {}).get("done") for v in pos["legs"].values()):
+        # An exit leg is still PENDING (filler unavailable or skipped, or the close intent was not durable and the exit was rolled back): never
+        # book a close, bankroll, trade record or verdict for a position that still holds unsold units. It stays open; the exit retries next poll.
+        pos.setdefault("pending_exit", {"leg": "close", "why": "legs_not_done", "ts": time.time()})
+        _write(d)
+        return None
     _N = float(pos.get("notional_usd") or NOTIONAL_USD)  # the real entry notional
     realized = round(float(pos["realized_usd"]), 6)
     pnl = round(realized - _N, 4)
@@ -1880,13 +1914,13 @@ def _poll_exits(price_fn):
                         _close_remaining(
                             pos, _f2_stamp["last_real_price"],
                             _f2.F2_REASON)
-                        closes.append(_finalize(
+                        _append_close(closes, _finalize(
                             d, mint, pos, _f2.F2_REASON))
                         continue
                     if now - pos["entry_ts"] > TIME_STOP_H * 3600:
                         _close_remaining(pos, 0.0,
                                          "time_stop_24h_unquotable")
-                        closes.append(_finalize(
+                        _append_close(closes, _finalize(
                             d, mint, pos, "time_stop_24h_unquotable"))
                     continue
                 entry = pos["entry_price"]
@@ -1905,13 +1939,13 @@ def _poll_exits(price_fn):
                 # Hard stop first: -50% closes everything immediately.
                 if mult <= HARD_STOP_MULT:
                     _close_remaining(pos, px, "hard_stop_-50pct")
-                    closes.append(_finalize(d, mint, pos,
+                    _append_close(closes, _finalize(d, mint, pos,
                                             "hard_stop_-50pct"))
                     continue
                 # Time stop: 24h hygiene backstop.
                 if now - pos["entry_ts"] > TIME_STOP_H * 3600:
                     _close_remaining(pos, px, "time_stop_24h")
-                    closes.append(_finalize(d, mint, pos,
+                    _append_close(closes, _finalize(d, mint, pos,
                                             "time_stop_24h"))
                     continue
                 # Leg A: 50% at 2x.
@@ -1930,7 +1964,7 @@ def _poll_exits(price_fn):
                     elif px <= lc["peak"] * (1 - LEG_C_TRAIL):
                         _close_leg(pos, "c", px, "leg_c_trail_30pct")
                 if all(pos["legs"][k]["done"] for k in ("a", "b", "c")):
-                    closes.append(_finalize(d, mint, pos,
+                    _append_close(closes, _finalize(d, mint, pos,
                                             "ladder_complete"))
                 else:
                     _write(d)

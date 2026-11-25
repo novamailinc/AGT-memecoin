@@ -3852,6 +3852,35 @@ def _obs_fields(q, now):
         return dict(base, obs_status="invalid:error")
 
 
+_JUP_REJECTS = {"n": 0}   # Jupiter observed-price entries rejected per mint at the boundary (visible counter)
+
+
+def _validate_jup_observed(requested, raw):
+    """(prices, obs, rejected). PURE, never raises. `raw` is {mint: (price, observed_ts)} as get_prices_observed returns it. A mint is accepted ONLY
+    when it was requested, its value is a 2-sequence, and the price is a finite, strictly positive int/float (not bool). The observation ts is kept
+    only if it is a finite positive number, else None (unknown, never invented; _obs_fields reports it). Every other entry is rejected INDIVIDUALLY
+    with a reason, so one bad mint cannot discard the others and a bad price is never used (a NaN price would defeat every stop comparison)."""
+    import math
+    prices, obs, rej = {}, {}, {}
+    if not isinstance(raw, dict):
+        return prices, obs, ({"*": "not_a_dict"} if raw else rej)
+    want = set(m for m in (requested or []) if isinstance(m, str))
+    for m, v in raw.items():
+        if m not in want:
+            rej[str(m)[:12]] = "unrequested_mint"; continue
+        try:
+            if not isinstance(v, (tuple, list)) or len(v) != 2:
+                rej[str(m)[:12]] = "bad_shape"; continue
+            px, ts = v
+            if isinstance(px, bool) or not isinstance(px, (int, float)) or not math.isfinite(px) or px <= 0:
+                rej[str(m)[:12]] = "bad_price"; continue
+            prices[m] = float(px)
+            obs[m] = ts
+        except Exception:
+            rej[str(m)[:12]] = "error"
+    return prices, obs, rej
+
+
 def _poll_exits(price_fn):
     _POLL_SEQ["n"] += 1
     # Phase 1: snapshot (locked read). Quotes happen outside the lock.
@@ -3881,9 +3910,12 @@ def _poll_exits(price_fn):
         _jm = [m for m, p in snapshot.items() if (p.get("chain") or "solana") == "solana"]
         try:
             if hasattr(_jup, "get_prices_observed"):
-                _o = _jup.get_prices_observed(_jm) or {}
-                jup_prices = {m: v[0] for m, v in _o.items()}
-                jup_obs = {m: v[1] for m, v in _o.items()}
+                # PER-MINT validation at the source boundary: one malformed entry drops THAT mint only (it then falls through to the existing
+                # fallback quote chain), never every mint's Jupiter price, and a non-finite/non-positive/boolean/mistyped price can never become q["px"].
+                jup_prices, jup_obs, _rej = _validate_jup_observed(_jm, _jup.get_prices_observed(_jm))
+                if _rej:
+                    _JUP_REJECTS["n"] += len(_rej)
+                    logger.warning("grad poll_exits: %d Jupiter price(s) rejected at the boundary (%s); those mints use the fallback route", len(_rej), sorted(set(_rej.values())))
             else:
                 jup_prices = _jup.get_prices(_jm) or {}
                 _OBS_UNSUPPORTED["n"] += 1

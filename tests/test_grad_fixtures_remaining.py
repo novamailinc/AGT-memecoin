@@ -1398,6 +1398,21 @@ _r1 = _JP.get_prices_observed(["MX"], now=1000.0); _JP._fetch_batch = lambda min
 _r2 = _JP.get_prices_observed(["MX"], now=1005.0); _dbg = ""
 check("P7zd6 real jup_price semantics (offline): the reported time is the LOCAL fetch time of the cache fill (fresh read at 1000 -> 1000; a cache hit at 1005 still reports 1000), no upstream timestamp exists in this layer (%s, %s)" % (_r1, _r2),
       _r1.get("MX") == (2.5, 1000.0) and _r2.get("MX") == (2.5, 1000.0))
+# P7zd7 (UNRUN draft): the Jupiter PRICE (not only its timestamp) is an untrusted source value, validated PER MINT at the boundary (grad._validate_jup_observed).
+# A bad price must never raise, abort the poll, or become the recorded px; the reject counter must rise, and that mint falls through to the fallback route.
+class _JupBadPx:
+    SOURCE = "jupiter-fake"
+    px = None
+    def get_prices_observed(self, mints, now=None): return {m: (self.px, time.time()) for m in mints}
+_jpx = _JupBadPx(); _bpx = {}
+try:
+    GR._jup = _jpx
+    for _lab, _v in (("nan", float("nan")), ("inf", float("inf")), ("negative", -2.5), ("zero", 0.0), ("bool", True), ("string", "2.5"), ("none", None), ("tuple_value", (2.5, 1.0))):
+        _jpx.px = _v; _a0 = GR._POLL_ABORTS.get("count", 0); _r0 = GR._JUP_REJECTS["n"]; GR.poll_exits(price_fn=None)
+        _bpx[_lab] = ((GR.open_positions().get(_gmp, {}).get("quote_journal") or [{}])[-1], GR._POLL_ABORTS.get("count", 0) - _a0, GR._JUP_REJECTS["n"] - _r0)
+finally: GR._jup = _jsave
+check("P7zd7 a bad Jupiter PRICE (nan, inf, negative, zero, bool, string, None, nested tuple) never raises or aborts the poll, is counted as a reject (+1 per poll), and is never the recorded px (%s)" % ({k: (v[1], v[2], v[0].get("px"), v[0].get("src")) for k, v in _bpx.items()},),
+      all(v[1] == 0 and v[2] == 1 and v[0].get("src") != "jupiter-fake" and not (isinstance(v[0].get("px"), float) and (v[0]["px"] != v[0]["px"] or abs(v[0]["px"]) == float("inf") or v[0]["px"] < 0)) for v in _bpx.values()))
 check("P7zc unavailable_gates key is present on every verdict path: TWAP %s, entry_op %s, quarantine %s, unavailable %s" % ("unavailable_gates" in _dt, "unavailable_gates" in GR.diagnose_position(_gmi) , "unavailable_gates" in _dq, "unavailable_gates" in _dm),
       all("unavailable_gates" in x for x in (_dt, _dq, _dm, _di)) and _dt["unavailable_gates"] == [] and _dm["unavailable_gates"] == ["G3", "G6"] and _dq["unavailable_gates"] in (["G3", "G6"], ["G3"], ["G6"], []))
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.

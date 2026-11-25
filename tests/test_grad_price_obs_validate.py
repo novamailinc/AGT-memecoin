@@ -44,7 +44,10 @@ class _Weird:
     def __len__(self): raise RuntimeError("boom")
 r = V(["A", "B"], {"A": _Weird(), "B": (2.0, NOW)})
 check("V6 a hostile object never raises and does not spoil the other mint (%s)" % (r,), r[0] == {"B": 2.0} and len(r[2]) == 1)
-check("V7 the observation ts is passed through untouched for _obs_fields to judge (string stays, validated downstream): %s" % (V(["A"], {"A": (1.0, "yesterday")})[1],), V(["A"], {"A": (1.0, "yesterday")})[1] == {"A": "yesterday"})
+check("V7 the observation ts is passed through UNCHANGED (any type) and judged downstream by _obs_fields, not here (string stays): %s" % (V(["A"], {"A": (1.0, "yesterday")})[1],), V(["A"], {"A": (1.0, "yesterday")})[1] == {"A": "yesterday"})
+_m1, _m2 = "P" * 20 + "1", "P" * 20 + "2"      # share a 20-char prefix: the reject map must keep BOTH (full-mint keys), never merge them
+px, ob, rj = V([_m1, _m2, "OK"], {_m1: (float("nan"), NOW), _m2: ("x", NOW), "OK": (1.0, NOW)})
+check("V9 two bad mints with a common prefix are two distinct rejects keyed by the full mint (%s)" % (rj,), set(rj) == {_m1, _m2} and px == {"OK": 1.0} and len(rj) == 2)
 check("V8 the reject counter exists and starts a plain dict counter (%s)" % (G._JUP_REJECTS,), isinstance(G._JUP_REJECTS.get("n"), int))
 check("T9 no process/thread start attempted", STARTS == [])
 print("FAILS: %d" % len(FAILS))

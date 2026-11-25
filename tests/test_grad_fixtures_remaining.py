@@ -1413,6 +1413,23 @@ try:
 finally: GR._jup = _jsave
 check("P7zd7 a bad Jupiter PRICE (nan, inf, negative, zero, bool, string, None, nested tuple) never raises or aborts the poll, is counted as a reject (+1 per poll), and is never the recorded px (%s)" % ({k: (v[1], v[2], v[0].get("px"), v[0].get("src")) for k, v in _bpx.items()},),
       all(v[1] == 0 and v[2] == 1 and v[0].get("src") != "jupiter-fake" and not (isinstance(v[0].get("px"), float) and (v[0]["px"] != v[0]["px"] or abs(v[0]["px"]) == float("inf") or v[0]["px"] < 0)) for v in _bpx.values()))
+# P7zd8 (UNRUN draft): MIXED good + bad in ONE poll: a bad price for one open mint must not cost the other mint its Jupiter price (per-mint isolation), and the bad
+# mint must fall through to the fallback route independently. Two real grad positions on a fresh account; fake _jup prices mint 1 well and mint 2 with a NaN.
+PAm, Fm, CTm = fresh(start="10"); go_sim(); _lm = dict(build(PAm, CTm)); _okm1, _whm1 = _lm["grad"](1); _okm2, _whm2 = _lm["grad"](2)
+assert _okm1 and _okm2, ("two grad entries needed for the mixed case", _whm1, _whm2)
+_mm = sorted(GR.open_positions()); assert len(_mm) == 2, _mm
+_good_m, _bad_m = _mm[0], _mm[1]; _gpx = float(GR.open_positions()[_good_m]["entry_price"]) * 1.1
+class _JupMixed:
+    SOURCE = "jupiter-fake"
+    def get_prices_observed(self, mints, now=None): return {m: ((_gpx if m == _good_m else float("nan")), time.time()) for m in mints}
+    def get_prices(self, mints, now=None): return {}
+try:
+    GR._jup = _JupMixed(); _a0 = GR._POLL_ABORTS.get("count", 0); _r0 = GR._JUP_REJECTS["n"]; GR.poll_exits(price_fn=None)
+    _jg = (GR.open_positions().get(_good_m, {}).get("quote_journal") or [{}])[-1]; _jbd = (GR.open_positions().get(_bad_m, {}).get("quote_journal") or [{}])[-1]
+    _abm = GR._POLL_ABORTS.get("count", 0) - _a0; _rjm = GR._JUP_REJECTS["n"] - _r0
+finally: GR._jup = _jsave
+check("P7zd8 mixed poll: the GOOD mint keeps its Jupiter price (px %s == %s, src %s), the BAD (nan) mint is rejected alone and uses the fallback route (src %s, px %s, not nan/inf/negative), one reject counted (%s), no abort (%s)" % (_jg.get("px"), _gpx, _jg.get("src"), _jbd.get("src"), _jbd.get("px"), _rjm, _abm),
+      _abm == 0 and _rjm == 1 and _jg.get("src") == "jupiter-fake" and abs(float(_jg.get("px") or 0) - _gpx) < 1e-12 * max(1.0, _gpx) and _jbd.get("src") != "jupiter-fake" and not (isinstance(_jbd.get("px"), float) and (_jbd["px"] != _jbd["px"] or abs(_jbd["px"]) == float("inf") or _jbd["px"] < 0)))
 check("P7zc unavailable_gates key is present on every verdict path: TWAP %s, entry_op %s, quarantine %s, unavailable %s" % ("unavailable_gates" in _dt, "unavailable_gates" in GR.diagnose_position(_gmi) , "unavailable_gates" in _dq, "unavailable_gates" in _dm),
       all("unavailable_gates" in x for x in (_dt, _dq, _dm, _di)) and _dt["unavailable_gates"] == [] and _dm["unavailable_gates"] == ["G3", "G6"] and _dq["unavailable_gates"] in (["G3", "G6"], ["G3"], ["G6"], []))
 # G3 and G6 stubs (labelled): a ledger op that disagrees with the journal event; a second open instance; an unresolved register entry.

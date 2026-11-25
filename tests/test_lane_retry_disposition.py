@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""bb76 REAL-LANE / PUBLIC-ENTRY admission harness, MOMENTUM, SOURCE ONLY (NOT RUN until main clears an exact HEAD/blob/script). Scratch dirs only, canned feed
-(tests/_guard_fixture price feed and the lane's canned tape, engineering-only, no network, live executors forbidden). Every scenario uses a FRESH PROCESS per phase.
-What is REAL: the lane's own entry (momentum_lane.consider_candidate -> PA.try_debit -> lane ledger write, so pa_pos_id/pa_account_id/pa_entry_op and the lane
-registration are written by the production code), the account generation transition (the account files are removed between processes and a new account is created by the
-real account load, so account_id changes and pos_ids repeat), the PUBLIC admission operations (PA.try_debit and the lane's consider_candidate) after a restart, and a
-kernel write-failure fault (works as root; RLIMIT_FSIZE=0 set only around the real PA.credit in the child (ROOT-SAFE kernel EFBIG on BOTH refusal recorders, no chmod) during a real
-settle through L.poll_exits; limit restored in a finally; no mount, disk or shared-storage change). What is NOT real: the feed, tape and safety stubs.
-Predeclared (hand-written, UNVERIFIED):
-  A  real entry opens a bound position; the registry primary and mirror exist after it.
-  B  POSITIVE CONTROL matching state, fresh process: lane recovery not blocked, public lane entry admitted, direct account debit admitted.
-  C  generation transition (account files removed, new account created): FIRST a direct PA.try_debit is refused at ACCOUNT level (message names the persisted lane evidence and
-     generation-mismatch) with zero debit events in the new WAL, THEN lane recovery is blocked and a public lane entry is refused.
-  D  real permission fault during a real settle: _refuse_generation is REACHED, the OS refuses both recorders (no marker file, no refusal journal record, proven by a failed create
-     probe), permissions are restored, and a FRESH process still refuses a direct debit and a public lane entry on persisted lane evidence alone.
-  E  MUTANT: the same C state with the registry check nulled in the child admits the direct debit (so C's refusal is the account-level check).
-If _refuse_generation is not reached in D, the row FAILS (the fault was not exercised); nothing is relaxed."""
+"""bb78 SUBSEQUENT-CYCLE / RESTART DISPOSITION harness, MOMENTUM, SOURCE ONLY. Reuses the bb77 preamble and fault (RLIMIT_FSIZE=0 around the real PA.credit). After the faulted settle it observes the lane ledger, intent journal and account WAL, then a second real poll_exits cycle in the same process and a fresh-process restart, asserting INVARIANTS (no account credit, no debit, no rebinding, one obligation, position open, intent unapplied) and never inventing convergence. See rows in the parent section."""
 if __name__ != "__main__":
     import pytest
     pytest.skip("script-style test", allow_module_level=True)
@@ -126,12 +111,14 @@ def child_probe(order, mutant):
     if order == "direct_first": direct(); lane()
     else: lane(); direct()
     print("RESULT " + _json.dumps(out, default=str), flush=True)
-def child_fault():
+def _fault_core(mutant=""):
     """ROOT-SAFE real OS write failure: RLIMIT_FSIZE=0 (SIGXFSZ ignored) is set ONLY around the real PA.credit call, in this child only. Every real write that grows a
     file then fails in the kernel with EFBIG (root is not exempt). No permission, mount, disk, identity or host change; the limit dies with the process and is restored in
     a finally. Failures are OBSERVED as real OSError(EFBIG) captured from the production code's own logged exc_info and by an in-window write probe."""
     import resource, errno, logging
-    PA = fresh(); cash(PA)   # the real account load creates the NEW generation (the parent removed the old account files)
+    PA = fresh(); cash(PA)
+    if mutant == "nofreeze": CI.freeze = lambda *a, **k: True   # MUTANT: the old behavior, a freeze that claims success and writes nothing
+    # the real account load creates the NEW generation (the parent removed the old account files)
     ad = _acct_dir(ROOTDIR); out = {"euid": os.geteuid()}
     hits = {"refuse": 0, "credit": 0}; errs = []
     class _H(logging.Handler):
@@ -175,10 +162,68 @@ def child_fault():
     try: r = PA.try_debit(LANE_NAME, "PostFaultMint", 1.0, 1000.0, "probe:postfault:1")
     except Exception as e: r = (False, "EXC %s" % type(e).__name__)
     out["postfault_direct_ok"] = bool(r[0]); out["postfault_direct_why"] = str(r[1])[:300]
+    return PA, out
+def _snap(PA):
+    """State fingerprint from the persisted files (not from in-memory objects)."""
+    d = {}
+    try: led = _json.load(open(L.LEDGER_PATH)); pos = (led.get("positions") or {}).get(MINT) or {}
+    except Exception as e: pos = {"_err": type(e).__name__}
+    d["pos_open"] = bool(pos) and "_err" not in pos
+    d["legs_done"] = {k: bool((pos.get("legs") or {}).get(k, {}).get("done")) for k in ("a", "b", "c")} if d["pos_open"] else None
+    d["pa_account_id"] = pos.get("pa_account_id"); d["pa_pos_id"] = pos.get("pa_pos_id"); d["tokens"] = pos.get("tokens")
+    d["n_positions"] = len((led.get("positions") or {})) if d["pos_open"] else None
+    jp = CI.journal_path(LANE_NAME)
+    try: raw = open(jp, "rb").read()
+    except OSError: raw = b""
+    d["journal_sha"] = hashlib.sha256(raw).hexdigest()[:16]; d["journal_len"] = len(raw)
+    ents = [_json.loads(x) for x in raw.decode("utf-8", "replace").splitlines() if x.strip().startswith("{")]
+    d["intent_ops"] = sorted(set(op.get("op_id") for e in ents if e.get("ev") == "intent" for op in (e.get("settle_ops") or []) if isinstance(op, dict)))
+    d["n_intent_events"] = len([e for e in ents if e.get("ev") == "intent"])
+    d["ev_kinds"] = sorted(set(e.get("ev") for e in ents))
+    d["pending_unfrozen"] = len(CI.pending(LANE_NAME)); d["frozen_unresolved"] = len(CI.frozen_unresolved(jp)[0])
+    evs = _jl(ROOTDIR)[0]
+    d["credit"] = len([e for e in evs if e.get("event") == "credit"]); d["debit"] = len([e for e in evs if e.get("event") == "debit"])
+    d["wal_events"] = sorted(set(e.get("event") for e in evs))
+    mp = os.path.join(_acct_dir(ROOTDIR), "unresolved_generation_refusals.jsonl")
+    d["marker_records"] = len([1 for ln in open(mp) if ln.strip()]) if os.path.exists(mp) else 0
+    return d
+def _pf2(mult):
+    def f(chain, mint, spot_index=None):
+        pos = (L.open_positions() or {}).get(mint) or {}
+        return float(pos.get("entry_price") or 0) * mult
+    return f
+def child_fault2(mutant=""):
+    PA, out = _fault_core(mutant)
+    s1 = _snap(PA); out["s1"] = s1
+    L._ENTRY_BLOCKED_AFTER_FAULT = bool(getattr(L, "_ENTRY_BLOCKED", None))
+    try: L.poll_exits(price_fn=_pf2(2.0)); out["c2_exc"] = None
+    except Exception as e: out["c2_exc"] = type(e).__name__
+    s2 = _snap(PA); out["s2"] = s2
+    out["entry_blocked_flag"] = bool(getattr(L, "_ENTRY_BLOCKED", False))
+    try: e = _enter(MINT2); out["c2_entry_ok"] = bool(e[0]); out["c2_entry_reason"] = str(e[1])[:160]
+    except Exception as ex: out["c2_entry_ok"] = False; out["c2_entry_reason"] = "EXC %s" % type(ex).__name__
+    out["s3"] = _snap(PA)
     print("RESULT " + _json.dumps(out, default=str), flush=True)
+def child_restart2():
+    PA = fresh(); out = {"s0": _snap(PA)}
+    L._RECOVERY_DONE = False; L._ENTRY_BLOCKED = False
+    out["recovery_blocked"] = bool(L._recover_close_intents()); out["s1"] = _snap(PA)
+    try: L.poll_exits(price_fn=_pf2(2.0)); out["poll_exc"] = None
+    except Exception as e: out["poll_exc"] = type(e).__name__
+    out["s2"] = _snap(PA)
+    try: r = PA.try_debit(LANE_NAME, "DirectProbeMint", 1.0, 1000.0, "probe:direct:2")
+    except Exception as e: r = (False, "EXC %s" % type(e).__name__)
+    out["direct_ok"] = bool(r[0]); out["direct_why"] = str(r[1])[:240]
+    e = _enter(MINT2); out["entry_ok"] = bool(e[0]); out["entry_reason"] = str(e[1])[:160]
+    try: out["ledger_account_id"] = _json.load(open(os.path.join(_acct_dir(ROOTDIR), "ledger.json"))).get("account_id")
+    except Exception: out["ledger_account_id"] = None
+    out["s3"] = _snap(PA)
+    print("RESULT " + _json.dumps(out, default=str), flush=True)
+
 if MODE == "open": child_open(); sys.exit(0)
 if MODE == "probe": child_probe(sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""); sys.exit(0)
-if MODE == "fault": child_fault(); sys.exit(0)
+if MODE == "fault2": child_fault2(sys.argv[3] if len(sys.argv) > 3 else ""); sys.exit(0)
+if MODE == "restart2": child_restart2(); sys.exit(0)
 
 FAILS = []
 def check(n, c):
@@ -211,30 +256,30 @@ def probe(root, order, mutant=""):
     if r is None: print("FAIL SETUP probe (rc %s, %s)" % (rc, err[-200:])); raise SystemExit(2)
     return r
 NEED = "persisted lane evidence blocks admission"
+def run_fault(mutant=""):
+    root = newroot("F"); do_open(root); wipe(root)
+    rc, out, err = spawn(["fault2", root] + ([mutant] if mutant else [])); f = res(out)
+    if f is None: print("FAIL SETUP fault2 child (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
+    return root, f
+def same(a, b, keys): return all(a.get(k) == b.get(k) for k in keys)
 try:
-    rA = do_open(newroot("A"))
-    check("A1 the real lane entry opened a bound position (%r)" % ({k: rA[k] for k in ("pa_pos_id", "pa_account_id", "pa_entry_op")},), bool(rA["pa_pos_id"] and rA["pa_account_id"] and rA["pa_entry_op"]))
-    check("A2 registry primary and mirror exist after the real entry (%r %r)" % (rA["registry_primary"], rA["registry_mirror"]), rA["registry_primary"] is True and rA["registry_mirror"] is True)
-    rootB = newroot("B"); do_open(rootB); pB = probe(rootB, "lane_first")
-    check("B1 matching state, fresh process: lane recovery not blocked and public lane entry admitted (%r)" % pB, pB["lane_blocked"] is False and pB["lane_entry_ok"] is True)
-    check("B2 matching state: direct account debit admitted after the lane restart (%r)" % pB.get("direct_why"), pB["direct_ok"] is True)
-    rootC = newroot("C"); do_open(rootC); wipe(rootC); pC = probe(rootC, "direct_first")
-    check("C1 after the generation transition a direct PA.try_debit is refused at ACCOUNT level, naming persisted lane evidence and generation-mismatch (%r)" % pC["direct_why"], pC["direct_ok"] is False and NEED in pC["direct_why"] and "generation-mismatch" in pC["direct_why"])
-    check("C2 no debit event was written to the new generation's WAL by the refused direct debit (%r)" % pC["direct_new_debits"], pC["direct_new_debits"] == 0)
-    check("C3 lane recovery is blocked and the public lane entry is refused (%r)" % ({k: pC[k] for k in ("lane_blocked", "lane_entry_ok", "lane_entry_reason")},), pC["lane_blocked"] is True and pC["lane_entry_ok"] is False)
-    rootE = newroot("E"); do_open(rootE); wipe(rootE); pE = probe(rootE, "direct_first", "nullreg")
-    check("E MUTANT (registry check nulled in the child): the same transition admits the direct debit, so C1 is the account-level check (%r)" % pE["direct_why"], pE["direct_ok"] is True)
-    rootD = newroot("D"); do_open(rootD); wipe(rootD)
-    rc, out, err = spawn(["fault", rootD]); fD = res(out)
-    if fD is None: print("FAIL SETUP fault child (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
-    check("D1 the kernel refused a growing write inside the credit window (EFBIG probe, root-safe) (%r)" % ({k: fD.get(k) for k in ("euid", "write_probe_failed")},), fD.get("write_probe_failed") is True)
-    check("D2 the real settle called credit and reached _refuse_generation (%r)" % ({k: fD.get(k) for k in ("credit_called", "refuse_reached")},), (fD.get("credit_called") or 0) >= 1 and (fD.get("refuse_reached") or 0) >= 1)
-    check("D2b the production recorders raised real OSError EFBIG (>=2: journal and marker) (%r)" % ({k: fD.get(k) for k in ("n_efbig", "efbig_errors")},), (fD.get("n_efbig") or 0) >= 2)
-    check("D3 nothing durable: no marker record, no refusal journal record, no credit event (%r)" % ({k: fD.get(k) for k in ("marker_records", "refusal_journal_records", "credit_events")},), fD.get("marker_records") == 0 and fD.get("refusal_journal_records") == 0 and fD.get("credit_events") == 0)
-    check("D3b same process, limit restored: public direct debit refused because the refusal could not be recorded (%r)" % fD.get("postfault_direct_why"), fD.get("postfault_direct_ok") is False and "could not be recorded" in str(fD.get("postfault_direct_why")))
-    pD = probe(rootD, "direct_first")
-    check("D4 FRESH process: direct debit refused on persisted lane evidence (%r)" % pD["direct_why"], pD["direct_ok"] is False and NEED in pD["direct_why"] and "generation-mismatch" in pD["direct_why"])
-    check("D5 FRESH process: public lane entry refused (%r)" % pD["lane_entry_reason"], pD["lane_entry_ok"] is False)
+    rootF, f = run_fault()
+    s1, s2, s3 = f["s1"], f["s2"], f["s3"]
+    check("F0 the bb77 fault reproduced inside this harness: credit reached refusal, 2+ real EFBIG, nothing durable in the account (%r)" % ({k: f.get(k) for k in ("credit_called", "refuse_reached", "n_efbig", "credit_events", "refusal_journal_records")},), (f.get("credit_called") or 0) >= 1 and (f.get("refuse_reached") or 0) >= 1 and (f.get("n_efbig") or 0) >= 2 and f.get("credit_events") == 0)
+    check("F1 after the faulted settle the lane position is OPEN, bound to its original generation, with no leg done (%r)" % ({k: s1[k] for k in ("pos_open", "legs_done", "pa_pos_id", "n_positions")},), s1["pos_open"] is True and s1["legs_done"] == {"a": False, "b": False, "c": False} and s1["n_positions"] == 1)
+    check("F2 exactly one obligation exists: one distinct credit op id across the journal, it is FROZEN and unapplied, none pending-unfrozen (%r)" % ({k: s1[k] for k in ("intent_ops", "frozen_unresolved", "pending_unfrozen")},), len(s1["intent_ops"]) == 1 and s1["frozen_unresolved"] == 1 and s1["pending_unfrozen"] == 0)
+    check("F3 SECOND CYCLE (same process, storage restored): no account credit or debit, position still open and unchanged, same single obligation, nothing pending-unfrozen (%r)" % ({k: s2[k] for k in ("credit", "debit", "pos_open", "legs_done", "intent_ops", "frozen_unresolved", "pending_unfrozen")},), s2["credit"] == 0 and s2["debit"] == 0 and s2["pos_open"] is True and s2["legs_done"] == s1["legs_done"] and s2["intent_ops"] == s1["intent_ops"] and s2["pending_unfrozen"] == 0 and s2["frozen_unresolved"] >= 1 and s2["pa_account_id"] == s1["pa_account_id"] and s2["tokens"] == s1["tokens"])
+    check("F4 second cycle with storage restored: the refusal is now DURABLY recorded in the account marker (observation, hypothesis; marker_records %r -> %r)" % (s1["marker_records"], s2["marker_records"]), s2["marker_records"] >= 1)
+    check("F5 no second buy: the public lane entry after the faulted cycles is refused and the lane holds one position, account has the original debit count (%r)" % ({k: f.get(k) for k in ("c2_entry_ok", "c2_entry_reason")}, ), f["c2_entry_ok"] is False and s3["n_positions"] == 1 and s3["debit"] == s1["debit"])
+    rc, out, err = spawn(["restart2", rootF]); r = res(out)
+    if r is None: print("FAIL SETUP restart2 (rc %s, %s)" % (rc, err[-300:])); raise SystemExit(2)
+    q0, q1, q2, q3 = r["s0"], r["s1"], r["s2"], r["s3"]
+    check("R1 FRESH process: lane recovery is blocked and applies nothing: the journal bytes are identical before and after recovery, no credit, no account_applied event (%r)" % ({k: q1[k] for k in ("journal_sha", "credit")}, q0["journal_sha"]), r["recovery_blocked"] is True and q1["journal_sha"] == q0["journal_sha"] and q1["credit"] == 0 and "account_applied" not in q1["ev_kinds"])
+    check("R2 FRESH process poll_exits cycle: no credit, no debit, position unchanged and still bound to the ORIGINAL generation, no new obligation (%r)" % ({k: q2[k] for k in ("credit", "debit", "pos_open", "pa_account_id", "intent_ops", "pending_unfrozen")},), q2["credit"] == 0 and q2["debit"] == 0 and q2["pos_open"] is True and q2["pa_account_id"] == s1["pa_account_id"] and q2["intent_ops"] == s1["intent_ops"] and q2["pending_unfrozen"] == 0)
+    check("R3 NO REBINDING: the lane position keeps the old generation id while the account ledger holds a different one (%r vs %r)" % (q3["pa_account_id"], r["ledger_account_id"]), q3["pa_account_id"] == s1["pa_account_id"] and bool(r["ledger_account_id"]) and r["ledger_account_id"] != q3["pa_account_id"])
+    check("R4 FRESH process: public debit and public lane entry still refused, still no second position (%r)" % ({k: r[k] for k in ("direct_ok", "direct_why", "entry_ok")},), r["direct_ok"] is False and NEED in r["direct_why"] and r["entry_ok"] is False and q3["n_positions"] == 1 and q3["debit"] == s1["debit"])
+    rootM, m = run_fault("nofreeze")
+    check("M MUTANT (freeze claims success and writes nothing, the old behavior): the same scenario leaves NO frozen obligation, so F2 would fail (%r)" % ({k: m["s1"][k] for k in ("frozen_unresolved", "intent_ops", "pending_unfrozen")},), m["s1"]["frozen_unresolved"] == 0)
 except _TO as e:
     print("FAIL BUDGET %s" % e); FAILS.append("budget")
 except SystemExit:

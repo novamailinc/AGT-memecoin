@@ -68,10 +68,15 @@ r5 = ci._append(ci.journal_path("t2b"), {"ev": "probe"})
 r6 = ci.recover_lane("t2b", lambda op: (True, "x"), lambda i: False, lambda i: True)
 check("t2b mid-file corruption plus torn tail: append refused %r, recover returns the pending id %r, bytes unchanged %r" % (r5, r6, hashlib.sha256(raw("t2b")).hexdigest() == b2),
       r5 is False and r6 == pend_id and hashlib.sha256(raw("t2b")).hexdigest() == b2)
-# negative control: a RAW append without the repair merges into the half line (proves the guard is what prevents it)
+# negative control: a RAW append WITHOUT the repair merges into the half line. ONE raw append leaves one unparseable LAST record (still torn_tail); a SECOND raw append
+# (what the next writer would do) turns the merged line into MID-FILE garbage (status torn). Both states are asserted, proving the guard is what prevents the merge.
 put("t2c", json.dumps({"ev": "probe"}).encode() + b'\n{"ev": "half')
 with open(ci.journal_path("t2c"), "a") as f: f.write(json.dumps({"ev": "probe"}) + "\n")
-check("t2c negative control: a raw append onto a half line is NOT clean (status %r)" % ci._read(ci.journal_path("t2c"))[1], ci._read(ci.journal_path("t2c"))[1] == "torn")
+st_one = ci._read(ci.journal_path("t2c"))[1]
+with open(ci.journal_path("t2c"), "a") as f: f.write(json.dumps({"ev": "probe"}) + "\n")
+st_two = ci._read(ci.journal_path("t2c"))[1]
+check("t2c negative control: one raw append onto a half line gives %r (want torn_tail), a second raw append gives %r (want torn, mid-file)" % (st_one, st_two),
+      st_one == "torn_tail" and st_two == "torn")
 
 # (3) resume
 a = ci.begin("t3", "M", "p#1", OPS, dict(INFO))

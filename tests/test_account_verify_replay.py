@@ -22,7 +22,14 @@ subprocess.Popen = _no; subprocess.run = _no; threading.Thread.start = _no
 
 _home = tempfile.mkdtemp(prefix="verify-replay-home-")
 os.environ["FOREX_AGENT_HOME"] = _home
-os.environ["PAPER_ACCOUNT_ENABLED"] = "1"; os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"      # MANDATORY gates on, else try_debit refuses ("mandatory gates off; entry blocked fail-closed"): found by the first run
+# The account's MANDATORY entry gates must be ON or every try_debit refuses ("mandatory gates off; entry blocked fail-closed"), and with
+# gates on every limit must be configured or the gate fails closed. These are TEST-FIXTURE limits in this isolated temp env (set only so the
+# real debit path can be exercised to build a WAL); they are NOT owner operating limits and nothing here arms a production account.
+for _k, _v in (("PAPER_ACCOUNT_ENABLED", "1"), ("PAPER_ACCOUNT_GATES_ENABLED", "1"), ("PAPER_ACCOUNT_MAX_DAILY_LOSS_USD", "5.0"),
+               ("PAPER_ACCOUNT_MAX_DRAWDOWN_PCT", "50.0"), ("PAPER_ACCOUNT_MAX_EXPOSURE_PCT", "100.0"), ("PAPER_ACCOUNT_MAX_SIMULTANEOUS", "1000"),
+               ("PAPER_ACCOUNT_MAX_POSITIONS", "1000"), ("PAPER_ACCOUNT_MAX_DATA_AGE_S", "100000"),
+               ("PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD", "1000000"), ("PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD", "1000000")):
+    os.environ[_k] = _v
 from daemon.launch_scanner import paper_account as PA
 check("T0 the account module is pointed at the TEMP dir, never a real home (%s)" % PA.ACCOUNT_DIR, PA.ACCOUNT_DIR.startswith(_home))
 if not PA.ACCOUNT_DIR.startswith(_home):
@@ -39,12 +46,36 @@ def _tree(d):
             out[os.path.relpath(p, d)] = (open(p, "rb").read(), st.st_mtime_ns, st.st_ino)
     return out
 
+
+import time as _time
+def _mk(PA_):
+    """Fresh, fully bound marks for every open position (fixture-only; value = cost basis): with a position open, the gate needs a trusted
+    mark for each one or it refuses. Keyed like the account does (pos_id for instance lots, mint otherwise)."""
+    try:
+        led = json.load(open(PA_.LEDGER_PATH))
+    except Exception:
+        return None
+    out = {}
+    for lane, st in (led.get("lanes") or {}).items():
+        for k, pos in (st.get("open") or {}).items():
+            key = pos["pos_id"] if pos.get("instance") is True else k
+            out.setdefault(lane, {})[key] = {"value": float(pos["basis"]), "ts": _time.time(), "source": "jup-v3", "qty": float(pos["qty"]), "pos_id": pos["pos_id"]}
+    return out or None
+def _need(label, res):
+    """FAIL FAST: a setup call that did not succeed aborts the whole file with the raw result, so no later case can pass on an empty account."""
+    ok = isinstance(res, tuple) and len(res) >= 1 and res[0] is True
+    if not ok:
+        print("FAIL SETUP %s: %r" % (label, res)); raise SystemExit("setup call failed: %s: %r" % (label, res))
+    return res
+def _deb(lane, mint, stake, qty, op):
+    return _need("debit " + op, PA.try_debit_instance(lane, mint, stake, qty, op, marks=_mk(PA)))
+
 _pristine = os.path.join(_home, "pristine"); os.makedirs(_pristine)
 _use(_pristine)
-_r1 = PA.try_debit_instance("grad", "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
+_r1 = _deb("grad", "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
 check("T1a try_debit_instance returned (True, 'ok', pos_id) (%s)" % (_r1,), isinstance(_r1, tuple) and len(_r1) == 3 and _r1[0] is True and _r1[1] == "ok" and isinstance(_r1[2], str) and _r1[2])
 _led_after_debit = open(PA.LEDGER_PATH, "rb").read()      # the ledger as it stood after the debit, BEFORE the credit (for the crash-window case)
-_r2 = PA.credit("grad", "MINTA", 1.5, "grad:exit:MINTA:k1", pos_id=_r1[2], qty=100.0)
+_r2 = _need("credit k1", PA.credit("grad", "MINTA", 1.5, "grad:exit:MINTA:k1", pos_id=_r1[2], qty=100.0))
 check("T1b the credit was accepted (%s)" % (_r2,), isinstance(_r2, tuple) and _r2[0] is True)
 _j = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip()]
 _mut = [e for e in _j if isinstance(e.get("seq"), int) and e.get("event") in PA._MUTATION_EVENTS]
@@ -132,12 +163,12 @@ check("V13 snapshot() truncates a torn tail (%d -> %d bytes): the heal that veri
 # R: a REALISTIC valid WAL: a partial sell with a fee and a VERIFIED price kind (spendable bucket), a fully closed instance, a reopened mint (second
 # instance), one open position left, a hold, and a released hold. Every call's result is asserted so a wrong API assumption fails loudly here.
 _real = os.path.join(_home, "realistic"); os.makedirs(_real); _use(_real)
-_a1 = PA.try_debit_instance("grad", "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
-_a2 = PA.credit("grad", "MINTA", 1.4, "grad:exit:MINTA:k1", pos_id=_a1[2], qty=100.0, fee=0.01, price_kind="current_price_simulated_fill")
-_a3 = PA.try_debit_instance("grad", "MINTA", 1.0, 80.0, "grad:entry:MINTA:2")          # the SAME mint reopened: a second instance
-_b1 = PA.try_debit_instance("grad", "MINTB", 1.0, 50.0, "grad:entry:MINTB:1")
-_b2 = PA.credit("grad", "MINTB", 0.6, "grad:exit:MINTB:k1", pos_id=_b1[2], qty=20.0, fee=0.01, price_kind="current_price_simulated_fill")   # PARTIAL: B stays open
-_h1 = PA.hold_stake("grad", 0.3, "grad:hold:1"); _h2 = PA.hold_stake("grad", 0.2, "grad:hold:2"); _h3 = PA.release_hold("grad:hold:2", "test: provider reports the tx never landed")
+_a1 = _deb("grad", "MINTA", 1.0, 100.0, "grad:entry:MINTA:1")
+_a2 = _need("credit A", PA.credit("grad", "MINTA", 1.4, "grad:exit:MINTA:k1", pos_id=_a1[2], qty=100.0, fee=0.01, price_kind="current_price_simulated_fill"))
+_a3 = _deb("grad", "MINTA", 1.0, 80.0, "grad:entry:MINTA:2")          # the SAME mint reopened: a second instance
+_b1 = _deb("grad", "MINTB", 1.0, 50.0, "grad:entry:MINTB:1")
+_b2 = _need("partial credit B", PA.credit("grad", "MINTB", 0.6, "grad:exit:MINTB:k1", pos_id=_b1[2], qty=20.0, fee=0.01, price_kind="current_price_simulated_fill"))   # PARTIAL: B stays open
+_h1 = _need("hold 1", PA.hold_stake("grad", 0.3, "grad:hold:1", marks=_mk(PA))); _h2 = _need("hold 2", PA.hold_stake("grad", 0.2, "grad:hold:2", marks=_mk(PA))); _h3 = _need("release hold 2", PA.release_hold("grad:hold:2", "test: provider reports the tx never landed"))
 _all = (_a1, _a2, _a3, _b1, _b2, _h1, _h2, _h3)
 check("R0 every real call in the realistic WAL succeeded (%s)" % [x[0] if isinstance(x, tuple) else x for x in _all], all(isinstance(x, tuple) and x[0] is True for x in _all))
 _ev = [json.loads(l) for l in open(PA.JOURNAL_PATH) if l.strip()]

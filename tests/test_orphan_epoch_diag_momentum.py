@@ -9,7 +9,7 @@ torn_mid | stale_ledger (pre-target ledger over ledger and bak) | trail_cut (tar
 midchain (target is the FIRST debit; only the target debit line removed, a later debit stays) | pair_rollback (pre-target ledger AND pre-target journal restored together, bak too: a consistent clean older pair) |
 reuse (wipe_all, then a real PA.try_debit for the same lane and mint with the same stake/qty to observe whether the fresh account REUSES the old pos_id: possible misattribution).
 NO production or earlier test file is edited. There is NO positive safe-pre-epoch control here (no never-debited orphan case): that original purpose stays separate coverage, and no timestamp/seq/account_id is promoted to proof (account_id and seq are printed as candidate evidence only).
-ASSERTED: setup/instrument facts, injection-did-what-its-label-says, E0 control, and the accounting-reconciliation invariant (credit events for the op <=1; no new debit in recovery; cash delta == sum of net of the credit events journaled DURING recovery; the lane close count changes by <=1). The CLASS of every loss scenario is an OBSERVATION, not asserted.
+ASSERTED: setup/instrument facts (exactly one pending unapplied intent for the target pid/op, no prior credit/write_down/orphan/degraded event for that pid or mint, clean create/debit identity), injection-did-what-its-label-says, E0 control, and an EVENT-LEVEL reconciliation (credit plus write_down events for the pid or the mint <=1 over the full journal and during recovery; no new debit during recovery; cash delta == the sum of the net proceeds of the credit events journaled during recovery, event by event; the lane close count changes by <=1). This checks event counts and event amounts only: it is NOT a proof that no cash was gained twice and NOT a conservation proof. The CLASS of every loss scenario is an OBSERVATION, not asserted.
 HYPOTHESES (UNVERIFIED, hand, not conclusions): E0 CREDITED_ONCE; E1 wipe_all and E8 pair_rollback and E6 trail_cut-with-consistent-ledger: orphan no-op candidate; E2/E3/E4/E5/E7: no orphan convergence (degraded/unknown/hold/freeze); E9 reuse: credit applies to the new position if ids collide.
 Run: python3 -B tests/test_orphan_epoch_diag_momentum.py"""
 if __name__ != "__main__":
@@ -197,6 +197,10 @@ def child_recover(entry_cash, reuse_stake, reuse_qty):
            "new_debit_events": len([x for x in new_evs if x.get("event") == "debit"]),
            "new_credit_net_sum": round(sum(float(x.get("net") or 0.0) for x in new_evs if x.get("event") == "credit"), 6),
            "all_credit_events_for_op": len([x for x in evs if x.get("op_id") == op_id and x.get("event") == "credit"]),
+           "new_settle_events_pid_or_mint": len([x for x in new_evs if x.get("event") in ("credit", "write_down") and (x.get("pos_id") == pid or x.get("mint") == MINT)]),
+           "all_settle_events_pid_or_mint": len([x for x in evs if x.get("event") in ("credit", "write_down") and (x.get("pos_id") == pid or x.get("mint") == MINT)]),
+           "new_write_down_events": len([x for x in new_evs if x.get("event") == "write_down"]),
+           "new_credit_events_detail": [{"op_id": x.get("op_id"), "pos_id": x.get("pos_id"), "mint": x.get("mint"), "net": x.get("net"), "proceeds": x.get("proceeds"), "fee": x.get("fee"), "qty": x.get("qty")} for x in new_evs if x.get("event") == "credit"],
            "orphan_events": [str(x.get("event")) + ("/reason" if x.get("reason") else "") for x in evs if x.get("op_id") == op_id and "orphan" in str(x.get("event"))],
            "degraded_events": [str(x.get("event")) for x in evs if x.get("op_id") == op_id and "degraded" in str(x.get("event"))],
            "journal_status": PA._journal_read()[1], "intent_status": st, "pending": len(CI.pending(LANE_NAME)), "frozen_open": fro,
@@ -302,10 +306,14 @@ for tag, mode, order in (SC if lname else ()):
         tdeb = [e for e in evs if e.get("event") == "debit" and e.get("pos_id") == pid]
         led = before["ledger"] if isinstance(before["ledger"], dict) else {}
         cr = [e for e in evs if e.get("event") == "create"]
-        proof = (len(tdeb) == 1 and bad == 0 and len(cr) == 1 and cr[0].get("account_id") == led.get("account_id") and pid in before["debit_pos_ids"] and
+        pend = CI.pending(lname)   # env of this scratch root was set by raw_state above
+        _pop = ((pend[0].get("intent") or {}).get("settle_ops") or [{}])[0].get("op_id") if len(pend) == 1 else None
+        prior = [e for e in evs if e.get("event") not in ("create", "debit") and (e.get("pos_id") == pid or e.get("mint") == MINT or (_pop is not None and e.get("op_id") == _pop))]
+        proof = (len(pend) == 1 and not pend[0].get("account_applied") and (pend[0].get("intent") or {}).get("pos_id") == pid and (pend[0].get("intent") or {}).get("mint") == MINT and _pop is not None and not prior and
+                 len(tdeb) == 1 and bad == 0 and len(cr) == 1 and cr[0].get("account_id") == led.get("account_id") and pid in before["debit_pos_ids"] and
                  isinstance(before["lane_ledger"], dict) and before["lane_ledger"]["pos_ids"].get(MINT) == pid and before["intent_events"] and before["intent_events"][0] == "intent" and before["intent_status"] is None
                  and any(("%s#" % MINT2) in str(p) for p in before["debit_pos_ids"]))
-        check("%s: BEFORE injection pid-specific proof: exactly one debit for %s, journal clean, one create event whose account_id equals the ledger's, lane position pos_id equals it, intent journaled, second debit present (debits %r, account_id %s)" % (tag, pid, before["debit_pos_ids"], str(led.get("account_id"))[:8]), proof)
+        check("%s: BEFORE injection pid-specific proof: exactly one debit for %s, journal clean, one create event whose account_id equals the ledger's, lane position pos_id equals it, intent journaled, second debit present (debits %r, account_id %s, pending intents %d, prior events for pid/mint/op %r)" % (tag, pid, before["debit_pos_ids"], str(led.get("account_id"))[:8], len(pend), [e.get("event") for e in prior]), proof)
         if not proof: continue
         inject(root, mode)
         check("%s: INJECTION-VERIFIED the files match the label %r before recovery (%r)" % (tag, mode, {k: v for k, v in raw_state(root, lname)["files"].items()}), verify_injection(root, mode, before))
@@ -326,9 +334,9 @@ for tag, mode, order in (SC if lname else ()):
     print("  RAW-ENTRYTRY %s %s" % (tag, el[0][9:] if el else None), flush=True)
     check("%s: INSTRUMENT zero polls in the recovery process (%d) and the gate/recovery path was reached (gate stats %r)" % (tag, r["cnt"]["poll_exits"], r["gate_stats"]), r["cnt"]["poll_exits"] == 0 and r["gate_stats"] is not None and sum(r["gate_stats"].values()) >= 1)
     delta = round(float(r["cash_after_recovery"]) - float(r["cash_before_recovery"]), 6)
-    check("%s: INVARIANT accounting reconciliation: new credit events for the op <=1 (%d), all <=1 (%d), no new debit in recovery (%d), cash delta %.6f == net sum of credit events journaled during recovery %.6f, lane close delta %r <=1" % (
-          tag, r["new_credit_events_for_op"], r["all_credit_events_for_op"], r["new_debit_events"], delta, r["new_credit_net_sum"], r["lane_closes_delta"]),
-          r["new_credit_events_for_op"] <= 1 and r["all_credit_events_for_op"] <= 1 and r["new_debit_events"] == 0 and abs(delta - r["new_credit_net_sum"]) < 1e-6 and r["lane_closes_delta"] is not None and r["lane_closes_delta"] <= 1)
+    check("%s: INVARIANT event-level reconciliation (counts and amounts only, not conservation): credit events for the op <=1 (%d new, %d all), credit+write_down events for the pid or mint <=1 (%d new, %d all), write_down new %d, no new debit in recovery (%d), cash delta %.6f == net sum of credit events journaled during recovery %.6f, lane close delta %r <=1" % (
+          tag, r["new_credit_events_for_op"], r["all_credit_events_for_op"], r["new_settle_events_pid_or_mint"], r["all_settle_events_pid_or_mint"], r["new_write_down_events"], r["new_debit_events"], delta, r["new_credit_net_sum"], r["lane_closes_delta"]),
+          r["new_credit_events_for_op"] <= 1 and r["all_credit_events_for_op"] <= 1 and r["new_settle_events_pid_or_mint"] <= 1 and r["all_settle_events_pid_or_mint"] <= 1 and r["new_debit_events"] == 0 and abs(delta - r["new_credit_net_sum"]) < 1e-6 and r["lane_closes_delta"] is not None and r["lane_closes_delta"] <= 1)
     cl = classify(r)
     gen_b = (before["ledger"] or {}).get("account_id") if isinstance(before["ledger"], dict) else None
     gen_a = (post["ledger"] or {}).get("account_id") if isinstance(post["ledger"], dict) else None
@@ -338,6 +346,7 @@ for tag, mode, order in (SC if lname else ()):
     print("OBS %s: CANDIDATE-EVIDENCE ONLY (not proof): account_id before=%s after=%s changed=%s; ledger seq before=%s after=%s; pos_id of intent=%s reuse=%s" % (
         tag, str(gen_b)[:8], str(gen_a)[:8], gen_b != gen_a, (before["ledger"] or {}).get("seq") if isinstance(before["ledger"], dict) else None, (post["ledger"] or {}).get("seq") if isinstance(post["ledger"], dict) else None, pid, r["reuse"]), flush=True)
     print("OBS %s: cash entry=%.6f before-recovery=%.6f after-recovery=%.6f; lane ledger before=%r after=%r" % (tag, entry_cash, r["cash_before_recovery"], r["cash_after_recovery"], pre2["lane_ledger"], post["lane_ledger"]), flush=True)
+    print("OBS %s: event-specific credit proceeds during recovery: %r; new write_down events %d" % (tag, r["new_credit_events_detail"], r["new_write_down_events"]), flush=True)
     for m in r["recover_logs"]: print("OBS %s: LOG %s" % (tag, m), flush=True)
     if mode == "none":
         check("%s: CONTROL converges: the real credit applied exactly once, intent terminal, no freeze, entries not blocked, cash up by the credit (class %s)" % (tag, cl),

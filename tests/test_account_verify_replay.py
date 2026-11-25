@@ -22,6 +22,7 @@ subprocess.Popen = _no; subprocess.run = _no; threading.Thread.start = _no
 
 _home = tempfile.mkdtemp(prefix="verify-replay-home-")
 os.environ["FOREX_AGENT_HOME"] = _home
+os.environ["PAPER_ACCOUNT_ENABLED"] = "1"; os.environ["PAPER_ACCOUNT_GATES_ENABLED"] = "1"      # MANDATORY gates on, else try_debit refuses ("mandatory gates off; entry blocked fail-closed"): found by the first run
 from daemon.launch_scanner import paper_account as PA
 check("T0 the account module is pointed at the TEMP dir, never a real home (%s)" % PA.ACCOUNT_DIR, PA.ACCOUNT_DIR.startswith(_home))
 if not PA.ACCOUNT_DIR.startswith(_home):

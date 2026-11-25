@@ -1641,13 +1641,18 @@ try:
     #     persisted lane ledger, and the latched poll_abort fault and the refused scans remain after convergence;
     #   - PAr.verify_replay() is read BEFORE any snapshot() after the converging cycle and its verdict is asserted (not guessed).
     # Still an in-process fresh-state replay: NOT a kill/restart proof.
+    # Schemas READ from source: account WAL credit event {op_id, qty, proceeds, fee, net, realized, final, cash_after, pos_id}; account open position
+    # {pos_id, qty, basis} in ledger["lanes"][lane]["open"]; fill journal record {gross_usd, fee_usd, price_usd, ...}; lane leg {done, realized_usd,
+    # fill_gross, exit_price, frac}, lane position {tokens, realized_usd}.
     def _wal_credits(pid_): return [dict(e) for e in PAr._journal_read()[0] if e.get("event") == "credit" and str(e.get("pos_id")) == str(pid_)]
-    def _acct_qty(pid_):
-        for _p in (((PAr.snapshot().get("lanes") or {}).get("grad") or {}).get("positions") or []):
-            if str(_p.get("pos_id")) == str(pid_): return _p.get("qty")
+    def _acct_pos(pid_):
+        for _p in (((PAr._read_json(PAr.LEDGER_PATH) or {}).get("lanes") or {}).get("grad") or {}).get("open", {}).values():
+            if isinstance(_p, dict) and str(_p.get("pos_id")) == str(pid_): return dict(_p)
         return None
-    _pid4 = GR.open_positions()[_gmr].get("pa_pos_id"); _q0 = _acct_qty(_pid4); _cr0 = _wal_credits(_pid4)
-    _fk0 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}; _cash0 = float(PAr.snapshot().get("cash"))
+    def _tree4(): return {os.path.join(r_, f_): open(os.path.join(r_, f_), "rb").read() for r_, _d, fs_ in os.walk(PAr.ACCOUNT_DIR) for f_ in fs_}
+    _lp0 = GR.open_positions()[_gmr]; _pid4 = _lp0.get("pa_pos_id"); _ap0 = _acct_pos(_pid4); _cr0 = _wal_credits(_pid4)
+    _leg_tokens = float(_lp0["tokens"]) * float(_lp0["legs"]["a"]["frac"]); _real0 = float(_lp0.get("realized_usd") or 0.0)
+    _fk0 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}; _cash0 = float(PAr._read_json(PAr.LEDGER_PATH)["cash"])
     _wr_save = GR._write; _once = {"n": 0, "credits_at_fail": None}
     def _write_boom(d_):
         _once["n"] += 1
@@ -1657,25 +1662,35 @@ try:
     GR._persist_poll_failure = lambda d, mint, pos, exc: False; GR._write = _write_boom; _scans.clear(); _a4 = GR._POLL_ABORTS.get("count", 0)
     try: _r4 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(4), now=time.time())
     finally: GR._persist_poll_failure = _pf_save; GR._write = _wr_save
-    _cr1 = _wal_credits(_pid4); _cash1 = float(PAr.snapshot().get("cash")); _q1 = _acct_qty(_pid4); _fk1 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
-    _hi2_px = lambda c, m, i: _epr * 2.6      # DIFFERENT price: a re-quote instead of a replay of the journaled fill would change proceeds and qty
+    _cr1 = _wal_credits(_pid4); _ap1 = _acct_pos(_pid4); _cash1 = float(PAr._read_json(PAr.LEDGER_PATH)["cash"]); _fk1 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
+    _fills1 = _fills_now(GR._demo_filler()); _newkey = sorted(_fk1 - _fk0)[0] if len(_fk1 - _fk0) == 1 else None; _fill = _fills1.get(_newkey) or {}
+    _hi2_px = lambda c, m, i: _epr * 2.6      # DIFFERENT price: a re-quote instead of a replay of the journaled fill would change proceeds, qty and the fill key's values
     _r5 = _GCY.run_cycle(GR, price_fn=_hi2_px, scan_fn=lambda: _scans.append(5), now=time.time())     # clean cycle, seam removed
-    _vr5 = PAr.verify_replay()                                                                          # BEFORE any snapshot() (which heals on access)
-    _cr2 = _wal_credits(_pid4); _cash2 = float(PAr.snapshot().get("cash")); _q2 = _acct_qty(_pid4); _fk2 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
+    _t_before = _tree4(); _vr5 = PAr.verify_replay(); _t_after = _tree4()                               # BEFORE any snapshot() (which heals on access)
+    _cr2 = _wal_credits(_pid4); _ap2 = _acct_pos(_pid4); _cash2 = float(PAr._read_json(PAr.LEDGER_PATH)["cash"]); _fills2 = _fills_now(GR._demo_filler())
     _lg = GR._read().get("positions", {}).get(_gmr) or {}; _la = ((_lg.get("legs") or {}).get("a") or {})
-    _flt = _GCY._read_fault(GR) or {}
-    check("P7zr4a the injected failure is POST-credit: at the failing write the account WAL already held a credit for the position (%d before, %d at failure), and the poll aborted (count %s -> %s)"
+    _flt = _GCY._read_fault(GR) or {}; _c = (_cr1[-1] if _cr1 else {}); _f_ = lambda v: float(v if v is not None else float("nan")); _near = lambda x, y, t=1e-6: abs(_f_(x) - _f_(y)) <= t
+    check("P7zr4a the injected failure is POST-credit: at the failing write the account WAL already held one more credit for the position (%d before, %d at failure), and the poll aborted (count %s -> %s)"
           % (len(_cr0), len(_once["credits_at_fail"] or []), _a4, GR._POLL_ABORTS.get("count")),
           _once["credits_at_fail"] is not None and len(_once["credits_at_fail"]) == len(_cr0) + 1 and GR._POLL_ABORTS.get("count", 0) == _a4 + 1)
-    check("P7zr4b credit exactly once so far: cash %.6f -> %.6f, exactly one new exit fill key (%s), account qty %s -> %s" % (_cash0, _cash1, sorted(_fk1 - _fk0), _q0, _q1),
-          _cash1 > _cash0 and len(_fk1 - _fk0) == 1 and len(_cr1) == len(_cr0) + 1 and _q0 is not None and _q1 is not None and float(_q1) < float(_q0))
-    check("P7zr4c REPLAY IDENTITY at a different price (x2.6 vs x2.5): the WAL credit events for the position are IDENTICAL (%d vs %d), cash unchanged (%.6f), account qty unchanged once (%s), exit fill keys unchanged, leg a done on the lane ledger (%s)"
-          % (len(_cr1), len(_cr2), _cash2, _q2, _la.get("done")),
-          _cr2 == _cr1 and abs(_cash2 - _cash1) < 1e-9 and _q2 == _q1 and _fk2 == _fk1 and _la.get("done") is True)
-    check("P7zr4d the latched poll_abort fault REMAINS after convergence and the scan stayed refused in both cycles (scans %s, fault reasons %s, scan_skipped %s)"
+    check("P7zr4b the one credit is EXACT against the journaled fill: proceeds==fill gross_usd (%s vs %s), fee==fill fee_usd (%s vs %s), net==proceeds-fee, qty==leg tokens (%s vs %.8f), one new exit fill key (%s)"
+          % (_c.get("proceeds"), _fill.get("gross_usd"), _c.get("fee"), _fill.get("fee_usd"), _c.get("qty"), _leg_tokens, _newkey),
+          _newkey is not None and len(_cr1) == len(_cr0) + 1 and _near(_c.get("proceeds"), _fill.get("gross_usd")) and _near(_c.get("fee"), _fill.get("fee_usd"))
+          and _near(_c.get("net"), _f_(_c.get("proceeds")) - _f_(_c.get("fee"))) and _near(_c.get("qty"), _leg_tokens, 1e-6 * max(1.0, _leg_tokens)))
+    _alloc = _f_(_c.get("net")) - _f_(_c.get("realized"))
+    check("P7zr4c account position decremented exactly ONCE with the allocated basis: qty %s -> %s (minus %.8f), basis %s -> %s (minus alloc %.6f)"
+          % ((_ap0 or {}).get("qty"), (_ap1 or {}).get("qty"), _leg_tokens, (_ap0 or {}).get("basis"), (_ap1 or {}).get("basis"), _alloc),
+          _ap0 is not None and _ap1 is not None and _near(_f_(_ap0["qty"]) - _f_(_ap1["qty"]), _leg_tokens, 1e-6 * max(1.0, _leg_tokens)) and _near(_f_(_ap0["basis"]) - _f_(_ap1["basis"]), _alloc)
+          and _near(_cash1 - _cash0, _c.get("net")))
+    check("P7zr4d REPLAY IDENTITY at a different price (x2.6 vs x2.5): WAL credits for the position IDENTICAL (%d vs %d), the fill record unchanged, account qty/basis/cash unchanged (%s / %s / %.6f), lane leg a done with realized_usd==credit net (%s vs %s) and fill_gross==fill gross_usd (%s)"
+          % (len(_cr1), len(_cr2), (_ap2 or {}).get("qty"), (_ap2 or {}).get("basis"), _cash2, _la.get("realized_usd"), _c.get("net"), _la.get("fill_gross")),
+          _cr2 == _cr1 and _fills2.get(_newkey) == _fill and _ap2 == _ap1 and _near(_cash2, _cash1, 1e-9) and _la.get("done") is True
+          and _near(_la.get("realized_usd"), _c.get("net")) and _near(_la.get("fill_gross"), _fill.get("gross_usd")) and _near(_lg.get("realized_usd"), _real0 + _f_(_c.get("net"))))
+    check("P7zr4e the latched poll_abort fault REMAINS after convergence and the scan stayed refused in both cycles (scans %s, fault reasons %s, scan_skipped %s)"
           % (_scans, [x.get("reason") for x in (_flt.get("reasons") or [])], _r5.get("scan_skipped")),
           _scans == [] and _GCY.fault_active(GR)[0] and any(x.get("reason") == "poll_abort" for x in (_flt.get("reasons") or [])) and str(_r5.get("scan_skipped", "")).startswith("unresolved_fault"))
-    check("P7zr4e verify_replay on the RAW account after the converging cycle, before any heal, gives a definite verdict (not None): %s" % (_vr5,), _vr5[0] in (True, False))
+    check("P7zr4f EXPECTED classification, traced: the credit saved the ledger (_save_locked after the WAL append), so the ACCOUNT is consistent with its own WAL: verify_replay is exactly (True, ...) (%s), and it changed no byte of the account dir (%s files)"
+          % (_vr5, len(_t_before)), _vr5[0] is True and _t_before == _t_after)
 finally:
     for _k, _v in _env_save.items():
         if _v is None: os.environ.pop(_k, None)

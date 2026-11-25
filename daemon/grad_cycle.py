@@ -204,6 +204,9 @@ def fault_active(grad):
     f = _read_fault(grad)
     if f is not None:
         return True, "unreadable_record" if f.get("unreadable") else "recorded"
+    _im = _inflight_state(grad)
+    if _im is not None:
+        return True, _im
     logged = _open_logged_faults(grad)
     if logged is None or logged:
         return True, "fault_log_unreadable" if logged is None else "logged_fault_without_clear_record"
@@ -268,6 +271,54 @@ class _fault_lock:
             try: self.fh.close()
             except Exception: pass
         return False
+
+
+def _inflight_path(grad):
+    return grad.LEDGER_PATH + ".poll-inflight.json"
+
+
+def mark_inflight(grad, mint, err):
+    """Write-ahead marker: a poll failure is being handled (restore I/O not yet known good). Returns a token, or None when it could not be written
+    (lock timeout / I/O error; the exit path goes on regardless, so a failure here never delays or blocks a risk-reducing exit beyond the fault-lock
+    retry window). Never raises. Mandatory ENTRY refusal only: nothing on the exit path reads the marker."""
+    try:
+        import uuid  # noqa: PLC0415
+        with _fault_lock(grad):
+            prev = _read_json(_inflight_path(grad))
+            tok = uuid.uuid4().hex
+            rec = {"token": tok, "since": (prev or {}).get("since") or time.time(), "boot_id": _BOOT["id"], "pid": os.getpid(),
+                   "mint": str(mint), "error": str(err)[:200], "n": int((prev or {}).get("n") or 0) + 1}
+            if prev:
+                rec["prior_tokens"] = list(prev.get("prior_tokens") or []) + [prev.get("token")]       # an unresolved earlier marker is never dropped
+            _atomic(_inflight_path(grad), rec)
+            return tok
+    except Exception:
+        return None
+
+
+def unmark_inflight(grad, tok):
+    """Remove the marker ONLY when it carries exactly this token and no earlier unresolved marker. True when removed or already absent."""
+    if tok is None:
+        return False
+    try:
+        with _fault_lock(grad):
+            cur = _read_json(_inflight_path(grad))
+            if cur is None:
+                return True
+            if cur.get("unreadable") or cur.get("token") != tok or cur.get("prior_tokens"):
+                return False
+            os.remove(_inflight_path(grad))
+            return True
+    except Exception:
+        return False
+
+
+def _inflight_state(grad):
+    """None = no marker; else a reason string. Unreadable counts as present."""
+    m = _read_json(_inflight_path(grad))
+    if m is None:
+        return None
+    return "inflight_marker_unreadable" if m.get("unreadable") else "poll_failure_inflight"
 
 
 def _record_fault(grad, out, reason, **detail):
@@ -463,7 +514,11 @@ def clear_fault(grad, account=None, operator_note=""):
     _lg = _open_logged_faults(grad)
     if _lg is None and f is None:
         return False, dict(ev, blocked=["fault_log_unreadable"])
-    if f is None and not _lg:
+    _mk = _read_json(_inflight_path(grad))
+    ev["inflight_marker"] = "none" if _mk is None else ("unreadable" if _mk.get("unreadable") else "present")
+    if _mk is not None and _mk.get("unreadable"):
+        return False, dict(ev, blocked=["inflight_marker_unreadable"])
+    if f is None and not _lg and _mk is None:
         return False, dict(ev, blocked=["no_fault"])
     bad = []
     if _lg and _TORN_TAIL in _lg: bad.append("fault_log_torn_tail")
@@ -556,7 +611,7 @@ def clear_fault(grad, account=None, operator_note=""):
             return False, dict(ev, blocked=["state_changed_during_evidence"])
         try:
             with open(_clear_log_path(grad), "a") as fh:
-                fh.write(json.dumps({"ts": time.time(), "fault_id": (f or {}).get("fault_id"), "fault_ids": sorted(set(filter(None, [(f or {}).get("fault_id")] + list(_open_logged_faults(grad) or [])))), "fault_since": (f or {}).get("since"), "fault": f,
+                fh.write(json.dumps({"ts": time.time(), "fault_id": (f or {}).get("fault_id"), "fault_ids": sorted(set(filter(None, [(f or {}).get("fault_id")] + list(_open_logged_faults(grad) or [])))), "fault_since": (f or {}).get("since"), "fault": f, "inflight_marker": _mk,
                                      "evidence": ev, "boot_id": _BOOT["id"], "fingerprint": fp0}, default=str) + "\n")
                 fh.flush(); os.fsync(fh.fileno())
         except Exception as e:
@@ -565,6 +620,12 @@ def clear_fault(grad, account=None, operator_note=""):
             if f is not None: os.remove(_fault_path(grad))
         except Exception as e:
             return False, dict(ev, blocked=["fault_file_not_removed:%r" % (e,)])
+        try:      # the clear record above already names the marker, so removing it cannot lose evidence
+            if _mk is not None: os.remove(_inflight_path(grad))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            return False, dict(ev, blocked=["inflight_marker_not_removed:%r" % (e,)])
     except FaultLockTimeout as e:
         return False, dict(ev, blocked=["fault_lock_unavailable:%r" % (e,)])
     finally:

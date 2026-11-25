@@ -3785,6 +3785,22 @@ _POLL_ABORTS = {"count": 0, "last_ts": None, "last_mint": None, "last_error": No
 # Seam (default None = no behavior): called inside the ledger lock, right after an abort is counted, so a wiring layer can make the abort durable
 # BEFORE the lock is released. It must not raise; any exception is swallowed here so the abort path is unchanged.
 _ABORT_HOOK = None
+# Write-ahead seams (default None = no behavior). BEGIN is called inside the ledger lock when a per-position poll exception is caught, BEFORE the restore
+# I/O (_persist_poll_failure) and before the abort is counted, so a process death anywhere after it leaves a durable in-flight marker. It returns an opaque
+# token (or None when no marker was written). END is called with that token only after the restore succeeded. After an abort the marker is NOT removed
+# here: _ABORT_HOOK itself decides, and removes it only once its fault is durable. Hooks must not raise and must not take the cycle or ledger lock; exceptions are swallowed so exits and the abort path are
+# unchanged. Hooks run only on the exception path: the normal poll adds no I/O.
+_FAILURE_BEGIN_HOOK = None
+_FAILURE_END_HOOK = None
+
+
+def _call_failure_hook(hook, *a, **kw):
+    if hook is None:
+        return None
+    try:
+        return hook(*a, **kw)
+    except Exception:
+        return None
 
 
 def _persist_poll_failure(d, mint, pos, exc):
@@ -4333,7 +4349,11 @@ def _poll_exits(price_fn):
                     _write(d)
             except Exception as e:
                 logger.warning("grad poll_exits %s failed: %s", mint, e, exc_info=True)
-                if not _persist_poll_failure(d, mint, pos, e):
+                _tok = _call_failure_hook(_FAILURE_BEGIN_HOOK, str(mint), repr(e)[:200])     # write-ahead marker BEFORE the restore I/O (K1 window)
+                _restored = _persist_poll_failure(d, mint, pos, e)
+                if _restored:
+                    _call_failure_hook(_FAILURE_END_HOOK, str(mint), _tok)
+                if not _restored:
                     # the in-memory ledger may hold half-mutated state and could not be replaced by a fresh persisted view: FAIL CLOSED,
                     # abort the rest of this cycle so no later write can persist it. Positions not yet visited are retried next poll.
                     _POLL_ABORTS["count"] += 1; _POLL_ABORTS.update(last_ts=time.time(), last_mint=str(mint), last_error=repr(e)[:200])

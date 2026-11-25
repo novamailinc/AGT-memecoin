@@ -74,6 +74,25 @@ def _abort_count(engine):
         return None
 
 
+_INFLIGHT = {}      # lane -> token of the write-ahead marker for the failure currently being handled (set by BEGIN, used by the abort hook)
+
+
+def _make_begin_hook(engine):
+    lane = str(engine.LANE)
+
+    def _begin(mint, err):
+        tok = _gc().mark_inflight(engine, mint, err)
+        _INFLIGHT[lane] = tok
+        return tok
+    return _begin
+
+
+def _make_end_hook(engine):
+    def _end(mint, tok):
+        _gc().unmark_inflight(engine, tok)
+    return _end
+
+
 def _make_abort_hook(engine):
     lane = str(engine.LANE)
 
@@ -82,6 +101,8 @@ def _make_abort_hook(engine):
             ok = _gc()._record_fault(engine, {}, "poll_abort_live", mint=mint, error=err)      # serialised inside grad_cycle by the fault lock
             if not ok:
                 _HOOK_FAILED[lane] = True
+            else:
+                _gc().unmark_inflight(engine, _INFLIGHT.pop(lane, None))      # durable fault recorded: marker superseded. On failure it STAYS (protects after restart)
         except Exception:
             _HOOK_FAILED[lane] = True
     return _hook
@@ -97,6 +118,8 @@ def register(engine):
         _HOOK_FAILED.pop(lane, None)
         if os.environ.get(FLAG) == "1":
             engine._ABORT_HOOK = _make_abort_hook(engine)
+            engine._FAILURE_BEGIN_HOOK = _make_begin_hook(engine)
+            engine._FAILURE_END_HOOK = _make_end_hook(engine)
     except Exception:
         pass
 

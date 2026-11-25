@@ -109,7 +109,7 @@ def child(mode, root, kind, flag):
                                   "status": CI.intent_status(lane, iids[0]) if iids else None, "n": len(iids), "hits": hits["n"],
                                   "led_same": led0 == _led() and not led0.startswith("unreadable"), "led0": led0[:12], "journal_same": j0 == j1,
                                   "pending_after": len(CI.pending(lane)),
-                                  "gate_stats": dict(M._GATE_STATS), "fz_why": calls["why"]}))
+                                  "gate_stats": dict(getattr(M, "_GATE_STATS", {}) or {}), "fz_why": calls["why"]}))
 
 if MODE != "parent":
     child(MODE, sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""); sys.exit(0)

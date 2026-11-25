@@ -69,12 +69,12 @@ import time, signal
 BUDGET_S = 60.0           # WHOLE-harness budget (the cycle harness runs alone, well under the 120 s wrapper); each child gets min(30, remaining); early stop
 _T0 = time.time(); _STOP = {"why": None}
 def py(code, *args, timeout=30):
-    """Bounded child: own process group, whole group killed and reaped on timeout or any exception. Children start no descendants."""
+    """Bounded child: own session (setsid, so pgid == pid), whole group killed and reaped on timeout or any exception. Children start no descendants."""
     rem = BUDGET_S - (time.time() - _T0)
     if rem <= 1.0:
         _STOP["why"] = "budget_exhausted"; raise TimeoutError("harness budget exhausted")
     env = dict(os.environ, AGT_REPO_ROOT=REPO)
-    p = subprocess.Popen([sys.executable, "-c", code] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, process_group=0)
+    p = subprocess.Popen([sys.executable, "-c", code] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, start_new_session=True)
     try:
         out, err = p.communicate(timeout=min(timeout, rem))
     except BaseException:

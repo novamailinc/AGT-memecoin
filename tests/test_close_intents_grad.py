@@ -331,6 +331,22 @@ G._ENTRY_BLOCKED = False
 # before debiting.
 ps, _mv, _ms = _fresh()
 G._ENTRY_BLOCKED = False
+# TEST EDIT (disclosed, BB37): the earlier sections of THIS test deliberately left frozen, unapplied intents in the shared grad journal (ghost, divergence-site). Under the
+# intended contract a persisted frozen intent keeps blocking entries across restarts, so the old assumption that a flag reset unblocks it is wrong. FIRST capture, on the
+# unchanged journal, that the restart's entry IS refused and which frozen intents block it; THEN isolate this section on a fresh journal (same disclosed pattern as below).
+_e_f, _s_f, _t_f = CI._read(CI.journal_path("grad"))
+_succ_f = {e.get("supersedes") for e in _e_f if e.get("ev") == "intent" and e.get("supersedes")}
+_blk_f = sorted(i for i, x in CI._state(_e_f).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in _succ_f)
+G._RECOVERY_DONE = False
+_o_f, _w_f, _x_f = G.consider_candidate(_cand(mint="FRZPRE1pump"))
+print("  frozen-journal entry attempt: opened %r, why %r, flag %r, blocking frozen intents %r" % (_o_f, _w_f, G._ENTRY_BLOCKED, _blk_f))
+check("frozen journal: a post-restart entry is REFUSED (opened %r, why %r) with entries blocked (%r)" % (_o_f, _w_f, G._ENTRY_BLOCKED), _o_f is False and G._ENTRY_BLOCKED is True)
+check("frozen journal: the blockers are the earlier frozen unapplied intents, including the ghost intent (%r)" % (_blk_f,),
+      len(_blk_f) >= 1 and any(i.startswith("grad:GHOSTB1pump") for i in _blk_f) and CI.pending("grad") is not None)
+unlink_j = CI.journal_path("grad")
+if os.path.exists(unlink_j): os.remove(unlink_j)   # DISCLOSED TEST SETUP: fresh journal for the healthy-replay section; the frozen-blocks-entry behavior is asserted above
+G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+check("isolation: the fresh journal has no frozen blockers and no pending intents", _events() == [] and CI.pending("grad") == [])
 _cash_pre_pend = PA.snapshot()["cash"]
 opened, _w, _f = G.consider_candidate(_cand(mint="PEND11pump"))
 check("fixture: pending-close entry opened", opened)

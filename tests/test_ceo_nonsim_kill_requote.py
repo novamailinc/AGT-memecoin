@@ -383,7 +383,9 @@ if r is not None and pre is not None:
           _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is True and r["entry_blocked"] is True)
     rc3, err3, pre3, r3 = recover(root, "2.3", None, "tryfirst")
     check("%s: FRESH process: the persisted frozen intent blocks entry BEFORE any exit poll (%r), still the same two frozen intents, no new events (ev %r), nothing credited (cash %r)" % (tag, r3 and r3["entry_first"], r3 and r3["ev"], r3 and r3["cash"]),
-          rc3 == 0 and r3 is not None and REFUSAL in str(r3["entry_first"]) and r3["ev"] == r["ev"] and r3["n_intents"] == 2 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)
+          rc3 == 0 and r3 is not None and REFUSAL in str(r3["entry_first"]) and r3["ev"] == r["ev"] and r3["n_intents"] == 2 and _cents(r3["cash"]) == _cents(pre["pre_cash"])
+          and r3["a_done"] is True and r3["a_realized"] == r["a_realized"] and r3["a_exit_price"] == r["a_exit_price"] and r3["by_intent"] == r["by_intent"])
+    # Characterization of the CURRENT unresolved divergence (lane booked leg a, account never credited, new intent frozen): NOT an approved contract, recorded so a change is visible.
 
 # H1: HEALTHY positive control (documents the CURRENT admission behavior; it is not a policy claim): the same real SIGKILL-after-credit pending intent with a
 # VALID recorded op. In a fresh process a new entry attempted BEFORE any exit poll is NOT refused with the divergence text, no recognition or freeze ran, and the

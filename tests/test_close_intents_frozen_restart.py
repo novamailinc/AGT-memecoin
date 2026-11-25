@@ -39,8 +39,18 @@ def child(mode, root, modname, flag):
     import hashlib
     opid = "%s:leg:a:FrzMint1:pos-frz-1" % lane
     def _led():
-        try: return hashlib.sha256(json.dumps(M._read(), sort_keys=True, default=str).encode()).hexdigest()
+        try:
+            if modname == "mirror": return hashlib.sha256(json.dumps(M._read(), sort_keys=True, default=str).encode()).hexdigest()
+            # on-disk ledger BYTES (a missing file is 'absent'): _read() returns a blank ledger with a time.time() created_ts when the file is absent, so it is not stable
+            return "absent" if not os.path.exists(M.LEDGER_PATH) else hashlib.sha256(open(M.LEDGER_PATH, "rb").read()).hexdigest()
         except Exception as e: return "unreadable:%s" % type(e).__name__
+    if mode == "hashctl":   # POSITIVE ORACLE CONTROL for the ledger-hash check: the hash is stable across reads, and a real byte change to the ledger file changes it
+        h_absent = _led(); h_absent2 = _led()
+        with open(M.LEDGER_PATH, "w") as _f: json.dump({"positions": {}, "closes": [], "x": 1}, _f)
+        h1 = _led(); h1b = _led()
+        with open(M.LEDGER_PATH, "w") as _f: json.dump({"positions": {}, "closes": [], "x": 2}, _f)
+        h2 = _led()
+        print("RESULT " + json.dumps({"absent_stable": h_absent == h_absent2 == "absent", "stable": h1 == h1b, "mutation_changes_hash": h1 != h2 and h1 != "absent"})); return
     hits = {"n": 0}
     _real_pa = M._paper_account
     class _PX:
@@ -77,6 +87,11 @@ def run(mode, root, mod, flag=""):
     rl = [l for l in p.stdout.splitlines() if l.startswith("RESULT ")]
     return p.returncode, (json.loads(rl[0][7:]) if rl else None), p.stderr
 for mod in LANES:
+    if mod != "mirror":
+        rh = tempfile.mkdtemp(prefix="frz-H-%s-" % mod)
+        rc, hc, err = run("hashctl", rh, mod)
+        check("%s ORACLE CONTROL: the ledger hash is 'absent' and stable with no file, stable across reads, and CHANGES when the ledger file bytes change (rc %d, %r)" % (mod, rc, hc),
+              rc == 0 and hc is not None and hc["absent_stable"] is True and hc["stable"] is True and hc["mutation_changes_hash"] is True and "Traceback" not in err)
     r0 = tempfile.mkdtemp(prefix="frz-C-%s-" % mod)
     rc, c, err = run("recover", r0, mod)
     check("%s C control: empty journal does NOT block entries (rc %d, %r)" % (mod, rc, c), rc == 0 and c is not None and c["ret"] is False and c["flag"] is False and "Traceback" not in err)

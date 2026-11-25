@@ -94,7 +94,7 @@ res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g))
 check("G20 qualification: a failing or slow exit never waits behind a scan (scan is not even started after an exit failure)", "scan" not in g.calls)
 g = fake(); g._demo_mode = lambda: (_ for _ in ()).throw(RuntimeError("state"))
 res, n, rec = T.main_cycle(g, PF, scan_for(g), legacy_for(g))
-check("G21 flag on, DEMO state unreadable: FAIL CLOSED, exits run directly, NO scan, NO legacy ungated path (%s)" % g.calls, g.calls == ["time_exits", "exits"] and res.get("skipped") == "flag_on_cycle_unavailable" and T.entry_allowed(g) == (False, "flag_on_cycle_unavailable") and T.mode(g) == "refuse")
+check("G21 flag on, DEMO state unreadable: FAIL CLOSED, exits run directly, NO scan, NO legacy ungated path (%s)" % g.calls, g.calls == ["time_exits", "exits"] and str(res.get("skipped")).startswith("flag_on_cycle_unavailable:") and T.entry_allowed(g)[0] is False and T.entry_allowed(g)[1].startswith("flag_on_cycle_unavailable:") and T.mode(g) == "refuse")
 _orig = T._gc
 def _brk(): raise ImportError("grad_cycle broken")
 T._gc = _brk
@@ -107,7 +107,7 @@ os.environ.pop(GC.ENV_FLAG, None)
 g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g))
 check("G23 flag off: entry_scan is the plain scan, no journal", ran is True and g.calls == ["scan"] and not os.path.exists(g.LEDGER_PATH + ".cycle.json"))
 os.environ[GC.ENV_FLAG] = "1"
-g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g)); j = json.load(open(g.LEDGER_PATH + ".cycle.json"))
+g = fake(); ran, why, r_ = T.entry_scan(g, scan_for(g))
 ej = json.load(open(g.LEDGER_PATH + ".entry-scan.json"))
 check("G24 (v3) flag on: entry-thread scan runs journaled in ITS OWN file (entry-scan.json done) and never touches cycle.json", ran is True and g.calls == ["scan"] and ej["status"] == "done" and not os.path.exists(g.LEDGER_PATH + ".cycle.json") and r_.get("opened") == 1)
 g = fake(); lk = open(g.LEDGER_PATH + ".entry-scan.lock", "w"); fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -886,13 +886,14 @@ def maybe_buyback(engine, now=None):
                                               now)
             if not fire:
                 continue
-            with engine._ledger_lock():
-                # Commit-time mandatory entry gate INSIDE the ledger lock (a buyback buys tokens: it is an entry). Closes the window where a fault latched after any precheck. Fault files only, no lock taken. Refusal is visible; exits unaffected.
+            try:
+                from daemon.launch_scanner import entry_guard as _eg
+            except ImportError:
+                import entry_guard as _eg
+            # ledger lock, then (flag on) the cycle FAULT lock held across the guard read AND the write (see entry_guard.commit_barrier). A fault-lock timeout or import failure raises here, is logged by the handler below, and nothing is written (fail closed).
+            with engine._ledger_lock(), _eg.commit_barrier(engine):
+                # Commit-time mandatory entry gate (a buyback buys tokens: it is an entry). Refusal is visible; exits unaffected.
                 try:
-                    try:
-                        from daemon.launch_scanner import entry_guard as _eg
-                    except ImportError:
-                        import entry_guard as _eg
                     _why = _eg.mandatory_entry_refusal(engine.LANE)
                 except Exception as _e:
                     _why = "entry guard unavailable (%r)" % (_e,)

@@ -66,6 +66,23 @@ def mandatory_entry_refusal(lane):
     return None
 
 
+def commit_barrier(engine):
+    """Context manager for an entry-like ledger commit that does not go through the opener (the tranche buyback). Flag off: a no-op. Flag on: the cycle's
+    cross-thread/cross-process FAULT LOCK (grad_cycle._fault_lock: a leaf lock, reentrant per thread, bounded acquire). Take it INSIDE the lane ledger lock
+    (documented order ledger -> fault, the same as the poll-abort hook) and hold it across BOTH the mandatory_entry_refusal read and the ledger write: every
+    fault writer holds the same lock for its whole write, so a fault is either fully recorded before the guard reads it, or is recorded only after this
+    commit finished. A lock timeout or an import failure RAISES, and the caller must treat that as a refusal (fail closed). The guard's own fault reads
+    may re-enter the lock safely (reentrant). It never takes the cycle or ledger lock."""
+    import contextlib
+    if os.environ.get("AGT_GRAD_CYCLE_ENABLED") != "1":
+        return contextlib.nullcontext()
+    try:
+        from daemon import grad_cycle as _gcb
+    except ImportError:
+        import grad_cycle as _gcb
+    return _gcb._fault_lock(engine)
+
+
 def unrouted_opener_refusal(lane):
     """Openers that keep their OWN ledger (mirror, challenge-trader) and do
     not yet reserve cash from the single shared $10 account. Per the owner

@@ -213,7 +213,7 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
         if _freeze_it:
             check("%s FROZEN op: the retry is held (ret %r, leg done %r, pending why %r), NO credit (%d), NO second intent (%d), the intent stays frozen (%s)"
                   % (modname, _rb, pz_b["legs"]["a"]["done"], _pe.get("why"), len(spyz.credits), len(_lane_ints(_tag)), CI.intent_status(lane, _iid) if _iid else None),
-                  bool(_iid) and _rb == 0.0 and pz_b["legs"]["a"]["done"] is False and _pe.get("why") == ("frozen_intent_unresolved" if modname == "momentum_lane" else "close_intent_not_durable") and not spyz.credits
+                  bool(_iid) and _rb == 0.0 and pz_b["legs"]["a"]["done"] is False and _pe.get("why") == ("frozen_intent_unresolved" if modname in ("momentum_lane", "ceo", "watcher_lane") else "close_intent_not_durable") and not spyz.credits
                   and len(_lane_ints(_tag)) == 1 and CI.intent_status(lane, _iid) == "frozen")
         else:
             check("%s CONTROL (same sequence, NOT frozen): the retry RESUMES the same intent (%d intent), credits once (%d), leg done %r, intent %s"

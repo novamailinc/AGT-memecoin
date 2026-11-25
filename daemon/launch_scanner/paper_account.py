@@ -2402,12 +2402,15 @@ def _registry_read(path):
     except Exception:
         return [], "corrupt"
     out = []
-    for ln in raw.split("\n"):
+    parts = raw.split("\n")
+    for i, ln in enumerate(parts):
         if not ln.strip():
             continue
         try:
             e = json.loads(ln)
         except ValueError:
+            if i == len(parts) - 1 and not raw.endswith("\n"):
+                return out, "torn_tail"   # crash mid-append: only the unterminated LAST line is lost; every complete record is kept
             return [], "corrupt"
         if not isinstance(e, dict) or not isinstance(e.get("lane"), str):
             return [], "corrupt"
@@ -2426,6 +2429,35 @@ def _registry_fold(recs):
     return lanes, ids
 
 
+def _nl_fix(path):
+    """Torn tail (crash mid-append, last byte not a newline): truncate exactly the unterminated partial LAST line so a new record never glues onto it and the
+    file stays parseable. Complete records are never touched. Returns b"" (kept for the call shape)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data and not data.endswith(b"\n"):
+            keep = data.rfind(b"\n") + 1
+            with open(path, "r+b") as f:
+                f.truncate(keep); f.flush(); os.fsync(f.fileno())
+    except OSError:
+        pass
+    return b""
+
+
+def _registry_view():
+    """-> (records, state) where records = primary UNION mirror (a record in either copy is evidence), state is one of
+    ok | lost (primary missing, mirror present) | corrupt (either copy has mid-file garbage) | empty (both missing)."""
+    pri, mir = _registry_paths()
+    pr, ps = _registry_read(pri)
+    mr, ms = _registry_read(mir)
+    if ps == "corrupt" or ms == "corrupt":
+        return [], "corrupt"
+    if ps == "missing":
+        return (mr, "lost") if ms != "missing" else ([], "empty")
+    seen = {json.dumps(e, sort_keys=True) for e in pr}
+    return pr + [e for e in mr if json.dumps(e, sort_keys=True) not in seen], "ok"
+
+
 def _registry_append(rec):
     """Append-only, fsync'd primary in the account directory, then a mirror in the PARENT directory. Returns True when the PRIMARY is durable. The mirror is a
     second witness that the registry once existed; both on one filesystem, so whole-filesystem loss is not detectable from inside (see restart_admission_blockers)."""
@@ -2435,7 +2467,7 @@ def _registry_append(rec):
         os.makedirs(os.path.dirname(pri), exist_ok=True)
         fd = os.open(pri, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, line); os.fsync(fd)
+            os.write(fd, _nl_fix(pri) + line); os.fsync(fd)
         finally:
             os.close(fd)
     except Exception:
@@ -2444,7 +2476,7 @@ def _registry_append(rec):
     try:
         fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, line); os.fsync(fd)
+            os.write(fd, _nl_fix(mir) + line); os.fsync(fd)
         finally:
             os.close(fd)
     except Exception:
@@ -2456,9 +2488,9 @@ def register_lane(lane, lane_ledger_path, intent_journal_path=None):
     """A lane records, once per process start and whenever something changed, WHERE its persisted state lives and which account generation it saw. Idempotent: no
     record is written when the folded registry already holds the same facts. True = the registry reflects this lane (or the write is not needed); False = the
     registry could not be written (the lane's own restart check then reports 'lane-registry-unwritable')."""
-    recs, st = _registry_read(_registry_paths()[0])
-    if st == "corrupt":
-        return False
+    recs, st = _registry_view()
+    if st in ("corrupt", "lost"):
+        return False   # never heal a lost primary from one lane: the mirror holds the other lanes' evidence
     lanes, ids = _registry_fold(recs)
     cur = lanes.get(lane) or {}
     led, lst = _ledger_file_status(LEDGER_PATH)
@@ -2475,8 +2507,8 @@ def register_lane(lane, lane_ledger_path, intent_journal_path=None):
 
 def register_intent_journal(lane, intent_journal_path):
     """Called by close_intents.begin after its first durable append: records that this lane's intent journal NOW EXISTS, so a later absence is loss, not a first start."""
-    recs, st = _registry_read(_registry_paths()[0])
-    if st == "corrupt":
+    recs, st = _registry_view()
+    if st in ("corrupt", "lost"):
         return False
     lanes, _ids = _registry_fold(recs)
     cur = lanes.get(lane) or {}
@@ -2491,16 +2523,18 @@ def _registry_blockers():
     block. Both copies absent is indistinguishable from 'no lane ever registered' (direct account use, first start): it blocks nothing here, and each lane's
     OWN restart check still runs against its own persisted ledger."""
     pri, mir = _registry_paths()
-    recs, pst = _registry_read(pri)
-    mrecs, mst = _registry_read(mir)
-    if pst == "corrupt":
+    recs, vst = _registry_view()
+    if vst == "corrupt":
         return ["lane registry unreadable (fail-closed)"]
-    if pst == "missing":
-        return ["lane registry lost (its mirror remains)"] if mst != "missing" else []
-    if mst == "missing":
+    if vst == "lost":
+        return ["lane registry lost (its mirror remains)"]
+    if vst == "empty":
+        return []
+    if _registry_read(mir)[1] == "missing":
+        pr = _registry_read(pri)[0]
         try:
-            with open(mir, "a") as f:    # repair a missing mirror FROM the primary's own bytes
-                for e in recs: f.write(json.dumps(e, sort_keys=True) + "\n")
+            with open(mir, "a") as f:    # repair a missing mirror FROM the primary's own complete records
+                for e in pr: f.write(json.dumps(e, sort_keys=True) + "\n")
                 f.flush(); os.fsync(f.fileno())
         except OSError:
             pass
@@ -2582,10 +2616,9 @@ def restart_admission_blockers(lane, lane_ledger_path, _from_registry=False):
             wal = os.path.exists(JOURNAL_PATH) and os.path.getsize(JOURNAL_PATH) > 0
         except OSError:
             wal = True
-        rrecs, rst = _registry_read(_registry_paths()[0])
-        mrecs, mst = _registry_read(_registry_paths()[1])
-        seen_ids = _registry_fold(rrecs)[1] | _registry_fold(mrecs)[1]
-        if wal or seen_ids or rst == "corrupt" or (rst == "missing" and mst != "missing"):
+        vrecs, vst = _registry_view()
+        seen_ids = _registry_fold(vrecs)[1]
+        if wal or seen_ids or vst in ("corrupt", "lost"):
             return ["account-state-lost (ledger missing; WAL %s, registry saw a generation %s)" % ("present" if wal else "absent", "yes" if seen_ids else "no")]
         lots = 0   # no witness of prior state anywhere: a supported first start
     if lst != "ok":

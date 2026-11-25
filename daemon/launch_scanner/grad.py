@@ -3288,6 +3288,16 @@ def _finalize(d, mint, pos, closed_reason):
                                              or (_chain_moved and json.dumps(_prev_ev.get("settle_ops"), sort_keys=True) == json.dumps(_plan, sort_keys=True))):
                     _iid = _prev_id   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
                 else:
+                    if _prev_st == "frozen":
+                        # A frozen LIVE GENERATION REFUSAL is terminal until an operator reconciles: never auto-superseded (that would open a new intent
+                        # and a retry window for an account whose generation could not be proven). Other frozen reasons keep the existing supersede path.
+                        try:
+                            _fz = _ci._state(_ci._read(_ci.journal_path(LANE))[0]).get(_prev_id, {}).get("frozen")
+                        except Exception:
+                            _fz = None
+                        if "generation refusal" in str(_fz or ""):
+                            _block_entries()
+                            raise _ci.IntentNotDurable("frozen intent %s is an unresolved generation refusal: never auto-superseded (operator reconciliation required)" % _prev_id)
                     if _prev_st in ("open", "frozen") and _prev_ev is not None:
                         # Changing the op set must not DROP (or re-kind) an op that is already booked in the account: that would evade conflict
                         # detection (e.g. a booked write-down, then a sale of the written-down units). Unreadable account history cannot prove it.
@@ -3321,7 +3331,9 @@ def _finalize(d, mint, pos, closed_reason):
                                              "since": _prev_sp.get("since") or time.time(), "last_try": time.time(),
                                              "tries": int(_prev_sp.get("tries") or 0) + 1,
                                              **{_k: _prev_sp[_k] for _k in ("intent_id", "plan_sig") if _prev_sp.get(_k)}}
-                pos["pending_exit"] = {"leg": "settlement", "why": "close_intent_not_durable", "ts": time.time()}
+                pos["pending_exit"] = {"leg": "settlement", "why": ("generation_refusal_unresolved" if "unresolved generation refusal" in str(_nd) else "close_intent_not_durable"), "ts": time.time()}
+                if "unresolved generation refusal" in str(_nd):
+                    pos["settlement_pending"]["why"] = "generation_refusal_unresolved"
                 d["bankroll"] = round(float(d["bankroll"]) - realized, 6)
                 _write(d)
                 return None

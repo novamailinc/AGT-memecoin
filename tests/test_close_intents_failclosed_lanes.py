@@ -327,5 +327,29 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
     M._append_close(cl4, rec4); M._append_close(cl4, {"x": 1})
     check("%s: _append_close skips None and keeps a real record" % modname, cl4 == [{"x": 1}])
 
+# ---- corrupt journal with NO incomplete intent: the lane's real _recover_close_intents must still BLOCK entries (BB30). DISCLOSED test setup: the lane
+# journal file in this test's own temp home is removed first so the control starts from a healthy empty journal. ----
+import json as _json30
+for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
+    M = importlib.import_module("daemon.launch_scanner." + modname)
+    lanes = sorted(set(M.LANE_BY_CHAIN.values())) if modname == "mirror" else [M.LANE]
+    for ln in lanes:
+        if os.path.exists(CI.journal_path(ln)):
+            os.remove(CI.journal_path(ln))
+    M._RECOVERY_DONE = False; M._ENTRY_BLOCKED = False
+    r_ctl = M._recover_close_intents()
+    check("%s corrupt-journal control: healthy journal, no intent: recovery does NOT block entries (returned %r, flag %r)" % (modname, r_ctl, M._ENTRY_BLOCKED),
+          r_ctl is False and M._ENTRY_BLOCKED is False)
+    for ln in lanes[:1]:   # corrupt ONE lane's journal (mirror recovers every chain lane; one corrupt lane must block all entries)
+        CI.journal_writable(ln)
+        with open(CI.journal_path(ln), "a") as _f30:
+            _f30.write("{not json\n" + _json30.dumps({"ev": "probe", "lane": ln}) + "\n")
+    _st30 = CI._read(CI.journal_path(lanes[0]))[1]; _inc30 = len(CI.pending(lanes[0]))
+    M._RECOVERY_DONE = False; M._ENTRY_BLOCKED = False
+    r_bad = M._recover_close_intents()
+    check("%s corrupt journal (status %r, %d incomplete intents visible): recovery BLOCKS entries (returned %r, flag %r)" % (modname, _st30, _inc30, r_bad, M._ENTRY_BLOCKED),
+          _st30 == "torn" and _inc30 == 0 and r_bad is True and M._ENTRY_BLOCKED is True)
+    M._RECOVERY_DONE = False; M._ENTRY_BLOCKED = False
+
 print("fails: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

@@ -131,9 +131,21 @@ check("t5b mid-file corruption, NO intent at all in the readable part: sentinel 
 # NAMED FAULT INJECTION: a provable torn tail whose truncate FAILS (no intent visible) must also stay non-converged
 put("t5c", good5 + b'{"ev": "half')
 from unittest.mock import patch as _patch5
-with _patch5.object(ci, "_truncate", side_effect=OSError("injected truncate failure")):
-    r5c = ci.recover_lane("t5c", lambda op: (True, "x"), lambda i: True, lambda i: True)
-check("t5c torn tail, truncate fails (named injection), no intent visible: sentinel %r, tail bytes still present %r" % (r5c, b"half" in raw("t5c")),
-      r5c == ["journal-corrupt:" + "t5c"] and b"half" in raw("t5c"))
+import logging as _lg5
+class _Cap5(_lg5.Handler):
+    def __init__(self): super().__init__(); self.recs = []
+    def emit(self, r): self.recs.append(r)
+_cap5 = _Cap5(); _lgr5 = ci.logger; _prop5 = _lgr5.propagate
+_lgr5.addHandler(_cap5); _lgr5.propagate = False        # per-site capture of THIS module logger only, restored below (no blanket mute of other loggers)
+try:
+    with _patch5.object(ci, "_truncate", side_effect=OSError("injected truncate failure")):
+        r5c = ci.recover_lane("t5c", lambda op: (True, "x"), lambda i: True, lambda i: True)
+finally:
+    _lgr5.removeHandler(_cap5); _lgr5.propagate = _prop5
+_errs5 = [r for r in _cap5.recs if r.levelno >= _lg5.ERROR]
+_tf5 = [r for r in _errs5 if r.getMessage().startswith("close_intents: torn-tail truncate failed") and r.exc_info and r.exc_info[0] is OSError and "injected truncate failure" in str(r.exc_info[1])]
+check("t5c torn tail, truncate fails (named injection), no intent visible: sentinel %r, tail bytes still present %r; exactly ONE captured ERROR (%d), it is the torn-tail truncate failure with the injected OSError (%d); logger propagate restored %r"
+      % (r5c, b"half" in raw("t5c"), len(_errs5), len(_tf5), _lgr5.propagate == _prop5),
+      r5c == ["journal-corrupt:" + "t5c"] and b"half" in raw("t5c") and len(_errs5) == 1 and len(_tf5) == 1 and _lgr5.propagate == _prop5)
 print("fails: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

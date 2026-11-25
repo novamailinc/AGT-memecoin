@@ -73,7 +73,7 @@ check("main(): NO tools/phone-test path in the created tree (neither changed nor
 check("main(): changed file and the stale deletion still go through", "tools/scripts/new.py" in paths and "stale.py" in paths and any(e["path"] == "stale.py" and e["sha"] is None for e in rec["trees"][0]["tree"]), paths)
 import base64
 check("main(): no phone-test blob content uploaded (only 'new')", [base64.b64decode(b["content"]) for b in rec["blobs"]] == [b"new"], [base64.b64decode(b["content"]) for b in rec["blobs"]])
-check("main(): NOTICE says not a complete phone release", "NOT a complete phone release" in out and "2 remote paths preserved" in out, out[-300:])
+check("main(): NOTICE says not a complete phone release; count = REMOTE-ONLY deletions preserved (1: remote_only.py); the locally-present old.py is filtered from changed and not counted", "NOT a complete phone release" in out and "1 remote paths preserved" in out, out[-300:])
 rc, out, rec = run_main(["--dry-run"])
 check("main() dry-run lists no phone-test path", "phone-test/" not in out.replace("tools/phone-test is NOT", "") and rc == 0, out[-300:])
 rc, out, rec = run_main([], env_allow=True)

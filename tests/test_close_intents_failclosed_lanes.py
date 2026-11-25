@@ -113,6 +113,28 @@ for modname in ("ceo", "watcher_lane", "momentum_lane", "mirror"):
           % (modname, len(ff.calls), [c[3] if len(c) > 3 else None for c in spy2.credits], [e.get("ev") for e in ev2]),
           r_ok > 0 and pos2["legs"]["a"]["done"] is True and len(set(ff.calls)) == 1 and len(ff.calls) == 2 and len(spy2.credits) == 1
           and abs(float(spy2.credits[0][2]) - 0.1) < 1e-12 and [e.get("ev") for e in ev2][:2] == ["intent", "account_applied"])
+    # RESUME after a held exit: the position is persisted (JSON round trip = process restart), the price trigger is GONE (a reversal), and the poll-start
+    # hook still resumes THE SAME exit (same deterministic sale op id, same journaled fill) and settles once; a pre-existing pending_exit field survives the hold.
+    lm = "mirror" if modname == "mirror" else None
+    ff5 = _FakeFiller(); spy5 = _SpyAccount(); spy5.max_price_impact_pct = lambda: 50.0
+    pos5 = mkpos("FS" + modname[:3], lm); pos5["pending_exit"] = {"leg": "a", "why": "earlier_reason", "custom_field": 42}; pos5["peak_price"] = 7.0
+    with patch.object(M, "_paper_account", lambda: spy5), patch.object(M, "_demo_filler", lambda: ff5), patch.object(M, "_exit_fee_venue", lambda p: None), \
+         patch.object(CI, "_append", _no_intent_only):
+        M._close_leg(pos5, "a", 0.001, "leg_a_2x")
+    pe5 = pos5.get("pending_exit") or {}
+    check("%s hold keeps the pre-existing pending fields (prior %r, peak_price %r) and records the resume target (%r)"
+          % (modname, (pe5.get("prior") or {}).get("custom_field"), pos5.get("peak_price"), (pe5.get("resume") or {}).get("key")),
+          (pe5.get("prior") or {}).get("custom_field") == 42 and pos5.get("peak_price") == 7.0 and (pe5.get("resume") or {}).get("fn") == "leg"
+          and (pe5.get("resume") or {}).get("key") == "a" and pe5.get("why") == "close_intent_not_durable")
+    import json as _json
+    pos5r = _json.loads(_json.dumps(pos5))   # persisted and reloaded: a restart
+    with patch.object(M, "_paper_account", lambda: spy5), patch.object(M, "_demo_filler", lambda: ff5), patch.object(M, "_exit_fee_venue", lambda p: None):
+        _rr = M._resume_pending_exit(pos5r)   # NO price trigger is evaluated anywhere in this call
+    check("%s restart + price reversal: resume returns %r, leg a done, ONE credit (%d), the SAME sale op id reused (%r), pending_exit cleared (%r)"
+          % (modname, _rr, len(spy5.credits), sorted(set(ff5.calls)), pos5r.get("pending_exit")),
+          _rr == "resumed" and pos5r["legs"]["a"]["done"] is True and len(spy5.credits) == 1 and len(set(ff5.calls)) == 1 and "pending_exit" not in pos5r)
+    check("%s resume with nothing pending is a no-op (None)" % modname, M._resume_pending_exit(pos5r) is None)
+
     # an exception that is NOT IntentNotDurable still propagates (the rollback is narrow, never a blanket catch)
     pos3 = mkpos("FX" + modname[:3], "mirror" if modname == "mirror" else None)
     if modname == "mirror":

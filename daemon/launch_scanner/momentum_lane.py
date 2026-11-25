@@ -284,7 +284,11 @@ def _intent_gate(pos, key):
     if _ok:
         return True
     logger.error("momentum: close intent journal NOT writable: exit %s not executed (pending_exit close_intent_not_durable), retried next poll", key)
-    pos["pending_exit"] = {"leg": key, "why": "close_intent_not_durable", "ts": time.time()}
+    _p0 = pos.get("pending_exit"); _pe = dict(_p0) if isinstance(_p0, dict) else {}
+    if _p0:   # keep a pre-existing pending exit in full (its identity moves under "prior")
+        _pe["prior"] = {k: v for k, v in _p0.items() if k != "prior"}
+    _pe.update({"leg": key, "why": "close_intent_not_durable", "ts": time.time()})
+    pos["pending_exit"] = _pe
     return False
 
 
@@ -1682,35 +1686,68 @@ def _verdict_check(d):
 
 
 
-def _guard_close(impl, pos, key, *args):
+def _guard_close(impl, pos, key, *args, resume=None):
     """Run one leg/close implementation; if the close intent could not be made durable (begin raised IntentNotDurable AFTER the sale fill), UNDO the
     in-memory leg/realized changes and report nothing done: no account op ran (begin precedes it), the lane persists nothing, pending_exit
     close_intent_not_durable is visible, and the next poll re-runs the exit. The sale is NOT repeated: the exit fill op id is deterministic
     ("<lane>:exit:<mint>:<key>") and the filler returns the already-journaled fill for an existing op id (demo_fill _existing), so the retry
     re-reads the same fill and only the intent write is retried."""
-    _legs0 = copy.deepcopy(pos["legs"]); _rz0 = pos.get("realized_usd"); _pe0 = copy.deepcopy(pos.get("pending_exit"))
+    _snap = copy.deepcopy(pos); _pe0 = copy.deepcopy(pos.get("pending_exit"))
     try:
-        return impl(*args)
+        _ret = impl(*args)
+        _stamp_resume(pos, resume)
+        return _ret
     except Exception as _e:
         _ci = _close_intents()
         if _ci is None or not isinstance(_e, _ci.IntentNotDurable):
             raise
-        pos["legs"] = _legs0
-        if _rz0 is not None:
-            pos["realized_usd"] = _rz0
-        if _pe0 is None:
-            pos.pop("pending_exit", None)
+        pos.clear(); pos.update(_snap)   # EVERY field of the position is restored (legs, realized, pending_exit, quote journal, peaks, ...)
         logger.error("close intent NOT DURABLE (%s): exit %s rolled back in memory (nothing persisted, no account op), retried next poll", _e, key)
-        pos["pending_exit"] = {"leg": key, "why": "close_intent_not_durable", "ts": time.time()}
+        _pe = dict(_pe0) if isinstance(_pe0, dict) else {}
+        if _pe0:   # a pre-existing pending exit is kept in full; its own identity moves under "prior" (nothing is overwritten)
+            _pe["prior"] = {k: v for k, v in _pe0.items() if k != "prior"}
+        _pe.update({"leg": key, "why": "close_intent_not_durable", "ts": time.time()})
+        pos["pending_exit"] = _pe
+        _stamp_resume(pos, resume)
         return 0.0
 
 
 def _close_leg(pos, leg_key, exit_price, reason, pkind=None):
-    return _guard_close(_close_leg_impl, pos, leg_key, pos, leg_key, exit_price, reason, pkind)
+    return _guard_close(_close_leg_impl, pos, leg_key, pos, leg_key, exit_price, reason, pkind,
+                        resume={"fn": "leg", "key": leg_key, "price": exit_price, "reason": reason, "pkind": pkind})
 
 
 def _close_remaining(pos, exit_price, reason, pkind=None):
-    return _guard_close(_close_remaining_impl, pos, "remaining", pos, exit_price, reason, pkind)
+    return _guard_close(_close_remaining_impl, pos, "remaining", pos, exit_price, reason, pkind,
+                        resume={"fn": "remaining", "key": "remaining", "price": exit_price, "reason": reason, "pkind": pkind})
+
+
+def _stamp_resume(pos, resume):
+    """When the exit is held for a non-durable close intent, remember EXACTLY what was being closed (which leg or the combined remainder, its price,
+    reason and kind), so the next poll resumes THE SAME exit (same deterministic sale op id, so the same journaled fill) whether or not the
+    price trigger still holds. Without this a price reversal would let a different leg/remainder key sell the same units a second time."""
+    _pe = pos.get("pending_exit")
+    if resume and isinstance(_pe, dict) and _pe.get("why") == "close_intent_not_durable":
+        _pe["resume"] = dict(resume)
+
+
+def _resume_pending_exit(pos):
+    """Poll-start hook. None = nothing to resume. "held" = resumed but still not durable (position stays open, nothing else is evaluated on it
+    this poll). "closed:<reason>" = every leg is now done (finalize with that reason). "resumed" = progressed but legs remain (normal evaluation continues)."""
+    _pe = pos.get("pending_exit")
+    if not isinstance(_pe, dict) or _pe.get("why") != "close_intent_not_durable" or not isinstance(_pe.get("resume"), dict):
+        return None
+    _r = _pe["resume"]
+    if _r.get("fn") == "leg":
+        _close_leg(pos, _r["key"], _r["price"], _r["reason"], _r.get("pkind"))
+    else:
+        _close_remaining(pos, _r["price"], _r["reason"], _r.get("pkind"))
+    _pe2 = pos.get("pending_exit")
+    if isinstance(_pe2, dict) and _pe2.get("why") == "close_intent_not_durable":
+        return "held"
+    if all((v or {}).get("done") for v in pos["legs"].values()):
+        return "closed:%s" % _r["reason"]
+    return "resumed"
 
 
 def _append_close(closes, rec):
@@ -1859,6 +1896,13 @@ def _poll_exits(price_fn):
         now = time.time()
         for mint, pos in list(d["positions"].items()):
             try:
+                _rr = _resume_pending_exit(pos)
+                if _rr == "held":
+                    _write(d)
+                    continue
+                if _rr and _rr.startswith("closed:"):
+                    _append_close(closes, _finalize(d, mint, pos, _rr[7:]))
+                    continue
                 px = float(quotes.get(mint, 0) or 0)
                 if px <= 0:
                     # Reserves refusal provenance (2026-11-22): the

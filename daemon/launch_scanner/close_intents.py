@@ -46,9 +46,11 @@ crash mid-append and is truncated under the lane lock; anything
 else is corruption and freezes recovery.
 """
 
+import fcntl
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -172,7 +174,7 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     what the lane ledger needs to re-book the close (realized_usd,
     entry_notional_usd, closed_reason). Returns the intent id.
     Raises IntentNotDurable when the intent event could not be durably appended (fail closed: no account op may run without it).
-    stable_id=True keeps the deterministic id lane:mint:pos:close_ts for a caller whose retry must regenerate the SAME id."""
+    stable_id=True: idempotent per OPERATION KEY (lane:mint:pos:close_ts), see below; the intent id itself is always unique."""
     intent_id = "%s:%s:%s:%d" % (lane, mint, pos_id or "legacy",
                                  int(close_info.get("close_ts")
                                      or time.time() * 1000))
@@ -180,23 +182,72 @@ def begin(lane: str, mint: str, pos_id: Optional[str],
     # same second, or two concurrent begins, would reuse an id and the new intent would read as the old terminal one. Uniqueness must not
     # depend on reading the journal (unreadable evidence would silently restore the collision) nor on a read/choose/append sequence
     # (racy across threads and processes): add a random 96-bit suffix. Ids are opaque (nothing parses them) and a begin is a new intent.
-    if not stable_id:
-        intent_id = "%s:%s" % (intent_id, uuid.uuid4().hex[:24])
-    if stable_id:
-        # Idempotent re-begin of a DETERMINISTIC id (the caller's retry regenerates it): never append a second "intent" event under an id whose
-        # intent is already on disk (open, frozen or applied: the existing record, and its terminal state, stands). The journal must be read
-        # cleanly to prove that; an unreadable or torn journal fails closed rather than guessing.
-        _ents, _st, _ = _read(journal_path(lane))
-        if _st is not None:
-            raise IntentNotDurable("journal not cleanly readable (%s): cannot prove intent %s is new" % (_st, intent_id))
-        if any(e.get("ev") == "intent" and e.get("intent_id") == intent_id for e in _ents):
-            return intent_id
-    if not _append(journal_path(lane), {
-            "ev": "intent", "intent_id": intent_id, "lane": lane,
-            "mint": mint, "pos_id": pos_id, "settle_ops": settle_ops,
-            "close_info": dict(close_info)}):
-        raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
+    # Intent identity is ALWAYS unique (random suffix). A caller whose retry must not open a second intent for the same logical operation
+    # passes stable_id=True: the deterministic base id then serves as a separate OPERATION KEY stored on the intent event, and a retry finds
+    # the existing intent by that key (journal read cleanly, under a lock) and returns ITS unique id after comparing the recorded plan.
+    op_key = intent_id if stable_id else None
+    intent_id = "%s:%s" % (intent_id, uuid.uuid4().hex[:24])
+    ev = {"ev": "intent", "intent_id": intent_id, "lane": lane, "mint": mint, "pos_id": pos_id,
+          "settle_ops": settle_ops, "close_info": dict(close_info)}
+    if op_key is None:
+        if not _append(journal_path(lane), ev):
+            raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
+        return intent_id
+    ev["op_key"] = op_key
+    with _op_key_lock(lane):
+        ents, st, _ = _read(journal_path(lane))
+        if st is not None:
+            raise IntentNotDurable("journal not cleanly readable (%s): cannot prove operation %s is new" % (st, op_key))
+        for e in ents:
+            if e.get("ev") == "intent" and e.get("op_key") == op_key:
+                same = (json.dumps(e.get("settle_ops"), sort_keys=True) == json.dumps(settle_ops, sort_keys=True)
+                        and e.get("mint") == mint and e.get("pos_id") == pos_id)
+                if not same:
+                    raise IntentNotDurable("operation %s already has intent %s with a DIFFERENT plan: refusing to reuse or replace it"
+                                           % (op_key, e.get("intent_id")))
+                return e["intent_id"]
+        if not _append(journal_path(lane), ev):
+            raise IntentNotDurable("close intent %s could not be journaled" % intent_id)
     return intent_id
+
+
+_THREAD_LOCKS: Dict[str, "threading.Lock"] = {}
+
+
+class _op_key_lock:
+    """Serializes read-check-append of a stable-key begin across threads (a lock) and processes (flock on a sidecar file)."""
+    def __init__(self, lane):
+        self.path = journal_path(lane) + ".lock"
+        self.tl = _THREAD_LOCKS.setdefault(self.path, threading.Lock())
+        self.fh = None
+    def __enter__(self):
+        self.tl.acquire()
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.fh = open(self.path, "a")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except Exception as e:
+            self.__exit__(None, None, None)
+            raise IntentNotDurable("cannot take the intent lock: %r" % (e,))
+        return self
+    def __exit__(self, *a):
+        try:
+            if self.fh is not None:
+                fcntl.flock(self.fh, fcntl.LOCK_UN); self.fh.close()
+        finally:
+            self.fh = None
+            self.tl.release()
+
+
+def intent_status(lane: str, intent_id: str) -> Optional[str]:
+    """'applied' | 'frozen' | 'open' for an intent id, None when absent. Raises IntentNotDurable when the journal is not cleanly readable."""
+    ents, st, _ = _read(journal_path(lane))
+    if st is not None:
+        raise IntentNotDurable("journal not cleanly readable (%s)" % st)
+    s_ = _state(ents).get(intent_id)
+    if not s_ or s_["intent"] is None:
+        return None
+    return "applied" if s_["applied"] else ("frozen" if s_["frozen"] is not None else "open")
 
 
 def mark_account_applied(lane: str, intent_id: str) -> None:

@@ -2084,7 +2084,12 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
                                                "qty": qty, "price_kind": kind, "pos_id": pos["pa_pos_id"]}],
                                              {"realized_usd": round(gross - fee, 6), "close_ts": int(float(pos.get("entry_ts") or 0) * 1000) + ord(str(leg_key)[-1]),   # STABLE: a retry regenerates the same intent id
                                               "closed_reason": "tranche_leg_" + str(leg_key)}, stable_id=True)
-                        _ci.freeze(LANE, _iid, "tranche credit refused: debited position absent from account (divergence): %s" % str(why)[:120])
+                        _st = _ci.intent_status(LANE, _iid)
+                        if _st == "applied":
+                            # an APPLIED intent is never frozen: that contradicts a divergence claim, so it is held visibly, not resolved
+                            raise RuntimeError("intent %s is already APPLIED: refusing to freeze it" % _iid)
+                        if _st != "frozen" and not _ci.freeze(LANE, _iid, "tranche credit refused: debited position absent from account (divergence): %s" % str(why)[:120]):
+                            raise RuntimeError("freeze of intent %s was not durable" % _iid)
                         logger.error("grad: tranche credit %s %s FROZEN: debited position absent from the account; "
                                      "ENTRIES BLOCKED until operator resolution", pos["mint"][:12], leg_key)
                 except Exception as _fe:

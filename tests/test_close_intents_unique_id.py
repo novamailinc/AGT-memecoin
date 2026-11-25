@@ -20,6 +20,13 @@ def check(name, cond):
     if not cond:
         FAILS += 1
 
+def _raises(fn):
+    try:
+        fn()
+    except ci.IntentNotDurable:
+        return True
+    return False
+
 OPS = [{"kind": "credit", "op_id": "op-1", "amount": 1.0}]
 INFO = {"close_ts": 1795593430.2, "realized_usd": 1.0, "entry_notional_usd": 1.0, "closed_reason": "t"}
 a = ci.begin("grad", "MINT1", "grad/MINT1#1", OPS, dict(INFO))
@@ -58,14 +65,41 @@ check("unwritable journal: begin raises IntentNotDurable (no id for a non-durabl
 shutil.rmtree(jp)
 check("healthy journal again: freeze returns True and begin works", ci.freeze("lanex", "grad:M:p:1:abc", "y") is True and bool(ci.begin("lanex", "M", "p", OPS, dict(INFO))))
 
-# stable_id=True keeps the deterministic id (a caller whose retry must regenerate the SAME id): same inputs, same id, no suffix
+# stable_id=True is idempotent per OPERATION KEY while every intent id stays UNIQUE: a retry finds the existing intent by the key and returns ITS id
 st1 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True); st2 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True)
-_n_int = len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent" and e.get("intent_id") == st1])
-check("stable_id=True: identical deterministic id on a retry (%s) and ONE intent event (idempotent re-begin, %d)" % (st1, _n_int), st1 == st2 and st1 == "lanes:MS:ps:1795593430" and _n_int == 1)
-ci.freeze("lanes", st1, "terminal")
+_ev = [e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent"]
+check("stable_id=True: the retry returns the SAME unique id (%s) with ONE intent event (%d) carrying op_key lanes:MS:ps:1795593430" % (st1, len(_ev)),
+      st1 == st2 and len(_ev) == 1 and _ev[0].get("op_key") == "lanes:MS:ps:1795593430" and st1 != "lanes:MS:ps:1795593430" and st1.startswith("lanes:MS:ps:1795593430:"))
+check("intent_status: open before the freeze", ci.intent_status("lanes", st1) == "open")
+check("a stable begin whose recorded PLAN differs is refused (raises, nothing appended, the old intent untouched)",
+      (lambda: [ci.begin("lanes", "MS", "ps", [{"kind": "credit", "op_id": "op-OTHER", "amount": 9.0}], dict(INFO), stable_id=True)])
+      and _raises(lambda: ci.begin("lanes", "MS", "ps", [{"kind": "credit", "op_id": "op-OTHER", "amount": 9.0}], dict(INFO), stable_id=True))
+      and len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent"]) == 1)
+check("freeze returns True, status frozen", ci.freeze("lanes", st1, "terminal") is True and ci.intent_status("lanes", st1) == "frozen")
 st3 = ci.begin("lanes", "MS", "ps", OPS, dict(INFO), stable_id=True)
-check("stable_id after a FREEZE: the frozen id is returned and NOT re-opened (no second intent event, still terminal, pending empty for it)",
-      st3 == st1 and len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent" and e.get("intent_id") == st1]) == 1 and st1 not in [x["intent_id"] for x in ci.pending("lanes")])
+check("stable begin after a FREEZE returns the existing frozen handle and opens NO new intent (still one event, still terminal, not pending)",
+      st3 == st1 and len([e for e in ci._read(ci.journal_path("lanes"))[0] if e.get("ev") == "intent"]) == 1 and st1 not in [x["intent_id"] for x in ci.pending("lanes")])
+ci.mark_account_applied("lanes", st1); ci.mark_lane_applied("lanes", st1)
+check("intent_status: applied after the terminal events; intent_status of an absent id is None", ci.intent_status("lanes", st1) == "applied" and ci.intent_status("lanes", "nope") is None)
+# serialization: 8 threads begin the SAME operation concurrently -> ONE intent, one distinct id
+import threading, subprocess
+_ids = []; _l = threading.Lock()
+def _w():
+    i = ci.begin("lanec", "MC", "pc", OPS, dict(INFO), stable_id=True)
+    with _l: _ids.append(i)
+_th = [threading.Thread(target=_w) for _ in range(8)]
+[t.start() for t in _th]; [t.join() for t in _th]
+_n = len([e for e in ci._read(ci.journal_path("lanec"))[0] if e.get("ev") == "intent"])
+check("8 concurrent stable begins (threads): ONE intent event (%d), one distinct id returned (%d of %d)" % (_n, len(set(_ids)), len(_ids)), _n == 1 and len(set(_ids)) == 1 and len(_ids) == 8)
+# the same across PROCESSES (flock): 4 real subprocesses, same home
+_code = ("import sys,os; sys.path.insert(0, %r); import daemon.launch_scanner.close_intents as ci; "
+         "print(ci.begin('lanep','MP','pp',[{'kind':'credit','op_id':'op-1','amount':1.0}],{'close_ts':1795593430.2,'realized_usd':1.0},stable_id=True))" % REPO)
+_ps = [subprocess.Popen([sys.executable, "-B", "-c", _code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ)) for _ in range(4)]
+_outs = [p.communicate() for p in _ps]
+_pids = {o[0].strip() for o in _outs}
+_np = len([e for e in ci._read(ci.journal_path("lanep"))[0] if e.get("ev") == "intent"])
+check("4 concurrent stable begins (separate processes): ONE intent event (%d), one distinct id (%d), all exit 0 (%r)" % (_np, len(_pids), [p.returncode for p in _ps]),
+      _np == 1 and len(_pids) == 1 and all(p.returncode == 0 for p in _ps))
 # stable_id on an unreadable journal fails closed
 jp2 = ci.journal_path("lanet"); open(jp2, "w").write("{not json}\n{also not json}\n")
 try:

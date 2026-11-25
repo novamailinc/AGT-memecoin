@@ -122,7 +122,7 @@ DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
 _MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol", "debit_refused",
-                    "hold", "hold_released", "fee")
+                    "hold", "hold_released", "fee", "debit_add")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -878,6 +878,24 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
     st["n_entries"] += 1
 
 
+def _apply_add(led: Dict[str, Any], lane: str, mint: str, pos_id: str,
+               stake: float, qty: float) -> Tuple[bool, str]:
+    """Shared add-to-open-position mutation (a reconciled buyback). Caller holds the lock and validated input
+    and cash. Adds `qty` units and `stake` cost basis to the EXISTING lot `pos_id` and takes `stake` from cash
+    and spendable cash. Refuses (state untouched) when the lot is absent or is a different instance."""
+    st = _lane(led, lane)
+    pos = st["open"].get(_position_key(st, mint, pos_id))
+    if pos is None or pos.get("pos_id") != pos_id:
+        return False, "no open lot %s for %s/%s" % (pos_id, lane, mint)
+    led["cash"] = round(float(led["cash"]) - stake, 6)
+    led["cash_spendable"] = round(float(led.get("cash_spendable", led["cash"] + stake)) - stake, 6)
+    pos["qty"] = float(pos["qty"]) + qty
+    pos["basis"] = float(pos["basis"]) + stake
+    pos["entry_qty"] = float(pos.get("entry_qty") or 0.0) + qty
+    pos["entry_cost"] = float(pos.get("entry_cost") or 0.0) + stake
+    return True, ""
+
+
 def _position_key(st: dict, mint: str, pos_id: Optional[str]) -> str:
     if pos_id is not None:
         pos = st["open"].get(pos_id)
@@ -1125,6 +1143,17 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                                   "reason": ev.get("reason")}
                                  if ev.get("instance") is True else {})}
             replayed += 1
+        elif kind == "debit_add" and lane and mint:
+            stake = float(ev.get("stake") or 0)
+            qty = float(ev.get("qty") or 0)
+            if stake <= 0 or qty <= 0 or not op_id or not ev.get("pos_id") or float(led["cash_spendable"]) < stake - _EPS:
+                return led, "replay cannot apply debit_add %s (bad stake/qty/op or cash)" % op_id
+            ok, why = _apply_add(led, lane, mint, ev.get("pos_id"), stake, qty)
+            if not ok:
+                return led, "replay divergence: debit_add %s: %s" % (op_id, why)
+            ops[op_id] = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": ev.get("pos_id"),
+                          "stake": stake, "qty": qty}
+            replayed += 1
         elif kind == "debit_refused":
             if not op_id or not (ev.get("instance") is True or ev.get("durable_refusal") is True):
                 return led, "invalid refused entry event"
@@ -1247,6 +1276,11 @@ def _derive_buckets_locked(led: Dict[str, Any],
                 return led, ("cash-split migration: write_down "
                              "%s: %s; manual reconciliation "
                              "required" % (ev.get("op_id"), why))
+        elif ev["event"] == "debit_add":
+            ok, why = _apply_add(gen, lane, mint, ev.get("pos_id"), float(ev.get("stake") or 0), float(ev.get("qty") or 0))
+            if not ok:
+                return led, ("cash-split migration: debit_add %s: %s; manual reconciliation required"
+                             % (ev.get("op_id"), why))
         elif ev["event"] == "debit_refused":
             continue  # exact attempt refusal, no economics
         elif ev["event"] == "hold":
@@ -1657,6 +1691,98 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
         return True, "ok", pid
+
+
+def add_to_position(lane: str, mint: str, pos_id: str, stake: float, qty: float,
+                    op_id: str, ts: Optional[float] = None,
+                    marks: Optional[Dict[str, Dict[str, Any]]] = None
+                    ) -> Tuple[bool, str]:
+    """Reserve `stake` paper dollars to ADD `qty` units to the lane's EXISTING open lot `pos_id` (a buyback is an
+    entry: same fail-closed admission as try_debit - spendable cash, lane cap on the enlarged basis, mandatory gates,
+    account risk gates and provider health, all inside ONE lock with the mutation). Idempotent by op_id: a retry of
+    an applied op returns (True, "ok (retry of applied op)") without re-applying; the same op_id with different
+    parameters is a conflict. A refusal changes nothing and journals nothing (the caller leaves its own book alone)."""
+    if not _valid_amount(stake) or stake <= 0:
+        return False, "stake must be a positive finite number"
+    if not _valid_amount(qty) or qty <= 0:
+        return False, "qty must be a positive finite number"
+    stake, qty = float(stake), float(qty)
+    if not lane or not mint or not pos_id:
+        return False, "lane, mint and pos_id are required"
+    if not op_id or not isinstance(op_id, str):
+        return False, "caller op_id is required"
+    if gates_enabled() and marks is None:
+        marks = _central_marks()
+    elif marks is not None:
+        marks = _boundary_marks(marks)
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return False, "account ledger unreadable (fail-closed)"
+        if degraded:
+            return False, "account degraded: %s" % degraded
+        prior = led.get("ops", {}).get(op_id)
+        if prior is not None:
+            _exp = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": pos_id}
+            if (any(prior.get(k) != v for k, v in _exp.items())
+                    or abs(float(prior.get("stake", -1)) - stake) > 1e-9
+                    or abs(float(prior.get("qty", -1)) - qty) > 1e-9):
+                return False, "add op_id parameter conflict"
+            return True, "ok (retry of applied op)"
+        spendable = float(led.get("cash_spendable", 0.0))
+        if spendable < stake:
+            return False, ("account spendable cash $%.2f < stake $%.2f (total $%.2f incl. quarantined estimated "
+                           "proceeds)" % (spendable, stake, float(led["cash"])))
+        st = _lane(led, lane)
+        pos = st["open"].get(_position_key(st, mint, pos_id))
+        if pos is None or pos.get("pos_id") != pos_id:
+            return False, "no open lot %s for %s/%s" % (pos_id, lane, mint)
+        cap = lane_cap()
+        if cap is not None:
+            open_basis = sum(_pos_basis(p) for p in st["open"].values())
+            open_basis += sum(float(p["basis"]) for p in led.get("pending_sol", {}).values() if p["lane"] == lane)
+            if open_basis + stake > cap:
+                return False, ("lane cap $%.2f would be exceeded ($%.2f open + $%.2f add)" % (cap, open_basis, stake))
+        if not gates_enabled():
+            return False, "mandatory gates off; entry blocked fail-closed"
+        view = _view_locked(led, marks, degraded)
+        _update_baselines_locked(led, view)
+        view.update(_gate_fields(led, view))
+        refusal = _gate_check_locked(led, view, stake, mint=mint)
+        if refusal is not None:
+            return False, refusal
+        if provider_health_gate_enabled():
+            refusal = _provider_health_refusal()
+            if refusal is not None:
+                return False, refusal
+        led["seq"] = int(led.get("seq") or 0) + 1
+        # journal FIRST (write-ahead): a crash between the journal append and the state save is recovered by
+        # replay at the next load, which applies this event exactly once (its op_id is not yet in led["ops"]).
+        _journal({"event": "debit_add", "event_id": "ev#%d" % led["seq"], "op_id": op_id, "lane": lane,
+                  "mint": mint, "pos_id": pos_id, "stake": stake, "qty": qty, "seq": led["seq"], "ts": ts})
+        ok, why = _apply_add(led, lane, mint, pos_id, stake, qty)
+        if not ok:
+            return False, why
+        led["ops"][op_id] = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": pos_id,
+                             "stake": stake, "qty": qty}
+        _save_locked(led)
+        return True, "ok"
+
+
+def applied_add(op_id: str) -> Optional[Dict[str, Any]]:
+    """Read-only: the applied add-to-position record {lane, mint, pos_id, stake, qty} for `op_id`, or None when
+    absent OR the ledger is unreadable/degraded (unknown is never proof of absence: the caller must then refuse,
+    not re-issue). Used by a caller recovering from a crash between this account's add and its own book."""
+    if not op_id or not isinstance(op_id, str):
+        return None
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None or degraded:
+            return None
+        rec = led.get("ops", {}).get(op_id)
+        if not isinstance(rec, dict) or rec.get("event") != "debit_add":
+            return None
+        return {k: rec.get(k) for k in ("lane", "mint", "pos_id", "stake", "qty")}
 
 
 def hold_stake(lane: str, amount: float, op_id: str,

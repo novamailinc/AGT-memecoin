@@ -2174,12 +2174,26 @@ def _tranche_receipt(pos, leg_key):
     return r.get(_op)
 
 
+def _leg_qty(pos, leg_key):
+    """Units leg `leg_key` sells: its share of the ORIGINAL entry units (pos["tokens"] x frac) plus any units a
+    reconciled buyback allocated to that leg ("buyback_qty", absent = 0). Every exit, rebuild, residue and finalize
+    site uses this one definition so that bought units are sold by the legs that were still open when they were bought."""
+    leg = pos["legs"][leg_key]
+    return pos["tokens"] * leg["frac"] + float(leg.get("buyback_qty") or 0.0)
+
+
+def _pos_total_qty(pos):
+    """Original entry units plus all units added by reconciled buybacks."""
+    return float(pos.get("tokens") or 0.0) + sum(float((v or {}).get("buyback_qty") or 0.0)
+                                                for v in (pos.get("legs") or {}).values())
+
+
 def _close_leg(pos, leg_key, exit_price, reason, pkind=None, receipt_kind=None):
     """Close one leg at an honest exit. Returns realized USD for the leg."""
     leg = pos["legs"][leg_key]
     if leg["done"]:
         return 0.0
-    leg_tokens = pos["tokens"] * leg["frac"]
+    leg_tokens = _leg_qty(pos, leg_key)
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
     _jfs_l = _journaled_fills(pos) if _sim else {}
     if _sim and _jfs_l is None and pos.get("tranche_credit") and pos.get("pa_pos_id"):
@@ -2387,7 +2401,7 @@ def _rebuild_tally_from_receipts(pos):
             if r is None or lk in seen:
                 continue
             seen[lk] = {"net": round(float(r["proceeds"]) - float(r.get("fee") or 0.0), 6),
-                        "qty": pos["tokens"] * lv["frac"]}
+                        "qty": _leg_qty(pos, lk)}
         tc["net"] = round(sum(v["net"] for v in seen.values()), 6)
         tc["qty"] = sum(v["qty"] for v in seen.values())
         return True
@@ -2507,8 +2521,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
         open_legs = [k for k in open_legs if k in _only_legs]
     if not open_legs:
         return 0.0
-    total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"]
-                       for k in open_legs)
+    total_tokens = sum(_leg_qty(pos, k) for k in open_legs)
     _sim = (pos.get("execution") or {}).get("source") == "jupiter_quote_sim"
     _cjf = None
     if _sim and pos.get("tranche_credit") and pos.get("pa_pos_id"):
@@ -2538,7 +2551,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
                 open_legs = [k for k in open_legs if k not in _jfs and not pos["legs"][k]["done"]]
                 if not open_legs:
                     return _pre_net
-                total_tokens = sum(pos["tokens"] * pos["legs"][k]["frac"] for k in open_legs)
+                total_tokens = sum(_leg_qty(pos, k) for k in open_legs)
     if _sim and (_pkind(reason, pkind) != "write_down_zero" or _cjf is not None):
         _rkey = _cjf[0] if _cjf is not None else "remaining:%s" % "".join(open_legs)
         _ots = None
@@ -2558,7 +2571,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
         net = gross - gas_out
         for key in open_legs:
             leg = pos["legs"][key]
-            share = (pos["tokens"] * leg["frac"]) / total_tokens if total_tokens else 0
+            share = _leg_qty(pos, key) / total_tokens if total_tokens else 0
             leg.update(done=True, exit_price=filled_exit, realized_usd=round(net * share, 6),
                        exit_reason=reason, exit_price_kind=_kind, **({"exit_ts": _ots} if _ots else {}),
                        exit_execution={"source": _fill["execution_source"], "signature": _fill["signature"],
@@ -2584,7 +2597,7 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
     net = gross - gas_out
     for key in open_legs:
         leg = pos["legs"][key]
-        share = (pos["tokens"] * leg["frac"]) / total_tokens \
+        share = _leg_qty(pos, key) / total_tokens \
             if total_tokens else 0
         leg.update(done=True, exit_price=filled_exit,
                    realized_usd=round(net * share, 6), exit_reason=reason,
@@ -2824,7 +2837,7 @@ def diagnose_position(mint):
     fsum, g1ok, g2ok, g3ok, g4ok, g5ok = 0.0, True, True, True, True, True
     g3_unavail = False
     for (k, v), op in zip(legs, ops):
-        ltok = toks * float(v.get("frac") or 0.0)
+        ltok = _leg_qty(pos, k)
         fl = _df.get_fill(_fill_key(pos, k)) or _df.get_fill("%s:exit:%s:%s" % (LANE, mint, k)); r = rc.get(op)   # instance-scoped key, else the legacy unstamped key
         row = {"key": k, "lane_qty": ltok, "fill": None if not fl else {"qty": fl.get("qty_tokens"), "gross": fl.get("gross_usd"), "fee": fl.get("fee_usd")},
                "receipt": None if r is None else {"qty": r.get("qty"), "proceeds": r.get("proceeds"), "fee": r.get("fee"), "kind": r.get("price_kind")}}
@@ -2856,7 +2869,7 @@ def diagnose_position(mint):
     gate("G3", g3ok and not g3_unavail, None if (g3ok and not g3_unavail) else ("receipt_or_ledger_op_fault" if not g3ok else "ledger_op_no_instance_contract"), unavailable=(g3ok and g3_unavail))
     gate("G4", g4ok, None if g4ok else "money_differs"); gate("G5", g5ok, None if g5ok else "no_historical_signature")
     all_done = bool(pos.get("legs")) and all(v.get("done") for v in pos["legs"].values())
-    g2ok = g2ok and ((not all_done) or abs(fsum - toks) <= max(1e-9, 1e-6 * toks))
+    g2ok = g2ok and ((not all_done) or abs(fsum - _pos_total_qty(pos)) <= max(1e-9, 1e-6 * _pos_total_qty(pos)))
     gate("G2", g2ok, None if g2ok else "fill_qty_does_not_prove_flat")
     # G6 identity: exactly one open account instance for this mint in the lane, its pos_id == the lane's, instance contract, no unresolved entry
     rwhy, rq = _account_residue(mint, pid, pos); out["residue"] = {"why": rwhy, "qty": rq}
@@ -2885,7 +2898,7 @@ def diagnose_position(mint):
         out["verdict"] = "evidence_unavailable:%s:%s" % (g, out["gates"][g]["why"]); return out
     # expected account units = the lane's still-open legs (all legs done: 0). Any other quantity is a residue; it is labelled "explained" ONLY
     # when the delta equals the persisted dust record exactly, otherwise "unexplained" (no other class is invented).
-    expect = toks * sum(float(v.get("frac") or 0.0) for v in (pos.get("legs") or {}).values() if not v.get("done"))
+    expect = sum(_leg_qty(pos, _k) for _k, v in (pos.get("legs") or {}).items() if not v.get("done"))
     acct_q = float(rq or 0.0) if rwhy == "account_remaining_qty_mismatch" else 0.0
     delta = acct_q - expect
     tol = max(1e-9, 1e-6 * toks)
@@ -2983,7 +2996,7 @@ def _finalize(d, mint, pos, closed_reason):
                 # booked as a write-down, never a sale).
                 _split_complete = False
                 break
-            _lq = pos["tokens"] * _lv["frac"]
+            _lq = _leg_qty(pos, _lk)
             if _lv.get("exit_price_kind") == _WD:
                 _wd_qty += _lq
             else:
@@ -3624,7 +3637,7 @@ def _migrate_legacy_tranches(pos):
         plan = []
         _df = _demo_filler() if _is_sim(pos) else None
         for (lk, lv), op in zip(legs, ops):
-            ltok = pos["tokens"] * lv["frac"]
+            ltok = _leg_qty(pos, lk)
             r = rc.get(op)
             if r is not None:
                 if not _receipt_qty_ok(r, ltok + (dust if lk == dust_leg else 0.0)):
@@ -3795,7 +3808,7 @@ def _reconcile_credited_legs(pos):
                 r = rc.get(_op(lk))
                 if r is None:
                     continue
-                _ltok = pos["tokens"] * pos["legs"][lk]["frac"]
+                _ltok = _leg_qty(pos, lk)
                 if _is_sim(pos):
                     f = _demo_sell(pos, _ltok, lk)
                     _okm = f is not None and _receipt_matches(f[0], r, _acct_qty(pos, lk, _ltok))

@@ -172,6 +172,39 @@ def remote_tree(owner: str, repo: str, branch: str):
     return entries, tree_sha, commit_sha
 
 
+# tools/phone-test is a FROZEN, UNQUALIFIED live-wallet (Termux) bundle that is maintained outside this repo and carries older execution
+# semantics (e.g. quote price impact compared as percent without ratio conversion). It must never be synced by default, and because this
+# push MIRRORS (remote paths absent locally are deleted) omitting it must not delete or silently replace the remote copy either.
+UNQUALIFIED_PREFIXES = ("tools/phone-test/",)
+ALLOW_UNQUALIFIED_ENV = "AGT_ALLOW_UNQUALIFIED_PHONE_BUNDLE"
+
+
+def _is_unqualified(path: str) -> bool:
+    p = path.strip("/") + "/"
+    return any(p.startswith(x) or (x.rstrip("/") + "/") == p for x in UNQUALIFIED_PREFIXES)
+
+
+def guard_extras(extras, environ):
+    """Refuse an --extra whose destination is under an unqualified prefix unless explicitly allowed. Returns None, or an error string."""
+    if environ.get(ALLOW_UNQUALIFIED_ENV) == "1":
+        return None
+    for spec in extras:
+        dest = spec.partition(":")[2]
+        if dest and _is_unqualified(dest):
+            return ("refusing --extra %r: %s is an unqualified frozen live-wallet bundle; set %s=1 only after it is qualified"
+                    % (spec, dest, ALLOW_UNQUALIFIED_ENV))
+    return None
+
+
+def guard_mirror(deleted, changed, environ):
+    """Under the default guard, remote paths under an unqualified prefix are left untouched: never deleted, never overwritten.
+    Returns (deleted, changed, preserved_count)."""
+    if environ.get(ALLOW_UNQUALIFIED_ENV) == "1":
+        return deleted, changed, 0
+    keep = [p for p in deleted if _is_unqualified(p)]
+    return ([p for p in deleted if not _is_unqualified(p)], [p for p in changed if not _is_unqualified(p)], len(keep))
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args or "-h" in args or "--help" in args:
@@ -227,6 +260,9 @@ def main() -> int:
                 raise
             print(f"repo {owner}/{repo} exists")
 
+    _err = guard_extras(extras, os.environ)
+    if _err:
+        raise SystemExit(_err)
     local = collect_files(root)
     for spec in extras:
         src, _, dest = spec.partition(":")
@@ -292,6 +328,11 @@ def main() -> int:
             print(f"no changes vs {owner}/{repo}@{branch}; nothing to push")
             return 0
 
+    deleted, changed, _kept = guard_mirror(deleted, changed, os.environ)
+    if _kept or not os.environ.get(ALLOW_UNQUALIFIED_ENV):
+        print(f"NOTICE: tools/phone-test is NOT part of this sync (unqualified frozen live-wallet bundle); remote copy left untouched ({_kept} remote paths preserved). This is NOT a complete phone release.")
+    if not changed and not deleted:
+        print("nothing to push after guard"); return 0
     print(f"{len(changed)} changed/new, {len(deleted)} deleted")
     if dry_run:
         for p in sorted(changed):

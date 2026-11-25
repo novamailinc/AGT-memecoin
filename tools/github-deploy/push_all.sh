@@ -6,6 +6,7 @@
 # (see EXCLUDE_* and SECRET_MARKERS in push_repo.py).
 set -e
 W=/home/hatch/workspace
+# tools/phone-test is intentionally NOT synced: frozen unqualified live-wallet bundle (guard in push_repo.py).
 exec python3 "$W/github-deploy/push_repo.py" "$W/Forex-agent/Forex-agent-main" \
   --message "Sync all project code" \
   --extra "$W/memecoin-toolkit:tools/memecoin-toolkit" \
@@ -18,7 +19,6 @@ exec python3 "$W/github-deploy/push_repo.py" "$W/Forex-agent/Forex-agent-main" \
   --extra "$W/reports/shadow-live-2026-11-22/*.py:tools/scripts/reports/shadow-live-2026-11-22" \
   --extra "$W/github-deploy:tools/github-deploy" \
   --extra "$W/agentlink-deploy:tools/agentlink-deploy" \
-  --extra "$W/phone-test/bundle:tools/phone-test" \
   --extra "$W/reports/*.py:tools/scripts/reports" \
   --extra "$W/wallet-hunt/*.py:tools/scripts/wallet-hunt" \
   --extra "$W/exit-backtest/*.py:tools/scripts/exit-backtest" \

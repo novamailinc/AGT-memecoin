@@ -58,19 +58,21 @@ if scen in ("Y0", "Y1"):
 LOCKFILE_PRE = os.path.exists(GC._fault_lock_path(GR))           # was the lock file already there BEFORE the opener ran (setup/register may create it)?
 def committed_ops():
     df = GR._demo_filler(); return sorted(k for k in raw_fills() if df.op_committed(k) is True)
-if scen == "Y9a":                                                # crash exactly between the buy (journaled fill, intent live) and the debit
+if scen in ("Y9a", "Y11a"):                                                # crash exactly between the buy (journaled fill, intent live) and the debit
     def _die(*a, **k):
         _reach("buy-before-debit"); os._exit(7)
     PA.try_debit = _die
     GR.consider_candidate(mkcand(1), time.time()); sys.exit(99)  # reached only if the crash site was NOT hit
-if scen == "Y9b":                                                # RESTART on the same home: the unreleased intent + journaled uncommitted fill exist
+if scen in ("Y9b", "Y11b"):                                                # RESTART on the same home: the unreleased intent + journaled uncommitted fill exist
     pre = {"intents": intents(), "fills": sorted(raw_fills()), "committed": committed_ops(), "cash": PA.snapshot()["cash"]}
     def _age(j):
         for v in j["fills"].values(): v["provenance"]["quote_requested_at"] = float(v["provenance"]["quote_requested_at"]) - 120.0
-    F._locked(_age)
+    if scen == "Y9b": F._locked(_age)                                       # Y11b: the journaled quote is left FRESH
     r1 = GR.consider_candidate(mkcand(1), time.time()); mid = snap(); mid_fills = sorted(raw_fills())
-    r2 = GR.consider_candidate(mkcand(1), time.time()); end = snap()
-    print(json.dumps({"reached": True, "pre": pre, "r1": [bool(r1[0]), str(r1[1])], "mid": mid, "mid_fills": mid_fills, "r2": [bool(r2[0]), str(r2[1])], "end": end, "end_fills": sorted(raw_fills()), "end_committed": committed_ops()}))
+    pos1 = list(raw_ledger().get("positions", {}).values()); px1 = pos1[0].get("entry_price") if pos1 else None
+    fill_px = {k: v.get("price_usd") for k, v in raw_fills().items()}
+    r2 = GR.consider_candidate(mkcand(1), time.time()) if scen == "Y9b" else (None, None); end = snap()
+    print(json.dumps({"reached": True, "pre": pre, "r1": [bool(r1[0]), str(r1[1])], "mid": mid, "mid_fills": mid_fills, "r2": [bool(r2[0]), str(r2[1])] if r2[0] is not None else None, "entry_px": px1, "fill_px": fill_px, "end": end, "end_fills": sorted(raw_fills()), "end_committed": committed_ops()}))
     sys.exit(0)
 started = threading.Event(); hold = {"Y2": 0.3, "Y3": 0.6, "Y4": 1.5, "Y8": 0.3}.get(scen)
 CAND = mkcand(1)                                   # FIXED candidate: same created_ts, and the op id is LANE:entry:mint:int(created_ts*1000) (grad.py), so the journal FILL KEY SET is the observable identity; no per-attempt nonce is in this op id (the per-run nonce seen elsewhere comes from other fixtures)
@@ -103,11 +105,12 @@ if scen in ("Y8", "Y9"):
     pos = list(raw_ledger().get("positions", {}).values())
     retry = {"r": [bool(rr[0]), str(rr[1])], "s": snap(), "same_ops": sorted(f2) == first_ops, "first_ops": first_ops, "ops_after": sorted(f2), "committed": committed_ops(), "n_fills_before": len(first_ops), "n_fills_after": len(f2),
              "entry_px": (pos[0].get("entry_price") if pos else None), "first_px": first_px}
+LOCKFILE_POST = os.path.exists(GC._fault_lock_path(GR))     # BEFORE the acquirable probe below: that probe opens (creates) the lock file itself
 try:
     with GC._fault_lock(GR, 0.5): acquirable = True
 except Exception as e: acquirable = False
 print(json.dumps({"reached": True, "scen": scen, "r": [bool(r[0]), str(r[1])], "s0": s0, "s1": s1, "calls": len(calls), "depth_empty": not getattr(GC._FLT, "depth", {}), "acquirable": acquirable,
-                  "lockfile": os.path.exists(GC._fault_lock_path(GR)), "lockfile_pre": LOCKFILE_PRE, "lock_ctor": LK["n"], "retry": retry, "writer_released": (t is None or not t.is_alive()), "main_depth_empty_note": "depth is thread-local: this is the MAIN thread; the writer thread releases its own lock, checked by writer_released"}))
+                  "lockfile": LOCKFILE_POST, "lockfile_after_probe": os.path.exists(GC._fault_lock_path(GR)), "lockfile_pre": LOCKFILE_PRE, "lock_ctor": LK["n"], "retry": retry, "writer_released": (t is None or not t.is_alive()), "main_depth_empty_note": "depth is thread-local: this is the MAIN thread; the writer thread releases its own lock, checked by writer_released"}))
 """
 def run(scen):
     h = H.newhome(); cp, j = H.run(CHILD, h, scen)
@@ -121,7 +124,7 @@ D = {}
 def delta(j): return round(float(j["s0"]["cash"]) - float(j["s1"]["cash"]), 9)
 def main():
     j = run("Y0")
-    if j: check("Y0 flag off control: opened (%s), one position, cash down once (%s -> %s), the opener constructed the fault lock %d times (expect 0: commit_barrier is a no-op with the flag off; lock file existed BEFORE the opener: %s, after: %s), guard called %d times, lock depth empty" % (j["r"], j["s0"]["cash"], j["s1"]["cash"], j["lock_ctor"], j["lockfile_pre"], j["lockfile"], j["calls"]),
+    if j: check("Y0 flag off control: opened (%s), one position, cash down once (%s -> %s), the opener constructed the fault lock %d times (expect 0: commit_barrier is a no-op with the flag off; lock file existed BEFORE the opener: %s, right after it (before the harness's own acquirable probe, which creates the file): %s), guard called %d times, lock depth empty" % (j["r"], j["s0"]["cash"], j["s1"]["cash"], j["lock_ctor"], j["lockfile_pre"], j["lockfile"], j["calls"]),
                 j["r"][0] and j["s1"]["n_pos"] == 1 and delta(j) > 0 and j["lock_ctor"] == 0 and j["lockfile"] == j["lockfile_pre"] and j["calls"] == 3 and j["depth_empty"] and j["s1"]["intents"] == [])
     j = run("Y1")
     if j: check("Y1 flag on control: opened, one position, cash down once (%s -> %s), no intent left, guard called %d times (pre-lock, in-lock, barrier re-check), lock free, fault lock constructed %d times (>= 1)" % (j["s0"]["cash"], j["s1"]["cash"], j["calls"], j["lock_ctor"]),
@@ -155,6 +158,16 @@ def main():
               j9["r1"][0] is False and "quote age" in j9["r1"][1] and j9["mid"]["n_pos"] == 0 and j9["mid"]["cash"] == pre["cash"] and j9["mid_fills"] == pre["fills"] and j9["mid"]["intents"] == [])
         check("Y9b RECOVERY: the next attempt after the stale refusal opens with a NEW op and one debit (%s; cash %s -> %s vs Y1 delta %s); fills %s -> %s (the stale one stays as an ORPHAN, uncommitted; committed %s)" % (j9["r2"], pre["cash"], j9["end"]["cash"], D.get("d1"), len(pre["fills"]), len(j9["end_fills"]), j9["end_committed"]),
               j9["r2"][0] is True and j9["end"]["n_pos"] == 1 and abs((pre["cash"] - j9["end"]["cash"]) - D.get("d1", -1)) < 1e-9 and len(j9["end_fills"]) == 2 and len(j9["end_committed"]) == 1 and j9["end_committed"][0] not in pre["fills"])
+    # Y11 (two phases, ONE home): crash between buy and debit, restart with a FRESH journaled quote: the intent is live, so the ORIGINAL fill is REPLAYED (no second buy)
+    h11 = H.newhome(); cp11 = H.py(CHILD, h11, "Y11a")
+    reached11 = os.path.exists(os.path.join(h11, "reached.buy-before-debit"))
+    check("Y11a deliberate crash between buy and debit: child rc=%s (expected 7) and the fsynced reached-site sentinel exists (%s)" % (cp11.returncode, reached11), cp11.returncode == 7 and reached11)
+    cp11b = H.py(CHILD, h11, "Y11b"); j11 = H.last_json(cp11b)
+    check("Y11b restart child ran (rc=%s, expected 0) and reached the site" % cp11b.returncode, cp11b.returncode == 0 and j11 is not None and j11.get("reached") is True)
+    if j11 and reached11:
+        pre = j11["pre"]
+        check("Y11b FRESH crash replay: intent survived (%s), one uncommitted fill (%s); the restart REPLAYS it: opened (%s), NO second buy (fills %s), the committed op is the ORIGINAL one (%s), entry price %s equals its fill price %s, one position, one debit (cash %s -> %s vs Y1 delta %s), intent consumed (%s)" % (pre["intents"], pre["fills"], j11["r1"], j11["end_fills"], j11["end_committed"], j11["entry_px"], list((j11["fill_px"] or {}).values()), pre["cash"], j11["end"]["cash"], D.get("d1"), j11["end"]["intents"]),
+              len(pre["intents"]) == 1 and len(pre["fills"]) == 1 and pre["committed"] == [] and j11["r1"][0] is True and j11["end_fills"] == pre["fills"] and j11["end_committed"] == pre["fills"] and j11["entry_px"] in list(j11["fill_px"].values()) and j11["end"]["n_pos"] == 1 and abs((pre["cash"] - j11["end"]["cash"]) - D.get("d1", -1)) < 1e-9 and j11["end"]["intents"] == [])
     j = run("Y10")
     if j:
         rt = j["retry"] or {}

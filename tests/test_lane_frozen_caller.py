@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bb82 REAL-CALLER frozen-hold harness, MOMENTUM, SOURCE ONLY (never run). The refused write-down and the refused leg credit are produced by the REAL poll_exits against a real generation mismatch (parent wipes the account files so the lane position is bound to an old generation); NO hand-written freezes except the unit child, which uses real begin/freeze and is labelled. Position age is set by editing the SCRATCH lane ledger (labelled fixture). Mutant: a labelled model of the BB81 pre-check (exact-op only)."""
+"""bb83 (= bb82 + measured fill-journal evidence + public re-entry rows) REAL-CALLER frozen-hold harness, MOMENTUM, SOURCE ONLY (never run). The refused write-down and the refused leg credit are produced by the REAL poll_exits against a real generation mismatch (parent wipes the account files so the lane position is bound to an old generation); NO hand-written freezes except the unit child, which uses real begin/freeze and is labelled. Position age is set by editing the SCRATCH lane ledger (labelled fixture). Mutant: a labelled model of the BB81 pre-check (exact-op only)."""
 if __name__ != "__main__":
     import pytest
     pytest.skip("script-style test", allow_module_level=True)
@@ -119,6 +119,14 @@ def _snap(PA):
     d["wal_events"] = sorted(set(e.get("event") for e in evs))
     mp = os.path.join(_acct_dir(ROOTDIR), "unresolved_generation_refusals.jsonl")
     d["marker_records"] = len([1 for ln in open(mp) if ln.strip()]) if os.path.exists(mp) else 0
+    fp = os.path.join(os.environ.get("FOREX_AGENT_HOME", "."), "demo_fill_journal.json")   # the REAL quote-sim fill journal (demo_fill.py), read from disk
+    try: fb = open(fp, "rb").read()
+    except OSError: fb = None
+    d["fj_exists"] = fb is not None; d["fj_sha"] = hashlib.sha256(fb or b"").hexdigest()[:16]; d["fj_len"] = len(fb or b"")
+    try: _fj = _json.loads(fb) if fb else None
+    except ValueError: _fj = "unparsable"
+    d["fj_n"] = (len(_fj) if isinstance(_fj, (dict, list)) else (None if _fj is None else -1))
+    d["fj_keys"] = sorted(str(k) for k in _fj)[:12] if isinstance(_fj, dict) else None
     return d
 def _pf2(mult):
     def f(chain, mint, spot_index=None):
@@ -150,6 +158,13 @@ def child_wdref(variant=""):
     out["ret_leg_a"] = L._close_leg(pos, "a", 0.002, "leg_a_2x")
     out["realized_unchanged"] = float(pos.get("realized_usd") or 0) == r0; out["legs_after"] = {k: bool((pos.get("legs") or {}).get(k, {}).get("done")) for k in ("a", "b", "c")}
     out["s3"] = _snap(PA)
+    try: e1 = _enter(MINT); out["entry_same_mint"] = [bool(e1[0]), str(e1[1])[:160]]
+    except Exception as ex: out["entry_same_mint"] = [False, "EXC %s" % type(ex).__name__]
+    try: e2 = _enter(MINT2); out["entry_other_mint"] = [bool(e2[0]), str(e2[1])[:160]]
+    except Exception as ex: out["entry_other_mint"] = [False, "EXC %s" % type(ex).__name__]
+    try: r = PA.try_debit(LANE_NAME, "DirectProbeMint", 1.0, 1000.0, "probe:direct:wd"); out["direct"] = [bool(r[0]), str(r[1])[:240]]
+    except Exception as ex: out["direct"] = [False, "EXC %s" % type(ex).__name__]
+    out["s4"] = _snap(PA)
     print("RESULT " + _json.dumps(out, default=str), flush=True)
 def child_legwd(variant=""):
     """REAL refused leg-a credit (2x poll vs stale generation), THEN a real write-down poll and a real remaining close on the same position."""
@@ -237,6 +252,11 @@ try:
     check("X1 REAL frozen leg credit (2x poll, stale generation): one frozen leg-a obligation, leg a open (%r)" % ({k: b1[k] for k in ("intent_ops", "frozen_unresolved", "pos_open", "legs_done")},), len(b1["intent_ops"]) == 1 and ":leg:a:" in b1["intent_ops"][0] and b1["frozen_unresolved"] == 1 and b1["pos_open"] is True and b1["legs_done"]["a"] is False)
     check("X2 CROSS-FAMILY: the later REAL write-down poll opens NO write-down intent and makes no account op while the leg-a credit is frozen (ops %r -> %r, credit %r -> %r, debit %r -> %r, why %r)" % (b1["intent_ops"], b2["intent_ops"], b1["credit"], b2["credit"], b1["debit"], b2["debit"], (b2.get("pending_exit") or {}).get("why")), b2["intent_ops"] == b1["intent_ops"] and b2["credit"] == b1["credit"] and b2["debit"] == b1["debit"] and b2["pos_open"] is True and b2["legs_done"] == b1["legs_done"])
     check("X3 CROSS-FAMILY: a real remaining close (spans leg a) is held too: returns 0.0, no new intent, journal unchanged (ret %r, lines %r -> %r)" % (g["ret_remaining"], b2["n_lines"], b3["n_lines"]), g["ret_remaining"] == 0.0 and b3["intent_ops"] == b1["intent_ops"] and b3["journal_sha"] == b2["journal_sha"] and b3["credit"] == b1["credit"])
+    FJK = ("fj_exists", "fj_sha", "fj_len", "fj_n")
+    check("C5 MEASURED NO-SALE (write-down family): the real quote-sim FILL JOURNAL on disk is byte-identical across every real cycle and direct close call after the freeze (s1 %r, s2b %r, s3 %r; before the first cycle %r)" % ({k: a1[k] for k in FJK}, {k: a2b[k] for k in FJK}, {k: a3[k] for k in FJK}, {k: a0[k] for k in FJK}), all(a1[k] == a2[k] == a2b[k] == a3[k] for k in FJK))
+    check("C6 PUBLIC RE-ENTRY stays refused while the obligation is unresolved (this is NOT authorization of re-entry): the lane entry for the SAME mint and for another mint and a direct account debit are all refused, one position, debit count unchanged (%r)" % ({k: w[k] for k in ("entry_same_mint", "entry_other_mint", "direct")},), w["entry_same_mint"][0] is False and w["entry_other_mint"][0] is False and w["direct"][0] is False and w["s4"]["debit"] == a1["debit"] and w["s4"]["n_positions"] == 1 and w["s4"]["fj_sha"] == a1["fj_sha"])
+    check("X4 MEASURED NO-SALE (cross-family): after the first real 2x sale of leg a, the fill journal is byte-identical through the later write-down poll and the real remaining close (after sale %r, after write-down poll %r, after remaining close %r)" % ({k: b1[k] for k in FJK}, {k: b2[k] for k in FJK}, {k: b3[k] for k in FJK}), all(b1[k] == b2[k] == b3[k] for k in FJK))
+    check("X5 the first real 2x cycle DID write the fill journal (positive control: the journal fingerprint is capable of changing, so X4/C5 are not vacuous) (%r)" % ({k: b1[k] for k in FJK},), b1["fj_exists"] is True and b1["fj_len"] > 0 and (b1["fj_n"] or 0) >= 1)
     u = run_unit("unit2")
     check("U1 overlap rule on a real journal: frozen leg a holds leg a and any spanning close, NOT legs b/c, NOT a new generation of the same mint (%r)" % ({k: u[k] for k in ("clean_a", "a_held", "b_free", "remaining_held", "newgen_free")},), all(u[k] is True for k in ("clean_a", "a_held", "b_free", "remaining_held", "newgen_free")))
     check("U2 a write-down close is held by any frozen intent of the position, the helper is read-only, and an unreadable journal returns None (%r)" % ({k: u[k] for k in ("writedown_held", "readonly", "unreadable_none")},), all(u[k] is True for k in ("writedown_held", "readonly", "unreadable_none")))

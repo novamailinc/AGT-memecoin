@@ -346,15 +346,15 @@ check("1d-A fault poll: the sale FILL is journaled (%d), the leg is NOT booked (
       % (len(_sl), _p.get("legs", {}).get("a", {}).get("done"), cash(PA), _cash0, (_p.get("pending_exit") or {}).get("why")),
       len(_sl) == 1 and _p.get("legs", {}).get("a", {}).get("done") is False and _cents(cash(PA)) == _cents(_cash0)
       and (_p.get("pending_exit") or {}).get("why") == "close_intent_not_durable")
-FakeJup.mult = 1.0   # RESTART with the price reversed: no trigger holds any more
+FakeJup.mult = 1.9   # RESTART with the price reversed to 1.9x: BELOW the 2.0x trigger and ABOVE the leg-c 30% trail floor (1.4x of the 2.0x peak), so no exit trigger holds
 _nq = JUP.calls
-C.poll_exits(price_fn=pf_for_mult(C, 1.0))
+C.poll_exits(price_fn=pf_for_mult(C, 1.9))
 _p = (C.open_positions() or {}).get(_mint) or {}; _sl2 = _ceo_sells(F); _net = sum(v["net_proceeds_usd"] for v in _sl2.values())
 check("1d-A resume after restart/price reversal: leg a booked from the JOURNALED fill (done %r), still exactly one sale fill (%d), no new quote request (%d -> %d), cash +%.4f == journaled net %.4f"
       % (_p.get("legs", {}).get("a", {}).get("done"), len(_sl2), _nq, JUP.calls, cash(PA) - _cash0, _net),
       _p.get("legs", {}).get("a", {}).get("done") is True and len(_sl2) == 1 and JUP.calls == _nq and _cents(cash(PA) - _cash0) == _cents(_net)
       and not _p.get("pending_exit"))
-_c1 = cash(PA); C.poll_exits(price_fn=pf_for_mult(C, 1.0))
+_c1 = cash(PA); C.poll_exits(price_fn=pf_for_mult(C, 1.9))
 check("1d-A a further poll changes nothing (cash %.4f -> %.4f, sale fills %d)" % (_c1, cash(PA), len(_ceo_sells(F))), _cents(cash(PA)) == _cents(_c1) and len(_ceo_sells(F)) == 1)
 PA, F, CT = fresh(); ok, why, ps = _ceo_pos(PA, CT); _mint = next(iter(ps)); _cash0 = cash(PA)
 FakeJup.mult = 2.0
@@ -363,8 +363,8 @@ with __import__("unittest.mock", fromlist=["patch"]).patch.object(CI, "_append",
 _p = (C.open_positions() or {}).get(_mint) or {}
 check("1d-B gate failure before any sale: nothing sold (%d fills), position open with leg a not done, hold tries %r" % (len(_ceo_sells(F)), (_p.get("pending_exit") or {}).get("tries")),
       not _ceo_sells(F) and _p.get("legs", {}).get("a", {}).get("done") is False and (_p.get("pending_exit") or {}).get("tries") == 2)
-FakeJup.mult = 1.0; _nq = JUP.calls
-C.poll_exits(price_fn=pf_for_mult(C, 1.0))
+FakeJup.mult = 1.9; _nq = JUP.calls
+C.poll_exits(price_fn=pf_for_mult(C, 1.9))
 check("1d-B storage back and price recovered below the trigger: still NOTHING sold (%d fills, quote calls %d -> %d), cash unchanged (%.4f)" % (len(_ceo_sells(F)), _nq, JUP.calls, cash(PA)),
       not _ceo_sells(F) and JUP.calls == _nq and _cents(cash(PA)) == _cents(_cash0))
 FakeJup.mult = 1.0

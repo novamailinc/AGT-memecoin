@@ -35,6 +35,25 @@ def raw_probe(pid):
     except Exception as e: r["cmdline"] = "unreadable:" + type(e).__name__
     return r
 
+
+def classify(pr, marker):
+    """Distinct, named outcomes (never signals). 'owned-alive' is the ONLY class that may be signalled."""
+    if pr["kill0"] == "ProcessLookupError": return "absent"
+    if pr["kill0"] == "PermissionError": return "permission-error (alive but not signalable by this uid: ownership ambiguous, never signal)"
+    if pr["state"].startswith("unreadable"): return "proc-unreadable (ambiguous, never signal)"
+    if pr["state"] in ("Z", "X"): return "zombie-or-dead (awaiting reaper)"
+    if pr["cmdline"].startswith("unreadable"): return "cmdline-unreadable (ambiguous, never signal)"
+    if marker not in pr["cmdline"]: return "cmdline-mismatch (alive, different program than the stand-in: ambiguous, never signal)"
+    return "owned-alive"
+
+def ns_facts():
+    f = {}
+    try: f["pidns_self"] = os.readlink("/proc/self/ns/pid")
+    except Exception as e: f["pidns_self"] = "unreadable:" + type(e).__name__
+    try: f["uid"] = os.getuid(); f["pid1_cmdline"] = open("/proc/1/cmdline", "rb").read().replace(b"\0", b" ").decode("utf8", "replace")[:80]
+    except Exception as e: f["pid1_cmdline"] = "unreadable:" + type(e).__name__
+    return f
+
 def sv5b():
     """Corrected SV5 (the sl11 probe was ambiguous): same leave-mode driver (v2 SV2 text), but the facts are recorded raw at probe time and survival is asserted from them."""
     h = B.newhome(); sp = os.path.join(h, "standin.py"); open(sp, "w").write(V2.STANDIN)
@@ -45,14 +64,16 @@ def sv5b():
         except Exception: starts = []
         check("SV5b driver exited 0 with a result (rc %s) and 3 stand-in incarnations (%d)" % (p.returncode, len(starts)), p.returncode == 0 and isinstance(r, dict) and len(starts) == 3)
         if not (isinstance(r, dict) and len(starts) == 3): return
-        pid = starts[2]["pid"]; time.sleep(0.3); pr = raw_probe(pid)
-        print("INFO SV5b RAW PROBE after the supervisor driver exited (driver pid %s, exited %s): %s" % (r.get("driver_pid"), p.poll() is not None, pr))
-        alive = pr["kill0"] == "ok" and pr["state"] not in ("Z", "X") and not pr["state"].startswith("unreadable")
-        check("SV5b child survived the supervisor driver's exit (from raw facts): kill-0 %s == ok, /proc state %s not Z/X, cmdline carries this run's stand-in path (%s), ppid %s != the exited driver pid %s" % (pr["kill0"], pr["state"], sp in pr["cmdline"], pr.get("ppid"), r.get("driver_pid")),
-              alive and sp in pr["cmdline"] and pr.get("ppid") != r.get("driver_pid"))
-        if alive and sp in pr["cmdline"]:
-            os.kill(pid, signal.SIGKILL); time.sleep(0.3); st2 = pid_state(pid, sp)
-            check("SV5b exact-pid cleanup: after SIGKILL of that one pid its state is %s (absent or zombie)" % st2, st2 in ("absent", "zombie"))
+        pid = starts[2]["pid"]; time.sleep(0.3); pr = raw_probe(pid); cls = classify(pr, sp)
+        print("INFO SV5b RAW PROBE after the supervisor driver exited (driver pid %s, exited %s): %s; class: %s; namespace facts: %s" % (r.get("driver_pid"), p.poll() is not None, pr, cls, ns_facts()))
+        check("SV5b child survived the supervisor driver's exit: probe class %s == owned-alive (kill-0 ok, /proc state %s not Z/X, cmdline carries this run's stand-in path %s) and ppid %s != the exited driver pid %s" % (cls, pr["state"], sp in pr["cmdline"], pr.get("ppid"), r.get("driver_pid")),
+              cls == "owned-alive" and pr.get("ppid") != r.get("driver_pid"))
+        if cls == "owned-alive":
+            os.kill(pid, signal.SIGKILL); time.sleep(0.3); pr2 = raw_probe(pid); c2_ = classify(pr2, sp)
+            print("INFO SV5b RAW PROBE after exact-pid SIGKILL: %s; class: %s" % (pr2, c2_))
+            check("SV5b exact-pid cleanup OBSERVED: class after SIGKILL of that one pid is %s (absent or zombie-or-dead)" % c2_, c2_ == "absent" or c2_.startswith("zombie"))
+        else:
+            print("INFO SV5b UNRESOLVED ownership (class %s): NOT signalled. The process is left for the wrapper's namespace teardown, which is NOT exact-pid cleanup and is not claimed as observed cleanup." % cls)
     finally:
         left = V2.reap_owned(h, sp)
         if left: print("INFO SV5b last-resort cleanup killed exact owned pids %s" % (left,))

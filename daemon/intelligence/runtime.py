@@ -21,6 +21,23 @@ Rules this module enforces (each is covered by tests/test_intelligence_runtime.p
   or unusable provider response, a processing failure or an unreadable
   state file leaves the stream DEGRADED, with the gap persisted in
   ``intelligence/runtime_state.json``, until a later cycle proves recovery.
+* Held-market policy differs from the shared processor on purpose. With a
+  stream_key the shared EventProcessor checkpoints a "held" event (stored,
+  not applied; tests/test_intelligence_checkpoint_order.py). This runtime
+  never passes a stream_key, so it never uses that path, and it is
+  STRICTER: a held event of a market type (MARKET_EVENT_TYPES) blocks its
+  stream's checkpoint until a later observation verifies and applies it
+  (tests: held_market_event_does_not_advance_checkpoint and
+  held_market_event_recovers_when_verified). A persistent held or
+  conflicting market event therefore leaves its stream degraded. This is a
+  shadow-only, unwired policy: no entry gate consumes it yet, and changing
+  the shared processor's policy is a separate reviewed change.
+* Requested commitment is explicit. Every getTransaction this module issues
+  (signature recovery AND the retry-queue refetch) carries
+  commitment=TX_COMMITMENT in its request options, and the observation says
+  the same; a caller-supplied different commitment is refused, never relabelled.
+* A rebuild that hit REBUILD_LIMIT leaves the in-memory registry incomplete,
+  so the status is DEGRADED ("registry_rebuild_truncated"), never ok.
 * Shadow only. Fusion output goes to its own journal; nothing here calls a
   trading path, changes a lane, stake or kill switch, or opens a socket.
   No import of the launch_scanner package. No network at import time:
@@ -117,6 +134,29 @@ def _atomic_write(path, data):
     os.replace(tmp, path)
 
 
+def _pin_commitment(rpc_call):
+    """Wrap rpc_call so every getTransaction request names TX_COMMITMENT.
+
+    The observation label (commitment=TX_COMMITMENT) must equal what was
+    requested, on every fetch path. A request that already names another
+    commitment is answered "commitment_mismatch" instead of being relabelled."""
+    def call(method, params):
+        if method == "getTransaction":
+            params = list(params)
+            opts = dict(params[1]) if len(params) > 1 \
+                and isinstance(params[1], dict) else {}
+            named = opts.get("commitment")
+            if named is not None and named != TX_COMMITMENT:
+                return {"kind": "commitment_mismatch"}
+            opts["commitment"] = TX_COMMITMENT
+            if len(params) > 1:
+                params[1] = opts
+            else:
+                params.append(opts)
+        return rpc_call(method, params)
+    return call
+
+
 class RuntimeState(object):
     """Persistent per-stream gaps and degraded reasons.
 
@@ -195,7 +235,7 @@ class IntelligenceRuntime(object):
                  provider_of=None, processor=None, page_limit=None):
         self.home = home
         self.store = store
-        self.rpc_call = rpc_call
+        self.rpc_call = _pin_commitment(rpc_call)
         self.streams = list(streams)
         self._clock = clock
         self.max_pages = max_pages
@@ -403,6 +443,10 @@ class IntelligenceRuntime(object):
     def status(self):
         streams = {}
         degraded = bool(self.config_errors)
+        runtime_reasons = []
+        if self.rebuild_truncated:
+            runtime_reasons.append("registry_rebuild_truncated")
+            degraded = True
         for s in self.streams:
             st = self.state.stream(s.key)
             cp = None
@@ -439,6 +483,7 @@ class IntelligenceRuntime(object):
             "registry_tokens": len(self.processor.registry.tokens),
             "rebuilt_from_store": self.rebuilt,
             "rebuild_truncated": self.rebuild_truncated,
+            "runtime_reasons": runtime_reasons,
             "fusion": {"enabled": self.fusion is not None,
                        "mode": "shadow"},
             "counters": dict(self.counters),

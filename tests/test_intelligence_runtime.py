@@ -40,9 +40,12 @@ class Chain(object):
         self.fail_tx = False
         self.fail_sigs = None
         self.calls = []
+        self.tx_options = []        # options dict of every getTransaction request
 
     def __call__(self, method, params):
         self.calls.append(method)
+        if method == "getTransaction":
+            self.tx_options.append(dict(params[1]) if len(params) > 1 else {})
         if method == "getSignaturesForAddress":
             if self.fail_sigs:
                 return {"kind": self.fail_sigs}
@@ -399,3 +402,81 @@ def test_corrupt_checkpoint_store_error_is_a_store_error():
     except ImportError:
         pytest.skip("needs the shared checkpoint delta")
     assert rt._is_store_error(CorruptCheckpointStoreError("x"))
+
+
+def test_held_market_event_recovers_when_verified(tmp_path):
+    """WRITTEN, NOT RUN. A held market event blocks its checkpoint; once the
+    same signature is observed at the finalized commitment it is verified,
+    applied exactly once, the checkpoint moves and the stream is no longer
+    degraded."""
+    chain = Chain([_tx("create")])
+    r = _make(tmp_path, chain)
+    real = r.processor.process_transaction
+
+    def processed(provider, tx, commitment=None, **kw):
+        return real(provider, tx, commitment="processed", **kw)
+    r.processor.process_transaction = processed
+    st = r.run_cycle()
+    assert r.store.get_checkpoint(KEY) is None
+    assert st["state"] == rt.STATE_DEGRADED
+    sig = _row(_tx("create"))["signature"]
+    held = r.store.get_by_signature(sig)
+    assert held and all(not r.store.is_applied(e.event_id) for e in held)
+    assert _applied(r) == 0
+    # The finalized observation arrives (no patch: the runtime's own label).
+    r.processor.process_transaction = real
+    st = r.run_cycle()
+    assert r.store.get_checkpoint(KEY)["last_signature"] == sig
+    assert _applied(r) == 1
+    assert st["state"] == rt.STATE_OK, st
+    assert st["streams"][KEY]["reasons"] == [] and st["streams"][KEY]["gaps"] == []
+    st = r.run_cycle()
+    assert _applied(r) == 1         # never applied twice
+    r.store.close()
+
+
+def test_every_get_transaction_request_names_the_finalized_commitment(tmp_path):
+    """WRITTEN, NOT RUN. The observation label must equal the request, on the
+    signature-recovery path and on the retry-queue refetch path."""
+    chain = Chain([_tx("create"), _tx("buy")])
+    r = _make(tmp_path, chain)
+    r.run_cycle()
+    assert chain.tx_options, "no getTransaction was issued"
+    assert all(o.get("commitment") == rt.TX_COMMITMENT for o in chain.tx_options)
+    n = len(chain.tx_options)
+    sig = _row(_tx("create"))["signature"]
+    obs = r._fetch_observation("evt", sig, None)
+    assert obs["commitment"] == rt.TX_COMMITMENT
+    assert len(chain.tx_options) == n + 1
+    assert chain.tx_options[-1].get("commitment") == rt.TX_COMMITMENT
+    r.store.close()
+
+
+def test_conflicting_commitment_request_is_refused_not_relabelled(tmp_path):
+    """WRITTEN, NOT RUN."""
+    chain = Chain([_tx("create")])
+    r = _make(tmp_path, chain)
+    sig = _row(_tx("create"))["signature"]
+    res = r.rpc_call("getTransaction", [sig, {"encoding": "jsonParsed",
+                                              "commitment": "processed"}])
+    assert res == {"kind": "commitment_mismatch"}
+    assert chain.tx_options == []     # never reached the provider
+    r.store.close()
+
+
+def test_truncated_registry_rebuild_is_never_ok(tmp_path, monkeypatch):
+    """WRITTEN, NOT RUN. A rebuild cut short by REBUILD_LIMIT leaves the
+    registry incomplete: status degraded, reason named, consumer refuses."""
+    chain = Chain([_tx("create"), _tx("buy")])
+    r = _make(tmp_path, chain)
+    assert r.run_cycle()["state"] == rt.STATE_OK
+    r.store.close()
+    monkeypatch.setattr(rt, "REBUILD_LIMIT", 1)
+    r2 = _make(tmp_path, chain)
+    st = r2.run_cycle()
+    assert st["rebuild_truncated"] is True
+    assert "registry_rebuild_truncated" in st["runtime_reasons"]
+    assert st["state"] == rt.STATE_DEGRADED
+    ok, why = rt.intelligence_usable(str(tmp_path), now=st["ts"])
+    assert ok is False and why == "state_" + rt.STATE_DEGRADED
+    r2.store.close()

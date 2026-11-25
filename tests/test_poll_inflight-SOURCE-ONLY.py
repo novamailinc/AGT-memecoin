@@ -81,14 +81,16 @@ check("I24 register on an engine whose lane is unreadable returns False and latc
 good_g = fake(); T.register(good_g)
 check("I25 with a latched registration failure, EVERY lane's commit_refusal refuses (fail closed, flag on), naming the registration failure", "registration failed" in (T.commit_refusal(good_g.LANE) or ""))
 T._REGISTER_FAILED.clear()
-class _Raises:
-    LANE = "lane_reg_boom"
-    @property
-    def _POLL_ABORTS(self): raise RuntimeError("nope")
-r_ = _Raises(); T._REGISTER_FAILED.clear()
-res_ = T.register(r_)
-check("I26 an engine whose abort counter raises on a NAMED lane: register still completes (counter unreadable becomes baseline None, refused at commit), never silent", res_ is True and T.commit_refusal("lane_reg_boom") is not None)
-T._REGISTER_FAILED.clear(); T._ENGINES.pop("lane_reg_boom", None); T._BASELINE.pop("lane_reg_boom", None)
+class _BadCounter(dict):
+    def __getitem__(self, k): raise RuntimeError("abort counter unreadable")
+gb = fake(); gb._POLL_ABORTS = _BadCounter(count=0); T._REGISTER_FAILED.clear()
+res_ = T.register(gb); why_ = T.commit_refusal(gb.LANE)
+check("I26 DIRECT: the abort counter raises at register: register completes (True), baseline is None, and commit_refusal gives the counter reason (%s), not a fault-state reason" % why_,
+      res_ is True and T._BASELINE.get(gb.LANE) is None and why_ is not None and "abort count unreadable" in why_ and GC.fault_active(gb) == (False, None))
+gb2 = fake(); T._REGISTER_FAILED.clear(); T.register(gb2); gb2._POLL_ABORTS = _BadCounter(count=0)
+why2 = T.commit_refusal(gb2.LANE)
+check("I26b DIRECT: counter that becomes unreadable AFTER a good register is refused with the same counter reason (%s)" % why2, why2 is not None and "abort count unreadable" in why2)
+T._REGISTER_FAILED.clear()
 # clear_fault marker handling (evidence key, no_fault bypass, removal after the clear record, and the call of _marker_unchanged at commit) is WRITTEN but NOT end-to-end tested: clear_fault needs a full ledger/account fixture and its commit is disabled; only the _marker_unchanged helper is unit-tested.
 # (evidence key, no_fault bypass, removal after the clear record) is WRITTEN but has NO test here: clear_fault needs a full ledger/account fixture and its commit is disabled.
 print("FAILS: %d" % FAILS); sys.exit(1 if FAILS else 0)

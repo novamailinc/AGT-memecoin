@@ -285,5 +285,10 @@ check("G49 repair vs concurrent append: appender blocks during the repair, log e
 # G50 static: every call of the repair goes through the serialising wrapper; the unlocked body is called only from the wrapper
 callers = [m.start() for m in re.finditer(r"_repair_log_tail_locked\(", gsrc2)]
 check("G50 static: _repair_log_tail_locked is called only inside the _repair_log_tail wrapper (plus its own def)", len(callers) == 2 and gsrc2.index("def _repair_log_tail(") < callers[0] < gsrc2.index("def _repair_log_tail_locked("))
+os.environ[GC.ENV_FLAG] = "1"
+g = fake(closes_t=1, closes_e=2); res, n, rec = T.main_cycle(g, None, scan_for(g), legacy_for(g))
+check("G53 price_fn None (the grad-trader call): exits-first order time_exits -> exits -> scan, price exits NOT skipped, record done (%s, %s)" % (g.calls, rec.get("status")),
+      g.calls == ["time_exits", "exits", "scan"] and rec["status"] == "done" and (rec.get("steps") or {}).get("exits", {}).get("ok") is True and n == 3)
+check("G54 price_fn None: the cycle record carries no no_price_route degradation", rec.get("degraded") != "no_price_route")
 print("FAILS: %d" % FAILS)
 sys.exit(1 if FAILS else 0)

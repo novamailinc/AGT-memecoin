@@ -350,7 +350,9 @@ def main_cycle(engine, price_fn, scan_fn, legacy):
         held["res"] = r
         return r
     try:
-        rec = _gc().run_cycle(grad=engine, price_fn=price_fn, scan_fn=_scan, defer_scan=True)
+        # price_fn None means "the lane's own default price route" (the legacy poll_exits() call): run_cycle needs that stated explicitly, otherwise it SKIPS the
+        # price-exit step ("no_price_route") and refuses entries, which would silently stop price exits for a caller that passes no price_fn.
+        rec = _gc().run_cycle(grad=engine, price_fn=price_fn, scan_fn=_scan, price_route=(None if price_fn is not None else "lane_default"), defer_scan=True)
     except Exception as e:           # run_cycle never raises; an exception is an integration fault: fall back so exits still run
         logger.warning("grad_trader_cycle: run_cycle raised %r; falling back to the direct exit calls", e)
         rec = {"status": "cycle_exception:%r" % (e,)}

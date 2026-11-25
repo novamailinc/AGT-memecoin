@@ -812,6 +812,15 @@ def maybe_verdict_report(engine):
 
 # ---- buyback (dip) rule -----------------------------------------------------
 
+def _buyback_impact_refusal(pa):
+    """Fail-closed price-impact gate for a buyback. Returns a refusal reason (never None today): the owner limit
+    max_price_impact_pct is a Jupiter quote price-impact figure and the model-fill buyback path has no such measurement."""
+    cap = pa.max_price_impact_pct()
+    if cap is None:
+        return "no owner-approved max_price_impact_pct; buyback blocked fail-closed"
+    return ("no Jupiter quote-impact measurement on the model-fill buyback path (owner limit %s%%); buyback blocked fail-closed" % (cap,))
+
+
 def _buyback_due(pos, px, filled, now):
     """Pure buyback decision. Returns (True, cost, tokens) when a
     buyback should fire, else (False, reason, 0). Inputs: the
@@ -907,10 +916,12 @@ def maybe_buyback(engine, now=None):
             # price conditions no longer hold (the account already holds those units and cost); never left as an unexplained residue.
             if not fire and not pos.get("buyback_used") and pos.get("pa_pos_id"):
                 try:
-                    _pa0 = engine._paper_account() if hasattr(engine, "_paper_account") else None
+                    _pa0 = engine._paper_account()
                     _ad0 = _pa0.applied_add("%s:buyback:%s:%s" % (engine.LANE, mint, pos.get("pa_pos_id"))) if _pa0 is not None else None
-                except Exception:
-                    _ad0 = None
+                except Exception as _e0:
+                    # Unknown is never proof of absence: an adoption lookup that cannot be proven skips this position THIS cycle, loudly.
+                    logger.error("tranche buyback %s: adoption lookup failed (%r); position skipped this cycle (unknown != no applied add)", str(mint)[:16], _e0)
+                    continue
                 if _ad0 is not None:
                     fire, cost, tokens, _adopting = True, float(_ad0["stake"]), float(_ad0["qty"]), True
             if not fire:
@@ -949,48 +960,45 @@ def maybe_buyback(engine, now=None):
                 if _pa is None:
                     logger.warning("tranche buyback refused: shared paper account unavailable; fail-closed")
                     continue
-                if True:
-                    if engine._is_sim(live):
-                        logger.warning("tranche buyback refused: simulated-fill position (no reconciled buyback fill path); fail-closed")
+                if engine._is_sim(live):
+                    logger.warning("tranche buyback refused: simulated-fill position (no reconciled buyback fill path); fail-closed")
+                    continue
+                _pid = live.get("pa_pos_id")
+                if not _pid:
+                    logger.warning("tranche buyback refused: position has no account lot id (cannot reconcile); fail-closed")
+                    continue
+                _bop = "%s:buyback:%s:%s" % (engine.LANE, mint, _pid)
+                _applied = _pa.applied_add(_bop)
+                if _applied is not None:
+                    if (_applied.get("lane"), _applied.get("mint"), _applied.get("pos_id")) != (engine.LANE, mint, _pid):
+                        logger.warning("tranche buyback refused: applied account op identity mismatch; fail-closed")
                         continue
-                    _pid = live.get("pa_pos_id")
-                    if not _pid:
-                        logger.warning("tranche buyback refused: position has no account lot id (cannot reconcile); fail-closed")
+                    cost = float(_applied["stake"])
+                    tokens = float(_applied["qty"])
+                    logger.warning("tranche buyback: ADOPTING account-applied add %s (crash recovery)", _bop)
+                else:
+                    _age_why = _eg.quote_age_refusal(_buy_row, _pa.max_data_age_s(), time.time())
+                    if _age_why:
+                        logger.warning("tranche buyback refused: %s", _age_why)
                         continue
-                    _bop = "%s:buyback:%s:%s" % (engine.LANE, mint, _pid)
-                    _applied = _pa.applied_add(_bop)
-                    if _applied is not None:
-                        if (_applied.get("lane"), _applied.get("mint"), _applied.get("pos_id")) != (engine.LANE, mint, _pid):
-                            logger.warning("tranche buyback refused: applied account op identity mismatch; fail-closed")
-                            continue
-                        cost = float(_applied["stake"])
-                        tokens = float(_applied["qty"])
-                        logger.warning("tranche buyback: ADOPTING account-applied add %s (crash recovery)", _bop)
-                    else:
-                        _age_why = _eg.quote_age_refusal(_buy_row, _pa.max_data_age_s(), time.time())
-                        if _age_why:
-                            logger.warning("tranche buyback refused: %s", _age_why)
-                            continue
-                        # POST-QUOTE gate at commit (same function as the entry path): the quote request must still be inside the owner age cap.
-                        _pq = _eg.post_quote_refusal({"provenance": {"quote_requested_at": _q_req}}, None, False,
-                                                     _pa.max_data_age_s(), time.time())
-                        if _pq:
-                            logger.warning("tranche buyback refused: %s", _pq)
-                            continue
-                        # FILL-IMPACT gate: modelled slippage for this size against the owner max_price_impact_pct WHEN one is set. Unknown
-                        # liquidity cannot prove impact, so with a cap set it refuses. (Model-fill entries have no impact gate today; with no
-                        # owner cap set this adds nothing and the figure is only recorded.)
-                        _liq_now = float(getattr(engine, "_LAST_QUOTE_LIQ", 0.0) or 0.0) or float(liq or 0.0)
-                        _impact = engine._fills.slippage_pct(tokens * quoted, _liq_now) if _liq_now > 0 else None
-                        _cap_imp = _pa.max_price_impact_pct()
-                        if _cap_imp is not None and (_impact is None or _impact > float(_cap_imp)):
-                            logger.warning("tranche buyback refused: modelled impact %s%% vs owner max_price_impact_pct %s%% (or liquidity unknown); fail-closed",
-                                           _impact, _cap_imp)
-                            continue
-                        _ok, _why2 = _pa.add_to_position(engine.LANE, mint, _pid, cost, tokens, _bop, ts=now)
-                        if not _ok:
-                            logger.warning("tranche buyback refused by account: %s", _why2)
-                            continue
+                    # POST-QUOTE gate at commit (same function as the entry path): the quote request must still be inside the owner age cap.
+                    _pq = _eg.post_quote_refusal({"provenance": {"quote_requested_at": _q_req}}, None, False,
+                                                 _pa.max_data_age_s(), time.time())
+                    if _pq:
+                        logger.warning("tranche buyback refused: %s", _pq)
+                        continue
+                    # FILL-IMPACT gate (fail-closed). The owner limit max_price_impact_pct is a JUPITER QUOTE price-impact limit; modelled
+                    # slippage is NOT interchangeable with it. Today this model-fill path has NO Jupiter quote-impact measurement, so
+                    # _buyback_impact_refusal always refuses (reason names whether the owner limit is set). A positive buyback needs a real
+                    # Jupiter-quote impact measure wired in there. Entry-side model-fill protection is tracked separately.
+                    _imp = _buyback_impact_refusal(_pa)
+                    if _imp:
+                        logger.warning("tranche buyback refused: %s", _imp)
+                        continue
+                    _ok, _why2 = _pa.add_to_position(engine.LANE, mint, _pid, cost, tokens, _bop, ts=now)
+                    if not _ok:
+                        logger.warning("tranche buyback refused by account: %s", _why2)
+                        continue
                 _open = [k for k in ("a", "b", "c") if not (live.get("legs", {}).get(k) or {}).get("done")]
                 _ofrac = sum(float(live["legs"][k]["frac"]) for k in _open)
                 if not _open or not (_ofrac > 0):

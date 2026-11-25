@@ -146,6 +146,7 @@ def _repair_log_tail(grad):
     try:
         with open(path + ".torn-tails.jsonl", "a") as th:
             th.write(json.dumps({"ts": time.time(), "fragment": frag.decode("utf-8", "replace")[:2000], "bytes": len(frag)}) + "\n"); th.flush(); os.fsync(th.fileno())
+        _REPAIR_HOOK("after_preserve_before_marker")
         mark = (json.dumps({"fault_id": "torn_tail_" + uuid.uuid4().hex, "since": time.time(),
                             "entry": {"reason": "fault_log_torn_tail_repaired", "fragment_bytes": len(frag)}}) + "\n").encode()
         with open(path, "r+b") as fh:

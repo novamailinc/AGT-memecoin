@@ -1,7 +1,7 @@
 """REAL-ENGINE BUYBACK GATE / ADOPTION / LEGACY / FAULT CHECKS (derived from the replay harness rev2; SOURCE ONLY, WRITTEN NOT RUN). Uses the recorded provider responses, the real make_engine, real account, real maybe_buyback; no fake engine; named faults only. Positive model-fill buyback is blocked fail-closed (impact gate) so this file checks refusal, crash ADOPTION, fault refusal and the legacy hold. REAL-STACK REPLAY HARNESS rev2 (SOURCE ONLY, WRITTEN NOT RUN). NO entry-path claim: safety/veto/filler inputs are not captured,
 so _consider_candidate is NOT driven here. Covers (1) real freshness guard functions on a REAL captured tape row with a TIGHT
 env cap, (2) buyback accounting ASSERTIONS on a fixture-seeded position through the real quote path and real account.
-Fixture items are labeled: seeded position/ledger state, TEST-ENGINEERING limits, tight test caps (not policy), replay clock.
+LABEL: the real add_to_position call in the adoption case uses GF.at_cost_marks (FIXTURE marks, engineering only; NOT real-provider mark acceptance). Fixture items are labeled: seeded position/ledger state, TEST-ENGINEERING limits, tight test caps (not policy), replay clock.
 Real code: tranche.make_engine() (grad.py engine), real paper_account (scratch HOME), real entry_guard,
 real commit_barrier, real sources.py parsing. The ONLY substituted layer is the HTTP byte transport
 (sources._curl_bytes), which serves ACTUAL provider response bodies recorded by capture_public.py.

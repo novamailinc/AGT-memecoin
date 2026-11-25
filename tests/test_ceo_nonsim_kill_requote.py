@@ -166,9 +166,11 @@ def child_recover(mult, inject=None, try_entry=None):
     if inject == "different_trigger":
         _orig = C._close_leg   # labelled: the retry fires under a DIFFERENT trigger reason than the recorded one
         C._close_leg = lambda pos, k, px, reason, pkind=None: _orig(pos, k, px, "operator_probe_other_trigger", pkind)
-    et_first = None
+    et_first = None; snap = None
     if try_entry == "tryfirst":   # a NEW entry is attempted BEFORE any exit retry runs in this fresh process
         et_first = repr(C.consider_card(csig("CeoMint2")))[:300]; try_entry = None
+        _e0, _s0, _ = CI._read(CI.journal_path("ceo")); _p0 = (C.open_positions() or {}).get(MINT) or {}
+        snap = {"ev": [e.get("ev") for e in _e0 if e.get("intent_id")], "a_done": bool(_p0.get("legs", {}).get("a", {}).get("done")), "cash": cash(PA)}
     for _ in range(3):
         C.poll_exits(price_fn=pf_mult(float(mult)))
     pos = (C.open_positions() or {}).get(MINT) or {}
@@ -184,7 +186,8 @@ def child_recover(mult, inject=None, try_entry=None):
            "n_intents": len([e for e in ents if e.get("ev") == "intent"]), "pend_why": (pos.get("pending_exit") or {}).get("why"),
            "n_pos": len(C.open_positions() or {}), "hits": HITS["n"], "guard_logs": len(guard),
            "frozen_open": _frozen_open_n(), "freeze_calls": FZC["n"], "rec_logs": len([m for m in LOGS if "has an unusable recorded op" in m]), "entry_blocked": bool(C._ENTRY_BLOCKED), "entry_try": et,
-           "n_pos_all": len(C.open_positions() or {}), "entry_first": et_first,
+           "n_pos_all": len(C.open_positions() or {}), "entry_first": et_first, "snap": snap,
+           "by_intent": [[e.get("intent_id"), e.get("ev"), ((e.get("settle_ops") or [{}])[0].get("op_id") if e.get("ev") == "intent" else None)] for e in ents if e.get("intent_id")],
            "fz_logs": len([m for m in LOGS if "freeze event for" in m or "freeze event was NOT written" in m])}
     print("RESULT " + _json.dumps(res), flush=True)
 
@@ -361,10 +364,23 @@ if r is not None and pre is not None:
     print("  %s PRE %s" % (tag, pre)); print("  %s RESULT %s" % (tag, r))
     # EXISTING contract (unchanged): the lane's own settle is never blocked by an account failure. After the poll the foreign position's leg a is booked in the lane,
     # its NEW intent's account credit is refused (the fixture's foreign pa_pos_id has no account position), so that second intent is FROZEN: divergence visible, entries blocked.
-    check("%s: entry BEFORE any exit poll refused (%r); the pending intent is FROZEN first (ev %r, exactly 2 intents %r, both frozen); no credit for either (cash %r vs %r); the lane booked the foreign leg a (%r) while its new intent is frozen, not silently applied"
-          % (tag, r["entry_first"], r["ev"], r["n_intents"], r["cash"], pre["pre_cash"], r["a_done"]),
-          REFUSAL in str(r["entry_first"]) and r["ev"] == ["intent", "account_applied", "frozen", "intent", "frozen"] and r["n_intents"] == 2
-          and _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is True and r["pending"] == 0 and r["entry_blocked"] is True)
+    sn = r["snap"] or {}
+    check("%s: SNAPSHOT right after the entry refusal and BEFORE any exit poll isolates the original contract: refused (%r), original intent frozen exactly once (ev %r), leg a not closed (%r), cash unchanged (%r vs %r)"
+          % (tag, r["entry_first"], sn.get("ev"), sn.get("a_done"), sn.get("cash"), pre["pre_cash"]),
+          REFUSAL in str(r["entry_first"]) and sn.get("ev") == ["intent", "account_applied", "frozen"] and sn.get("a_done") is False and _cents(sn.get("cash")) == _cents(pre["pre_cash"]))
+    bi = r["by_intent"]; ids = []
+    for _i, _ev, _op in bi:
+        if _i not in ids: ids.append(_i)
+    per = {i_: [ev_ for (j_, ev_, _o) in bi if j_ == i_] for i_ in ids}
+    ops = [o_ for (_i, _ev, o_) in bi if o_]
+    # EXISTING contract (unchanged, open debt): the lane's own settle is never blocked by an account failure. The poll AFTER the refusal closes the foreign instance under a NEW
+    # intent at the current price; the account refuses its unknown pa_pos_id, so that NEW intent is frozen, unresolved divergence (lane booked, account not credited), entries stay blocked.
+    check("%s: per-intent identity: exactly 2 distinct intents %r with events %r; the ORIGINAL intent is not re-applied after the poll (still exactly [intent, account_applied, frozen], no lane_applied/applied); the NEW intent is [intent, frozen] with a different op id (%r), unapplied"
+          % (tag, ids, per, ops),
+          len(ids) == 2 and per[ids[0]] == ["intent", "account_applied", "frozen"] and per[ids[1]] == ["intent", "frozen"] and len(set(ops)) == 2 and r["pending"] == 0)
+    check("%s: no credit for either intent (cash %r vs %r); the lane booked the foreign leg a (%r, realized %r) while its NEW intent is frozen (unresolved divergence, not silently applied); entries stay blocked (%r)"
+          % (tag, r["cash"], pre["pre_cash"], r["a_done"], r["a_realized"], r["entry_blocked"]),
+          _cents(r["cash"]) == _cents(pre["pre_cash"]) and r["a_done"] is True and r["entry_blocked"] is True)
     rc3, err3, pre3, r3 = recover(root, "2.3", None, "tryfirst")
     check("%s: FRESH process: the persisted frozen intent blocks entry BEFORE any exit poll (%r), still the same two frozen intents, no new events (ev %r), nothing credited (cash %r)" % (tag, r3 and r3["entry_first"], r3 and r3["ev"], r3 and r3["cash"]),
           rc3 == 0 and r3 is not None and REFUSAL in str(r3["entry_first"]) and r3["ev"] == r["ev"] and r3["n_intents"] == 2 and _cents(r3["cash"]) == _cents(pre["pre_cash"]) and r3["a_done"] is False)

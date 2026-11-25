@@ -1380,7 +1380,7 @@ def _gate_intent(lane, it, d, status):
     if not (isinstance(_ops, list) and _ops):
         return "freeze", "settle_ops missing or empty", {}
     _suffix = (_int.get("close_info") or {}).get("leg_suffix") if isinstance(_int.get("close_info"), dict) else None
-    _seen = set(); _probs = []; _legacy = []
+    _seen = set(); _probs = []; _legacy = []; _corr = {}
     for _i, _op in enumerate(_ops):
         if not isinstance(_op, dict):
             _probs.append("op[%d] is not a record" % _i); continue
@@ -1407,6 +1407,7 @@ def _gate_intent(lane, it, d, status):
                 _probs.append("op[%d] binding generation %r differs from the intent's recorded account generation %r" % (_i, _bx, _int.get("account_id")))
             for _rec in list((d.get("positions") or {}).values()) + list(d.get("closes") or []):
                 if isinstance(_rec, dict) and _rec.get("pa_pos_id") == pid:
+                    _corr[_i] = True
                     if _rec.get("pa_account_id") != _bx or _rec.get("pa_entry_op") != _be:
                         _probs.append("op[%d] binding %r/%r contradicts the lane ledger's record of %s (%r/%r)" % (_i, _bx, _be, pid, _rec.get("pa_account_id"), _rec.get("pa_entry_op")))
                     break
@@ -1419,6 +1420,9 @@ def _gate_intent(lane, it, d, status):
         elif _k == "write_down":
             if not (isinstance(_op.get("reason"), str) and _op.get("reason").strip()):
                 _legacy.append("op[%d] write_down has no recorded reason (legacy/missing field: held, no reason is invented)" % _i)
+    for _i, _op in enumerate(_ops):
+        if isinstance(_op, dict) and isinstance(_op.get("entry_op_id"), str) and _op.get("entry_op_id") and not _corr.get(_i) and not _probs:
+            _legacy.append("op[%d] entry_op_id %r is not corroborated by any lane ledger position or close record of %s (held, nothing applied, nothing reconstructed)" % (_i, _op.get("entry_op_id"), pid))
     _ids = [o.get("op_id") for o in _ops if isinstance(o, dict) and isinstance(o.get("op_id"), str)]
     _diag = _outcome_diag(_ids)
     _dtxt = ", ".join("%s=%s" % (k, v) for k, v in sorted(_diag.items())) or "no op ids"

@@ -20,6 +20,8 @@ FAILS = []
 def check(n, c):
     print(("PASS " if c else "FAIL ") + n, flush=True)
     if not c: FAILS.append(n)
+def LEDGER(lane, acct, eop):
+    return {"positions": {"GateMint1": {"lane": lane, "mint": "GateMint1", "pa_pos_id": "%s/GateMint1#1" % lane, "pa_account_id": acct, "pa_entry_op": eop}}, "closes": []}
 def ENTRY(lane): return "%s:entry:GateMint1:1700000000000" % lane
 def intent(mod, lane, acct, op_extra):
     mint, pid = "GateMint1", "%s/GateMint1#1" % lane
@@ -33,8 +35,14 @@ from daemon.launch_scanner import momentum_lane as ML
 from daemon.launch_scanner import mirror as MR
 for name, mod, lane in (("momentum", ML, "momentum"), ("mirror", MR, next(iter(getattr(MR, "LANE_BY_CHAIN", {}).values()), "mirror"))):
     d = {"positions": {}, "closes": []}
+    dp = LEDGER(lane, "acct-A", ENTRY(lane))
+    v, why, _ = mod._gate_intent(lane, intent(mod, lane, "acct-A", {"expected_account_id": "acct-A", "entry_op_id": ENTRY(lane)}), dp, "ok")
+    check("%s POSITIVE bound op, non-demo entry id, corroborated by the ledger: verdict is exactly ok (%s: %s)" % (name, v, why[:140]), v == "ok")
+    DEMO = "%s:entry:GateMint1:1700000000000:3" % lane
+    v, why, _ = mod._gate_intent(lane, intent(mod, lane, "acct-A", {"expected_account_id": "acct-A", "entry_op_id": DEMO}), LEDGER(lane, "acct-A", DEMO), "ok")
+    check("%s POSITIVE demo-mode two-segment entry id (demo_fill.intent_id form): verdict is exactly ok (%s: %s)" % (name, v, why[:140]), v == "ok")
     v, why, _ = mod._gate_intent(lane, intent(mod, lane, "acct-A", {"expected_account_id": "acct-A", "entry_op_id": ENTRY(lane)}), d, "ok")
-    check("%s POSITIVE bound op: no binding or extra-field problem (verdict %s: %s)" % (name, v, why[:140]), "carries fields" not in why and "binding" not in why)
+    check("%s NEGATIVE bound op with no ledger position or close to corroborate the entry op is a non-mutating HOLD (%s: %s)" % (name, v, why[:140]), v == "hold" and "not corroborated" in why)
     v, why, _ = mod._gate_intent(lane, intent(mod, lane, "acct-A", {"expected_account_id": "acct-FOREIGN", "entry_op_id": ENTRY(lane)}), d, "ok")
     check("%s NEGATIVE foreign generation is a freeze naming the mismatch (%s: %s)" % (name, v, why[:140]), v == "freeze" and "differs from the intent's recorded account generation" in why)
     v, why, _ = mod._gate_intent(lane, intent(mod, lane, "acct-A", {"expected_account_id": "acct-A"}), d, "ok")

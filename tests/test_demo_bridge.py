@@ -39,7 +39,7 @@ def make_bridge(quote=None, book=None, seed=7, decimals=6, **kw):
     ex = SimulationExecutor(
         jupiter=FakeJupiter(quote if quote is not None else
                             {"outAmount": "2000000",
-                             "priceImpactPct": "0.40"}),
+                             "priceImpactPct": "0.004"}),
         book=book if book is not None else BalanceBook(10**9),
         seed=seed, **kw)
     return DemoExecutionBridge(ex, lambda mint: decimals), ex
@@ -61,7 +61,7 @@ def test_sell_fill_math():
     book = BalanceBook(10**9)
     book.credit(TOK, 2_000_000)  # 2 tokens at 6 decimals
     bridge, ex = make_bridge(
-        quote={"outAmount": "9000000", "priceImpactPct": "0.40"},
+        quote={"outAmount": "9000000", "priceImpactPct": "0.004"},
         book=book, hourly_vol=0.0)
     fill = bridge.sell(TOK, 2.0)
     # Measured out is NET of the 15_000-lamport network fee — exactly
@@ -77,7 +77,7 @@ def test_sell_fill_math():
 
 def test_skips_pass_through_unchanged():
     bridge, _ = make_bridge(quote={"outAmount": "100",
-                                   "priceImpactPct": "9.9"})
+                                   "priceImpactPct": "0.099"})
     try:
         bridge.buy(TOK, 0.01)
         raise AssertionError("expected price_impact_over_cap")
@@ -111,7 +111,7 @@ def test_decimals_unknown_refuses_blind_sell():
     book = BalanceBook(10**9)
     ex = SimulationExecutor(
         jupiter=FakeJupiter({"outAmount": "9000000",
-                             "priceImpactPct": "0.40"}),
+                             "priceImpactPct": "0.004"}),
         book=book, hourly_vol=0.0)
     bridge = DemoExecutionBridge(
         ex, lambda mint: (_ for _ in ()).throw(KeyError(mint)))

@@ -65,6 +65,13 @@ except Exception:
     except Exception:
         _recorder = None
 
+# Cycle wiring (hooks, exits-first main loop, gated entry thread). Fail-soft import, but a missing module with the flag on REFUSES entries (below).
+try:
+    from daemon import grad_trader_cycle as _gtc
+except Exception:
+    _gtc = None
+_FLAG_ON = os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1"
+
 POLL_SECS = 5
 GT_BACKFILL_EVERY_S = 60
 GT_BACKFILL_PAGES = 5
@@ -93,6 +100,13 @@ def main():
         return 1
     engine = _tr.make_engine()
     state = engine.ensure_ledger()
+    # BEFORE any thread (heartbeat, feed, armed watcher, exit poller, entry loop) can call poll_exits; no ledger I/O. No-op unless AGT_GRAD_CYCLE_ENABLED=1.
+    if _gtc is not None:
+        if not _gtc.register(engine):
+            logger.error("tranche cycle hook registration FAILED: entries are refused while AGT_GRAD_CYCLE_ENABLED=1 (exits continue)")
+        logger.warning("tranche cycle wiring: %s", _gtc.startup_report(engine))
+    elif _FLAG_ON:
+        logger.error("tranche cycle flag on but grad_trader_cycle could not be imported: NO ENTRIES (exits only)")
     # Materialize the killswitch lane entry (not halted) so the
     # lane is visible in killswitch status from day one.
     try:
@@ -190,8 +204,22 @@ def main():
             try:
                 q = getattr(feed, "_q", None)
                 if q is not None and not q.empty():
-                    _tr.scan_once(engine, feed=feed, gt_rows=None,
-                                  on_items=_observe, fresh_only=True)
+                    def _fresh():
+                        return _tr.scan_once(
+                            engine, feed=feed, gt_rows=None,
+                            on_items=_observe, fresh_only=True)
+                    if _gtc is None:
+                        if _FLAG_ON:
+                            # flag on, wiring module missing: NEVER scan ungated
+                            logger.warning("tranche entries refused: cycle flag on, wiring missing")
+                            time.sleep(1.0)
+                            continue
+                        _fresh()
+                    else:
+                        _ran, _why, _r = _gtc.entry_scan(engine, _fresh)
+                        if not _ran:
+                            logger.warning("tranche entry scan skipped: %s", _why)
+                            time.sleep(0.2)
                 else:
                     time.sleep(0.1)
             except Exception:
@@ -215,21 +243,44 @@ def main():
             if now - last_gt >= GT_BACKFILL_EVERY_S:
                 last_gt = now
                 gt_rows = engine.fetch_candidates(GT_BACKFILL_PAGES)
-            res = _tr.scan_once(engine, feed=feed, gt_rows=gt_rows,
-                                on_items=_observe)
-            # Time-only exit FIRST: the 24h stop fires on the last
-            # known price with no price read at all, so it works
-            # even when every pricing source is down.
-            closes = engine.poll_time_exits() + engine.poll_exits(_armed_price_fn)
+            def _legacy():
+                # ORIGINAL order (scan, then time-only exit FIRST, then price exits), used whenever the cycle wiring is off.
+                r = _tr.scan_once(engine, feed=feed, gt_rows=gt_rows,
+                                  on_items=_observe)
+                c = engine.poll_time_exits() + engine.poll_exits(_armed_price_fn)
+                return r, len(c)
+            if _gtc is None and _FLAG_ON:
+                logger.warning("tranche entries refused: cycle flag on, wiring missing")
+                closes = (engine.poll_time_exits()
+                          + engine.poll_exits(_armed_price_fn))
+                res, n_closes = {"stream": 0, "opened": 0}, len(closes)
+            elif _gtc is None:
+                res, n_closes = _legacy()
+            else:
+                # EXITS FIRST when the flag is on (main_cycle); flag off: _legacy, the original order.
+                res, n_closes, _rec = _gtc.main_cycle(
+                    engine, _armed_price_fn,
+                    lambda: _tr.scan_once(engine, feed=feed,
+                                          gt_rows=gt_rows,
+                                          on_items=_observe),
+                    _legacy)
             try:
-                buys = _tr.maybe_buyback(engine)
+                # a buyback OPENS a position: it is an entry and must respect the same gate (flag on and not allowed: skipped, visible)
+                _bb_ok = True
+                if _gtc is None and _FLAG_ON:
+                    _bb_ok = False
+                elif _gtc is not None:
+                    _bb_ok, _bb_why = _gtc.entry_allowed(engine)
+                    if not _bb_ok:
+                        logger.warning("tranche buyback skipped: %s", _bb_why)
+                buys = _tr.maybe_buyback(engine) if _bb_ok else []
             except Exception:
                 logger.exception("tranche buyback failed")
                 buys = []
             watcher.set_positions(
                 _aw.armed_positions(engine.open_positions()))
             _tr.maybe_verdict_report(engine)
-            if res.get("opened") or closes or \
+            if res.get("opened") or n_closes or \
                     res.get("tranche_rejected") or buys:
                 st = engine.account_state()
                 logger.warning(
@@ -239,7 +290,7 @@ def main():
                     res.get("stream", 0), res.get("opened", 0),
                     res.get("tranche_rejected", 0),
                     res.get("tranche_reasons") or {},
-                    len(closes), len(buys), st.get("bankroll", 0.0),
+                    n_closes, len(buys), st.get("bankroll", 0.0),
                     st.get("n_open", 0), st.get("state"))
         except Exception:
             logger.exception("tranche-trader loop failed")

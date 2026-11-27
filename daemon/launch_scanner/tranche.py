@@ -80,6 +80,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 
 logger = logging.getLogger("forex_agent.daemon.launch_scanner.tranche")
 
@@ -812,6 +813,102 @@ def maybe_verdict_report(engine):
 
 # ---- buyback (dip) rule -----------------------------------------------------
 
+def _buyback_impact_refusal(pa):
+    """Fail-closed price-impact gate for a buyback. Returns a refusal reason (never None today): the owner limit
+    max_price_impact_pct is a Jupiter quote price-impact figure and the model-fill buyback path has no such measurement."""
+    cap = pa.max_price_impact_pct()
+    if cap is None:
+        return "no owner-approved max_price_impact_pct; buyback blocked fail-closed"
+    return ("no Jupiter quote-impact measurement on the model-fill buyback path (owner limit %s%%); buyback blocked fail-closed" % (cap,))
+
+
+_BB_POSTFILL_REFUSALS = ("refused:post_quote_gate", "refused:fill_economics_invalid", "refused:proceeds_below_actual_debit", "refused:account")
+
+
+def _bb_fingerprint(live, pa, state):
+    """REASON-SPECIFIC state fingerprint for same-condition refusal suppression (no strategy limit, no attempt cap): only the state that
+    can change THIS refusal reason counts, so an unrelated cash move never unblocks a non-cash failure.
+      refused:account                      -> banked proceeds + account cash_spendable (not cash_estimated)
+      refused:proceeds_below_actual_debit  -> banked proceeds
+      refused:post_quote_gate              -> the owner max_data_age_s limit value
+      refused:fill_economics_invalid       -> constant (a deterministic bad fill: only an explicit retry re-attempts)
+    None when the needed account/limit reading is unavailable (then no suppression claim is made)."""
+    try:
+        rz = round(float(live.get("realized_usd") or 0.0), 6)
+        if state == "refused:account":
+            snap = pa.snapshot()
+            if snap is None or snap.get("degraded"):
+                return None
+            return [rz, round(float(snap.get("cash_spendable")), 6)]
+        if state == "refused:proceeds_below_actual_debit":
+            return [rz]
+        if state == "refused:post_quote_gate":
+            v = pa.max_data_age_s()
+            return None if v is None else [float(v)]
+        if state == "refused:fill_economics_invalid":
+            return []
+    except Exception:
+        return None
+    return None
+
+
+def _bb_mark(engine, d, live, state, why=None, fop=None, fp=None):
+    """Persist the buyback INTENT/outcome on the lane position (durable, inside the caller's ledger lock). State machine:
+    quoting (fill op recorded BEFORE the quote) -> filled (quote done, gates passed, BEFORE the account add) -> applied | refused:<why>.
+    A crash leaves the last state, so an orphan fill or an applied add is always explained by a lane record. Prior attempts are kept
+    (last 5). Best effort: a failed write raises to the caller (nothing is applied after a failed pre-fill write)."""
+    it = dict(live.get("buyback_intent") or {})
+    if fop is not None and it.get("fill_op") not in (None, fop):
+        hist = list(live.get("buyback_attempts") or [])
+        hist.append(it)
+        live["buyback_attempts"] = hist[-5:]
+        it = {}
+    if fop is not None:
+        it["fill_op"] = fop
+        it.setdefault("ts", time.time())
+        # COMPLETE durable list of every fill op ever attempted for this position (never truncated; buyback_attempts is only a
+        # convenience tail). Every journaled orphan fill is findable from the lane record.
+        _all = list(live.get("buyback_fill_ops") or [])
+        if fop not in [x.get("fop") for x in _all if isinstance(x, dict)]:
+            _all.append({"fop": fop, "ts": it["ts"]})
+        live["buyback_fill_ops"] = _all
+    if fp is not None:
+        it["fp"] = fp
+    it["state"] = state
+    if why is not None:
+        it["why"] = str(why)[:200]
+    live["buyback_intent"] = it
+    engine._write(d)
+
+
+def _bb_evidence(engine, live, stake, qty):
+    """Adoption evidence: find the journaled fill named by the lane intent and accept it ONLY if its own debit and quantity equal
+    the account's applied add. Returns (status, fill) where status is recovered | no_intent | filler_unavailable | fill_missing |
+    mismatch. The account's numbers stay authoritative in every case; anything but 'recovered' is recorded as missing evidence."""
+    it = live.get("buyback_intent") or {}
+    fop = it.get("fill_op")
+    if not fop:
+        return "no_intent", None
+    try:
+        df = engine._demo_filler()
+    except Exception:
+        df = None
+    if df is None:
+        return "filler_unavailable", None
+    try:
+        fl = df.get_fill(fop)
+    except Exception:
+        return "filler_unavailable", None
+    if not isinstance(fl, dict) or fl.get("status") != "filled" or fl.get("side") != "buy":
+        return "fill_missing", None
+    try:
+        ok = (abs(float(fl["total_debit_usd"]) - float(stake)) <= 1e-6
+              and abs(float(fl["qty_tokens"]) - float(qty)) <= 1e-9 * max(1.0, abs(float(qty))))
+    except Exception:
+        ok = False
+    return ("recovered", fl) if ok else ("mismatch", None)
+
+
 def _buyback_due(pos, px, filled, now):
     """Pure buyback decision. Returns (True, cost, tokens) when a
     buyback should fire, else (False, reason, 0). Inputs: the
@@ -876,8 +973,18 @@ def maybe_buyback(engine, now=None):
         positions = list(positions.values())
     for pos in positions or []:
         try:
+            if engine._legacy_unreconciled_buyback(pos):
+                logger.error("tranche LEGACY UNRECONCILED BUYBACK %s: lane units include bought tokens the shared account never "
+                             "received; its remaining legs may strand (pending_exit account_remaining_qty_mismatch). Detected only: "
+                             "nothing healed, owner ledger untouched; operator resolution required.", str(pos.get("mint") or "?")[:16])
             mint = pos.get("mint") or ""
             chain = pos.get("chain") or CHAIN
+            try:
+                _st_row = engine._fresh_tape(mint)
+                _buy_row = dict(_st_row) if isinstance(_st_row, dict) else None   # the row THIS decision read (freshness gate below)
+            except Exception:
+                _buy_row = None
+            _q_req = time.time()   # observation time of THIS quote request (post-quote age gate at commit)
             quoted = engine.quote_price(chain, mint)
             if not quoted or quoted <= 0:
                 continue
@@ -892,26 +999,218 @@ def maybe_buyback(engine, now=None):
                 filled = quoted
             fire, cost, tokens = _buyback_due(pos, quoted, filled,
                                               now)
+            _adopting = False
+            # CRASH RECOVERY: an account add that was applied before the lane book was written must be adopted even when the
+            # price conditions no longer hold (the account already holds those units and cost); never left as an unexplained residue.
+            if not fire and not pos.get("buyback_used") and pos.get("pa_pos_id"):
+                try:
+                    _pa0 = engine._paper_account()
+                    _ad0 = _pa0.applied_add("%s:buyback:%s:%s" % (engine.LANE, mint, pos.get("pa_pos_id"))) if _pa0 is not None else None
+                except Exception as _e0:
+                    # Unknown is never proof of absence: an adoption lookup that cannot be proven skips this position THIS cycle, loudly.
+                    logger.error("tranche buyback %s: adoption lookup failed (%r); position skipped this cycle (unknown != no applied add)", str(mint)[:16], _e0)
+                    continue
+                if _ad0 is not None:
+                    fire, cost, tokens, _adopting = True, float(_ad0["stake"]), float(_ad0["qty"]), True
             if not fire:
                 continue
-            with engine._ledger_lock():
+            try:
+                from daemon.launch_scanner import entry_guard as _eg
+            except ImportError:
+                import entry_guard as _eg
+            # ledger lock, then (flag on) the cycle FAULT lock held across the guard read AND the write (see entry_guard.commit_barrier). A fault-lock timeout or import failure raises here, is logged by the handler below, and nothing is written (fail closed).
+            with engine._ledger_lock(), _eg.commit_barrier(engine, _eg.ENTRY_FAULT_WAIT_S):
+                # Commit-time mandatory entry gate (a buyback buys tokens: it is an entry). Refusal is visible; exits unaffected.
+                try:
+                    _why = _eg.mandatory_entry_refusal(engine.LANE)
+                except Exception as _e:
+                    _why = "entry guard unavailable (%r)" % (_e,)
+                if _why:
+                    logger.warning("tranche buyback refused at commit: %s", _why)
+                    continue
                 d = engine._read()
                 live = d["positions"].get(mint)
                 if live is None or live.get("buyback_used"):
                     continue
                 # Re-check proceeds on the live record: the
                 # position may have banked or closed since listing.
-                if float(live.get("realized_usd") or 0) < cost:
+                if not _adopting and float(live.get("realized_usd") or 0) < cost:
                     continue
-                live["tokens"] = float(live.get("tokens") or 0) \
-                    + tokens
+                # RECONCILED BUYBACK (root-cause fix): a buyback is an entry. With the shared paper account enabled the cost is
+                # reserved THERE first (same fail-closed admission as an entry: freshness, spendable cash, lane cap, mandatory and
+                # account gates, provider health) with a stable op_id, and the lane book is edited only on success. A refusal leaves
+                # both books untouched. Crash recovery: if the account already applied this op_id (crash before the lane write) the
+                # applied stake/qty are ADOPTED exactly, never re-issued with fresh numbers.
+                # NO fallback: the shared account is the capital authority. mandatory_entry_refusal already refuses when it is
+                # disabled; an engine without an account interface, a None account, or an account that raises is a refusal, never a
+                # lane-only buyback.
+                _pa = engine._paper_account()
+                if _pa is None:
+                    logger.warning("tranche buyback refused: shared paper account unavailable; fail-closed")
+                    continue
+                _sim = bool(engine._is_sim(live))   # a quote-simulation position buys back through the REAL DemoFiller quote path below
+                _pid = live.get("pa_pos_id")
+                if not _pid:
+                    logger.warning("tranche buyback refused: position has no account lot id (cannot reconcile); fail-closed")
+                    continue
+                _bop = "%s:buyback:%s:%s" % (engine.LANE, mint, _pid)
+                _bb_fill, _fop = None, None
+                _applied = _pa.applied_add(_bop)
+                if _applied is not None:
+                    if (_applied.get("lane"), _applied.get("mint"), _applied.get("pos_id")) != (engine.LANE, mint, _pid):
+                        logger.warning("tranche buyback refused: applied account op identity mismatch; fail-closed")
+                        continue
+                    cost = float(_applied["stake"])
+                    tokens = float(_applied["qty"])
+                    _adopting = True   # also when the price conditions still hold (fire True before the lock): evidence recovery must run
+                    logger.warning("tranche buyback: ADOPTING account-applied add %s (crash recovery)", _bop)
+                else:
+                    # SAME-CONDITION SUPPRESSION (no invented attempt limit): after a post-fill refusal the next quote would hit the same
+                    # refusal and journal another orphan fill. Re-attempt only when the banked proceeds or account cash changed, or an
+                    # explicit retry is requested on the lane record. Unknown fingerprint (account unreadable) makes no suppression claim.
+                    _it0 = live.get("buyback_intent") or {}
+                    _fp0 = _bb_fingerprint(live, _pa, _it0.get("state"))
+                    if (_it0.get("state") in _BB_POSTFILL_REFUSALS and _fp0 is not None and _it0.get("fp") == _fp0
+                            and not live.get("buyback_retry_requested")):
+                        logger.warning("tranche buyback suppressed: same-condition refusal (%s) and banked proceeds/account cash unchanged; "
+                                       "no quote, no new fill (set buyback_retry_requested to force)", _it0.get("state"))
+                        continue
+                    live.pop("buyback_retry_requested", None)
+                    # CHEAP PRE-GATE before any quote: the account must hold spendable cash for the planned cost (the account add refuses
+                    # otherwise, after a fill). The exact actual-debit and fee check still runs after the fill.
+                    try:
+                        _snap0 = _pa.snapshot()
+                        _spend = None if (_snap0 is None or _snap0.get("degraded")) else float(_snap0.get("cash_spendable"))
+                    except Exception:
+                        _spend = None
+                    if _spend is not None and _spend < cost:
+                        logger.warning("tranche buyback skipped before quote: account cash_spendable %.6f < planned cost %.6f", _spend, cost)
+                        continue
+                    _age_why = _eg.quote_age_refusal(_buy_row, _pa.max_data_age_s(), time.time())
+                    if _age_why:
+                        logger.warning("tranche buyback refused: %s", _age_why)
+                        continue
+                    # POST-QUOTE gate at commit (same function as the entry path): the quote request must still be inside the owner age cap.
+                    _pq = _eg.post_quote_refusal({"provenance": {"quote_requested_at": _q_req}}, None, False,
+                                                 _pa.max_data_age_s(), time.time())
+                    if _pq:
+                        logger.warning("tranche buyback refused: %s", _pq)
+                        continue
+                    # FILL-IMPACT gate (fail-closed). The owner limit max_price_impact_pct is a JUPITER QUOTE price-impact limit; modelled
+                    # slippage is NOT interchangeable with it. Today this model-fill path has NO Jupiter quote-impact measurement, so
+                    # _buyback_impact_refusal always refuses (reason names whether the owner limit is set). A positive buyback needs a real
+                    # Jupiter-quote impact measure wired in there. Entry-side model-fill protection is tracked separately.
+                    _bb_fill, _fop = None, None
+                    if not _sim:
+                        _imp = _buyback_impact_refusal(_pa)
+                        if _imp:
+                            logger.warning("tranche buyback refused: %s", _imp)
+                            continue
+                    else:
+                        # REAL quote-simulation buyback: the fill comes from the DemoFiller (a real Jupiter V1 quote through the
+                        # sim executor, impact checked against the owner cap on the QUOTE), never from the model fill. The owner cap
+                        # unset or an unavailable filler REFUSES. The fill op id is fresh per attempt: a crash before the account add
+                        # moved no money, so a retry re-quotes; a crash after the add is recovered by the applied-add adoption above
+                        # (the account's own stake/qty are authoritative, never a re-issued fill).
+                        _cap = _pa.max_price_impact_pct()
+                        if _cap is None:
+                            logger.warning("tranche buyback refused: %s", _buyback_impact_refusal(_pa))
+                            continue
+                        try:
+                            _capok = (not isinstance(_cap, bool)) and 0.0 < float(_cap) < float("inf")   # NaN/inf/0/negative: refuse (a NaN cap would never trip the executor's `impact > cap`)
+                        except Exception:
+                            _capok = False
+                        if not _capok:
+                            logger.warning("tranche buyback refused: max_price_impact_pct %r is not a finite positive number; fail-closed", _cap)
+                            continue
+                        try:
+                            _dfl = engine._demo_filler()
+                        except Exception as _de:
+                            logger.warning("tranche buyback refused: demo filler unavailable (%r); fail-closed", _de)
+                            continue
+                        if _dfl is None:
+                            logger.warning("tranche buyback refused: quote-simulation filler unavailable; fail-closed")
+                            continue
+                        _fop = "%s:fill:%s" % (_bop, uuid.uuid4().hex)   # globally unique: a collision could replay another attempt's fill
+                        # DURABLE INTENT BEFORE THE QUOTE: the fill op is on the lane record before any journal fill exists, so an
+                        # orphan fill or a crash is always explained and the adoption path can find the evidence. A failed write
+                        # raises (outer handler): no quote was taken.
+                        _bb_mark(engine, d, live, "quoting", fop=_fop)
+                        try:
+                            _bb_fill = _dfl.buy(_fop, mint, cost, _cap)
+                        except Exception as _fe:
+                            _w = "demo fill failed (%s: %s)" % (type(_fe).__name__, getattr(_fe, "reason", None) or str(_fe)[:120])
+                            logger.warning("tranche buyback refused: %s; nothing applied", _w)
+                            _bb_mark(engine, d, live, "refused:no_fill", _w)
+                            continue
+                        _pq2 = _eg.post_quote_refusal(_bb_fill, None, False, _pa.max_data_age_s(), time.time())
+                        if _pq2:
+                            logger.warning("tranche buyback refused: %s", _pq2)
+                            _bb_mark(engine, d, live, "refused:post_quote_gate", _pq2, fp=_bb_fingerprint(live, _pa, "refused:post_quote_gate"))
+                            continue
+                        try:
+                            _bst = float(_bb_fill["total_debit_usd"]); _bqty = float(_bb_fill["qty_tokens"]); _bpx = float(_bb_fill["price_usd"])
+                        except Exception:
+                            _bst = _bqty = _bpx = 0.0
+                        if not all(0 < v < float("inf") for v in (_bst, _bqty, _bpx)):
+                            logger.warning("tranche buyback refused: fill economics invalid; nothing applied")
+                            _bb_mark(engine, d, live, "refused:fill_economics_invalid", fp=_bb_fingerprint(live, _pa, "refused:fill_economics_invalid"))
+                            continue
+                        if float(live.get("realized_usd") or 0) < _bst:
+                            logger.warning("tranche buyback refused: banked proceeds below the actual fill debit; nothing applied")
+                            _bb_mark(engine, d, live, "refused:proceeds_below_actual_debit", fp=_bb_fingerprint(live, _pa, "refused:proceeds_below_actual_debit"))
+                            continue
+                        cost, tokens, filled = _bst, _bqty, _bpx
+                        _bb_mark(engine, d, live, "filled")   # BEFORE the account add: a crash now is 'filled, add outcome unknown'
+                    _ok, _why2 = _pa.add_to_position(engine.LANE, mint, _pid, cost, tokens, _bop, ts=now)
+                    if not _ok:
+                        logger.warning("tranche buyback refused by account: %s", _why2)
+                        if _bb_fill is not None:
+                            _bb_mark(engine, d, live, "refused:account", _why2, fp=_bb_fingerprint(live, _pa, "refused:account"))
+                        continue
+                _open = [k for k in ("a", "b", "c") if not (live.get("legs", {}).get(k) or {}).get("done")]
+                _ofrac = sum(float(live["legs"][k]["frac"]) for k in _open)
+                if not _open or not (_ofrac > 0):
+                    # no leg left to sell the bought units: with an account add this cannot happen (buyback needs a banked leg and
+                    # an open position), so it is an inconsistency: leave the lane untouched and say so loudly.
+                    logger.error("tranche buyback: no open leg to carry the bought units (account add may already be applied); lane left unchanged")
+                    if _bb_fill is not None:
+                        _bb_mark(engine, d, live, "account_applied_lane_unchanged:no_open_leg")
+                    continue
+                for _k in _open:
+                    _lg = live["legs"][_k]
+                    _lg["buyback_qty"] = float(_lg.get("buyback_qty") or 0.0) + tokens * float(_lg["frac"]) / _ofrac
+                live["buyback_qty_total"] = float(live.get("buyback_qty_total") or 0.0) + tokens
                 live["realized_usd"] = round(
                     float(live.get("realized_usd") or 0) - cost, 6)
                 live["buyback_used"] = True
+                _it = dict(live.get("buyback_intent") or {})
+                _it["state"] = "applied"
+                live["buyback_intent"] = _it
                 ef = live.setdefault("entry_features", {})
                 ef["buyback"] = {
                     "ts": now, "price": filled, "tokens": tokens,
                     "cost": round(cost, 6)}
+                if _adopting:
+                    # crash recovery: the account's own stake/qty are authoritative (never re-issued). Fill evidence is recovered
+                    # from the journal ONLY when the lane intent names a fill whose debit and qty equal the applied add; otherwise the
+                    # record says exactly what is missing (never "complete").
+                    _evs, _evf = _bb_evidence(engine, live, cost, tokens)
+                    ef["buyback"]["adopted_from_account"] = True
+                    ef["buyback"]["fill_evidence"] = _evs
+                    if _evf is not None:
+                        _bb_fill, _fop = _evf, (live.get("buyback_intent") or {}).get("fill_op")
+                        try:
+                            filled = float(_evf["price_usd"])   # the fill's own price, not the model's
+                        except Exception:
+                            pass
+                    else:
+                        logger.error("tranche buyback ADOPTED without fill evidence (%s): account numbers kept, provenance unavailable", _evs)
+                if _bb_fill is not None:
+                    ef["buyback"].update({"execution_source": _bb_fill.get("execution_source"), "fill_op": _fop,
+                                          "fee_usd": _bb_fill.get("fee_usd"), "signature": _bb_fill.get("signature"),
+                                          "synthetic_signature": _bb_fill.get("synthetic_signature"),
+                                          "provenance": _bb_fill.get("provenance")})
                 engine._write(d)
             done.append({"mint": mint, "symbol": pos.get("symbol"),
                          "price": filled, "tokens": tokens,

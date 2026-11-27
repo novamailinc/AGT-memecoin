@@ -83,6 +83,8 @@ class DemoExecutionBridge:
             "signature": res["signature"],
             "latency_move_pct": res.get("latency_move_pct"),
             "price_impact_pct": res.get("price_impact_pct"),
+            "price_impact_unit": res.get("price_impact_unit"),
+            "price_impact_raw": res.get("price_impact_raw"),
             "raw": res,
         }
 
@@ -115,5 +117,7 @@ class DemoExecutionBridge:
             "signature": res["signature"],
             "latency_move_pct": res.get("latency_move_pct"),
             "price_impact_pct": res.get("price_impact_pct"),
+            "price_impact_unit": res.get("price_impact_unit"),
+            "price_impact_raw": res.get("price_impact_raw"),
             "raw": res,
         }

@@ -471,6 +471,10 @@ except Exception:
     pass
 _tmpD = tempfile.mkdtemp(prefix="smart-select-deferred-")
 engD.LEDGER_PATH = os.path.join(_tmpD, "smart_select_ledger.json")
+# DISCLOSED TEST EDIT (legacy-unknown-marks hook): engD starts a FRESH lane ledger, but the shared account still holds the
+# earlier engine's smart_select positions: "account position the lane books do not know", which the hook fails closed on.
+# Reset the account together with the new lane ledger so the pair is consistent.
+import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 engD.ensure_ledger()
 with engD._ledger_lock():
     d = engD._read()
@@ -709,6 +713,10 @@ try:
 finally:
     restore()
 
+# DISCLOSED TEST EDIT (legacy-unknown-marks hook): the deferred section ran on engD's own ledger; the sections below go back
+# to `eng` and its ledger, which do not know engD's account positions. Reset the account with the engine switch so the pair
+# is consistent (eng's own ledger positions are re-created by the sections that use them).
+import shutil as _shl2; _shl2.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 # ---------------- standard ladder exits ----------------
 # Drive MINT_P to 4x: legs A (2x) and B (3x) fire, leg C peaks 4x.
 px = {"v": 0.004}

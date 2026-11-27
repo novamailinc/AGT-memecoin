@@ -194,18 +194,28 @@ pos["last_liquidity"] = 30000.0
 fake = FakeEngine({"positions": {"TESTMINT": pos}, "closes": [],
                    "created_ts": NOW - 3600})
 buys = T.maybe_buyback(fake, NOW)
-check("tranche: buyback executes once", len(buys) == 1)
+# RECONCILED BUYBACK (bb3 root-cause fix): a buyback is an entry through
+# the shared paper account + the real DemoFiller quote path. The old
+# lane-only model fill is GONE by design ("NO fallback ... never a
+# lane-only buyback"): an engine without the account interface gets NO
+# buyback at all, however eligible the position looks. The positive
+# path is covered by tests/test_tranche_buyback_demofill.py (real
+# account + real DemoFiller, passing). These checks assert the
+# fail-closed side: the stub engine books nothing and mutates nothing.
+check("tranche: no lane-only buyback without the account interface",
+      buys == [])
 live = fake.d["positions"]["TESTMINT"]
-check("tranche: buyback grows tokens",
-      abs(live["tokens"] - 1250000.0) < 1e-6)
-check("tranche: buyback spends proceeds",
-      live["realized_usd"] < 10.0)
-check("tranche: buyback flagged used", live["buyback_used"] is True)
-check("tranche: buyback stamped on entry_features",
-      "buyback" in live.get("entry_features", {}))
+check("tranche: refused buyback leaves tokens untouched",
+      live["tokens"] == 1000000.0)
+check("tranche: refused buyback leaves proceeds untouched",
+      live["realized_usd"] == 10.0)
+check("tranche: refused buyback not flagged used",
+      live.get("buyback_used") is not True)
+check("tranche: refused buyback stamps nothing on entry_features",
+      "buyback" not in live.get("entry_features", {}))
 T._LAST_BUYBACK_CHECK = 0.0
 buys2 = T.maybe_buyback(fake, NOW)
-check("tranche: buyback never repeats", buys2 == [])
+check("tranche: buyback never repeats (still refused)", buys2 == [])
 
 # Regression (2026-10-30): the real grad engine's open_positions()
 # returns {mint: position}, not a list. Iterating the dict fed mint
@@ -223,9 +233,9 @@ pos3["last_liquidity"] = 30000.0
 fake3 = DictFakeEngine({"positions": {"TESTMINT": pos3}, "closes": [],
                         "created_ts": NOW - 3600})
 buys3 = T.maybe_buyback(fake3, NOW)
-check("tranche: buyback works with dict-shaped positions",
-      len(buys3) == 1 and fake3.d["positions"]["TESTMINT"].get(
-          "buyback_used") is True)
+check("tranche: dict-shaped positions also refuse without the account interface",
+      buys3 == [] and fake3.d["positions"]["TESTMINT"].get(
+          "buyback_used") is not True)
 
 # ---- deadline verdict (fake engine) ---------------------------------------
 # Profitable sample at the deadline -> SURVIVED, no halt.

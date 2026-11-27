@@ -205,7 +205,7 @@ class FakeJup:
         # buy: price 0.00001 SOL/token (dec 6): tokens = amount_lamports/1e9/1e-5 ; sell mirrors with self.mult
         if inp == SOLM: o = int(amount / 1e9 / 0.00001 * 1e6 * self.bmult)
         else: o = int(amount / 1e6 * 0.00001 * self.mult * 1e9)
-        return {"outAmount": str(o), "priceImpactPct": 0.4, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
+        return {"outAmount": str(o), "priceImpactPct": 0.004, "routePlan": [{"swapInfo": {"label": "FakeAMM"}}]}
 
 JUP = FakeJup()
 def new_filler():
@@ -233,6 +233,12 @@ check("position records execution_source jupiter_quote_sim and a synthetic signa
 check("tokens come from the QUOTE (1 USD @ $100/SOL, 1e-5 SOL/token => ~99.85 tokens), not the paper fill model",
       abs(pos.get("tokens", 0) - (1.0 - 0.0015) / 100.0 / 0.00001) < 0.01)
 check("quote was requested for the real notional in lamports (not scaled)", JUP.calls and JUP.calls[0][2] == int(round(1.0 / 100.0 * 1e9)) - 15000)
+
+_pv = ex.get("provenance") or {}
+check("propagation (real DemoFiller -> grad entry -> persisted position): provenance carries the percent_v2 stamp, true-percent pct (0.4 from ratio 0.004) and the RAW quote value 0.004",
+      _pv.get("price_impact_unit") == "percent_v2" and abs((_pv.get("price_impact_pct") or 0) - 0.4) < 1e-9 and _pv.get("price_impact_raw") == 0.004)
+check("propagation: the impact fields are NOT at the top level of the persisted execution record (they live in provenance; top-level reads would find nothing)",
+      "price_impact_unit" not in ex and "price_impact_pct" not in ex)
 
 # B. exit leg A: proceeds are the quote sim's. grad now credits the shared account PER LEG (tranche_credit), and the final
 #    close credits only the remainder, so cash rises by leg A's sim net after leg A and by the sum of all sims' nets after the close.

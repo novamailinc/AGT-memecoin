@@ -205,22 +205,53 @@ class LogicalEvent(object):
         if provider not in owners:
             owners.append(provider)
 
+    @staticmethod
+    def observation_commitment(observation):
+        """Normalised commitment of one stored/serialised observation.
+
+        Only the three known commitment strings count. A missing, null or
+        unknown value (legacy or hand-built records) is None: it never
+        counts as confirmed, and all such values share one dedup bucket so
+        the observation list stays bounded."""
+        value = observation.get("commitment")
+        if value in (LIFECYCLE_PROCESSED, LIFECYCLE_CONFIRMED,
+                     LIFECYCLE_FINALIZED):
+            return value
+        return None
+
     def add_observation(self, observation):
-        """Attach one provider observation (deduped by provider+kind).
+        """Attach one provider observation (deduped by provider + kind +
+        commitment).
 
         Returns True when the observation was new, False when an
-        identical provider observation was already recorded.
+        identical provider observation at the same commitment was already
+        recorded. The same provider reporting the same transaction at a
+        different commitment is new information (a held event can be
+        promoted by its own provider's later finalized observation); at
+        most three records per provider+kind (plus one for legacy records
+        without a known commitment) are ever kept.
         """
         provider = observation.get("provider")
         kind = observation.get("kind")
+        commitment = self.observation_commitment(observation)
         for existing in self.observations:
             if existing.get("provider") == provider \
-                    and existing.get("kind") == kind:
+                    and existing.get("kind") == kind \
+                    and self.observation_commitment(existing) == commitment:
                 return False
         self.observations.append(dict(observation))
         if provider and provider not in self.providers:
             self.providers.append(provider)
         return True
+
+    def has_confirmed_verified_observation(self):
+        """True when an observation whose OWN commitment is confirmed or
+        finalized was decoded as verified. A verdict reached at a weaker
+        commitment is never borrowed by a later, stronger observation."""
+        return any(
+            o.get("decoder_validation") == "verified"
+            and self.observation_commitment(o) in CONFIRMED_LIFECYCLES
+            for o in self.observations)
 
     def add_disagreement(self, field, values_by_provider):
         """Record a cross-provider disagreement (never resolved

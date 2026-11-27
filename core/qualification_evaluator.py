@@ -408,6 +408,11 @@ def _bps(a, b):
     return (a / b - 1.0) * 1e4
 
 
+def _impact_ok(t):
+    v = t.get("price_impact_pct")
+    return t.get("price_impact_unit") == "percent_v2" and _num(v) and v >= 0
+
+
 def execution_quality(trades, attempts):
     """Entry/exit slippage vs quote, price impact, failed-execution and exit-completion rates,
     time-to-enter/exit. attempts: list of {kind: entry|exit, ok: bool, reason: str}."""
@@ -421,8 +426,14 @@ def execution_quality(trades, attempts):
            if _num(t.get("deterioration_detected_ts")) and t["deterioration_detected_ts"] >= t["entry_ts"]]
     return {
         "entry_slippage_bps_mean": mean(ent), "exit_slippage_bps_mean": mean(ext),
-        "price_impact_pct_mean": mean([t["price_impact_pct"] for t in trades]),
-        "price_impact_pct_max": max(t["price_impact_pct"] for t in trades),
+        # Unit versioning: only records stamped price_impact_unit == "percent_v2" with a finite, non-negative value hold usable true percent.
+        # Anything else (unstamped legacy ratio-under-_pct, unknown unit, stamped-but-None/NaN/inf/negative) is NOT EVALUABLE: excluded from
+        # mean/max and COUNTED, and evaluate() records an unsupported metric so the verdict can never reach PASSED on partial impact evidence.
+        "price_impact_pct_mean": mean([t["price_impact_pct"] for t in trades if _impact_ok(t)]),
+        "price_impact_pct_max": max([t["price_impact_pct"] for t in trades if _impact_ok(t)], default=None),
+        "price_impact_evaluable_trades": sum(1 for t in trades if _impact_ok(t)),
+        "price_impact_legacy_unit_trades": sum(1 for t in trades if t.get("price_impact_unit") != "percent_v2"),
+        "price_impact_stamped_invalid_trades": sum(1 for t in trades if t.get("price_impact_unit") == "percent_v2" and not _impact_ok(t)),
         "failed_execution_rate": (sum(1 for a in attempts if not a["ok"]) / len(attempts)) if attempts else None,
         "exit_completion_rate": (sum(1 for a in xa if a["ok"]) / len(xa)) if xa else None,
         "entry_attempts": len(ea), "exit_attempts": len(xa),
@@ -497,6 +508,10 @@ def evaluate(trades, gates, evidence, start_capital, seed, attempts=None, ablati
         unsupported.append("time_to_recognize_deterioration:no_deterioration_samples")
     if eq["exit_completion_rate"] is None:
         unsupported.append("exit_completion_rate:no_exit_attempts")
+    if not trades or eq["price_impact_evaluable_trades"] != len(trades):
+        unsupported.append("price_impact:not_evaluable:evaluable=%d_of_%d_legacy_or_unstamped=%d_stamped_invalid=%d"
+                           % (eq["price_impact_evaluable_trades"], len(trades), eq["price_impact_legacy_unit_trades"],
+                              eq["price_impact_stamped_invalid_trades"]))
     # Ablation needs verifiable paired family-masked replay (same input digest, timestamps and
     # strategy version) that this module cannot re-derive. Caller-supplied verdicts are assertions,
     # not evidence: ignored here, so a positive verdict is unreachable until such a verifier exists.

@@ -355,7 +355,7 @@ class DemoFiller:
                                 self._jup.last or {})
         return self._save(op_id, fill)
 
-    def sell(self, op_id, mint, qty_tokens, impact_cap_pct, slippage_bps=100):
+    def sell(self, op_id, mint, qty_tokens, impact_cap_pct, slippage_bps=100, meta=None):
         rec = self._existing(op_id)
         if rec is not None:
             return rec
@@ -374,6 +374,8 @@ class DemoFiller:
         fill = self._build_fill(op_id, "sell", mint, res, {"qty_tokens": float(qty_tokens),
                                 "total_fee": total_fee, "dec": dec, "asof": asof, "px": px},
                                 self._jup.last or {})
+        if meta:
+            fill["intent"] = dict(meta)   # original reason/kind/legs/ts: durable atomically WITH the fill (no crash window)
         return self._save(op_id, fill)
 
     def _build_fill(self, op_id, side, mint, res, c, q, reconciled=False):
@@ -476,6 +478,8 @@ class DemoFiller:
             "in_amount": int(res["in_amount"]), "out_amount": int(res["out_amount"]),
             "quote_out_amount": res.get("quote_out_amount"), "decimals": dec,
             "price_impact_pct": res.get("price_impact_pct"),
+            "price_impact_unit": res.get("price_impact_unit"),
+            "price_impact_raw": res.get("price_impact_raw"),
             "route": _route_labels(q.get("quote")),
             "quote_requested_at": q.get("requested_at"), "quote_received_at": q.get("received_at"),
             "slippage_bps": q.get("slippage_bps"),

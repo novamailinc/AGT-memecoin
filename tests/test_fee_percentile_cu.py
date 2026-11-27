@@ -394,7 +394,7 @@ class _FakeJupiter:
     def __init__(self, kp, quote=None):
         self._kp = kp
         self._quote = quote or {
-            "outAmount": "1000000", "priceImpactPct": "0.5"}
+            "outAmount": "1000000", "priceImpactPct": "0.005"}
 
     def get_quote(self, input_mint, output_mint, amount,
                   slippage_bps=100):

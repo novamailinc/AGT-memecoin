@@ -1221,7 +1221,13 @@ class LaunchScanner(Daemon):
         pp = getattr(self, "_pumpportal", None)
         if pp is None:
             return
-        for c in pp.drain():
+        _pp_items = pp.drain()
+        try:     # DISABLED by default: no-op unless AGT_GRAD_FEED_SPOOL names a spool file. Hand-off BEFORE the loop so a SIGTERM break below cannot drop
+            from daemon import grad_feed_spool as _gfs  # noqa: PLC0415   items for the grad lane. Never raises, never blocks the pipeline.
+            _gfs.spool_from_env(_pp_items)
+        except Exception:
+            logger.exception("grad feed spool hand-off failed (ignored)")
+        for c in _pp_items:
             if getattr(self, "_stop", False):
                 logger.warning("pumpportal drain stopping on SIGTERM — "
                                "remaining queued detections wait for the "

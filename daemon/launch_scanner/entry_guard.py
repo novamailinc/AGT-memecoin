@@ -49,7 +49,42 @@ def mandatory_entry_refusal(lane):
     if unset:
         return ("mandatory entry guard: no owner-approved limit for %s; "
                 "entries blocked fail-closed" % ", ".join(unset))
+    # Commit-time cycle fault check (R1). Flag off: nothing below runs. Flag on: a registered lane with an unresolved fault refuses, and a broken
+    # import refuses (fail closed). Fault files only; no ledger lock is taken here (the caller already holds the lane ledger lock).
+    if os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1":
+        try:
+            try:
+                from daemon import grad_trader_cycle as _gtc
+            except ImportError:
+                import grad_trader_cycle as _gtc
+            _why = _gtc.commit_refusal(lane)
+        except Exception:
+            return ("mandatory entry guard: cycle fault check unavailable with "
+                    "AGT_GRAD_CYCLE_ENABLED=1; entries blocked fail-closed")
+        if _why:
+            return "mandatory entry guard: " + _why
     return None
+
+
+ENTRY_ACCOUNT_WAIT_S = 0.5   # bound on the ACCOUNT flock ACQUIRE inside the entry commit barrier (paper_account.bounded_lock_wait); I/O inside the account critical section is not bounded
+ENTRY_FAULT_WAIT_S = 0.5   # entry commits hold the LANE LEDGER LOCK while waiting: keep the wait short; a timeout REFUSES the entry (fail closed) instead of delaying exits behind it
+
+
+def commit_barrier(engine, wait_s=None):
+    """Context manager for an entry-like ledger commit that does not go through the opener (the tranche buyback). Flag off: a no-op. Flag on: the cycle's
+    cross-thread/cross-process FAULT LOCK (grad_cycle._fault_lock: a leaf lock, reentrant per thread, bounded acquire). Take it INSIDE the lane ledger lock
+    (documented order ledger -> fault, the same as the poll-abort hook) and hold it across BOTH the mandatory_entry_refusal read and the ledger write: every
+    fault writer holds the same lock for its whole write, so a fault is either fully recorded before the guard reads it, or is recorded only after this
+    commit finished. A lock timeout or an import failure RAISES, and the caller must treat that as a refusal (fail closed). The guard's own fault reads
+    may re-enter the lock safely (reentrant). It never takes the cycle or ledger lock."""
+    import contextlib
+    if os.environ.get("AGT_GRAD_CYCLE_ENABLED") != "1":
+        return contextlib.nullcontext()
+    try:
+        from daemon import grad_cycle as _gcb
+    except ImportError:
+        import grad_cycle as _gcb
+    return _gcb._fault_lock(engine, wait_s)
 
 
 def unrouted_opener_refusal(lane):

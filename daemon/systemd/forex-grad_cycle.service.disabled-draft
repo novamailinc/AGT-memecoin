@@ -1,0 +1,16 @@
+# DRAFT, NOT INSTALLED, NOT PART OF forex-agent.target. Authored for review only: installing or enabling it is a separate human decision.
+# The driver does nothing unless AGT_GRAD_CYCLE_ENABLED=1, and refuses unless the lane is in DEMO (simulated) mode.
+[Unit]
+Description=Forex agent grad_cycle (SIM lane cycle driver, DISABLED DRAFT)
+After=network.target
+
+[Service]
+Type=simple
+User=forex
+WorkingDirectory=/opt/forex-agent
+Environment=FOREX_AGENT_HOME=/var/lib/forex-agent
+Environment=AGT_GRAD_CYCLE_ENABLED=0
+ExecStart=/usr/bin/python3 -m daemon.grad_cycle
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30

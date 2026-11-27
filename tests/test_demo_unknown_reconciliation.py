@@ -22,7 +22,7 @@ from broker import OrderRequest
 
 MINT = "BonkMint111111111111111111111111111111111111"
 DEC = 6
-QUOTE = {"outAmount": "49000000000", "priceImpactPct": "0.40"}
+QUOTE = {"outAmount": "49000000000", "priceImpactPct": "0.004"}
 
 
 class FakeMarket(MemecoinMarketData):

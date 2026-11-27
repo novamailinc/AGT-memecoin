@@ -207,6 +207,16 @@ def main():
                        "(pass --arm to enable live sends)")
     engine = _live.make_live_engine(home, executor)
     state = engine.ensure_ledger()
+    # HOOK REGISTRATION ONLY (no main_cycle: the cycle never drives a non-simulated lane, grad_trader_cycle.mode_info 'off_non_demo'). Before any thread; no ledger
+    # I/O; a no-op unless AGT_GRAD_CYCLE_ENABLED=1. Flag on: an exit-step abort leaves a write-ahead marker / durable fault and entries refuse; exits are never gated.
+    try:
+        from daemon import grad_trader_cycle as _gtc
+        if not _gtc.register(engine):
+            logger.error("grad-select-live cycle hook registration FAILED: entries are refused while AGT_GRAD_CYCLE_ENABLED=1 (exits continue)")
+        logger.warning("grad-select-live cycle hooks: %s", _gtc.startup_report(engine))
+    except Exception as e:
+        if os.environ.get("AGT_GRAD_CYCLE_ENABLED") == "1":
+            logger.error("grad-select-live cycle flag on but hook wiring unavailable (%r): entry_guard refuses entries fail-closed", e)
     # Materialize the killswitch lane entry (not halted) so the
     # lane is visible in killswitch status from day one.
     try:

@@ -172,6 +172,63 @@ def remote_tree(owner: str, repo: str, branch: str):
     return entries, tree_sha, commit_sha
 
 
+# tools/phone-test is a FROZEN, UNQUALIFIED live-wallet (Termux) bundle that is maintained outside this repo and carries older execution
+# semantics (e.g. quote price impact compared as percent without ratio conversion). It must never be synced by default, and because this
+# push MIRRORS (remote paths absent locally are deleted) omitting it must not delete or silently replace the remote copy either.
+UNQUALIFIED_PREFIXES = ("tools/phone-test/",)
+ALLOW_UNQUALIFIED_ENV = "AGT_ALLOW_UNQUALIFIED_PHONE_BUNDLE"
+
+
+def _norm_dest(path: str):
+    """Normalize a repo path/destination: backslashes -> '/', collapse '//' and '.', resolve '..' (a path that escapes or climbs is returned as
+    None = refuse), strip leading '/', casefold. Returns the normalized string ('' for the repo root) or None when unresolvable."""
+    import posixpath
+    p = str(path).replace("\\", "/")
+    parts = [x for x in p.split("/") if x not in ("", ".")]
+    if ".." in parts:
+        return None
+    return posixpath.normpath("/".join(parts)).casefold() if parts else ""
+
+
+def _is_unqualified(path: str) -> bool:
+    n = _norm_dest(path)
+    if n is None:
+        return True            # unresolvable path: treat as unqualified (refuse / preserve)
+    return any(n == x.rstrip("/") or n.startswith(x) for x in UNQUALIFIED_PREFIXES)
+
+
+def _is_ancestor_of_unqualified(path: str) -> bool:
+    n = _norm_dest(path)
+    return n is not None and any(x.rstrip("/").startswith(n + "/") or n == "" for x in UNQUALIFIED_PREFIXES) and not _is_unqualified(path)
+
+
+def guard_extras(extras, environ):
+    """Refuse an --extra whose destination is under an unqualified prefix unless explicitly allowed. Returns None, or an error string."""
+    if environ.get(ALLOW_UNQUALIFIED_ENV) == "1":
+        return None
+    for spec in extras:
+        src, _, dest = spec.partition(":")
+        if _norm_dest(dest) is None:
+            return "refusing --extra %r: destination cannot be normalized (contains '..')" % spec
+        if _is_ancestor_of_unqualified(dest) and os.path.isdir(src):
+            for _dp, _dn, _fn in os.walk(src):
+                if any(d.casefold() == "phone-test" for d in _dn):
+                    return "refusing --extra %r: destination is a parent of tools/phone-test and the source contains a phone-test directory" % spec
+        if dest and _is_unqualified(dest):
+            return ("refusing --extra %r: %s is an unqualified frozen live-wallet bundle; set %s=1 only after it is qualified"
+                    % (spec, dest, ALLOW_UNQUALIFIED_ENV))
+    return None
+
+
+def guard_mirror(deleted, changed, environ):
+    """Under the default guard, remote paths under an unqualified prefix are left untouched: never deleted, never overwritten.
+    Returns (deleted, changed, preserved_count)."""
+    if environ.get(ALLOW_UNQUALIFIED_ENV) == "1":
+        return deleted, changed, 0
+    keep = [p for p in deleted if _is_unqualified(p)]
+    return ([p for p in deleted if not _is_unqualified(p)], [p for p in changed if not _is_unqualified(p)], len(keep))
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args or "-h" in args or "--help" in args:
@@ -227,6 +284,9 @@ def main() -> int:
                 raise
             print(f"repo {owner}/{repo} exists")
 
+    _err = guard_extras(extras, os.environ)
+    if _err:
+        raise SystemExit(_err)
     local = collect_files(root)
     for spec in extras:
         src, _, dest = spec.partition(":")
@@ -292,6 +352,11 @@ def main() -> int:
             print(f"no changes vs {owner}/{repo}@{branch}; nothing to push")
             return 0
 
+    deleted, changed, _kept = guard_mirror(deleted, changed, os.environ)
+    if _kept or not os.environ.get(ALLOW_UNQUALIFIED_ENV):
+        print(f"NOTICE: tools/phone-test is NOT part of this sync (unqualified frozen live-wallet bundle); remote copy left untouched ({_kept} remote paths preserved). This is NOT a complete phone release.")
+    if not changed and not deleted:
+        print("nothing to push after guard"); return 0
     print(f"{len(changed)} changed/new, {len(deleted)} deleted")
     if dry_run:
         for p in sorted(changed):

@@ -78,6 +78,39 @@ def _post_json(url: str, payload: Dict[str, Any],
                           ) from exc
 
 
+def quote_price_impact_pct(quote: Any) -> float:
+    """Price impact of a Jupiter /quote in PERCENT (comparable with price_impact_cap_pct and the owner
+    max_price_impact_pct). Jupiter documents the quote field priceImpactPct as a decimal ratio in [0, 1]
+    (0.01 = 1%, 1 = 100%; https://developers.jup.ag/docs/guides/how-to-build-a-custom-swap-with-metis), so the
+    result is ratio * 100. Fail closed (BrokerError, reason price_impact_unknown) on a missing, non-numeric,
+    non-finite, negative or >1 value: a value above 1 contradicts the documented range (e.g. a percent-form
+    value), so it is refused rather than guessed."""
+    raw = quote.get("priceImpactPct") if isinstance(quote, dict) else None
+    if raw is None or isinstance(raw, bool):
+        raise BrokerError(
+            BROKER_UNAVAILABLE,
+            "jupiter quote has no priceImpactPct — refusing to trade blind",
+            detail={"reason": "price_impact_unknown"})
+    try:
+        ratio = float(raw)
+    except (TypeError, ValueError):
+        ratio = float("nan")
+    if not (ratio == ratio) or ratio in (float("inf"), float("-inf")):
+        raise BrokerError(
+            BROKER_UNAVAILABLE, "jupiter quote priceImpactPct not finite — refusing to trade blind",
+            detail={"reason": "price_impact_unknown", "price_impact_raw": str(raw)[:64]})
+    if ratio < 0.0:
+        # V1 sign semantics are NOT documented (signed language exists only for V2 /order). Conservative refusal, not a favorable-sign reading.
+        raise BrokerError(
+            BROKER_UNAVAILABLE, "jupiter quote priceImpactPct negative: V1 sign semantics undocumented — refusing",
+            detail={"reason": "price_impact_negative_unsupported", "price_impact_raw": str(raw)[:64]})
+    if ratio > 1.0:
+        raise BrokerError(
+            BROKER_UNAVAILABLE, "jupiter quote priceImpactPct above the documented 0..1 ratio range — refusing",
+            detail={"reason": "price_impact_out_of_documented_range", "price_impact_raw": str(raw)[:64]})
+    return ratio * 100.0
+
+
 class JupiterClient:
     """Thin client for Jupiter Swap API v1 quote + swap endpoints
     (api.jup.ag/swap/v1)."""

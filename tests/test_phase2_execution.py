@@ -157,7 +157,7 @@ class _FakeJupiter:
     def __init__(self, kp, quote=None, swap_b64=None):
         self._kp = kp
         self._quote = quote or {
-            "outAmount": "1000000", "priceImpactPct": "0.5"}
+            "outAmount": "1000000", "priceImpactPct": "0.005"}
         # swap_b64 overrides the canned tx (e.g. an ALT-loaded tx).
         self._swap_b64 = swap_b64
         self.quotes = 0

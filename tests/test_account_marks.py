@@ -28,6 +28,21 @@ def check(name, cond):
         FAILURES.append(name)
 
 
+def debit_grad(pa, mint, stake, qty, op):
+    """DISCLOSED TEST EDIT (legacy-unknown-marks hook). These cases fabricate account positions directly. A grad account
+    position the lane's own books do not know is, by contract, unprovable (no mark), so the setup now also records the
+    matching lane position (current per-tranche marker, nothing sold) in the lane ledger, as the real entry path does.
+    The hook is unchanged and is exercised as written."""
+    res = pa.try_debit("grad", mint, stake, qty, op)
+    if res[0]:
+        import daemon.launch_scanner.grad as G
+        G.LEDGER_PATH = os.path.join(os.environ["FOREX_AGENT_HOME"], "grad_ledger.json")
+        d = G._read() if os.path.exists(G.LEDGER_PATH) else G._blank()
+        d["positions"][mint] = {"pa_pos_id": res[2], "tranche_credit": True, "legs": {}}
+        G._write(d)
+    return res
+
+
 def fresh(home):
     os.environ["FOREX_AGENT_HOME"] = home
     os.environ["PAPER_ACCOUNT_ENABLED"] = "1"
@@ -47,7 +62,7 @@ check("empty account: no marks", m == {})
 # argument is QTY, matching the lane wiring: stake / entry price).
 H = tempfile.mkdtemp(prefix="marks-one-")
 pa, am = fresh(H)
-ok, why, pid = pa.try_debit("grad", "MINTA", 2.0, 1000.0, "am-1")
+ok, why, pid = debit_grad(pa, "MINTA", 2.0, 1000.0, "am-1")
 assert ok, why
 m = am.collect_marks(price_fn=lambda mints: {"MINTA": 0.003})
 mk = m.get("grad", {}).get("MINTA")
@@ -87,7 +102,7 @@ check("raising price source: empty map, no exception", m == {})
 # Two lanes, partial pricing coverage.
 H = tempfile.mkdtemp(prefix="marks-two-")
 pa, am = fresh(H)
-pa.try_debit("grad", "A", 2.0, 1000.0, "am-t1")
+debit_grad(pa, "A", 2.0, 1000.0, "am-t1")
 # setup (mandatory-guard migration, disclosed): the 2nd entry needs a
 # trustworthy mark for the open position A; use the REAL collect_marks seam
 # at A's cost (2.00 / 1000 units) so the gated debit is admitted.
@@ -172,7 +187,7 @@ for bad, label in [(0.0, "zero"), (-2.0, "negative"),
 # ts, and the account's TTL then rejects what it must.
 H = tempfile.mkdtemp(prefix="marks-obs-")
 pa, am = fresh(H)
-pa.try_debit("grad", "OBS1", 1.0, 1000.0, "am-o1")
+debit_grad(pa, "OBS1", 1.0, 1000.0, "am-o1")
 old = time.time() - 300.0   # older than the default 120s TTL
 m = am.collect_marks(price_fn=lambda mints: {"OBS1": (0.003, old)})
 mk = m["grad"]["OBS1"]
@@ -205,7 +220,7 @@ check("mark without a qty binding rejected",
 # ---------------- per-source equity split ---------------------------
 H = tempfile.mkdtemp(prefix="marks-src-")
 pa, am = fresh(H)
-pa.try_debit("grad", "LISTED", 1.0, 1000.0, "am-s1")
+debit_grad(pa, "LISTED", 1.0, 1000.0, "am-s1")
 # setup (disclosed): trustworthy at-cost mark for the open LISTED position
 # via the real collect_marks seam so the 2nd gated entry is admitted.
 pa.try_debit("watcher", "CURVED", 1.0, 500.0, "am-s2",
@@ -236,7 +251,7 @@ os.environ["PAPER_ACCOUNT_MAX_TOTAL_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE v
 os.environ["PAPER_ACCOUNT_MAX_TOKEN_EXPOSURE_USD"] = "1000000"  # TEST-FIXTURE value, not owner
 H = tempfile.mkdtemp(prefix="marks-auto-")
 pa, am = fresh(H)
-ok, why, pid = pa.try_debit("grad", "MINTA", 2.0, 1000.0, "g-1")
+ok, why, pid = debit_grad(pa, "MINTA", 2.0, 1000.0, "g-1")
 check("gated first entry on an empty account passes", ok)
 
 am.collect_marks = lambda price_fn=None, curve_price_fn=None, \

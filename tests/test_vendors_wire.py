@@ -267,7 +267,9 @@ G.consider_candidate(_cand(mint="VND222pump"))
 entry2 = G._load()["positions"]["VND222pump"]["entry_price"]
 # DISCLOSED TEST EDIT: the shared-account guard fixture installs an at-cost price feed under jup_price, which G._jup.get_prices
 # reads, so the no-price_fn exit poll was priced at cost instead of via the DS/GT path this case models. Jupiter returns nothing here.
-with patch.object(G._jup, "get_prices", return_value={}):
+# (2026-11-27) grad now prefers get_prices_observed over get_prices, so BOTH Jupiter entry points are stubbed empty here.
+with patch.object(G._jup, "get_prices", return_value={}), \
+     patch.object(G._jup, "get_prices_observed", return_value={}):
     G.poll_exits()
 pos2 = G._load()["positions"].get("VND222pump") or {}
 vc2 = pos2.get("vendor_chain") or {}

@@ -104,6 +104,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -121,7 +122,7 @@ DEFAULT_START = 10.00  # owner-approved $10 example (2026-11-22)
 DEFAULT_MARK_TTL_S = 120.0
 
 _MUTATION_EVENTS = ("debit", "credit", "write_down", "pending_sol", "settle_sol", "debit_refused",
-                    "hold", "hold_released", "fee")
+                    "hold", "hold_released", "fee", "debit_add")
 
 # Cash split (2026-11-22, quarantine design v4 Stage A): proceeds are
 # spendable ONLY when the tranche's exit price was a current observed
@@ -178,6 +179,37 @@ ENFORCED_OWNER_KEYS = ("max_daily_loss_usd", "max_drawdown_pct",
 
 def gates_enabled() -> bool:
     return os.environ.get("PAPER_ACCOUNT_GATES_ENABLED") == "1"
+
+
+_LEGACY_HOOKS: Dict[str, Any] = {}
+
+
+def register_legacy_hook(lane: str, fn) -> None:
+    """A lane that can carry LEGACY positions (account units out of step with the lane's own books) registers a callable
+    returning the set of its account pos_ids whose marks are unprovable, or None when it cannot tell. Engine-loaded lane
+    variants (separate module instances with their own ledger) register under their own lane name. account_marks omits
+    those marks (no peak/baseline update, entry gate fails closed). In-process only; never persisted."""
+    if isinstance(lane, str) and lane and callable(fn):
+        _LEGACY_HOOKS[lane] = fn
+
+
+def legacy_hooks() -> Dict[str, Any]:
+    return dict(_LEGACY_HOOKS)
+
+
+def _boundary_marks(marks):
+    """Caller-supplied marks win over the central collector, but they never bypass the lanes' legacy truth: a mark for a
+    position its lane cannot prove consistent is dropped HERE, at the account boundary, whatever supplied it."""
+    if not marks:
+        return marks
+    try:
+        try:
+            from daemon.launch_scanner import account_marks
+        except ImportError:
+            import account_marks  # sibling import context (scripts)
+        return account_marks.omit_unproven(marks)
+    except Exception:
+        return {}
 
 
 def _central_marks() -> Dict[str, Dict[str, Any]]:
@@ -655,16 +687,51 @@ def _valid_amount(v: Any) -> bool:
             and math.isfinite(v))
 
 
+class AccountBusy(OSError):
+    """Raised ONLY by _lock() while acquiring, and ONLY inside a bounded_lock_wait() scope, when the account flock was not obtained within the bound.
+    The critical section has not started, so nothing was written."""
+
+
+_WAIT = threading.local()
+
+
+@contextlib.contextmanager
+def bounded_lock_wait(wait_s):
+    """Scope (per thread) in which _lock() acquires with a NON-BLOCKING monotonic retry up to wait_s seconds and raises AccountBusy on timeout, instead of
+    blocking forever. Default (outside any scope) is the original unbounded blocking acquire, so exits, credits, reconcile and every other caller are
+    unchanged. The bound covers the ACQUIRE only: I/O inside the critical section is not bounded. Used by the entry debit commit (see grad.consider_candidate)."""
+    prev = getattr(_WAIT, "s", None)
+    _WAIT.s = float(wait_s)
+    try:
+        yield
+    finally:
+        _WAIT.s = prev
+
+
 @contextlib.contextmanager
 def _lock():
     """Exclusive inter-process lock for the account ledger. Same
     pattern as the live10 mirror / killswitch locks: two processes
     can exist after a watchdog restart, and the fd is released
-    automatically if the holder dies."""
+    automatically if the holder dies. Outside bounded_lock_wait()
+    the acquire blocks (unchanged); inside it, it retries
+    non-blocking and raises AccountBusy at the bound."""
     os.makedirs(ACCOUNT_DIR, exist_ok=True)
     fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        _w = getattr(_WAIT, "s", None)
+        if _w is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            _end = time.monotonic() + _w
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= _end:
+                        raise AccountBusy("account lock busy after %.2fs" % _w)
+                    time.sleep(0.01)
         yield
     finally:
         try:
@@ -693,7 +760,7 @@ def _atomic_write(path: str, data: Dict[str, Any]) -> None:
         raise
 
 
-def _journal(event: Dict[str, Any]) -> None:
+def _journal(event: Dict[str, Any], strict: bool = False) -> None:
     """Append-only event journal, written BEFORE the ledger save:
     if the process dies mid-save the money movement is still
     recoverable from the journal."""
@@ -706,7 +773,7 @@ def _journal(event: Dict[str, Any]) -> None:
             os.fsync(f.fileno())
     except Exception:
         logger.exception("paper_account: journal write failed")
-        if event.get("instance") is True:
+        if event.get("instance") is True or strict:
             raise
 
 
@@ -809,6 +876,24 @@ def _apply_debit(led: Dict[str, Any], lane: str, mint: str,
         "ts": ts or time.time(),
     }
     st["n_entries"] += 1
+
+
+def _apply_add(led: Dict[str, Any], lane: str, mint: str, pos_id: str,
+               stake: float, qty: float) -> Tuple[bool, str]:
+    """Shared add-to-open-position mutation (a reconciled buyback). Caller holds the lock and validated input
+    and cash. Adds `qty` units and `stake` cost basis to the EXISTING lot `pos_id` and takes `stake` from cash
+    and spendable cash. Refuses (state untouched) when the lot is absent or is a different instance."""
+    st = _lane(led, lane)
+    pos = st["open"].get(_position_key(st, mint, pos_id))
+    if pos is None or pos.get("pos_id") != pos_id:
+        return False, "no open lot %s for %s/%s" % (pos_id, lane, mint)
+    led["cash"] = round(float(led["cash"]) - stake, 6)
+    led["cash_spendable"] = round(float(led.get("cash_spendable", led["cash"] + stake)) - stake, 6)
+    pos["qty"] = float(pos["qty"]) + qty
+    pos["basis"] = float(pos["basis"]) + stake
+    pos["entry_qty"] = float(pos.get("entry_qty") or 0.0) + qty
+    pos["entry_cost"] = float(pos.get("entry_cost") or 0.0) + stake
+    return True, ""
 
 
 def _position_key(st: dict, mint: str, pos_id: Optional[str]) -> str:
@@ -1058,6 +1143,17 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                                   "reason": ev.get("reason")}
                                  if ev.get("instance") is True else {})}
             replayed += 1
+        elif kind == "debit_add" and lane and mint:
+            stake = float(ev.get("stake") or 0)
+            qty = float(ev.get("qty") or 0)
+            if stake <= 0 or qty <= 0 or not op_id or not ev.get("pos_id") or float(led["cash_spendable"]) < stake - _EPS:
+                return led, "replay cannot apply debit_add %s (bad stake/qty/op or cash)" % op_id
+            ok, why = _apply_add(led, lane, mint, ev.get("pos_id"), stake, qty)
+            if not ok:
+                return led, "replay divergence: debit_add %s: %s" % (op_id, why)
+            ops[op_id] = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": ev.get("pos_id"),
+                          "stake": stake, "qty": qty}
+            replayed += 1
         elif kind == "debit_refused":
             if not op_id or not (ev.get("instance") is True or ev.get("durable_refusal") is True):
                 return led, "invalid refused entry event"
@@ -1180,6 +1276,11 @@ def _derive_buckets_locked(led: Dict[str, Any],
                 return led, ("cash-split migration: write_down "
                              "%s: %s; manual reconciliation "
                              "required" % (ev.get("op_id"), why))
+        elif ev["event"] == "debit_add":
+            ok, why = _apply_add(gen, lane, mint, ev.get("pos_id"), float(ev.get("stake") or 0), float(ev.get("qty") or 0))
+            if not ok:
+                return led, ("cash-split migration: debit_add %s: %s; manual reconciliation required"
+                             % (ev.get("op_id"), why))
         elif ev["event"] == "debit_refused":
             continue  # exact attempt refusal, no economics
         elif ev["event"] == "hold":
@@ -1263,6 +1364,41 @@ def _derive_buckets_locked(led: Dict[str, Any],
                    "replay: spendable $%.6f, estimated $%.6f",
                    gen["cash_spendable"], gen["cash_estimated"])
     return led, None
+
+
+def verify_replay() -> Tuple[Optional[bool], str]:
+    """READ-ONLY check on an EXISTING account (no financial writes: no torn-tail truncation, no ledger creation, no .bak restore, no reconcile, and no directory or lock-file creation: a virgin path returns (None, account_dir_or_lock_file_missing_not_created); it holds the exclusive account flock during the read phase; _derive_buckets_locked logs a WARNING). Replays the WAL from genesis
+    on a deepcopy of the stored ledger file and compares: cash total, cash_spendable, cash_estimated, assumed_sold keys and the per-lane open
+    position key sets (the first two are checked inside _derive_buckets_locked, the rest here). NOT checked, because the replay keeps them local:
+    holds, pending_sol, per-position qty/basis. Returns (True, why) only on a full match of those; (False, reason) on a divergence; (None, reason)
+    when it cannot be evaluated (unreadable/torn/holed journal, missing ledger file). It is the account against its OWN journal, not independent
+    conservation."""
+    import copy
+    try:
+        # never CREATE anything: _lock() would makedirs the account dir and O_CREAT the lock file on a virgin path
+        if not (os.path.isdir(ACCOUNT_DIR) and os.path.isfile(LOCK_FILE)):
+            return None, "account_dir_or_lock_file_missing_not_created"
+        with _lock():
+            entries, jstatus, _off = _journal_read()
+            if jstatus is not None:
+                return None, "journal_status:%s" % jstatus
+            if _seq_violation(entries) is not None:
+                return None, "journal_seq_violation"
+            led = _read_json(LEDGER_PATH)
+            if not isinstance(led, dict):
+                return None, "ledger_file_unreadable_or_missing"
+            led2 = copy.deepcopy(led)
+        _res, reason = _derive_buckets_locked(led2, entries)
+        if reason:
+            return False, str(reason)[:300]
+        for k in ("cash_spendable", "cash_estimated"):
+            if abs(float(led.get(k) or 0.0) - float(led2.get(k) or 0.0)) > 1e-6:
+                return False, "%s differs from the replay" % k
+        if set((led.get("assumed_sold") or {}).keys()) != set((led2.get("assumed_sold") or {}).keys()):
+            return False, "assumed_sold keys differ from the replay"
+        return True, "cash_buckets_assumed_sold_keys_and_open_position_sets_match_the_journal"
+    except Exception as e:
+        return None, "verify_replay_error:%r" % (e,)
 
 
 def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
@@ -1473,6 +1609,8 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         return False, "caller op_id is required", None
     if gates_enabled() and marks is None:
         marks = _central_marks()
+    elif marks is not None:
+        marks = _boundary_marks(marks)
     def _refuse(*a):
         return _debit_refused(*a, durable=durable_refusal)
     with _lock():
@@ -1555,6 +1693,101 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         return True, "ok", pid
 
 
+def add_to_position(lane: str, mint: str, pos_id: str, stake: float, qty: float,
+                    op_id: str, ts: Optional[float] = None,
+                    marks: Optional[Dict[str, Dict[str, Any]]] = None
+                    ) -> Tuple[bool, str]:
+    """Reserve `stake` paper dollars to ADD `qty` units to the lane's EXISTING open lot `pos_id` (a buyback is an
+    entry: same fail-closed admission as try_debit - spendable cash, lane cap on the enlarged basis, mandatory gates,
+    account risk gates and provider health, all inside ONE lock with the mutation). Idempotent by op_id: a retry of
+    an applied op returns (True, "ok (retry of applied op)") without re-applying; the same op_id with different
+    parameters is a conflict. A refusal changes nothing and journals nothing (the caller leaves its own book alone)."""
+    if not _valid_amount(stake) or stake <= 0:
+        return False, "stake must be a positive finite number"
+    if not _valid_amount(qty) or qty <= 0:
+        return False, "qty must be a positive finite number"
+    stake, qty = float(stake), float(qty)
+    if not lane or not mint or not pos_id:
+        return False, "lane, mint and pos_id are required"
+    if not op_id or not isinstance(op_id, str):
+        return False, "caller op_id is required"
+    if gates_enabled() and marks is None:
+        marks = _central_marks()
+    elif marks is not None:
+        marks = _boundary_marks(marks)
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None:
+            return False, "account ledger unreadable (fail-closed)"
+        if degraded:
+            return False, "account degraded: %s" % degraded
+        prior = led.get("ops", {}).get(op_id)
+        if prior is not None:
+            _exp = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": pos_id}
+            if (any(prior.get(k) != v for k, v in _exp.items())
+                    or abs(float(prior.get("stake", -1)) - stake) > 1e-9
+                    or abs(float(prior.get("qty", -1)) - qty) > 1e-9):
+                return False, "add op_id parameter conflict"
+            return True, "ok (retry of applied op)"
+        spendable = float(led.get("cash_spendable", 0.0))
+        if spendable < stake:
+            return False, ("account spendable cash $%.2f < stake $%.2f (total $%.2f incl. quarantined estimated "
+                           "proceeds)" % (spendable, stake, float(led["cash"])))
+        st = _lane(led, lane)
+        pos = st["open"].get(_position_key(st, mint, pos_id))
+        if pos is None or pos.get("pos_id") != pos_id:
+            return False, "no open lot %s for %s/%s" % (pos_id, lane, mint)
+        cap = lane_cap()
+        if cap is not None:
+            open_basis = sum(_pos_basis(p) for p in st["open"].values())
+            open_basis += sum(float(p["basis"]) for p in led.get("pending_sol", {}).values() if p["lane"] == lane)
+            if open_basis + stake > cap:
+                return False, ("lane cap $%.2f would be exceeded ($%.2f open + $%.2f add)" % (cap, open_basis, stake))
+        if not gates_enabled():
+            return False, "mandatory gates off; entry blocked fail-closed"
+        view = _view_locked(led, marks, degraded)
+        _update_baselines_locked(led, view)
+        view.update(_gate_fields(led, view))
+        refusal = _gate_check_locked(led, view, stake, mint=mint)
+        if refusal is not None:
+            return False, refusal
+        if provider_health_gate_enabled():
+            refusal = _provider_health_refusal()
+            if refusal is not None:
+                return False, refusal
+        led["seq"] = int(led.get("seq") or 0) + 1
+        # journal FIRST (write-ahead): a crash between the journal append and the state save is recovered by
+        # replay at the next load, which applies this event exactly once (its op_id is not yet in led["ops"]).
+        try:
+            _journal({"event": "debit_add", "event_id": "ev#%d" % led["seq"], "op_id": op_id, "lane": lane,
+                      "mint": mint, "pos_id": pos_id, "stake": stake, "qty": qty, "seq": led["seq"], "ts": ts}, strict=True)
+        except Exception:
+            return False, "journal write failed (add refused fail-closed, nothing applied)"
+        ok, why = _apply_add(led, lane, mint, pos_id, stake, qty)
+        if not ok:
+            return False, why
+        led["ops"][op_id] = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": pos_id,
+                             "stake": stake, "qty": qty}
+        _save_locked(led)
+        return True, "ok"
+
+
+def applied_add(op_id: str) -> Optional[Dict[str, Any]]:
+    """Read-only: the applied add-to-position record {lane, mint, pos_id, stake, qty} for `op_id`, or None when
+    absent OR the ledger is unreadable/degraded (unknown is never proof of absence: the caller must then refuse,
+    not re-issue). Used by a caller recovering from a crash between this account's add and its own book."""
+    if not op_id or not isinstance(op_id, str):
+        return None
+    with _lock():
+        led, healthy, degraded = _load_locked()
+        if not healthy or led is None or degraded:
+            return None
+        rec = led.get("ops", {}).get(op_id)
+        if not isinstance(rec, dict) or rec.get("event") != "debit_add":
+            return None
+        return {k: rec.get(k) for k in ("lane", "mint", "pos_id", "stake", "qty")}
+
+
 def hold_stake(lane: str, amount: float, op_id: str,
                ts: Optional[float] = None,
                marks: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -1589,6 +1822,8 @@ def hold_stake(lane: str, amount: float, op_id: str,
         return False, "caller op_id is required"
     if gates_enabled() and marks is None:
         marks = _central_marks()
+    elif marks is not None:
+        marks = _boundary_marks(marks)
     with _lock():
         led, healthy, degraded = _load_locked()
         if not healthy or led is None:
@@ -2320,6 +2555,19 @@ def op_outcome(op_id: str) -> str:
     return outcome
 
 
+def position_debit(pos_id: str):
+    """Read-only: the journaled DEBIT event {qty, stake, lane, mint} that opened `pos_id`, or None when absent or the
+    journal is truncated/corrupt (unknown is never proof). Also None when more than one debit carries the pos_id."""
+    entries, status, _ = _journal_read()
+    if status is not None or not pos_id:
+        return None
+    hits = [ev for ev in entries if ev.get("event") == "debit" and ev.get("pos_id") == pos_id]
+    if len(hits) != 1:
+        return None
+    ev = hits[0]
+    return {"qty": ev.get("qty"), "stake": ev.get("stake"), "lane": ev.get("lane"), "mint": ev.get("mint")}
+
+
 def pos_ever_existed(pos_id: Optional[str] = None,
                      lane: Optional[str] = None,
                      mint: Optional[str] = None) -> bool:
@@ -2666,6 +2914,8 @@ def snapshot(marks: Optional[Dict[str, Dict[str, Any]]] = None
     drawdown_pct report None so a gate fails closed. Both are None
     until the first trustworthy mark.
     """
+    if marks:
+        marks = _boundary_marks(marks)
     try:
         with _lock():
             led, healthy, degraded = _load_locked()

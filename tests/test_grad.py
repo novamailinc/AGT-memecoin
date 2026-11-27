@@ -129,12 +129,24 @@ def _patch_all(price=0.00007):
     # with price_fn returning 0 ("unquotable") that feed answered at cost and the case closed as time_stop_24h instead of
     # time_stop_24h_unquotable. These cases model "Jupiter has no price", so the lane's Jupiter read returns nothing here.
     p7 = patch.object(G._jup, "get_prices", return_value={}) if getattr(G, "_jup", None) is not None else None
+    # DISCLOSED (second correction): poll_exits reads Jupiter through get_prices_observed whenever the module has it (grad.py
+    # `hasattr(_jup, "get_prices_observed")`), and the guard fixture installs its at-cost feed at THAT seam, so the get_prices patch
+    # above is never consulted by poll_exits. The lane's own view must therefore return nothing at get_prices_observed too. It is
+    # applied to the LANE'S binding only (a proxy over G._jup), NOT to the shared jup_price module: account_marks and paper_account
+    # (_central_marks, used by try_debit/credit) read jup_price.get_prices_observed directly, and blanking that would make every open
+    # position unmarked and the account refuse entries (fail-closed), changing unrelated cases.
+    class _NoJupView(object):
+        def __init__(self, real): self._real = real
+        def __getattr__(self, name): return getattr(self._real, name)
+        def get_prices_observed(self, mints, now=None): return {}
+        def get_prices(self, mints, now=None): return {}
+    p8 = patch.object(G, "_jup", _NoJupView(G._jup)) if getattr(G, "_jup", None) is not None and hasattr(G._jup, "get_prices_observed") else None
     m_veto, m_safety = p1.start(), p2.start()
-    for p in [x for x in (p3, p4, p5, p6, p7) if x is not None]:
+    for p in [x for x in (p3, p4, p5, p6, p7, p8) if x is not None]:
         p.start()
     m_veto.veto_check.return_value = {"passed": True, "vetoes": []}
     m_safety.check_token.return_value = dict(SAFETY_OK)
-    return tuple(x for x in (p1, p2, p3, p4, p5, p6, p7) if x is not None), m_veto, m_safety
+    return tuple(x for x in (p1, p2, p3, p4, p5, p6, p7, p8) if x is not None), m_veto, m_safety
 
 
 def _unpatch(ps):

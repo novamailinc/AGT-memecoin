@@ -70,7 +70,7 @@ class _FakeJupiter:
                  quote_error=None):
         self._kp = kp
         self._quote = quote or {
-            "outAmount": "1000000", "priceImpactPct": "0.5"}
+            "outAmount": "1000000", "priceImpactPct": "0.005"}
         self._swap_b64 = swap_b64
         self._quote_error = quote_error
         self.quotes = 0
@@ -236,7 +236,7 @@ def main():
         # -- over-cap price impact is a skip ---------------------------
         jup3 = _FakeJupiter(
             kp, quote={"outAmount": "1000000",
-                       "priceImpactPct": "5.0"})
+                       "priceImpactPct": "0.05"})
         ex3 = _executor(tmp, kp, provider, _FakeRPC(token_ata=ata),
                         jup3)
         ex3.arm_live()

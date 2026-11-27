@@ -283,8 +283,12 @@ def _cand(mint="AAA111pump", age_s=60.0, **kw):
     return c
 
 
+# DISCLOSED TEST EDIT (legacy-unknown-marks hook): removing ONLY the lane ledger leaves the previous scenario's position
+# in the shared account, the "account position the lane books do not know" shape the hook correctly fails closed on.
+# The account is reset together with the lane ledger so each scenario starts from a consistent pair.
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
+    import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 ps = _patch_all()
 G.ensure_ledger()
 opened, _why, _fin = G.consider_candidate(
@@ -320,8 +324,11 @@ def _fake_quote(chain, mint, spot_index=None):
 
 # DISCLOSED TEST EDIT: the shared-account guard fixture installs an at-cost price feed under jup_price, which G._jup.get_prices
 # reads, so the no-price_fn exit poll was priced at cost instead of via the DS/GT path this case models. Jupiter returns nothing here.
+# bb3's grad prefers get_prices_observed over get_prices, so BOTH
+# must be stubbed empty for "Jupiter returns nothing" to hold.
 with patch.object(G, "quote_price", side_effect=_fake_quote), \
-        patch.object(G._jup, "get_prices", return_value={}):
+        patch.object(G._jup, "get_prices", return_value={}), \
+        patch.object(G._jup, "get_prices_observed", return_value={}):
     closes = G.poll_exits()
 check("handler: close happened on hard stop", len(closes) == 1)
 rec = closes[0]
@@ -349,6 +356,7 @@ class _Feed:
 
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
+    import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 _FakeKS.halted = set()
 ps = _patch_all()
 G.ensure_ledger()
@@ -376,6 +384,7 @@ class _Dossiers:
 
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
+    import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
 ps = _patch_all()
 G.ensure_ledger()
 with patch.object(G, "_dossiers", _Dossiers):

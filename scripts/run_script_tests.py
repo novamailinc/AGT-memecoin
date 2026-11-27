@@ -27,6 +27,22 @@ PER_TEST_TIMEOUT_S = 600
 from test_discovery import is_script_test
 
 
+def is_declared_not_run(path):
+    """True when the file's own module docstring declares it NOT RUN
+    (e.g. a fixture-only harness "WRITTEN, NOT RUN until main clears
+    an exact commit+blob via pins.sh"). Such a file is not a runnable
+    test yet: executing it and counting a failure would misreport a
+    declared-unready fixture as a regression. Skipped files are
+    listed explicitly in the summary, never silently dropped."""
+    try:
+        with open(path) as f:
+            tree = ast.parse(f.read())
+        doc = ast.get_docstring(tree) or ""
+        return "NOT RUN" in doc
+    except Exception:
+        return False
+
+
 def main():
     if os.environ.get("AGT_CONTAINED") != "1":
         print("REFUSING: run via scripts/contained.sh (networkless namespace); coverage UNQUALIFIED")
@@ -37,9 +53,15 @@ def main():
                      and (not selected or os.path.basename(p) in selected
                           or os.path.relpath(p, REPO) in selected
                           or p in selected))
-    if not scripts:
+    skipped = [p for p in scripts if is_declared_not_run(p)]
+    scripts = [p for p in scripts if p not in skipped]
+    if not scripts and not skipped:
         print("no script-style tests found")
         return 0
+    if skipped:
+        print("skipped (declared NOT RUN in their own docstring):")
+        for p in skipped:
+            print("  " + os.path.relpath(p, REPO))
     base_env = dict(os.environ)
     base_env["PYTHONPATH"] = REPO + os.pathsep + base_env.get("PYTHONPATH", "")
     failures = []
@@ -76,6 +98,8 @@ def main():
             failures.append(rel)
     print("\n%d/%d script tests passed" % (len(scripts) - len(failures),
                                            len(scripts)))
+    if skipped:
+        print("skipped (declared NOT RUN): %d" % len(skipped))
     if failures:
         print("failing:")
         for f in failures:

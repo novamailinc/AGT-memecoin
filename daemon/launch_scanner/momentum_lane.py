@@ -1257,7 +1257,8 @@ def _consider_candidate(cand, now):
             except Exception as _ce:  # safe: a stale intent is classified from the account on re-entry
                 logger.warning("%s: consume_intent failed (%r); stale intent dropped on re-entry", LANE, _ce)
     logger.warning("momentum OPEN %s %s @ %s ($%.2f, %s, liq $%.0f, "
-                   "mcap $%.0f, cash now $%.2f)",
+                   "mcap $%.0f, NOTIONAL counter now $%.2f [unfunded; "
+                   "real cash is the shared paper account])",
                    symbol, mint[:12], filled, _N,
                    pos["tier"], liquidity, mcap, account_cash())
     return True, "opened", True

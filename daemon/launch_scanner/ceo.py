@@ -1276,7 +1276,8 @@ def _consider_card(sig):
                 _demo_filler().consume_intent(LANE, mint)
             except Exception as _ce:  # safe: a stale intent is detected from the account journal on re-entry
                 logger.warning("%s: consume_intent failed (%r); stale intent will be dropped on re-entry", LANE, _ce)
-    logger.warning("ceo OPEN %s %s %s @ %s ($%.2f, cash now $%.2f)",
+    logger.warning("ceo OPEN %s %s %s @ %s ($%.2f, NOTIONAL counter now $%.2f "
+                   "[unfunded; real cash is the shared paper account])",
                    chain, pos["symbol"], mint[:12], filled, _N,
                    account_cash())
     return True, "opened"

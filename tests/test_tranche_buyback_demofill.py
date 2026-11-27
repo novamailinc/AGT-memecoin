@@ -328,6 +328,11 @@ check("S1 conservation: account cash delta == sum(sim sell nets) - entry stake -
       abs((c_end - 100.0) - (_nets - 1.0 - f["total_debit_usd"])) < 1e-5)
 check("S1 conservation: lane pnl_usd == the account's cash delta (%.6f vs %.6f)" % (rec.get("pnl_usd", 0), c_end - 100.0),
       abs(rec.get("pnl_usd", 1e9) - (c_end - 100.0)) < 1e-4)
+check("S1 balance (tight): cash delta == lane realized_usd(6dp) - entry stake 1.0 (%.6f vs %.6f), and == journal nets - entry - buyback stake, both within 2e-6 (the 4dp pnl_usd above is a rounded field)"
+      % (c_end - 100.0, rec.get("realized_usd", 0) - 1.0),
+      abs((c_end - 100.0) - (rec.get("realized_usd", 1e9) - 1.0)) < 2e-6 and abs((c_end - 100.0) - (_nets - 1.0 - f["total_debit_usd"])) < 2e-6)
+check("S1 recorded buyback price is the FILL's price_usd (%r vs %r), source fill_price_usd" % (ef.get("price"), f["price_usd"]),
+      abs(float(ef.get("price") or -1) - float(f["price_usd"])) < 1e-15 and ef.get("price_source") == "fill_price_usd")
 dump("S1-end", mint, pid, "c_pre=%r c_end=%r nets=%r sell_qty=%r" % (c_pre, c_end, _nets, _sold_qty))
 from daemon.launch_scanner import close_intents as _CI
 check("S1 no close intent left open (the account settle applied)", _CI.pending("grad") == [])
@@ -406,6 +411,8 @@ dump("S5", mint, pid)
 check("S5 evidence RECOVERED from the journal via the lane intent (fill_evidence recovered, provenance with percent_v2 stamp, fill op)",
       ef.get("adopted_from_account") is True and ef.get("fill_evidence") == "recovered" and ef.get("fill_op") == list(fl.keys())[0]
       and (ef.get("provenance") or {}).get("price_impact_unit") == "percent_v2")
+check("S5 recovered adoption records the RECOVERED fill's price_usd, not the model price (%r vs fill %r)" % (ef.get("price"), f["price_usd"]),
+      abs(float(ef.get("price") or -1) - float(f["price_usd"])) < 1e-15 and ef.get("price_source") == "fill_price_usd")
 _bbq = sum(float(v.get("buyback_qty") or 0.0) for v in lp["legs"].values())
 check("S5 lane units equal the account add (legs %.6f)" % _bbq, abs(_bbq - ad["qty"]) < 1e-9 and lp.get("buyback_used") is True)
 
@@ -425,6 +432,8 @@ out = run_bb(mint, entry * 1.3); ef = (lane_pos(mint).get("entry_features") or {
 dump("S6", mint, pid)
 check("S6 adoption without evidence: booked from the account's numbers, fill_evidence says fill_missing, NO provenance claimed",
       len(out) == 1 and ef.get("adopted_from_account") is True and ef.get("fill_evidence") == "fill_missing" and "provenance" not in ef)
+check("S6 adoption without evidence records NO execution price (None, source named), never the model price (%r / %r)" % (ef.get("price"), ef.get("price_source")),
+      ef.get("price") is None and ef.get("price_source") == "unavailable_adopted_without_fill_evidence")
 
 # ---- S7: position that is not a quote-sim position stays refused (the interim always-refuse gate) ----
 mint = "BB7pump"
@@ -475,9 +484,11 @@ lp = lane_pos(mint); bq = lp.get("buyback_qty_total")
 JUP.mult = 0.05
 _real_credit = _PAm.credit
 _ncred = [0]
+_credit_ops = []
 def _credit_refuse(*a, **k):
     if str(a[3] if len(a) > 3 else k.get("op_id")).startswith("grad:close:"):
         _ncred[0] += 1
+        _credit_ops.append((str(a[3] if len(a) > 3 else k.get("op_id")), a[2] if len(a) > 2 else k.get("proceeds")))
         return (False, "declined (test)")
     return _real_credit(*a, **k)
 def _sells(m):
@@ -495,7 +506,10 @@ check("S10 refused settle: no close record for it", not [c for c in (G._read().g
 check("S10 no resale on retry (sell fills %d -> %d, legs all done)" % (s_a, s_b), s_a == s_b and s_a >= 2 and all(v.get("done") for v in lp["legs"].values()))
 check("S10 lane bankroll not advanced by the unsettled close (%r vs %r) and account cash unchanged (%r)" % (br_a, br_b, cash_a), br_a == br_b and abs(PA_cash() - cash_a) < 1e-12)
 check("S10 exactly ONE open close intent despite repeated refused retries (tries %r)" % sp.get("tries"), len(_CI.pending("grad")) == 1 and int(sp.get("tries") or 0) >= 2)
-check("S10 stable credit op: the refused op id is the same each retry (refusals %d)" % _ncred[0], _ncred[0] >= 2)
+_s10_ops = [o for o in _credit_ops if (":%s:" % mint) in o[0]]
+check("S10 stable credit op: ACTUAL refused op ids collected (%d refusals, distinct ids %r) are identical, carry this mint and pos id, amounts equal (%r)"
+      % (len(_s10_ops), sorted({o[0] for o in _s10_ops}), sorted({o[1] for o in _s10_ops})),
+      len(_s10_ops) >= 2 and len({o[0] for o in _s10_ops}) == 1 and len({o[1] for o in _s10_ops}) == 1 and pid in _s10_ops[0][0])
 dump("S10-pending", mint, pid)
 for _ in range(3):
     G.poll_exits(price_fn=prices([entry * 0.05]))
@@ -581,6 +595,16 @@ check("S13 pending refusal survives a restart: still OPEN, settlement_pending, n
       % (br0, G._read()["bankroll"], len(_rec_exits(mint)) - ex0, vc0, len(_verdict_closes(mint))),
       mint in G.open_positions() and bool(lp.get("settlement_pending")) and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
       and G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0 and len(_verdict_closes(mint)) == vc0)
+_ev13 = [e for e in _CI._read(_CI.journal_path("grad"))[0] if (e.get("mint") == mint and e.get("ev") == "intent") or e.get("ev") == "frozen"]
+_seen_frozen = set(); _reuse = 0
+for e in _CI._read(_CI.journal_path("grad"))[0]:
+    if e.get("ev") == "frozen":
+        _seen_frozen.add(e.get("intent_id"))
+    elif e.get("ev") == "intent" and e.get("intent_id") in _seen_frozen:
+        _reuse += 1
+_i13 = [e.get("intent_id") for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("mint") == mint]
+check("S13 no intent id is re-begun after it was frozen (re-used-after-frozen events: %d; intent events for this mint %d, distinct ids %d)" % (_reuse, len(_i13), len(set(_i13))),
+      _reuse == 0 and len(_i13) == len(set(_i13)))
 check("S13 restart re-drive of the refused op FROZE its intent visibly (frozen event present, never applied, amount untouched)",
       any(e.get("ev") == "frozen" for e in _e13) and not any(e.get("ev") in ("applied", "account_applied") for e in _e13))
 JUP.mult = 1.0
@@ -593,13 +617,462 @@ br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint))
 with patch.object(_PAm, "credit", _credit_refuse):
     for _ in range(3):
         G.poll_exits(price_fn=prices([entry * 0.05]))
-check("S10b during the refusal: no bankroll, recorder exit or verdict effect", G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0)
+vc14 = len(_verdict_closes(mint))
+check("S10b during the refusal: no bankroll, recorder exit or verdict effect", G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0 and vc14 == 0)
 for _ in range(3):
     G.poll_exits(price_fn=prices([entry * 0.05]))
 rec = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
 check("S10b after the settle: bankroll advanced by realized EXACTLY once (%r -> %r, realized %r), ONE recorder exit (%d)" % (br0, G._read()["bankroll"], rec[0].get("realized_usd") if rec else None, len(_rec_exits(mint)) - ex0),
       len(rec) == 1 and abs(G._read()["bankroll"] - (br0 + rec[0]["realized_usd"])) < 1e-6 and len(_rec_exits(mint)) - ex0 == 1)
+check("S10b verdict POSITIVE control: the settled close wrote exactly ONE verdict close event for the mint (was %d, now %d); the refused phases wrote none (negative checks above are therefore sensitive)" % (vc14, len(_verdict_closes(mint))),
+      len(_verdict_closes(mint)) - vc14 == 1)
 JUP.mult = 1.0
+
+# ---- S14: FAIL CLOSED when the close intent cannot be made durable (injected at the journal append, the real _finalize and real account):
+# no account credit, no close, bankroll unbooked, position pending with why close_intent_not_durable, nothing resold; once the journal works the
+# close settles exactly once ----
+mint = "BB15pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3); JUP.mult = 0.05
+br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint)); cash0 = PA_cash()
+_real_append = _CI._append
+def _append_no_intent(path, event):
+    if event.get("ev") == "intent":
+        return False   # INJECTED journal write failure for the intent record only (named fault)
+    return _real_append(path, event)
+_calls14 = []
+def _credit_spy(*a, **k):
+    _calls14.append(str(a[3] if len(a) > 3 else k.get("op_id")))
+    return _real_credit(*a, **k)
+with patch.object(_CI, "_append", _append_no_intent), patch.object(_PAm, "credit", _credit_spy):
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+lp = lane_pos(mint); sp14 = lp.get("settlement_pending") or {}
+check("S14 intent not durable: position still OPEN with settlement_pending why close_intent_not_durable (tries %r)" % sp14.get("tries"),
+      mint in G.open_positions() and sp14.get("why") == "close_intent_not_durable" and int(sp14.get("tries") or 0) >= 2)
+check("S14 no account credit was attempted for this close (credit calls with grad:close: for the mint: %d), cash unchanged (%r vs %r)"
+      % (len([c for c in _calls14 if (":%s:" % mint) in c]), PA_cash(), cash0), not [c for c in _calls14 if (":%s:" % mint) in c] and abs(PA_cash() - cash0) < 1e-12)
+check("S14 no close record, bankroll not booked (%r vs %r), no recorder exit, no resale (legs all done)" % (G._read()["bankroll"], br0),
+      not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint] and G._read()["bankroll"] == br0 and len(_rec_exits(mint)) == ex0
+      and all(v.get("done") for v in lp["legs"].values()))
+check("S14 no intent for this mint is on disk (nothing to replay, nothing silently applied)",
+      not [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("mint") == mint])
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+rec = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+check("S14 journal healthy again: closes exactly once, pending cleared, bankroll +realized once (%r -> %r), flat" % (br0, G._read()["bankroll"]),
+      len(rec) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (br0 + rec[0]["realized_usd"])) < 1e-6 and acct_lot_qty(pid) < 1e-6)
+JUP.mult = 1.0
+
+
+# ---- S16: SETTLE-PLAN SUPERSEDE LIVENESS (real grad poll, real journal, real account). The account refuses the close credit, so a settle intent I0 stays open
+# with its plan signature stored. NAMED STATE INJECTION: the stored plan_sig is replaced by a different value, which is exactly what a changed settle plan looks
+# like to the retry. NAMED FAULT INJECTION: the first begin() after the freeze raises IntentNotDurable. Expected: the freeze of I0 lands, begin fails (position stays
+# pending, close_intent_not_durable, still pointing at I0, no second intent); the NEXT poll recognises I0 as exactly frozen and opens its successor through
+# begin(supersedes=I0); further polls reuse that successor (no third intent); once the account accepts, the close books exactly once and I0 stays frozen. ----
+mint = "BB16pump"
+p, entry, ok = ready(mint); pid = p["pa_pos_id"]
+run_bb(mint, entry * 1.3); JUP.mult = 0.05
+br0 = G._read()["bankroll"]; ex0 = len(_rec_exits(mint))
+def _gi(m):
+    return [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("mint") == m]
+with patch.object(_PAm, "credit", _credit_refuse):
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    _i0 = (lane_pos(mint).get("settlement_pending") or {}).get("intent_id")
+    check("S16 setup: the refused settle left ONE open intent I0 (%s) with a stored plan_sig" % _i0,
+          bool(_i0) and len(_gi(mint)) == 1 and _CI.intent_status("grad", _i0) == "open" and bool((lane_pos(mint).get("settlement_pending") or {}).get("plan_sig")))
+    _d16 = G._read(); _d16["positions"][mint]["settlement_pending"]["plan_sig"] = "INJECTED-previous-plan-signature"; G._write(_d16)
+    _real_begin = _CI.begin; _bf = [0]
+    def _begin_fail_once(*a, **k):
+        if not _bf[0]:
+            _bf[0] = 1
+            raise _CI.IntentNotDurable("INJECTED: begin failed after the freeze landed")
+        return _real_begin(*a, **k)
+    with patch.object(_CI, "begin", _begin_fail_once):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    _sp1 = lane_pos(mint).get("settlement_pending") or {}
+    check("S16 freeze OK then begin fails: I0 is FROZEN, the position stays OPEN pending close_intent_not_durable still pointing at I0 (%r), no second intent (%d), nothing booked"
+          % (_sp1.get("intent_id"), len(_gi(mint))),
+          _CI.intent_status("grad", _i0) == "frozen" and mint in G.open_positions() and _sp1.get("why") == "close_intent_not_durable" and _sp1.get("intent_id") == _i0
+          and len(_gi(mint)) == 1 and G._read()["bankroll"] == br0)
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+    _gi1 = _gi(mint)
+    _sp2 = lane_pos(mint).get("settlement_pending") or {}
+    check("S16 NEXT poll recognises the exactly-frozen I0 and opens ONE successor with supersedes=I0 (intents %d, successor parent %r), position pending on the successor (%r)"
+          % (len(_gi1), _gi1[-1].get("supersedes") if len(_gi1) > 1 else None, _sp2.get("intent_id")),
+          len(_gi1) == 2 and _gi1[1].get("supersedes") == _i0 and _sp2.get("intent_id") == _gi1[1]["intent_id"] and _CI.intent_status("grad", _i0) == "frozen"
+          and _CI.intent_status("grad", _gi1[1]["intent_id"]) == "open" and mint in G.open_positions())
+    for _ in range(3):
+        G.poll_exits(price_fn=prices([entry * 0.05]))
+    check("S16 further refused polls reuse the successor: still exactly 2 intents (%d)" % len(_gi(mint)), len(_gi(mint)) == 2)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+_rec16 = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+_gi2 = _gi(mint)
+check("S16 account accepts: closes exactly once, flat, bankroll +realized once (%r -> %r), successor APPLIED, I0 still FROZEN, still 2 intents (%d)" % (br0, G._read()["bankroll"], len(_gi2)),
+      len(_rec16) == 1 and mint not in G.open_positions() and abs(G._read()["bankroll"] - (br0 + _rec16[0]["realized_usd"])) < 1e-6 and acct_lot_qty(pid) < 1e-6
+      and _CI.intent_status("grad", _gi2[1]["intent_id"]) == "applied" and _CI.intent_status("grad", _i0) == "frozen" and len(_gi2) == 2)
+JUP.mult = 1.0
+
+# ---- S17/S18: DROPPED-OP SAFETY (N2) and CHAIN-TIP RECONCILIATION (N3). Real grad poll, real journal, real shared account. NAMED STATE INJECTIONS are
+# labelled where used (stored plan_sig / intent pointer; a crafted two-op intent opened through the real begin; real account ops booked by the test). ----
+def _gi2(m):
+    return [e for e in _CI._read(_CI.journal_path("grad"))[0] if e.get("ev") == "intent" and e.get("mint") == m]
+def _point(m, iid, sig="INJECTED-previous-plan-signature"):
+    _d = G._read(); _sp = _d["positions"][m]["settlement_pending"]; _sp["intent_id"] = iid; _sp["plan_sig"] = sig; G._write(_d)
+def _refused_setup(m):
+    p_, entry_, ok_ = ready(m); pid_ = p_["pa_pos_id"]
+    run_bb(m, entry_ * 1.3); JUP.mult = 0.05
+    with patch.object(_PAm, "credit", _credit_refuse):
+        for _ in range(3):
+            G.poll_exits(price_fn=prices([entry_ * 0.05]))
+    return pid_, entry_, (lane_pos(m).get("settlement_pending") or {}).get("intent_id")
+
+# S17a: the old intent carries a write-down op (":wd") that the new plan does not; that op is BOOKED in the account -> the change is refused
+mint = "BB17pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+_two = [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+        {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}]
+_i2 = _CI.begin("grad", mint, pid, _two, {"realized_usd": 1.0, "close_ts": 1795600777.0, "closed_reason": "crafted"}, supersedes=_ir)
+# bb93: write_down() requires the generation binding; the crafted op
+# is booked against the position's own entry op (stored on the lane
+# position at entry), so the generation proof passes.
+_lp17 = lane_pos(mint)
+_wd_ok, _wd_why = _PAm.write_down("grad", mint, _opc + ":wd", pos_id=pid, qty=None, reason="crafted booked write-down",
+                                  expected_account_id=_lp17.get("pa_account_id"), entry_op_id=_lp17.get("pa_entry_op"))
+_point(mint, _i2); _cash17 = PA_cash(); _br17 = G._read()["bankroll"]; _n17 = len(_gi2(mint))
+G.poll_exits(price_fn=prices([entry * 0.05]))
+_sp17 = lane_pos(mint).get("settlement_pending") or {}
+check("S17a setup: the crafted write-down op is really BOOKED in the account (ok %r, outcome %r)" % (_wd_ok, _PAm.op_outcome(_opc + ":wd")), _wd_ok is True and _PAm.op_outcome(_opc + ":wd") == "applied")
+check("S17a a changed plan that would DROP the booked write-down is REFUSED: no new intent (%d -> %d), crafted intent still open (%s), position open and pending (%r), nothing booked"
+      % (_n17, len(_gi2(mint)), _CI.intent_status("grad", _i2), _sp17.get("why")),
+      len(_gi2(mint)) == _n17 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions() and _sp17.get("why") == "close_intent_not_durable"
+      and G._read()["bankroll"] == _br17 and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint])
+# S17b NEGATIVE CONTROL: identical setup but the ":wd" op was NOT booked -> the change proceeds (freeze, then a recorded successor)
+mint = "BB18pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+_two = [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+        {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}]
+_i2 = _CI.begin("grad", mint, pid, _two, {"realized_usd": 1.0, "close_ts": 1795600778.0, "closed_reason": "crafted"}, supersedes=_ir)
+_point(mint, _i2)
+with patch.object(_PAm, "credit", _credit_refuse):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+_g18 = _gi2(mint)
+check("S17b control (wd NOT booked, outcome %r): the same change proceeds: crafted intent FROZEN, a successor recorded with supersedes (intents %d)" % (_PAm.op_outcome(_opc + ":wd"), len(_g18)),
+      _PAm.op_outcome(_opc + ":wd") != "applied" and _CI.intent_status("grad", _i2) == "frozen" and len(_g18) == 3 and _g18[2].get("supersedes") == _i2)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S17b control: the account accepts, the close books once and the successor is applied", len([c for c in (G._read().get("closes") or []) if c.get("mint") == mint]) == 1 and mint not in G.open_positions()
+      and _CI.intent_status("grad", _g18[2]["intent_id"]) == "applied")
+
+# S17c: SAME op id, DIFFERENT kind (the crafted old intent holds a booked WRITE-DOWN under the close op id; the new plan is a credit under the same id) -> refused
+mint = "BB21pump"; pid, entry, _ir = _refused_setup(mint)
+_opc = "grad:close:%s:%s" % (mint, pid)
+_CI.freeze("grad", _ir, "test: replaced by a crafted write-down intent")
+_i2 = _CI.begin("grad", mint, pid, [{"kind": "write_down", "op_id": _opc, "mint": mint, "pos_id": pid, "reason": "crafted"}],
+                {"realized_usd": 0.0, "close_ts": 1795600779.0, "closed_reason": "crafted"}, supersedes=_ir)
+# bb93: same generation binding as S17a — the write-down under the
+# close op id is booked against the position's own entry op.
+_lp21 = lane_pos(mint)
+_wdk_ok, _ = _PAm.write_down("grad", mint, _opc, pos_id=pid, qty=None, reason="crafted booked write-down under the close op id",
+                             expected_account_id=_lp21.get("pa_account_id"), entry_op_id=_lp21.get("pa_entry_op"))
+_point(mint, _i2); _n21 = len(_gi2(mint)); _br21 = G._read()["bankroll"]
+G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S17c kind change on the SAME op id: the booked write-down (outcome %r) is not silently re-booked as a credit: refused, no new intent (%d -> %d), crafted intent open (%s), nothing booked"
+      % (_PAm.op_outcome(_opc), _n21, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
+      _wdk_ok is True and _PAm.op_outcome(_opc) == "applied" and len(_gi2(mint)) == _n21 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions()
+      and G._read()["bankroll"] == _br21 and not [c for c in (G._read().get("closes") or []) if c.get("mint") == mint])
+# S17d: an UNREADABLE account journal cannot prove a dropped op was not applied -> refused. NAMED FAULT INJECTION, SCOPED: only a call made DIRECTLY from
+# grad._finalize (the dropped-op guard site) sees the torn status; every other reader (buyback applied-add, snapshot) passes through unchanged, so the guard
+# under test is the one that fires. Reachability is asserted by a hit counter on that exact site, and a pass-through control with the SAME crafted state proceeds.
+import sys as _sys17, logging as _lg17
+class _Cap17(_lg17.Handler):
+    def __init__(self): super().__init__(); self.msgs = []
+    def emit(self, r): self.msgs.append(r.getMessage())
+def _scoped_jr(fault, hits):
+    # Intercepts _journal_read ONLY when the IMMEDIATE caller is grad._finalize (module grad, function _finalize); every other caller, and the real read when
+    # not faulting, is delegated to the real paper_account function unchanged.
+    _real = _PAm._journal_read
+    def _jr(*a, **k):
+        _f = _sys17._getframe(1)
+        if _f.f_code.co_name == "_finalize" and _f.f_globals.get("__name__") == G.__name__:
+            hits.append(1)
+            if fault:
+                return ([], "torn", None)
+        return _real(*a, **k)
+    return _jr
+def _s17d_setup(mint):
+    pid, entry, _ir = _refused_setup(mint)
+    _opc = "grad:close:%s:%s" % (mint, pid)
+    _CI.freeze("grad", _ir, "test: replaced by a crafted two-op intent")
+    _i2 = _CI.begin("grad", mint, pid, [{"kind": "credit", "op_id": _opc, "mint": mint, "amount": 1.0, "qty": None, "price_kind": "current", "pos_id": pid},
+                                          {"kind": "write_down", "op_id": _opc + ":wd", "mint": mint, "pos_id": pid, "reason": "crafted"}],
+                    {"realized_usd": 1.0, "close_ts": 1795600780.0, "closed_reason": "crafted"}, supersedes=_ir)
+    _point(mint, _i2)
+    return pid, entry, _i2
+def _s17d_run(mint, fault):
+    pid, entry, _i2 = _s17d_setup(mint); _n = len(_gi2(mint)); _h = []; _cap = _Cap17(); _root = _lg17.getLogger(); _root.addHandler(_cap)
+    try:
+        with patch.object(_PAm, "_journal_read", _scoped_jr(fault, _h)):
+            G.poll_exits(price_fn=prices([entry * 0.05]))
+    finally:
+        _root.removeHandler(_cap)
+    return pid, _i2, _n, _h, _cap.msgs
+mint = "BB22pump"; pid, _i2, _n22, _h, _msgs = _s17d_run(mint, True)
+_why = (lane_pos(mint).get("settlement_pending") or {}).get("why")
+_hit = [m for m in _msgs if "account journal unreadable: cannot prove the dropped op(s)" in m and "close_intent_not_durable" in m]
+check("S17d unreadable account journal AT THE DROPPED-OP GUARD (exactly %d intercept from grad._finalize; guard log lines %d; pending why %r, not buyback_applied_add_unreadable; no new intent %d -> %d, crafted intent %s, position open)"
+      % (len(_h), len(_hit), _why, _n22, len(_gi2(mint)), _CI.intent_status("grad", _i2)),
+      len(_h) == 1 and len(_hit) == 1 and _why == "close_intent_not_durable" and _why != "buyback_applied_add_unreadable"
+      and not [m for m in _msgs if "buyback_applied_add_unreadable" in m]
+      and len(_gi2(mint)) == _n22 and _CI.intent_status("grad", _i2) == "open" and mint in G.open_positions())
+mint = "BB23pump"; pid, _i2, _n23, _h, _msgs = _s17d_run(mint, False)
+_ev = [e for e in _gi2(mint)]
+check("S17d control: SAME crafted state with the IDENTICAL wrapper installed but delegating to the real read (exactly %d intercept, so the wrapper is neutral): crafted intent %s, successor recorded (intents %d -> %d), no guard log lines (%d)"
+      % (len(_h), _CI.intent_status("grad", _i2), _n23, len(_ev), len([m for m in _msgs if "account journal unreadable" in m])),
+      len(_h) == 1 and _CI.intent_status("grad", _i2) == "frozen" and len(_ev) > _n23 and not [m for m in _msgs if "account journal unreadable" in m])
+
+def _to_successor(m):
+    pid_, entry_, i0_ = _refused_setup(m)
+    _d = G._read(); _d["positions"][m]["settlement_pending"]["plan_sig"] = "INJECTED-previous-plan-signature"; G._write(_d)
+    with patch.object(_PAm, "credit", _credit_refuse):
+        G.poll_exits(price_fn=prices([entry_ * 0.05]))
+    g_ = _gi2(m)
+    return pid_, entry_, i0_, g_[1]["intent_id"], g_
+
+# S18a: successor B created and still OPEN, but the state write was lost (position still names the frozen parent I0): follow the chain to the tip, reuse B
+mint = "BB19pump"; pid, entry, _i0, _b, _g = _to_successor(mint)
+check("S18a setup: I0 frozen, successor B open (2 intents)", len(_g) == 2 and _CI.intent_status("grad", _i0) == "frozen" and _CI.intent_status("grad", _b) == "open" and _g[1].get("supersedes") == _i0)
+_point(mint, _i0, sig=(lane_pos(mint).get("settlement_pending") or {}).get("plan_sig"))   # INJECTION: the lost state write
+with patch.object(_PAm, "credit", _credit_refuse):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S18a the stale pointer to the frozen parent follows the chain to the open tip: NO third intent (%d), position now points at B (%r)" % (len(_gi2(mint)), (lane_pos(mint).get("settlement_pending") or {}).get("intent_id") == _b),
+      len(_gi2(mint)) == 2 and (lane_pos(mint).get("settlement_pending") or {}).get("intent_id") == _b and _CI.intent_status("grad", _b) == "open")
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.05]))
+check("S18a the account accepts: one close, B applied, I0 frozen", len([c for c in (G._read().get("closes") or []) if c.get("mint") == mint]) == 1 and _CI.intent_status("grad", _b) == "applied" and _CI.intent_status("grad", _i0) == "frozen")
+
+# S18b: B was driven to APPLIED in the journal (real account credit booked, both markers) but the LANE write was lost, the position still names I0, AND the
+# retry sees a DIFFERENT quote and a different current lane figure. The reconcile must come from B's DURABLE record (settle ops and close_info), never from the
+# current re-price. NAMED INJECTIONS: stored pointer; a different quote (JUP.mult and the poll price); the lane's current realized changed (what a re-price does).
+mint = "BB20pump"; pid, entry, _i0, _b, _g = _to_successor(mint)
+_bop = [o for o in _g[1]["settle_ops"] if o.get("kind") == "credit"][0]; _rec_real = float(_g[1]["close_info"]["realized_usd"])
+_cash_pre = PA_cash()
+# bb93: the injected real credit needs the generation binding from
+# the position's own entry op, as the lane's own settle calls do.
+_lp20 = lane_pos(mint)
+_ok20, _w20 = _real_credit("grad", mint, _bop["amount"], _bop["op_id"], pos_id=pid, qty=_bop.get("qty"), price_kind=_bop.get("price_kind"),
+                           expected_account_id=_lp20.get("pa_account_id"), entry_op_id=_lp20.get("pa_entry_op"))   # INJECTION: real account op booked
+_m1 = _CI.mark_account_applied("grad", _b); _m2 = _CI.mark_lane_applied("grad", _b)
+_cash20 = PA_cash(); _br20 = G._read()["bankroll"]
+check("S18b setup: B credit booked in the account (%r, cash delta %.6f vs recorded amount %.6f), journal says B applied (%r), the lane still holds the position open"
+      % (_ok20, _cash20 - _cash_pre, float(_bop["amount"]), _CI.intent_status("grad", _b)),
+      _ok20 is True and _m1 and _m2 and _CI.intent_status("grad", _b) == "applied" and mint in G.open_positions() and abs((_cash20 - _cash_pre) - float(_bop["amount"])) < 1e-6)
+_point(mint, _i0, sig=(lane_pos(mint).get("settlement_pending") or {}).get("plan_sig"))
+_d20 = G._read(); _d20["positions"][mint]["realized_usd"] = round(float(_d20["positions"][mint]["realized_usd"]) + 0.5, 6); G._write(_d20)
+JUP.mult = 0.03
+_cur_real = float(lane_pos(mint)["realized_usd"])
+check("S18b sensitivity: the CURRENT lane realized (%.6f) differs from B's recorded close_info realized (%.6f), the quote differs (JUP.mult 0.03 vs 0.05)" % (_cur_real, _rec_real), abs(_cur_real - _rec_real) > 0.4)
+for _ in range(3):
+    G.poll_exits(price_fn=prices([entry * 0.03]))
+_rec20 = [c for c in (G._read().get("closes") or []) if c.get("mint") == mint]
+check("S18b reconcile from the DURABLE tip record: no 3rd intent (%d), exactly ONE close, flat, close realized %r == B recorded %r, bankroll +recorded once (%r -> %r)"
+      % (len(_gi2(mint)), _rec20[0].get("realized_usd") if _rec20 else None, _rec_real, _br20, G._read()["bankroll"]),
+      len(_gi2(mint)) == 2 and len(_rec20) == 1 and mint not in G.open_positions() and abs(_rec20[0]["realized_usd"] - _rec_real) < 1e-9
+      and abs(G._read()["bankroll"] - (_br20 + _rec_real)) < 1e-6 and acct_lot_qty(pid) < 1e-6)
+check("S18b the account credit is NOT booked a second time and equals the recorded amount (cash %r vs %r after the injected credit, delta %.6f vs %.6f), no hold loop (no pending, no settlement_pending)"
+      % (PA_cash(), _cash20, _cash20 - _cash_pre, float(_bop["amount"])),
+      abs(PA_cash() - _cash20) < 1e-9 and abs((_cash20 - _cash_pre) - float(_bop["amount"])) < 1e-6 and not lane_pos(mint) and _CI.intent_status("grad", _b) == "applied")
+JUP.mult = 1.0
+
+# ---- S15: REAL DemoFiller sale idempotency and the execute-before-save window (real filler, real sim executor, FakeJup quotes = canned quote fixture, engineering only) ----
+setup(); _F = FILLER[0]; _mint15 = "S15pump"; _op15 = "grad:exit:%s:a" % _mint15
+_f1 = _F.sell(_op15, _mint15, 100.0, 2.0); _n1 = len(JUP.calls)
+_f2 = _F.sell(_op15, _mint15, 100.0, 2.0)
+check("S15a real sell: a second call with the SAME op id returns the SAME journaled fill and requests/executes nothing (calls %d -> %d)" % (_n1, len(JUP.calls)),
+      _f2 == _f1 and len(JUP.calls) == _n1 and _f1.get("status") == "filled")
+# crash/save-failure window: the swap executes, then the fill cannot be saved
+setup(); _F = FILLER[0]; _op = "grad:exit:S15crash:a"; _real_save = _F._save
+def _bad_save(op_id, fill): raise RuntimeError("INJECTED: fill journal save failed after the swap executed")
+_F._save = _bad_save; _n0 = len(JUP.calls)
+try:
+    _F.sell(_op, "S15crash", 100.0, 2.0); _raised = False
+except RuntimeError:
+    _raised = True
+_nx = len(JUP.calls); _rec = _F.get_fill(_op)
+check("S15b INJECTED save failure after execute: sell raised (%r), the swap WAS requested (%d -> %d), journal holds an INFLIGHT marker (%r)" % (_raised, _n0, _nx, (_rec or {}).get("status")),
+      _raised and _nx > _n0 and (_rec or {}).get("status") == "inflight")
+_F._save = _real_save
+try:
+    _F.sell(_op, "S15crash", 100.0, 2.0); _why = None
+except DF.DemoSkip as _e:
+    _why = _e.reason
+check("S15b retry after the crash is REFUSED fail-closed (unresolved_inflight, got %r) and does NOT execute the swap again (calls %d -> %d)" % (_why, _nx, len(JUP.calls)),
+      _why == "unresolved_inflight" and len(JUP.calls) == _nx and (_F.get_fill(_op) or {}).get("status") == "inflight")
+# clean executor refusal clears the marker: a later retry may execute exactly once
+setup(); _F = FILLER[0]; _op = "grad:exit:S15refuse:a"; JUP.fail_sell = True
+try:
+    _F.sell(_op, "S15refuse", 100.0, 2.0); _w = None
+except DF.DemoSkip as _e:
+    _w = _e.reason
+_after = _F.get_fill(_op)
+JUP.fail_sell = False; _nr = len(JUP.calls)
+_ok15 = _F.sell(_op, "S15refuse", 100.0, 2.0)
+check("S15c clean refusal (%r) leaves NO inflight marker (%r) and a later retry executes once (calls +%d) to a filled record" % (_w, _after, len(JUP.calls) - _nr),
+      _w is not None and _after is None and _ok15.get("status") == "filled" and len(JUP.calls) > _nr)
+# marker unwritable: nothing executes
+setup(); _F = FILLER[0]; _n0 = len(JUP.calls)
+def _bad_mark(*a, **k): raise RuntimeError("INJECTED: inflight marker not writable")
+_F._mark_inflight = _bad_mark
+try:
+    _F.sell("grad:exit:S15nomark:a", "S15nomark", 100.0, 2.0); _r = False
+except RuntimeError:
+    _r = True
+check("S15d marker not writable: the sale raises and the executor was never reached (execute calls %d -> %d)" % (_n0, len(JUP.calls)), _r and len(JUP.calls) == _n0)
+
+
+# ---- S15e-n: atomic claim, mint-level guard, timeout->unknown->reconcile, BUY path controls (real DemoFiller, canned FakeJup quotes) ----
+import threading as _thr
+# e. two concurrent callers of the SAME sell op id: exactly ONE executes (claim is a single locked check-and-claim)
+setup(); _F = FILLER[0]; _n0 = len(JUP.calls); _res = []; _lk = _thr.Lock()
+def _t():
+    try:
+        r = _F.sell("grad:exit:S15conc:a", "S15conc", 100.0, 2.0); o = ("fill", r.get("status"))
+    except DF.DemoSkip as e:
+        o = ("skip", e.reason)
+    with _lk: _res.append(o)
+_ts = [_thr.Thread(target=_t) for _ in range(6)]
+[t.start() for t in _ts]; [t.join() for t in _ts]
+_ex = len(JUP.calls) - _n0
+check("S15e 6 concurrent sells of ONE op id: swap executed exactly %d time(s) (quote calls), outcomes %r, final record %r" % (_ex, sorted(set(_res)), (_F.get_fill("grad:exit:S15conc:a") or {}).get("status")),
+      _ex == 1 and (_F.get_fill("grad:exit:S15conc:a") or {}).get("status") == "filled" and all(o[0] == "fill" or o[1] == "unresolved_inflight" for o in _res) and ("fill", "filled") in _res)
+# f. MINT-LEVEL guard: leg a left inflight (save failed after execute), then the combined remainder under a DIFFERENT op id must NOT execute
+setup(); _F = FILLER[0]; _real_save = _F._save
+def _bad(op_id, fill): raise RuntimeError("INJECTED save failure")
+_F._save = _bad
+try: _F.sell("grad:exit:S15mint:a", "S15mint", 100.0, 2.0)
+except RuntimeError: pass
+_F._save = _real_save; _n1 = len(JUP.calls)
+try: _F.sell("grad:exit:S15mint:remaining:abc", "S15mint", 300.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+check("S15f leg a inflight, then a remainder under another op id: refused (%r), NO executor call (%d -> %d), no record created for the remainder (%r)" % (_w, _n1, len(JUP.calls), _F.get_fill("grad:exit:S15mint:remaining:abc")),
+      _w == "unresolved_inflight" and len(JUP.calls) == _n1 and _F.get_fill("grad:exit:S15mint:remaining:abc") is None)
+_n2 = len(JUP.calls)
+_o = _F.sell("grad:exit:S15other:a", "S15other", 100.0, 2.0)
+check("S15f control: a DIFFERENT mint is unaffected by that inflight claim (fills, calls +%d)" % (len(JUP.calls) - _n2), _o.get("status") == "filled" and len(JUP.calls) > _n2)
+# g. confirm_timeout -> UNKNOWN replaces the claim -> retry refused (unresolved_unknown) -> reconcile settled adopts the ORIGINAL fill
+setup(); _F = FILLER[0]; _F._inject_outage = "settled"
+try: _F.sell("grad:exit:S15to:a", "S15to", 100.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+_st = (_F.get_fill("grad:exit:S15to:a") or {}).get("status"); _n3 = len(JUP.calls)
+try: _F.sell("grad:exit:S15to:a", "S15to", 100.0, 2.0); _w2 = None
+except DF.DemoSkip as e: _w2 = e.reason
+_fr = _F.reconcile("grad:exit:S15to:a")
+check("S15g confirm_timeout (%r) leaves an UNKNOWN record (%r) not inflight; retry refused %r with no executor call (%d -> %d); reconcile(settled) adopts a filled record (%r)"
+      % (_w, _st, _w2, _n3, len(JUP.calls), (_fr or {}).get("status")),
+      _w == "confirm_timeout" and _st == "unknown" and _w2 == "unresolved_unknown" and len(JUP.calls) == _n3 and (_fr or {}).get("status") == "filled")
+setup(); _F = FILLER[0]; _F._inject_outage = "unlanded"
+try: _F.sell("grad:exit:S15to2:a", "S15to2", 100.0, 2.0)
+except DF.DemoSkip: pass
+_F.reconcile("grad:exit:S15to2:a")
+check("S15g' reconcile(unlanded) clears the unknown (no fill, record %r) and a retry may execute again" % (_F.get_fill("grad:exit:S15to2:a"),),
+      _F.get_fill("grad:exit:S15to2:a") is None and _F.sell("grad:exit:S15to2:a", "S15to2", 100.0, 2.0).get("status") == "filled")
+# h. the claim survives a failure while recording the timeout: still INFLIGHT (fail closed), never cleared
+setup(); _F = FILLER[0]; _F._inject_outage = "settled"; _real_ra = _F._record_attempt
+def _bad_ra(*a, **k): raise RuntimeError("INJECTED: attempt journal not writable")
+_F._record_attempt = _bad_ra
+try: _F.sell("grad:exit:S15ra:a", "S15ra", 100.0, 2.0)
+except RuntimeError: pass
+_F._record_attempt = _real_ra
+check("S15h a timeout whose attempt record cannot be written leaves the INFLIGHT claim (%r), not cleared" % ((_F.get_fill("grad:exit:S15ra:a") or {}).get("status"),),
+      (_F.get_fill("grad:exit:S15ra:a") or {}).get("status") == "inflight")
+# i. an unlisted/unknown refusal reason keeps the claim (only PROVEN pre-execution reasons clear)
+setup(); _F = FILLER[0]
+_orig = _F._executor
+class _Ex:
+    def __init__(s, ex): s.ex = ex
+    def execute_swap(s, *a, **k): raise BrokerError(BROKER_UNAVAILABLE, "x", detail={"reason": "zero_output", "signature": "sig"})
+_F._executor = lambda *a, **k: _Ex(_orig(*a, **k))
+try: _F.sell("grad:exit:S15zero:a", "S15zero", 100.0, 2.0)
+except DF.DemoSkip as e: _zr = e.reason
+_F._executor = _orig
+check("S15i zero_output (swap landed, no output measured) does NOT clear the claim (reason %r, record %r)" % (_zr, (_F.get_fill("grad:exit:S15zero:a") or {}).get("status")),
+      _zr == "zero_output" and (_F.get_fill("grad:exit:S15zero:a") or {}).get("status") == "inflight")
+# BUY path controls
+setup(); _F = FILLER[0]
+_b = _F.buy("grad:entry:S15b:1", "S15b", 10.0, 2.0)
+check("S15j healthy BUY: filled record, NO inflight left (%r), a repeat returns the same fill with no new quote" % (_b.get("status"),),
+      _b.get("status") == "filled" and (_F.get_fill("grad:entry:S15b:1") or {}).get("status") == "filled")
+_nb = len(JUP.calls); _b2 = _F.buy("grad:entry:S15b:1", "S15b", 10.0, 2.0)
+check("S15j repeat BUY same op id: same fill, calls unchanged (%d -> %d)" % (_nb, len(JUP.calls)), _b2 == _b and len(JUP.calls) == _nb)
+setup(); _F = FILLER[0]; _real_save = _F._save; _F._save = _bad
+try: _F.buy("grad:entry:S15bs:1", "S15bs", 10.0, 2.0)
+except RuntimeError: pass
+_F._save = _real_save; _nbs = len(JUP.calls)
+try: _F.buy("grad:entry:S15bs:1", "S15bs", 10.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+check("S15k BUY save failure after execute: inflight kept, retry refused (%r) with no second execute (%d -> %d)" % (_w, _nbs, len(JUP.calls)), _w == "unresolved_inflight" and len(JUP.calls) == _nbs)
+setup(); _F = FILLER[0]; _real_get = JUP.get_quote
+def _fail_buy(inp, out, amount, slippage_bps=100):
+    raise BrokerError(BROKER_UNAVAILABLE, "no route", detail={"http_status": 400})
+JUP.get_quote = _fail_buy
+try: _F.buy("grad:entry:S15bn:1", "S15bn", 10.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+_after = _F.get_fill("grad:entry:S15bn:1"); JUP.get_quote = _real_get
+check("S15l BUY clean refusal (%r) clears the claim (%r) and a retry executes" % (_w, _after), _w is not None and _after is None and _F.buy("grad:entry:S15bn:1", "S15bn", 10.0, 2.0).get("status") == "filled")
+setup(); _F = FILLER[0]; _n0 = len(JUP.calls); _F._mark_inflight = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("INJECTED"))
+try: _F.buy("grad:entry:S15bw:1", "S15bw", 10.0, 2.0); _r = False
+except RuntimeError: _r = True
+check("S15m BUY claim not writable: raises, executor never reached (%d -> %d)" % (_n0, len(JUP.calls)), _r and len(JUP.calls) == _n0)
+
+# n. the mint guard blocks on an UNKNOWN record too (not only inflight), and the unknown record keeps the sale's intent
+setup(); _F = FILLER[0]; _F._inject_outage = "settled"
+try: _F.sell("grad:exit:S15ug:a", "S15ug", 100.0, 2.0, meta={"reason": "hard_stop_-50pct", "pkind": "x", "key": "a"})
+except DF.DemoSkip: pass
+_ug = _F.get_fill("grad:exit:S15ug:a") or {}; _n4 = len(JUP.calls)
+try: _F.sell("grad:exit:S15ug:remaining:abc", "S15ug", 300.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+try: _F.buy("grad:entry:S15ug:1", "S15ug", 10.0, 2.0); _wb = None
+except DF.DemoSkip as e: _wb = e.reason
+check("S15n leg a UNKNOWN: a remainder under another op id is refused (%r), a buyback entry is refused (%r), NO executor call (%d -> %d), unknown record keeps intent reason (%r)"
+      % (_w, _wb, _n4, len(JUP.calls), (_ug.get("intent") or {}).get("reason")),
+      _ug.get("status") == "unknown" and _w == "unresolved_unknown" and _wb == "unresolved_unknown" and len(JUP.calls) == _n4
+      and (_ug.get("intent") or {}).get("reason") == "hard_stop_-50pct")
+# o. a landed-failed tx: the attempt AND its fee are durable BEFORE the claim is cleared; if recording raises, the claim stays
+def _txfail_filler():
+    setup(); _F = FILLER[0]; _booked = []
+    _F._fee_sink = lambda usd, fid: (_booked.append((round(usd, 6), fid)) or (True, ""))
+    _orig = _F._executor
+    class _Ex:
+        def __init__(s, ex): s.ex = ex
+        def execute_swap(s, *a, **k): raise BrokerError(BROKER_UNAVAILABLE, "x", detail={"reason": "tx_failed", "fee_lamports": 5000, "signature": "sigfail"})
+    _F._executor = lambda *a, **k: _Ex(_orig(*a, **k))
+    return _F, _booked
+_F, _booked = _txfail_filler()
+try: _F.sell("grad:exit:S15tf:a", "S15tf", 100.0, 2.0); _w = None
+except DF.DemoSkip as e: _w = e.reason
+with open(_F._jpath()) as _fh: _j = json.load(_fh)
+check("S15o tx_failed: fee booked once (%r), attempt journaled (%d) with fee_op_id, then the claim is cleared (%r)" % (_booked, len(_j["attempts"]), _F.get_fill("grad:exit:S15tf:a")),
+      _w == "tx_failed" and len(_booked) == 1 and _booked[0][1] == "feeloss:grad:exit:S15tf:a:0" and len(_j["attempts"]) == 1
+      and _j["attempts"][0]["detail"].get("fee_op_id") == "feeloss:grad:exit:S15tf:a:0" and _F.get_fill("grad:exit:S15tf:a") is None)
+_F, _booked = _txfail_filler()
+def _bad_ra2(*a, **k): raise RuntimeError("INJECTED: attempt journal not writable")
+_F._record_attempt = _bad_ra2
+try: _F.sell("grad:exit:S15tf2:a", "S15tf2", 100.0, 2.0)
+except RuntimeError: pass
+check("S15o' tx_failed whose attempt/fee record cannot be written: claim STAYS inflight (%r), nothing booked (%r): the fee evidence is not lost by an early clear"
+      % ((_F.get_fill("grad:exit:S15tf2:a") or {}).get("status"), _booked), (_F.get_fill("grad:exit:S15tf2:a") or {}).get("status") == "inflight" and not _booked)
+# p. resolve_inflight is disabled: no caller string clears an inflight claim
+setup(); _F = FILLER[0]; _F._save = _bad
+try: _F.sell("grad:exit:S15rs:a", "S15rs", 100.0, 2.0)
+except RuntimeError: pass
+try: _F.resolve_inflight("grad:exit:S15rs:a", "not_executed", "operator says so", "op"); _w = None
+except DF.DemoSkip as e: _w = e.reason
+check("S15p resolve_inflight refuses (%r) and the claim remains (%r)" % (_w, (_F.get_fill("grad:exit:S15rs:a") or {}).get("status")),
+      _w == "resolution_disabled" and (_F.get_fill("grad:exit:S15rs:a") or {}).get("status") == "inflight")
 
 os.environ.pop("AGT_EXECUTION_MODE", None)
 print("fails: %d" % len(fails)); sys.exit(1 if fails else 0)

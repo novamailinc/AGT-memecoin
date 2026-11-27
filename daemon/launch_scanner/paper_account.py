@@ -766,6 +766,11 @@ def _journal(event: Dict[str, Any], strict: bool = False) -> None:
     recoverable from the journal."""
     event = dict(event)
     event["ts"] = event.get("ts") or time.time()
+    if event.get("event") in _MUTATION_EVENTS and "account_id" not in event:
+        # Every mutation record names the generation the writer LOADED under the account lock (_TL.ident, set by _load_locked: shadow restore included).
+        _ident = getattr(_TL, "ident", None)
+        if isinstance(_ident, str) and _ident:
+            event["account_id"] = _ident
     try:
         with open(JOURNAL_PATH, "a") as f:
             f.write(json.dumps(event) + "\n")
@@ -773,6 +778,10 @@ def _journal(event: Dict[str, Any], strict: bool = False) -> None:
             os.fsync(f.fileno())
     except Exception:
         logger.exception("paper_account: journal write failed")
+        try:
+            _PROBED.clear(); _MF_SCAN.update(key=None, off=0, found=False)   # a successful earlier probe or scan proves nothing after a failed write
+        except NameError:
+            pass
         if event.get("instance") is True or strict:
             raise
 
@@ -1056,10 +1065,24 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
         return led, None
     pending.sort(key=lambda t: t[0])
     replayed = 0
+    # LEGACY POLICY (engineering safety, owner decision pending): a mutation event (any kind in _MUTATION_EVENTS) WITHOUT an account_id is replayable only if it precedes the
+    # first generation-bound mutation event in the journal; once any bound event exists, an unbound one is a divergence (an operator restore of one file).
+    _bound_seqs = [e.get("seq") for e in entries if isinstance(e.get("account_id"), str) and e.get("event") in _MUTATION_EVENTS
+                   and isinstance(e.get("seq"), int)]
+    _first_bound = min(_bound_seqs) if _bound_seqs else None
     for ev_seq, ev in pending:
         kind = ev.get("event")
         lane, mint = ev.get("lane"), ev.get("mint")
         op_id = ev.get("op_id")
+        if (kind in _MUTATION_EVENTS and isinstance(ev.get("account_id"), str) and isinstance(led.get("account_id"), str)
+                and ev.get("account_id") != led.get("account_id")):
+            # GENERATION SAFETY: a mutation journaled under another account generation must never be replayed into this ledger.
+            return led, ("replay divergence: %s %s journaled under account generation %s, ledger is %s"
+                         % (kind, op_id, str(ev.get("account_id"))[:8], str(led.get("account_id"))[:8]))
+        if (kind in _MUTATION_EVENTS and not isinstance(ev.get("account_id"), str) and isinstance(led.get("account_id"), str)
+                and _first_bound is not None and ev_seq > _first_bound):
+            return led, ("replay divergence: %s %s carries no account generation after the first generation-bound event (mixed-generation journal)"
+                         % (kind, op_id))
         if kind in _MUTATION_EVENTS and op_id and op_id in ops:
             # Caller op already applied: idempotent skip. The seq
             # still advances — the state includes this mutation.
@@ -1074,7 +1097,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                 if cur.get("pos_id", _pos_id(lane, mint, ev_seq)) == pid:
                     if op_id:
                         ops[op_id] = {"event": "debit", "pos_id": pid,
-                                      "lane": lane, "mint": mint,
+                                      "lane": lane, "mint": mint, "account_id": ev.get("account_id"),
                                       "stake": ev.get("stake"), "qty": ev.get("qty"),
                                       **({"instance": True} if ev.get("instance") is True else {})}
                     led["seq"] = ev_seq
@@ -1090,7 +1113,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                          pid, ev.get("ts"), instance=ev.get("instance") is True)
             if op_id:
                 ops[op_id] = {"event": "debit", "pos_id": pid,
-                              "lane": lane, "mint": mint,
+                              "lane": lane, "mint": mint, "account_id": ev.get("account_id"),
                               "stake": stake, "qty": ev.get("qty"),
                               **({"instance": True} if ev.get("instance") is True else {})}
             replayed += 1
@@ -1121,7 +1144,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                              % (lane, mint, why))
             if op_id:
                 ops[op_id] = {"event": "credit", "lane": lane,
-                              "mint": mint, "pos_id": pid,
+                              "mint": mint, "pos_id": pid, "account_id": ev.get("account_id"),
                               "realized": realized,
                               **({"instance": True, "proceeds": ev.get("proceeds"),
                                   "fee": ev.get("fee"), "qty": ev.get("qty"),
@@ -1137,7 +1160,7 @@ def _reconcile(led: Dict[str, Any], entries: List[Dict[str, Any]]
                              "%s/%s: %s" % (lane, mint, why))
             if op_id:
                 ops[op_id] = {"event": "write_down", "lane": lane,
-                              "mint": mint,
+                              "mint": mint, "account_id": ev.get("account_id"),
                               "pos_id": ev.get("pos_id"),
                               **({"instance": True, "qty": ev.get("qty"),
                                   "reason": ev.get("reason")}
@@ -1401,7 +1424,53 @@ def verify_replay() -> Tuple[Optional[bool], str]:
         return None, "verify_replay_error:%r" % (e,)
 
 
-def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
+def _regenerate_ledger(entries: List[Dict[str, Any]]
+                     ) -> Optional[Dict[str, Any]]:
+    """Rebuild a missing ledger from a generation-consistent journal.
+
+    The book is RESTORED, not re-created: the genesis ledger adopts
+    the journal's single create event's account_id, so no new
+    generation is minted on top of journal history and no second
+    create event is journaled (the journal keeps exactly one
+    create, which _generation_refusal requires). Returns None when
+    regeneration is unsafe: no create event, several creates, a
+    create with no account_id, or ANY mutation event in the journal
+    (a mutated book that lost its ledger is refused — manual
+    reconciliation required). Callers still run _reconcile over the
+    result, so a divergence in the journal degrades instead of
+    applying.
+    """
+    creates = [e for e in entries if e.get("event") == "create"]
+    if len(creates) != 1:
+        return None
+    ident = creates[0].get("account_id")
+    if not isinstance(ident, str) or not ident:
+        return None
+    # NARROW: regenerate ONLY a never-mutated book — a journal with
+    # no mutation events at all (just the create). That is the crash
+    # window the WAL exists to cover: the create was journaled but
+    # its ledger save never completed, so no money has ever moved.
+    # Once ANY mutation is journaled, the ledger's absence means a
+    # real book was lost or wiped, and rebuilding it automatically
+    # would resurrect state no one has reconciled — that stays
+    # refused (manual reconciliation required).
+    for ev in entries:
+        if ev.get("event") in _MUTATION_EVENTS:
+            return None
+    led = _new_ledger()
+    led["account_id"] = ident
+    create = creates[0]
+    if isinstance(create.get("start_balance"), (int, float)):
+        sb = float(create["start_balance"])
+        led["start_balance"] = sb
+        led["cash"] = sb
+        led["cash_spendable"] = sb
+    if isinstance(create.get("ts"), (int, float)):
+        led["created_ts"] = float(create["ts"])
+    return led
+
+
+def _load_locked_impl() -> Tuple[Optional[Dict[str, Any]], bool,
                             Optional[str]]:
     """Read the ledger under the lock. Returns (ledger, healthy,
     degraded). First run creates it; a corrupt live file falls
@@ -1433,6 +1502,35 @@ def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool,
             degraded = ("journal seq violation %s -> %s; manual "
                         "WAL reconciliation required" % hole)
     if not os.path.exists(LEDGER_PATH):
+        if entries or jstatus is not None:
+            # Regenerate ONLY from a generation-consistent journal
+            # (see _regenerate_ledger): a crash between the WAL
+            # append and the ledger save must be recoverable, or the
+            # account bricks on exactly the window the WAL exists
+            # to cover. Anything else is a lost/replaced book:
+            # creating a clean account on top of the old WAL would
+            # merge old-generation debits into a new account_id on
+            # the next load. Fail closed, write nothing, create
+            # nothing.
+            led = _regenerate_ledger(entries) if degraded is None else None
+            if led is None:
+                logger.error("paper_account: ledger missing with WAL present (%d records, status %s): NOT regenerating; manual reconciliation required",
+                             len(entries), jstatus)
+                return None, False, "ledger missing with WAL present (not regenerated)"
+            seq_before = led.get("seq")
+            led, divergence = _reconcile(led, entries)
+            if divergence is not None:
+                degraded = divergence
+                logger.error("paper_account: %s", divergence)
+            # Persist the regenerated book even when nothing
+            # replayed: otherwise the ledger stays missing and
+            # every load regenerates it again.
+            _save_locked(led)
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            if led.get("day") != today:
+                led["day"] = today
+                led["day_realized_pnl"] = 0.0
+            return led, True, degraded
         led = _new_ledger()
         _journal({"event": "create", "start_balance":
                   led["start_balance"], "account_id": led["account_id"]})
@@ -1597,6 +1695,7 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
     taking the lock; a position it cannot price blocks further
     entries fail-closed.
     """
+    _TL.debit = None   # stale-capture guard: cleared on EVERY attempt (refusal, exception, busy), set only by a successful debit/retry below
     if not _valid_amount(stake) or stake <= 0:
         return False, "stake must be a positive finite number", None
     if not _valid_amount(qty) or qty <= 0:
@@ -1620,6 +1719,9 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        _ub = _entries_blocked_by_refusal()
+        if _ub and not (led.get("ops", {}).get(op_id) or {}).get("event") == "debit":
+            return False, "account entries blocked: %s" % _ub, None
         prior = led.get("ops", {}).get(op_id)
         if prior is not None and prior.get("event") == "debit_refused":
             _exp = {"lane": lane, "mint": mint, "stake": stake, "qty": qty}
@@ -1635,6 +1737,7 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         if rec is not None:
             if bool(rec.get("instance")) != instance:
                 return False, "op_id instance ownership conflict", None
+            _TL.debit = (op_id, rec["pos_id"], rec.get("account_id"))
             return True, "ok (retry of applied op)", rec["pos_id"]
         cash = float(led["cash"])
         spendable = float(led.get("cash_spendable", 0.0))
@@ -1681,15 +1784,17 @@ def _try_debit(lane: str, mint: str, stake: float, qty: float,
         _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
         led["ops"][op_id] = {"event": "debit", "lane": lane,
                              "mint": mint, "pos_id": pid,
-                             "stake": stake, "qty": qty,
+                             "stake": stake, "qty": qty, "account_id": led.get("account_id"),
                              **({"instance": True} if instance else {})}
         _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
-                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "op_id": op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "stake": stake, "qty": qty,
                   **({"instance": True} if instance else {}),
                   "cash_after": led["cash"],
                   "seq": led["seq"], "pos_id": pid, "ts": ts})
         _save_locked(led)
+        # ATOMIC original identity: captured under the SAME lock hold that wrote the debit, before any later load can see a different generation.
+        _TL.debit = (op_id, pid, led.get("account_id"))
         return True, "ok", pid
 
 
@@ -1721,6 +1826,9 @@ def add_to_position(lane: str, mint: str, pos_id: str, stake: float, qty: float,
             return False, "account ledger unreadable (fail-closed)"
         if degraded:
             return False, "account degraded: %s" % degraded
+        _ub = _entries_blocked_by_refusal()
+        if _ub and led.get("ops", {}).get(op_id) is None:
+            return False, "account exposure increase blocked: %s" % _ub
         prior = led.get("ops", {}).get(op_id)
         if prior is not None:
             _exp = {"event": "debit_add", "lane": lane, "mint": mint, "pos_id": pos_id}
@@ -1830,6 +1938,9 @@ def hold_stake(lane: str, amount: float, op_id: str,
             return False, "account ledger unreadable (fail-closed)"
         if degraded:
             return False, "account degraded: %s" % degraded
+        _ub = _entries_blocked_by_refusal()
+        if _ub and led.get("ops", {}).get(op_id) is None:
+            return False, "account reservation blocked: %s" % _ub
         prior = led.get("ops", {}).get(op_id)
         if prior is not None:
             _ps = prior.get("stake")
@@ -1944,6 +2055,7 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
     crash between the two journaled events is repaired by retry:
     an applied entry with the hold still present finishes the
     release."""
+    _TL.debit = None   # stale-capture guard, as in _try_debit
     if not _valid_amount(stake) or stake <= 0:
         return False, "stake must be a positive finite number", None
     if not _valid_amount(qty) or qty <= 0:
@@ -1963,6 +2075,9 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
                     "(fail-closed)", None)
         if degraded:
             return False, "account degraded: %s" % degraded, None
+        _ub = _entries_blocked_by_refusal()
+        if _ub and not (led.get("ops", {}).get(entry_op_id) or {}).get("event") == "debit":
+            return False, "account entries blocked: %s" % _ub, None
         rec, conflict = _op_lookup(led, entry_op_id, "debit", lane, mint,
                                    {"stake": stake, "qty": qty,
                                     "instance": instance})
@@ -1989,6 +2104,7 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
                           "reason": "consumed (crash repair)",
                           "seq": led["seq"], "ts": ts})
                 _save_locked(led)
+            _TL.debit = (entry_op_id, rec["pos_id"], rec.get("account_id"))
             return True, "ok (retry of applied op)", rec["pos_id"]
         if held is None:
             return False, "no such hold to consume", None
@@ -2010,10 +2126,10 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
         _apply_debit(led, lane, mint, stake, qty, pid, ts, instance=instance)
         led["ops"][entry_op_id] = {"event": "debit", "lane": lane,
                                    "mint": mint, "pos_id": pid,
-                                   "stake": stake, "qty": qty,
+                                   "stake": stake, "qty": qty, "account_id": led.get("account_id"),
                                    **({"instance": True} if instance else {})}
         _journal({"event": "debit", "event_id": "ev#%d" % led["seq"],
-                  "op_id": entry_op_id, "lane": lane, "mint": mint,
+                  "op_id": entry_op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "stake": stake, "qty": qty,
                   **({"instance": True} if instance else {}),
                   "cash_after": led["cash"],
@@ -2034,6 +2150,7 @@ def consume_hold_for_entry(hold_op_id: str, lane: str, mint: str,
                   "amount": float(held["amount"]), "reason": "consumed",
                   "seq": led["seq"], "ts": ts})
         _save_locked(led)
+        _TL.debit = (entry_op_id, pid, led.get("account_id"))   # atomic original identity, same lock hold as the entry debit
         return True, "ok", pid
 
 
@@ -2141,10 +2258,635 @@ def list_holds(prefix: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     return {k: v for k, v in holds.items() if k.startswith(prefix)}
 
 
+def _load_locked() -> Tuple[Optional[Dict[str, Any]], bool, Optional[str]]:
+    """_load_locked_impl plus the generation the CALLER now holds: _TL.ident is the account_id of the ledger actually loaded under this lock (shadow
+    restore included), which _journal stamps onto every mutation record. None when no ledger was loaded."""
+    _TL.ident = None
+    res = _load_locked_impl()
+    _led = res[0]
+    if isinstance(_led, dict) and isinstance(_led.get("account_id"), str):
+        _TL.ident = _led["account_id"]
+    return res
+
+
+def _generation_refusal(led, expected, entry_op_id, lane, mint, pos_id):
+    """ATOMIC settlement-generation proof. The caller holds _lock() and has just run _load_locked(), so the ledger, the journal and the entry-op
+    evidence checked here are the SAME ones the mutation then applies to: there is no check-then-mutate window. Returns None when proven,
+    else a refusal reason. Every failure is a refusal (never an orphan or a convergence): unknown is not proof."""
+    ident = led.get("account_id")
+    if not isinstance(ident, str) or not ident:
+        return "ledger account generation unbound (legacy)"
+    if not isinstance(expected, str) or not expected:
+        return "caller bound no account generation"
+    if expected != ident:
+        return "account generation mismatch (bound %s, ledger %s)" % (expected[:8], ident[:8])
+    entries, jst, _t = _journal_read()
+    if jst is not None:
+        return "journal not clean (%s)" % jst
+    creates = [e for e in entries if e.get("event") == "create"]
+    if len(creates) != 1 or creates[0].get("account_id") != ident:
+        return "journal create identity mismatch (%d create events)" % len(creates)
+    if not isinstance(entry_op_id, str) or not entry_op_id:
+        return "caller bound no entry op"
+    op = (led.get("ops") or {}).get(entry_op_id)
+    if not (isinstance(op, dict) and op.get("event") == "debit" and op.get("lane") == lane and op.get("mint") == mint):
+        return "entry op %s not proven in the ledger" % entry_op_id
+    if not (isinstance(pos_id, str) and pos_id):
+        return "caller bound no pos_id"
+    if op.get("pos_id") != pos_id:
+        return "entry op pos_id %s differs from the settled pos_id %s" % (op.get("pos_id"), pos_id)
+    if op.get("account_id") != ident:
+        return "entry op carries no matching account generation"
+    debs = [e for e in entries if e.get("event") == "debit" and e.get("op_id") == entry_op_id]
+    if len(debs) == 0:
+        return "journal holds no debit for the entry op"
+    if len(debs) != 1 or debs[0].get("pos_id") != op.get("pos_id") or debs[0].get("account_id") != ident:
+        return "journal does not hold exactly one matching debit for the entry op"
+    return None
+
+
+# _generation_refusal reasons that qualify for the pre-account-epoch
+# orphan carve-out in credit()/write_down(): either the caller bound
+# NOTHING (a missing field, not a contradicting one), or the caller
+# bound a generation/entry-op the account has NO record of at all
+# ("journal holds no debit for the entry op" — an absence, not a
+# contradiction). A caller that bound a CONTRADICTING generation,
+# entry op or pos_id — a generation mismatch, a pos_id that differs,
+# multiple/conflicting journal debits — is a divergence and always
+# refuses, never an orphan. The carve-out additionally requires the
+# account's own journal (clean) to prove the position was NEVER
+# debited here (pos_ever_existed() is False), so a wiped or unclear
+# journal can never qualify.
+_ORPHAN_CARVEOUT_REFUSALS = (
+    "caller bound no account generation",
+    "caller bound no entry op",
+    "caller bound no pos_id",
+    "journal holds no debit for the entry op",
+)
+
+
+def _orphan_carve_out(grf, pos_id, lane, mint):
+    """True when a generation refusal is a pre-account-epoch orphan,
+    not a divergence: the caller bound nothing, or bound a
+    generation/entry-op the account has no record of, AND the
+    account's own journal (clean) proves this (lane, mint, pos_id)
+    was NEVER debited here. pos_ever_existed returns True on any
+    unclear journal, so the carve-out is fail-closed. Callers that
+    clear this fall through to the no-open-position path, which
+    journals credit_orphan / write_down_orphan."""
+    return (grf in _ORPHAN_CARVEOUT_REFUSALS
+            and not pos_ever_existed(pos_id=pos_id, lane=lane, mint=mint))
+
+
+_TL = threading.local()
+
+
+def debit_binding(op_id: str, pos_id: str) -> Optional[str]:
+    """The account_id recorded by THIS thread's most recent debit under the lock that wrote it (new debit or retry of an applied op), only
+    when op_id and pos_id match. No later re-read: a wiped/regenerated account cannot rebind an old position. None = unproven."""
+    rec = getattr(_TL, "debit", None)
+    if rec and rec[0] == op_id and rec[1] == pos_id and isinstance(rec[2], str) and rec[2]:
+        return rec[2]
+    return None
+
+
+def entry_binding(lane: str, mint: str, entry_op_id: str, pos_id: str) -> Optional[str]:
+    """Binding for a position this thread just debited: the atomic debit-time capture only (no fallback re-read)."""
+    return debit_binding(entry_op_id, pos_id)
+
+
+def _retry_contract_refusal(led, op_id, event, lane, mint, pos_id, econ):
+    """EXACT-retry contract for an op_id THIS ledger already applied. The caller has ALREADY passed _generation_refusal (supplied generation == ledger id, clean
+    journal, single create, entry op proven) under the same lock. Here the single WAL event for the op_id must be the same event/lane/mint/pos_id/account_id
+    and every economic argument must equal the journaled one. Anything else (no event, several events, any mismatch) is a refusal, never an ack."""
+    entries, jst, _t = _journal_read()
+    if jst is not None:
+        return "journal not clean (%s)" % jst
+    ident = led.get("account_id")
+    evs = [e for e in entries if e.get("op_id") == op_id and e.get("event") == event]
+    if len(evs) != 1:
+        return "retry of op %s: %d journal %s event(s), expected exactly one" % (op_id, len(evs), event)
+    ev = evs[0]
+    for k, v in (("lane", lane), ("mint", mint), ("pos_id", pos_id), ("account_id", ident)):
+        if ev.get(k) != v:
+            return "retry of op %s conflicts with the journaled %s" % (op_id, k)
+    for k, v in (econ or {}).items():
+        if ev.get(k) != v:
+            return "retry of op %s parameter conflict on %s" % (op_id, k)
+    return None
+
+
+def _recent_refusals(window=262144):
+    """Refusal records in the last `window` bytes of the journal (bounded read; ignores a partial first line)."""
+    try:
+        with open(JOURNAL_PATH, "rb") as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - window))
+            raw = f.read().splitlines()
+        if size > window and raw: raw = raw[1:]
+        out = []
+        for l in raw:
+            try: e = json.loads(l.decode("utf-8", "replace"))
+            except ValueError: continue
+            if isinstance(e, dict) and e.get("event") == "settle_generation_refused": out.append(e)
+        return out
+    except OSError:
+        return []
+
+
+def _unresolved_path():
+    return os.path.join(os.path.dirname(LEDGER_PATH), "unresolved_generation_refusals.jsonl")
+
+
+def unresolved_refusals():
+    """DURABLE marker of settlement refusals that nothing has resolved. [] = none; None = the marker file is unreadable (callers treat that as BLOCKED). It is written
+    by _refuse_generation, is independent of the close-intent journal and of whether the lane position still exists, survives restarts, and is NEVER cleared by
+    code: an operator reconciles and removes it. It is evidence of an unresolved refusal, not authority for any action."""
+    try:
+        with open(_unresolved_path()) as f:
+            out = []
+            for ln in f:
+                if ln.strip():
+                    out.append(json.loads(ln))
+            return out
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return None
+
+
+def _record_unresolved(op_id, lane, mint, pos_id, reason):
+    try:
+        cur = unresolved_refusals()
+        if cur and any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in cur):
+            return True
+        os.makedirs(os.path.dirname(_unresolved_path()), exist_ok=True)
+        fd = os.open(_unresolved_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps({"ts": time.time(), "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason}, sort_keys=True) + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+    except Exception:
+        logger.exception("paper_account: could not write the unresolved-refusal marker")
+        _PROBED.clear()
+        return False
+
+
+_MF_SCAN = {"key": None, "off": 0, "found": False}   # incremental journal scan cache: the marker_failed latch is NOT bounded by a tail window
+
+
+def _journal_marker_failed():
+    """True when ANY record of the CURRENT journal file carries marker_failed. Scans incrementally (only bytes appended since the last call; a different or
+    shrunken file restarts from byte 0), so the answer covers the whole journal, never a bounded tail. An unreadable journal returns False here (its own
+    degraded/unreadable handling lives in _load_locked), exactly as the bounded version did."""
+    try:
+        st = os.stat(JOURNAL_PATH)
+    except OSError:
+        _MF_SCAN.update(key=None, off=0, found=False)
+        return False
+    key = (JOURNAL_PATH, st.st_ino)
+    if _MF_SCAN["key"] != key or st.st_size < _MF_SCAN["off"]:
+        _MF_SCAN.update(key=key, off=0, found=False)
+    if _MF_SCAN["found"]:
+        return True
+    if st.st_size == _MF_SCAN["off"]:
+        return False
+    try:
+        with open(JOURNAL_PATH, "rb") as f:
+            f.seek(_MF_SCAN["off"])
+            raw = f.read(st.st_size - _MF_SCAN["off"])
+    except OSError:
+        return False
+    cut = raw.rfind(b"\n") + 1
+    for ln in raw[:cut].splitlines():
+        if b"marker_failed" in ln:
+            try:
+                e = json.loads(ln.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("marker_failed"):
+                _MF_SCAN["found"] = True
+                break
+    _MF_SCAN["off"] += cut
+    return _MF_SCAN["found"]
+
+
+def _ledger_file_status(path):
+    """READ-ONLY (data, status): ok | missing | unreadable | corrupt. Never substitutes an empty ledger, takes no lock, writes nothing."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None, "missing"
+    except Exception:
+        return None, "unreadable"
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None, "corrupt"
+    if not (isinstance(d, dict) and isinstance(d.get("positions", {}), dict)):
+        return None, "corrupt"
+    return d, "ok"
+
+
+def _registry_paths():
+    d = os.path.dirname(LEDGER_PATH)
+    return (os.path.join(d, "lane_registry.jsonl"),
+            os.path.join(os.path.dirname(d), "lane_registry.%s.mirror.jsonl" % os.path.basename(d)))
+
+
+def _registry_read(path):
+    """-> (records, status): ok | missing | corrupt. Never substitutes an empty registry for an unreadable one."""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return [], "missing"
+    except Exception:
+        return [], "corrupt"
+    out = []
+    parts = raw.split("\n")
+    for i, ln in enumerate(parts):
+        if not ln.strip():
+            continue
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            if i == len(parts) - 1 and not raw.endswith("\n"):
+                return out, "torn_tail"   # crash mid-append: only the unterminated LAST line is lost; every complete record is kept
+            return [], "corrupt"
+        if not isinstance(e, dict) or not isinstance(e.get("lane"), str):
+            return [], "corrupt"
+        out.append(e)
+    return out, "ok"
+
+
+def _registry_fold(recs):
+    lanes, ids = {}, set()
+    for e in recs:
+        st = lanes.setdefault(e["lane"], {"ledger_path": None, "intent_path": None, "intent_seen": False})
+        if e.get("ledger_path"): st["ledger_path"] = e["ledger_path"]
+        if e.get("intent_path"): st["intent_path"] = e["intent_path"]
+        if e.get("intent_seen") is True: st["intent_seen"] = True
+        if isinstance(e.get("account_id"), str) and e["account_id"]: ids.add(e["account_id"])
+    return lanes, ids
+
+
+@contextlib.contextmanager
+def _reg_lock(path):
+    """Exclusive flock on a sidecar of the registry copy: every registry append, torn-tail truncation and mirror repair of that copy takes it, so a truncate decided
+    from one read can never cut a record another process appended in between. Readers stay lock-free (a reader may see an in-flight partial last line: torn_tail)."""
+    fd = os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _nl_fix(path):
+    """Torn tail (crash mid-append, last byte not a newline): truncate exactly the unterminated partial LAST line so a new record never glues onto it and the
+    file stays parseable. Complete records are never touched. Returns b"" (kept for the call shape)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data and not data.endswith(b"\n"):
+            keep = data.rfind(b"\n") + 1
+            with open(path, "r+b") as f:
+                f.truncate(keep); f.flush(); os.fsync(f.fileno())
+    except OSError:
+        pass
+    return b""
+
+
+def _registry_view():
+    """-> (records, state) where records = primary UNION mirror (a record in either copy is evidence), state is one of
+    ok | lost (primary missing, mirror present) | corrupt (either copy has mid-file garbage) | empty (both missing)."""
+    pri, mir = _registry_paths()
+    pr, ps = _registry_read(pri)
+    mr, ms = _registry_read(mir)
+    if ps == "corrupt" or ms == "corrupt":
+        return [], "corrupt"
+    if ps == "missing":
+        return (mr, "lost") if ms != "missing" else ([], "empty")
+    seen = {json.dumps(e, sort_keys=True) for e in pr}
+    return pr + [e for e in mr if json.dumps(e, sort_keys=True) not in seen], "ok"
+
+
+def _mirror_sync():
+    """Make the MIRROR contain every complete record of the PRIMARY (append-only, order kept, de-duplicated by exact line). Runs under the mirror lock and re-reads
+    both copies INSIDE it, so it never acts on a stale snapshot and never overwrites records another registrant just wrote. Lock order: the primary lock is never held
+    here (no nesting, no deadlock). Does nothing when the primary is missing/corrupt (a lost primary is evidence, never rebuilt from the mirror) or the mirror is
+    corrupt mid-file (not repaired by code). Returns True when the mirror holds all primary records afterwards."""
+    pri, mir = _registry_paths()
+    try:
+        os.makedirs(os.path.dirname(mir), exist_ok=True)
+        with _reg_lock(mir):
+            pr, ps = _registry_read(pri)
+            if ps not in ("ok", "torn_tail"):
+                return False
+            mr, ms = _registry_read(mir)
+            if ms == "corrupt":
+                return False
+            have = {json.dumps(e, sort_keys=True) for e in mr}
+            missing = [e for e in pr if json.dumps(e, sort_keys=True) not in have]
+            if missing:
+                _nl_fix(mir)
+                fd = os.open(mir, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.write(fd, "".join(json.dumps(e, sort_keys=True) + "\n" for e in missing).encode()); os.fsync(fd)
+                finally:
+                    os.close(fd)
+            return True
+    except Exception:
+        logger.exception("paper_account: lane registry mirror sync failed")
+        return False
+
+
+def _registry_append(rec):
+    """Append-only, fsync'd primary in the account directory, then a mirror in the PARENT directory. Returns True when the PRIMARY is durable. The mirror is a
+    second witness that the registry once existed; both on one filesystem, so whole-filesystem loss is not detectable from inside (see restart_admission_blockers)."""
+    pri, mir = _registry_paths()
+    line = (json.dumps(rec, sort_keys=True) + "\n").encode()
+    try:
+        os.makedirs(os.path.dirname(pri), exist_ok=True)
+        with _reg_lock(pri):
+            fd = os.open(pri, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, _nl_fix(pri) + line); os.fsync(fd)
+            finally:
+                os.close(fd)
+    except Exception:
+        logger.exception("paper_account: could not write the lane registry")
+        return False
+    _mirror_sync()   # copies THIS record and any earlier primary record the mirror lacks (a missing/lagging mirror is never left with only the newest record)
+    return True
+
+
+def register_lane(lane, lane_ledger_path, intent_journal_path=None):
+    """A lane records, once per process start and whenever something changed, WHERE its persisted state lives and which account generation it saw. Idempotent: no
+    record is written when the folded registry already holds the same facts. True = the registry reflects this lane (or the write is not needed); False = the
+    registry could not be written (the lane's own restart check then reports 'lane-registry-unwritable')."""
+    recs, st = _registry_view()
+    if st in ("corrupt", "lost"):
+        return False   # never heal a lost primary from one lane: the mirror holds the other lanes' evidence
+    lanes, ids = _registry_fold(recs)
+    cur = lanes.get(lane) or {}
+    led, lst = _ledger_file_status(LEDGER_PATH)
+    ident = led.get("account_id") if (lst == "ok" and isinstance(led.get("account_id"), str)) else None
+    seen = bool(intent_journal_path and os.path.exists(intent_journal_path))
+    if (cur.get("ledger_path") == lane_ledger_path and (not intent_journal_path or cur.get("intent_path") == intent_journal_path)
+            and (not seen or cur.get("intent_seen")) and (ident is None or ident in ids)):
+        return True
+    rec = {"lane": lane, "ledger_path": lane_ledger_path, "ts": time.time()}
+    if intent_journal_path: rec["intent_path"] = intent_journal_path; rec["intent_seen"] = seen
+    if ident: rec["account_id"] = ident
+    return _registry_append(rec)
+
+
+def register_intent_journal(lane, intent_journal_path):
+    """Called by close_intents.begin after its first durable append: records that this lane's intent journal NOW EXISTS, so a later absence is loss, not a first start."""
+    recs, st = _registry_view()
+    if st in ("corrupt", "lost"):
+        return False
+    lanes, _ids = _registry_fold(recs)
+    cur = lanes.get(lane) or {}
+    if cur.get("intent_seen") and cur.get("intent_path") == intent_journal_path:
+        return True
+    return _registry_append({"lane": lane, "intent_path": intent_journal_path, "intent_seen": True, "ts": time.time()})
+
+
+def _registry_blockers():
+    """Account-level, cross-lane admission evidence (NOT read-only: it may repair a missing mirror under the mirror lock and may record an unseen account generation in the registry; it never touches lane or account ledgers): every REGISTERED lane's persisted state judged against the CURRENT account (restart_admission_blockers per
+    lane, lifecycle included) plus intent-journal loss. [] = nothing known. A corrupt registry, or a primary registry that vanished while its mirror remains, is a
+    block. Both copies absent is indistinguishable from 'no lane ever registered' (direct account use, first start): it blocks nothing here, and each lane's
+    OWN restart check still runs against its own persisted ledger."""
+    pri, mir = _registry_paths()
+    recs, vst = _registry_view()
+    if vst == "corrupt":
+        return ["lane registry unreadable (fail-closed)"]
+    if vst == "lost":
+        return ["lane registry lost (its mirror remains)"]
+    if vst == "empty":
+        return []
+    _mirror_sync()
+    lanes, _ids = _registry_fold(recs)
+    _led, _lst = _ledger_file_status(LEDGER_PATH)
+    if _lst == "ok" and isinstance(_led.get("account_id"), str) and _led["account_id"] and _led["account_id"] not in _ids:
+        # the registry has not yet seen this account generation (account created after the lanes registered): record it so its later loss is a witness
+        _registry_append({"lane": "_account", "account_id": _led["account_id"], "ts": time.time()})
+    out = []
+    for ln, st in sorted(lanes.items()):
+        if st.get("ledger_path"):
+            for b in restart_admission_blockers(ln, st["ledger_path"], _from_registry=True):
+                out.append("lane %s: %s" % (ln, b))
+        if st.get("intent_seen") and st.get("intent_path") and not os.path.exists(st["intent_path"]):
+            out.append("lane %s: intent-journal-lost (it existed and is gone)" % ln)
+        elif st.get("intent_path"):
+            try:
+                try:
+                    from daemon.launch_scanner import close_intents as _ci
+                except ImportError:
+                    import close_intents as _ci
+                _fz, _jst = _ci.frozen_unresolved(st["intent_path"])
+                if _jst == "torn_tail":
+                    # cannot tell an in-flight append from a crash that tore a freeze/intent record: never read as clean (transient while a writer is mid-append;
+                    # the lane's recover_lane/append truncates a provable torn tail)
+                    out.append("lane %s: intent journal has an unterminated last record (in-flight append or torn freeze/intent; not judged clean)" % ln)
+                elif _jst not in (None, "missing"):
+                    out.append("lane %s: intent journal unreadable (%s)" % (ln, _jst))
+                elif _fz:
+                    out.append("lane %s: frozen unapplied intent(s) %s (unresolved economic obligation)" % (ln, ",".join(_fz[:3])))
+            except Exception as _e:
+                out.append("lane %s: intent journal check failed (%s)" % (ln, type(_e).__name__))
+    return out
+
+
+def orphan_lots(lane, lane_ledger_path):
+    """READ-ONLY: account open lots of this lane that NO persisted lane position references (by pa_pos_id). None = cannot judge (a ledger is unreadable)."""
+    led_d, lst = _ledger_file_status(lane_ledger_path)
+    acct, ast = _ledger_file_status(LEDGER_PATH)
+    if lst != "ok" or ast != "ok":
+        return None
+    refs = {p.get("pa_pos_id") for p in (led_d.get("positions") or {}).values() if isinstance(p, dict) and p.get("pa_pos_id")}
+    # A close record is ALSO a persisted lane reference to that
+    # position: the lane recorded the close, so a residual lot of a
+    # recorded close (e.g. the unsettled remainder of a partial
+    # legged close whose intent already converged) is known
+    # exposure, not a lost lot. The orphan check catches lots with
+    # NO lane record at all — neither an open position nor a close
+    # record — which this still flags.
+    refs |= {c.get("pa_pos_id") for c in (led_d.get("closes") or []) if isinstance(c, dict) and c.get("pa_pos_id")}
+    lots = (((acct.get("lanes") or {}).get(lane) or {}).get("open") or {})
+    return sorted(str(v.get("pos_id")) for v in lots.values() if isinstance(v, dict) and v.get("pos_id") and v.get("pos_id") not in refs)
+
+
+def record_orphan_lots(lane, orphans):
+    """A lane restart found account lots of its own that no persisted lane position references: that exposure has no owner. It is recorded in the durable
+    unresolved-refusal marker (evidence, never cleared by code, blocks every account admission). Returns False when any record could not be written."""
+    ok = True
+    for pid in orphans or []:
+        if not _record_unresolved("orphan-lot:%s" % pid, lane, None, pid, "account lot with no persisted lane position"):
+            ok = False
+    return ok
+
+
+def restart_admission_blockers(lane, lane_ledger_path, _from_registry=False):
+    """Entry-admission evidence DERIVED FROM PERSISTED STATE in every process (never from an in-process flag or a lost marker). [] = no known unresolved exposure.
+    READ-ONLY, no lock. Reasons:
+      '<mint>'                              open lane position with NO bound generation (legacy/unbound),
+      '<mint>@generation-mismatch'          its pa_account_id differs from the account's CURRENT generation,
+      '<mint>@entry-op-mismatch'            bound to the current generation, but the account has no matching debit (event, lane, mint, pos_id, account_id) for its
+                                            recorded entry op: the binding is not proven by the account,
+      '<mint>@account-identity-unavailable' the account ledger/generation cannot be read,
+      'account-state-lost ...'              the account ledger is MISSING although its WAL or the lane registry shows it existed,
+      'lane-ledger-<status>'                the lane ledger is missing/unreadable/corrupt WHILE the account holds open lots for the lane,
+      '<pos_id>@orphan-lot'                 (lane restart only; skipped when called from the registry) an account open lot of this lane that no persisted lane position references,
+      'orphan-check-unavailable'            the orphan scan could not read a ledger.
+    NEW INITIALIZATION vs LOST STATE: a missing account ledger counts as a fresh start only when NO prior-state witness exists: no WAL bytes, no registry record that
+    saw an account generation, and (below) no lane position bound to one. Any witness makes it lost state, never fresh. LIMIT (impossible from inside): if every file
+    on the filesystem is lost together (account ledger, WAL, registries, lane ledgers) no witness remains and it is indistinguishable from a first start; only an
+    external copy (not written by this code) could prove otherwise. A matching-generation, account-proven position never blocks."""
+    out = []
+    led_d, lst = _ledger_file_status(lane_ledger_path)
+    acct, ast = _ledger_file_status(LEDGER_PATH)
+    ident = acct.get("account_id") if (ast == "ok" and isinstance(acct.get("account_id"), str) and acct.get("account_id")) else None
+    lots = None
+    if ast == "ok":
+        try:
+            lots = len(((acct.get("lanes") or {}).get(lane) or {}).get("open") or {})
+        except Exception:
+            lots = None
+    elif ast == "missing":
+        try:
+            wal = os.path.exists(JOURNAL_PATH) and os.path.getsize(JOURNAL_PATH) > 0
+        except OSError:
+            wal = True
+        vrecs, vst = _registry_view()
+        seen_ids = _registry_fold(vrecs)[1]
+        if wal or seen_ids or vst in ("corrupt", "lost"):
+            return ["account-state-lost (ledger missing; WAL %s, registry saw a generation %s)" % ("present" if wal else "absent", "yes" if seen_ids else "no")]
+        lots = 0   # no witness of prior state anywhere: a supported first start
+    if lst != "ok":
+        if lst == "missing" and lots == 0:
+            return out
+        return ["lane-ledger-%s%s" % (lst, "" if lots is not None else " (account unreadable)")] if (lots is None or lots > 0) else out
+    ops = (acct.get("ops") or {}) if ast == "ok" else {}
+    for m, p in (led_d.get("positions") or {}).items():
+        if not isinstance(p, dict) or not p.get("pa_pos_id") or p.get("lane", lane) != lane:
+            continue
+        b = p.get("pa_account_id")
+        if not b:
+            out.append(str(m))
+        elif ast == "missing":
+            out.append("%s@account-identity-unavailable" % m)   # a bound lane position proves an account existed; its ledger is gone
+        elif ident is None:
+            out.append("%s@account-identity-unavailable" % m)
+        elif b != ident:
+            out.append("%s@generation-mismatch" % m)
+        else:
+            r = ops.get(p.get("pa_entry_op")) if isinstance(ops, dict) else None
+            if not (isinstance(r, dict) and r.get("event") == "debit" and r.get("lane") == lane and r.get("pos_id") == p.get("pa_pos_id")
+                    and r.get("mint") == (p.get("mint") or m) and r.get("account_id") == b):
+                out.append("%s@entry-op-mismatch" % m)
+    if not _from_registry and ast == "ok":
+        _o = orphan_lots(lane, lane_ledger_path)
+        if _o is None:
+            out.append("orphan-check-unavailable")
+        else:
+            out.extend("%s@orphan-lot" % p for p in _o)
+    return out
+
+
+_PROBED = set()   # account directories proven writable in THIS process
+
+
+def _durable_probe():
+    """None = the account directory accepted a create+write+fsync+unlink in this process (cached per directory); else the reason it is not provably writable.
+    A failed probe is never cached. LIMIT: this proves writability at probe time only, not at every later write; each write still fails closed on its own."""
+    d = os.path.dirname(LEDGER_PATH)
+    if d in _PROBED:
+        return None
+    p = os.path.join(d, ".durability_probe.%d" % os.getpid())
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, b"probe\n"); os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.unlink(p)
+        for _ex in (JOURNAL_PATH, LEDGER_PATH, _unresolved_path()):   # EXISTING files can be unwritable while the directory still accepts a new file
+            if os.path.exists(_ex):
+                os.close(os.open(_ex, os.O_WRONLY | os.O_APPEND))
+    except Exception as e:
+        try: os.unlink(p)
+        except OSError: pass
+        return "%s: %s" % (type(e).__name__, e)
+    _PROBED.add(d)
+    return None
+
+
+_MARKER_SEEN = [None]   # in-process latch: the ACCOUNT DIRECTORY whose unresolved-refusal marker WITH records was read once. That marker's later disappearance (SAME directory) is a block, not a clean state. A different directory is a different account (tests run many accounts per process; a daemon runs one): the latch does not carry across accounts.
+
+
+def _entries_blocked_by_refusal():
+    if _MARKER_FAILED[0] and _MARKER_FAILED[0] == JOURNAL_PATH:
+        return "a generation refusal could not be recorded in the durable marker (fail-closed)"
+    if _journal_marker_failed():
+        _MARKER_FAILED[0] = JOURNAL_PATH   # a discovered latch survives any later journal read failure, rotation or replacement of THIS journal in this process
+        return "a generation refusal could not be recorded in the durable marker (fail-closed)"
+    u = unresolved_refusals()
+    if u is None:
+        return "unresolved-refusal marker unreadable (fail-closed)"
+    _dir = os.path.dirname(LEDGER_PATH)
+    if not u and _MARKER_SEEN[0] is not None and _MARKER_SEEN[0] == _dir:
+        return "unresolved-refusal marker was read earlier in this process and is now gone or empty (fail-closed, evidence disappeared)"
+    if u:
+        _MARKER_SEEN[0] = _dir
+        return "unresolved generation refusal(s) on record (%d, first %s %s): operator reconciliation required" % (len(u), u[0].get("lane"), u[0].get("pos_id"))
+    _pr = _durable_probe()
+    if _pr:
+        return "account directory not provably writable (fail-closed): %s" % _pr
+    _rb = _registry_blockers()
+    if _rb:
+        return "persisted lane evidence blocks admission (fail-closed): %s" % "; ".join(_rb[:4])
+    return None
+
+
+_MARKER_FAILED = [None]   # in-process: the JOURNAL PATH whose refusal marker could not be written; blocks entries until restart AND is stamped into the journal event. Scoped to the journal (a different account's journal is unaffected); the branch's own tests reset it with `= False`, which still clears it (falsy).
+
+
+def _refuse_generation(op_id, lane, mint, pos_id, reason):
+    _mok = _record_unresolved(op_id, lane, mint, pos_id, reason)
+    if not _mok:
+        # FAIL CLOSED: the marker file could not be written. Block entries in this process and journal the refusal WITH marker_failed (never deduped), so the
+        # block is re-derived from the journal tail in every later process too.
+        _MARKER_FAILED[0] = JOURNAL_PATH
+        try:
+            _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason, "marker_failed": True}, strict=True)
+        except Exception:
+            _PROBED.clear(); _MF_SCAN.update(key=None, off=0, found=False)
+            logger.error("paper_account: generation refusal for %s could be recorded NEITHER in the marker NOR in the journal; only the in-process block exists", pos_id)
+            return False, ("generation refused: %s (NOT journaled and NOT recorded in the marker: nothing durable exists; entries blocked in this process only, "
+                           "restart admission must be re-derived from lane persisted state)" % reason)
+        return False, "generation refused: %s (journaled, nothing applied; durable marker unwritable: entries blocked)" % reason
+    if any(e.get("op_id") == op_id and e.get("pos_id") == pos_id and e.get("reason") == reason for e in _recent_refusals()):
+        return False, "generation refused: %s (already journaled, nothing applied)" % reason   # retry of the same refusal: no unbounded growth
+    _journal({"event": "settle_generation_refused", "lane": lane, "mint": mint, "op_id": op_id, "pos_id": pos_id, "reason": reason})
+    return False, "generation refused: %s (journaled, nothing applied)" % reason
+
+
 def credit(lane: str, mint: str, proceeds: float, op_id: str,
            ts: Optional[float] = None, pos_id: Optional[str] = None,
            qty: Optional[float] = None, fee: float = 0.0,
-           price_kind: Optional[str] = None
+           price_kind: Optional[str] = None,
+           expected_account_id: Optional[str] = None,
+           entry_op_id: Optional[str] = None
            ) -> Tuple[bool, str]:
     """Settle a sale of `qty` units of `mint` (None = ALL remaining
     units, i.e. a full close) for `proceeds` gross paper dollars
@@ -2203,6 +2945,20 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
                       "reason": degraded})
             return False, ("account degraded: %s (journaled for "
                            "manual reconciliation)" % degraded)
+        _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+        if _grf is None and op_id in (led.get("ops") or {}):
+            _grf = _retry_contract_refusal(led, op_id, "credit", lane, mint, pos_id, {"proceeds": proceeds, "fee": fee, "qty": qty, "price_kind": price_kind})
+        if _grf is not None and _orphan_carve_out(_grf, pos_id, lane, mint):
+            # PRE-ACCOUNT-EPOCH ORPHAN: the caller bound no
+            # generation and the journal proves this position was
+            # never debited here — it settles nothing. Fall through
+            # to the no-open-position path, which journals
+            # credit_orphan (the lane's recovery converges it).
+            # A debited position, or a contradicting binding, still
+            # refuses below.
+            _grf = None
+        if _grf is not None:
+            return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         rec, conflict = _op_lookup(led, op_id, "credit", lane, mint,
                                    {})
         if conflict:
@@ -2249,12 +3005,13 @@ def credit(lane: str, mint: str, proceeds: float, op_id: str,
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "credit", "lane": lane,
                              "mint": mint, "pos_id": pid,
+                             "account_id": led.get("account_id"),
                              "realized": realized,
                              **({"instance": True, "proceeds": proceeds,
                                  "fee": fee, "qty": qty, "price_kind": price_kind}
                                 if pos.get("instance") is True else {})}
         _journal({"event": "credit", "event_id": "ev#%d" % led["seq"],
-                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "op_id": op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "qty": qty, "proceeds": proceeds, "fee": fee,
                   **({"instance": True} if pos.get("instance") is True else {}),
                   "net": net, "realized": realized,
@@ -2332,7 +3089,9 @@ def write_down(lane: str, mint: str, op_id: str,
                ts: Optional[float] = None,
                pos_id: Optional[str] = None,
                reason: Optional[str] = None,
-               qty: Optional[float] = None
+               qty: Optional[float] = None,
+               expected_account_id: Optional[str] = None,
+               entry_op_id: Optional[str] = None
                ) -> Tuple[bool, str]:
     """Write a position down to zero carrying value: units and their
     original cost move to the unresolved register as
@@ -2353,6 +3112,19 @@ def write_down(lane: str, mint: str, op_id: str,
         led, healthy, degraded = _load_locked()
         if led is None:
             return False, "ledger unreadable"
+        if degraded is None:
+            _grf = _generation_refusal(led, expected_account_id, entry_op_id, lane, mint, pos_id)
+            if _grf is None and op_id in (led.get("ops") or {}):
+                _grf = _retry_contract_refusal(led, op_id, "write_down", lane, mint, pos_id, {"qty": qty, "reason": reason})
+            if _grf is not None and _orphan_carve_out(_grf, pos_id, lane, mint):
+                # PRE-ACCOUNT-EPOCH ORPHAN (same carve-out as
+                # credit): the caller bound no generation and the
+                # journal proves this position was never debited
+                # here. Fall through to the no-open-position path,
+                # which journals write_down_orphan.
+                _grf = None
+            if _grf is not None:
+                return _refuse_generation(op_id, lane, mint, pos_id, _grf)
         prior = led["ops"].get(op_id)
         if prior is not None:
             # Instance operations are exact. A different event or target can
@@ -2399,12 +3171,12 @@ def write_down(lane: str, mint: str, op_id: str,
             return False, "%s (journaled, not applied)" % why
         led["seq"] = int(led.get("seq") or 0) + 1
         led["ops"][op_id] = {"event": "write_down", "lane": lane,
-                             "mint": mint, "pos_id": pid,
+                             "mint": mint, "pos_id": pid, "account_id": led.get("account_id"),
                              **({"instance": True, "qty": qty, "reason": reason}
                                 if instance else {})}
         _journal({"event": "write_down",
                   "event_id": "ev#%d" % led["seq"],
-                  "op_id": op_id, "lane": lane, "mint": mint,
+                  "op_id": op_id, "lane": lane, "mint": mint, "account_id": led.get("account_id"),
                   "pos_id": pid, "reason": reason,
                   **({"instance": True} if instance else {}),
                   "qty": qty,

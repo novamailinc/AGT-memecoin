@@ -103,6 +103,15 @@ def _fresh(price=0.00007):
     if os.path.exists(G.LEDGER_PATH):
         os.remove(G.LEDGER_PATH)
         import shutil as _shl; _shl.rmtree(PA.ACCOUNT_DIR, ignore_errors=True)  # DISCLOSED TEST EDIT: reset the account with the lane ledger (see test_regime)
+        # The lane-registry MIRROR lives OUTSIDE the account dir
+        # (in HOME, next to it): removing only the account dir
+        # leaves a surviving mirror, which the account reads as a
+        # LOST primary registry and fail-closes entries. A full
+        # reset removes the mirror too, so the next start is a
+        # genuine first start (both copies absent).
+        _mir = PA._registry_paths()[1]
+        if os.path.exists(_mir):
+            os.remove(_mir)
     FAKE_KS.halted = set()
     FAKE_KS.recorded = []
     ps, m_veto, m_safety = _patch_all(price=price)
@@ -290,6 +299,40 @@ check("frozen: entry refused while divergence is frozen",
 _unpatch(ps)
 G._ENTRY_BLOCKED = False   # section isolation
 
+# ---- grad divergence site: freeze-success vs begin-failure (v7+ handler), real account + real journal ----
+from unittest.mock import patch as _patch
+_real_app = CI._append
+def _fail_intent(path, event): return False if event.get("ev") == "intent" else _real_app(path, event)
+ps, _mv, _ms = _fresh()
+opened, _w, _f = G.consider_candidate(_cand(mint="GHOSTB1pump"))
+check("fixture: divergence-site entry opened", opened)
+with PA._lock():
+    led, healthy, _deg = PA._load_locked()
+    led["lanes"]["grad"]["open"].pop("GHOSTB1pump", None)
+    PA._save_locked(led)
+def _leg_a(mint, mult=1.5):
+    with G._ledger_lock():
+        d = G._read(); pos = d["positions"][mint]
+        G._close_leg(pos, "a", pos["entry_price"] * mult, "test"); G._write(d)
+    return G._read()["positions"][mint]
+G._ENTRY_BLOCKED = False
+with _patch.object(CI, "_append", _fail_intent):
+    _pb = _leg_a("GHOSTB1pump")
+_evb = [e for e in _events() if e.get("intent_id", "").startswith("grad:GHOSTB1pump")]
+check("divergence + intent begin FAILS: no intent journaled (%r), hold why %r (journal failure, not divergence), leg a not done %r, entries blocked in-process %r"
+      % ([e["ev"] for e in _evb], (_pb.get("pending_exit") or {}).get("why"), not _pb["legs"]["a"]["done"], G._ENTRY_BLOCKED),
+      not _evb and (_pb.get("pending_exit") or {}).get("why") == "tranche_credit_refused" and _pb["legs"]["a"]["done"] is False and G._ENTRY_BLOCKED is True)
+_pb = _leg_a("GHOSTB1pump")
+_evb = [e for e in _events() if e.get("intent_id", "").startswith("grad:GHOSTB1pump")]
+check("storage back: the retry journals ONE intent and FREEZES it (%r), hold why %r, account side never applied"
+      % ([e["ev"] for e in _evb], (_pb.get("pending_exit") or {}).get("why")),
+      [e["ev"] for e in _evb] == ["intent", "frozen"] and (_pb.get("pending_exit") or {}).get("why") == "tranche_credit_divergence")
+_pb = _leg_a("GHOSTB1pump")
+_evb2 = [e for e in _events() if e.get("intent_id", "").startswith("grad:GHOSTB1pump")]
+check("a further poll does not open a second intent or re-freeze (%r)" % ([e["ev"] for e in _evb2],), [e["ev"] for e in _evb2] == ["intent", "frozen"])
+_unpatch(ps)
+G._ENTRY_BLOCKED = False
+
 # ---- recovery runs BEFORE a post-restart entry ---------------------
 # Simulate a kill after account_applied but before the lane write:
 # _finalize with a FAILING _write (the kill lands at the persist).
@@ -297,6 +340,30 @@ G._ENTRY_BLOCKED = False   # section isolation
 # before debiting.
 ps, _mv, _ms = _fresh()
 G._ENTRY_BLOCKED = False
+# TEST EDIT (disclosed, BB37): the earlier sections of THIS test deliberately left frozen, unapplied intents in the shared grad journal (ghost, divergence-site). Under the
+# intended contract a persisted frozen intent keeps blocking entries across restarts, so the old assumption that a flag reset unblocks it is wrong. FIRST capture, on the
+# unchanged journal, that the restart's entry IS refused and which frozen intents block it; THEN isolate this section on a fresh journal (same disclosed pattern as below).
+_e_f, _s_f, _t_f = CI._read(CI.journal_path("grad"))
+_succ_f = {e.get("supersedes") for e in _e_f if e.get("ev") == "intent" and e.get("supersedes")}
+_blk_f = sorted(i for i, x in CI._state(_e_f).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in _succ_f)
+G._RECOVERY_DONE = False
+_o_f, _w_f, _x_f = G.consider_candidate(_cand(mint="FRZPRE1pump"))
+print("  frozen-journal entry attempt: opened %r, why %r, flag %r, blocking frozen intents %r" % (_o_f, _w_f, G._ENTRY_BLOCKED, _blk_f))
+check("frozen journal: a post-restart entry is REFUSED (opened %r, why %r) with entries blocked (%r)" % (_o_f, _w_f, G._ENTRY_BLOCKED), _o_f is False and G._ENTRY_BLOCKED is True)
+check("frozen journal: the blockers are the earlier frozen unapplied intents, including the ghost intent (%r)" % (_blk_f,),
+      len(_blk_f) >= 1 and any(i.startswith("grad:GHOSTB1pump") for i in _blk_f) and CI.pending("grad") is not None)
+unlink_j = CI.journal_path("grad")
+if os.path.exists(unlink_j): os.remove(unlink_j)   # DISCLOSED TEST SETUP: fresh journal for the healthy-replay section; the frozen-blocks-entry behavior is asserted above
+# The registry recorded that grad HAS an intent journal; deleting
+# the journal file alone reads as a LOST journal (fail-closed,
+# "intent-journal-lost") on the next entry. A fresh journal needs
+# a fresh registry too: remove both registry copies (primary in
+# the account dir, mirror in HOME) so admission sees no prior
+# lane registration.
+for _rp in PA._registry_paths():
+    if os.path.exists(_rp): os.remove(_rp)
+G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+check("isolation: the fresh journal has no frozen blockers and no pending intents", _events() == [] and CI.pending("grad") == [])
 _cash_pre_pend = PA.snapshot()["cash"]
 opened, _w, _f = G.consider_candidate(_cand(mint="PEND11pump"))
 check("fixture: pending-close entry opened", opened)
@@ -421,6 +488,30 @@ check("torn: recovery cannot prove state -> entry BLOCKED",
       not opened_t and "frozen" in why_t)
 check("torn: op_outcome unknown on truncated/corrupt history",
       PA.op_outcome("grad:close:TORN11pump:nonexistent") == "unknown")
+_unpatch(ps)
+
+# ---- corrupt journal, NO incomplete intent anywhere: entries must still block ----
+# A corrupt journal may hide an incomplete intent; "nothing visible" is not "converged".
+ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+if os.path.exists(CI.journal_path("grad")): os.remove(CI.journal_path("grad"))   # DISCLOSED TEST SETUP: fresh journal in this test's own temp home (earlier sections left a deliberately corrupt one)
+CI.journal_writable("grad")
+_jp5 = CI.journal_path("grad")
+_ok5, _w5, _f = G.consider_candidate(_cand(mint="CTRL5pump"))
+check("corrupt-journal control: healthy journal with no intent: entry OPENS (%r) and entries are not blocked (%r)" % (_ok5, G._ENTRY_BLOCKED), _ok5 and not G._ENTRY_BLOCKED)
+_ps5, _mv5, _ms5 = ps, _mv, _ms
+_unpatch(ps)
+ps, _mv, _ms = _fresh()
+G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+if os.path.exists(CI.journal_path("grad")): os.remove(CI.journal_path("grad"))   # DISCLOSED TEST SETUP: fresh journal in this test's own temp home (earlier sections left a deliberately corrupt one)
+CI.journal_writable("grad")
+_jp5 = CI.journal_path("grad")
+with open(_jp5, "a") as _f5:
+    _f5.write("{not json\n" + json.dumps({"ev": "probe", "lane": "grad"}) + "\n")
+_st5 = CI._read(_jp5)[1]; _inc5 = len(CI.pending("grad"))
+_ok6, _w6, _f = G.consider_candidate(_cand(mint="CORR5pump"))
+check("corrupt journal (status %r) with %d incomplete intents visible: recovery still BLOCKS entries (entry opened %r, blocked flag %r, why %r)" % (_st5, _inc5, _ok6, G._ENTRY_BLOCKED, _w6),
+      _st5 == "torn" and _inc5 == 0 and not _ok6 and G._ENTRY_BLOCKED is True and "frozen" in str(_w6))
 _unpatch(ps)
 
 print()

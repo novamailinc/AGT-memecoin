@@ -11,6 +11,7 @@ C. A settled FAILED tx's fee was mirrored in the native SOL mirror but
 """
 import json
 import time
+from pathlib import Path
 
 import pytest
 from daemon.launch_scanner import paper_account as pa
@@ -194,11 +195,18 @@ class TestHoldCrashReplay:
         # LOW fix: a corrupt journal releasing a hold that never
         # existed must DEGRADE the account, never mint spendable cash.
         assert pa.hold_stake('main', 2.0, 'h1')[0]
+        # Generation binding (2026-11-27): the forged entry must
+        # carry the CURRENT account generation, so replay reaches the
+        # unknown-hold check instead of stopping at the earlier
+        # mixed-generation divergence. The corruption under test is
+        # the unknown hold, not the generation.
+        gen = json.loads(Path(pa.LEDGER_PATH).read_text())['account_id']
         with open(pa.JOURNAL_PATH, 'a') as fh:
             fh.write(json.dumps({
                 'event': 'hold_released', 'event_id': 'ev#2',
                 'op_id': 'ghost:release', 'hold_op_id': 'ghost',
-                'amount': 9.0, 'seq': 2, 'ts': time.time()}) + '\n')
+                'amount': 9.0, 'seq': 2, 'ts': time.time(),
+                'account_id': gen}) + '\n')
         snap = pa.snapshot()
         assert snap['degraded'] and 'unknown hold' in snap['degraded']
         assert snap['cash_spendable'] == 8.0  # never credited the ghost

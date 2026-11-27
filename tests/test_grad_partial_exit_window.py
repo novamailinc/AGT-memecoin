@@ -118,6 +118,16 @@ def fresh(start="10", max_age="60", impact="2.0"):
     GR.LEDGER_PATH = os.path.join(led, "grad.json"); GR.ensure_ledger()
     GR._demo_mode = lambda: True; GR._demo_filler = lambda F=F: F
     GR._ks = KS(); GR._veto = Veto(); GR.QUOTE_RETRY_GAP_S = 0.0; GR.MAX_OPEN = 50
+    # fresh() simulates a NEW PROCESS (new home, new ledgers, reloaded
+    # account): the grad module globals a restart clears must reset
+    # too. The other four lanes already reset theirs above; grad was
+    # missed, so a refused/blocked scenario poisoned every later
+    # scenario's entry (recovery is skipped as "done" and the stale
+    # _ENTRY_BLOCKED verdict is reused), and a crashed close intent
+    # staged in _PENDING_CLOSE_INTENTS could match a later scenario's
+    # close for the same reused pid (GradMint1pump#1) on its write.
+    GR._ENTRY_BLOCKED = False; GR._RECOVERY_DONE = False
+    GR._PENDING_CLOSE_INTENTS.clear()
     class GSafe:
         def check_token(self, chain, mint, timeout=10): return {"passed": True, "unknown": False, "score": 7, "flags": [], "fails": [], "source": "rugcheck"}
     GR._safety = GSafe()
@@ -383,6 +393,51 @@ check("W10 the unresolved units moved to the register, not left as an open accou
       len(sn10["lanes"]["grad"]["positions"]) == 0)
 
 # ---- W11. reconciliation uses the ORIGINAL kind from the account receipt; it never upgrades stale/unknown to current
+def _restate_leg_receipt_kind(PA, kind):
+    """Restate the price_kind of the journaled leg credits for the
+    crashed position, in BOTH the account journal and the account
+    ledger ops record. The receipt IS the journaled credit event
+    (op_receipts returns it verbatim), and the account's exact-retry
+    contract checks the journal while the instance check reads the
+    ledger ops — the two must agree, as they do in production. So a
+    receipt that "says STALE" (or has no kind) can only be simulated
+    by restating the durable record itself: patching op_receipts to
+    lie about the kind creates a state production can never reach,
+    and the exact-retry contract (correctly) refuses the replay as a
+    "parameter conflict on price_kind", leaving the leg pending and
+    blocking entries. kind=None strips the key (a legacy kind-less
+    record). The DemoFiller fill journal is NOT touched: the
+    reconcile takes its kind from the receipt, never from the fill's
+    stamp, so the fill's original kind cannot affect the outcome."""
+    import json as _json
+    _jpath, _lpath = PA.JOURNAL_PATH, PA.LEDGER_PATH
+    _rows = []
+    with open(_jpath) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line:
+                continue
+            _ev = _json.loads(_line)
+            if _ev.get("event") == "credit" and str(_ev.get("op_id") or "").startswith("grad:leg:"):
+                if kind is None:
+                    _ev.pop("price_kind", None)
+                else:
+                    _ev["price_kind"] = kind
+            _rows.append(_ev)
+    with open(_jpath, "w") as _f:
+        for _ev in _rows:
+            _f.write(_json.dumps(_ev) + "\n")
+    _led = _json.load(open(_lpath))
+    for _op, _rec in (_led.get("ops") or {}).items():
+        if str(_op).startswith("grad:leg:") and isinstance(_rec, dict):
+            if kind is None:
+                _rec.pop("price_kind", None)
+            else:
+                _rec["price_kind"] = kind
+    with open(_lpath, "w") as _f:
+        _json.dump(_led, _f)
+
+
 def crash_after_leg_credit():
     PA, F, CT = fresh(start="10"); lanes = dict(build(PA, CT))
     ok, why = lanes["grad"](1); assert ok, why
@@ -404,18 +459,18 @@ def crash_after_leg_credit():
     restart(PA); GR._recover_close_intents()
     return PA, F, gm
 PA, F, gm = crash_after_leg_credit()
-_ro = PA.op_receipts
-PA.op_receipts = lambda ops: {o: dict(r or {}, price_kind="stale_price_estimate") if r else r for o, r in _ro(ops).items()}
-GR.poll_exits(price_fn=gpf(1.0)); PA.op_receipts = _ro
+_restate_leg_receipt_kind(PA, "stale_price_estimate")
+GR.poll_exits(price_fn=gpf(1.0))
 la = GR.open_positions()[gm]["legs"]["a"]
 check("W11 receipt says STALE: reconciled leg A keeps the stale kind, not upgraded to current (%s)" % la.get("exit_price_kind"), la["done"] and la.get("exit_price_kind") == "stale_price_estimate")
 PA, F, gm = crash_after_leg_credit()
+_ro = PA.op_receipts
 PA.op_receipts = lambda ops: dict({o: None for o in ops}, _unreadable=True)
 GR.poll_exits(price_fn=gpf(1.0)); PA.op_receipts = _ro
 check("W11 journal unreadable: fail closed, leg A stays pending and is not marked done/current", not GR.open_positions()[gm]["legs"]["a"]["done"])
 PA, F, gm = crash_after_leg_credit()
-PA.op_receipts = lambda ops: {o: dict(r, price_kind=None) if r else r for o, r in _ro(ops).items()}
-GR.poll_exits(price_fn=gpf(1.0)); PA.op_receipts = _ro
+_restate_leg_receipt_kind(PA, None)
+GR.poll_exits(price_fn=gpf(1.0))
 check("W11 receipt without a kind: reconciled as UNKNOWN, never current (%s)" % GR.open_positions()[gm]["legs"]["a"].get("exit_price_kind"), GR.open_positions()[gm]["legs"]["a"].get("exit_price_kind") == "unknown")
 PA, F, gm = crash_after_leg_credit()
 GR.poll_exits(price_fn=gpf(1.0))
@@ -553,7 +608,13 @@ with GR._ledger_lock():
 FakeJup.mult = 3.0; GR.poll_exits(price_fn=gpf(3.0)); FakeJup.mult = 1.0
 p18b = GR.open_positions()[gm]
 check("W18 account identity mismatch (stale pos_id, a REAL inconsistency, not a pre-account orphan): refused loudly, leg pending, cash unchanged (%s)" % ((p18b.get("pending_exit") or {}).get("detail", "")[:40],),
-      not p18b["legs"]["a"]["done"] and (p18b.get("pending_exit") or {}).get("why") == "tranche_credit_refused" and _cents(cash(PA)) == _cents(c0))
+      not p18b["legs"]["a"]["done"] and (p18b.get("pending_exit") or {}).get("why") == "tranche_credit_generation_refused" and _cents(cash(PA)) == _cents(c0))
+# (bb93: a lane pos_id that does not match the account's entry op is a
+# generation/binding refusal, not a generic tranche refusal — the
+# account's entry-op pos_id check refuses it, the lane routes it to
+# tranche_credit_generation_refused and blocks entries with a durable
+# marker. The economic assertions — leg pending, cash unchanged — are
+# the same; only the diagnostic label changed, to the stricter class.)
 
 # ---- W19. TWAP with 3 slices: slice 1 persisted, slice 2 credited but its lane write lost (2-of-3 crash), NON-round quantities
 _old_tw = GR.TWAP_SLICES; GR.TWAP_SLICES = 3

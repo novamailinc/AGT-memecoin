@@ -62,10 +62,13 @@ LANE = "grad"
 _ok, _why, PID = pa.try_debit(LANE, "M", 2.0, qty=100.0,
                               op_id="grad:buy:M:1")
 assert _ok, _why
+_BIND = pa.entry_binding(LANE, "M", "grad:buy:M:1", PID)
+assert _BIND, "debit binding captured"
 
 SETTLE = [{"kind": "credit", "op_id": "grad:close:M:p1",
            "amount": 3.0, "qty": 100.0, "pos_id": PID,
-           "price_kind": "current_price_simulated_fill"}]
+           "price_kind": "current_price_simulated_fill",
+           "expected_account_id": _BIND, "entry_op_id": "grad:buy:M:1"}]
 CLOSE = {"realized_usd": 3.0, "entry_notional_usd": 2.0,
          "closed_reason": "take_profit", "close_ts": 1000.0}
 LANE_LEDGER = os.path.join(home, "lane_ledger.json")
@@ -83,12 +86,13 @@ def lane_write(rec):
         os.fsync(f.fileno())
     os.replace(tmp, LANE_LEDGER)
 
-iid = ci.begin(LANE, "M", PID, SETTLE, CLOSE)
+iid = ci.begin(LANE, "M", PID, SETTLE, CLOSE, account_id=_BIND)
 if mode == "kill_after_intent":
     os._exit(1)
 ok, why = pa.credit(LANE, "M", 3.0, "grad:close:M:p1",
                     pos_id=PID, qty=100.0,
-                    price_kind="current_price_simulated_fill")
+                    price_kind="current_price_simulated_fill",
+                    expected_account_id=_BIND, entry_op_id="grad:buy:M:1")
 assert ok, why
 ci.mark_account_applied(LANE, iid)
 if mode == "kill_after_account":
@@ -117,10 +121,14 @@ def account_apply(op):
     if op["kind"] == "credit":
         return pa.credit(LANE, "M", op["amount"], op["op_id"],
                          pos_id=op.get("pos_id"), qty=op.get("qty"),
-                         price_kind=op.get("price_kind"))
+                         price_kind=op.get("price_kind"),
+                         expected_account_id=op.get("expected_account_id"),
+                         entry_op_id=op.get("entry_op_id"))
     return pa.write_down(LANE, "M", op["op_id"],
                          pos_id=op.get("pos_id"), qty=op.get("qty"),
-                         reason=op.get("reason") or "recovered")
+                         reason=op.get("reason") or "recovered",
+                         expected_account_id=op.get("expected_account_id"),
+                         entry_op_id=op.get("entry_op_id"))
 
 def lane_has_close(intent):
     if not os.path.exists(LANE_LEDGER):

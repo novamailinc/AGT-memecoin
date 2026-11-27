@@ -68,9 +68,14 @@ pa = fresh(HOME)
 ok, why, pid = pa.try_debit("grad", "EST1", 10.0, 1000.0,
                             "t:entry:EST1")
 check("fixture: debit ok", ok)
+# bb93 generation binding: capture the debit-time binding NOW (the
+# thread-local holds only the most recent debit).
+bind_est1 = pa.entry_binding("grad", "EST1", "t:entry:EST1", pid)
 # partial tranche at an estimated kind: 400 of 1000 units
 ok, why = pa.credit("grad", "EST1", 6.0, "t:leg:a:EST1", pos_id=pid,
-                    qty=400.0, fee=0.1, price_kind="external")
+                    qty=400.0, fee=0.1, price_kind="external",
+                    expected_account_id=bind_est1,
+                    entry_op_id="t:entry:EST1")
 check("estimated partial credit applies", ok)
 snap = pa.snapshot()
 check("partial: proceeds quarantined in estimated bucket",
@@ -92,7 +97,9 @@ with pa._lock():
 # final close (qty=None) at an estimated kind: remaining 600 units
 ok, why = pa.credit("grad", "EST1", 9.0, "t:leg:final:EST1",
                     pos_id=pid, qty=None, fee=0.0,
-                    price_kind="unquotable_history")
+                    price_kind="unquotable_history",
+                    expected_account_id=bind_est1,
+                    entry_op_id="t:entry:EST1")
 check("estimated final credit applies", ok)
 snap = pa.snapshot()
 check("final: register holds both tranches",
@@ -117,9 +124,12 @@ check("conservation: register basis == disposed original cost",
 ok, why, pid2 = pa.try_debit("grad", "SPD1", 5.0, 500.0,
                              "t:entry:SPD1")
 check("fixture: second debit ok", ok)
+bind_spd1 = pa.entry_binding("grad", "SPD1", "t:entry:SPD1", pid2)
 ok, why = pa.credit("grad", "SPD1", 12.0, "t:final:SPD1", pos_id=pid2,
                     qty=None, fee=0.0,
-                    price_kind="current_price_simulated_fill")
+                    price_kind="current_price_simulated_fill",
+                    expected_account_id=bind_spd1,
+                    entry_op_id="t:entry:SPD1")
 check("spendable credit applies", ok)
 snap = pa.snapshot()
 check("spendable: sold_verified needs no register entry",
@@ -130,8 +140,11 @@ check("spendable: proceeds spendable, not quarantined",
 # ---- missing price_kind fails closed into the register --------------
 ok, why, pid3 = pa.try_debit("watcher", "UNK1", 2.0, 200.0,
                              "t:entry:UNK1")
+bind_unk1 = pa.entry_binding("watcher", "UNK1", "t:entry:UNK1", pid3)
 ok, why = pa.credit("watcher", "UNK1", 3.0, "t:final:UNK1",
-                    pos_id=pid3, qty=None, fee=0.0, price_kind=None)
+                    pos_id=pid3, qty=None, fee=0.0, price_kind=None,
+                    expected_account_id=bind_unk1,
+                    entry_op_id="t:entry:UNK1")
 check("unknown-kind credit applies (estimated route)", ok)
 snap = pa.snapshot()
 unk = [r for r in snap["assumed_sold"] if r["mint"] == "UNK1"]
@@ -139,8 +152,12 @@ check("unknown-kind: registered with explicit 'unknown' label",
       len(unk) == 1 and unk[0]["price_kind"] == "unknown")
 
 # ---- retry of the same op_id does not duplicate the register -------
+# Exact retry: identical economic args, so the retry contract acks
+# the original outcome instead of re-applying.
 ok, why = pa.credit("watcher", "UNK1", 3.0, "t:final:UNK1",
-                    pos_id=pid3, qty=None, fee=0.0, price_kind=None)
+                    pos_id=pid3, qty=None, fee=0.0, price_kind=None,
+                    expected_account_id=bind_unk1,
+                    entry_op_id="t:entry:UNK1")
 check("retry returns the original outcome", ok)
 snap = pa.snapshot()
 check("retry: register not duplicated",
@@ -161,8 +178,11 @@ pa3 = fresh(tempfile.mkdtemp(prefix="assumed-sold-wal-"))
 ok, why, pid4 = pa3.try_debit("grad", "WAL1", 4.0, 400.0,
                               "t:entry:WAL1")
 check("fixture: WAL debit ok", ok)
+bind_wal1 = pa3.entry_binding("grad", "WAL1", "t:entry:WAL1", pid4)
 ok, why = pa3.credit("grad", "WAL1", 5.0, "t:final:WAL1", pos_id=pid4,
-                     qty=None, fee=0.0, price_kind="external")
+                     qty=None, fee=0.0, price_kind="external",
+                     expected_account_id=bind_wal1,
+                     entry_op_id="t:entry:WAL1")
 check("fixture: WAL estimated credit ok", ok)
 jour = [json.loads(l) for l in open(pa3.JOURNAL_PATH)
         if l.strip()]

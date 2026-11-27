@@ -328,6 +328,34 @@ _RECOVERY_DONE = False
 _ENTRY_BLOCKED = False
 
 
+def _block_entries():
+    global _ENTRY_BLOCKED
+    _ENTRY_BLOCKED = True
+
+
+def _unresolved_positions(_lane=None):
+    """Restart/entry admission evidence from PERSISTED state (shared account generation vs the lane ledger, lane ledger availability). Falls back to the
+    unbound-only scan when the shared account is disabled. See paper_account.restart_admission_blockers."""
+    _pa = _paper_account()
+    _ln = _lane if _lane is not None else LANE
+    if _pa is not None and hasattr(_pa, "restart_admission_blockers"):
+        _ij = None
+        try:
+            from daemon.launch_scanner import close_intents as _ci
+        except ImportError:
+            import close_intents as _ci
+        try:
+            _ij = _ci.journal_path(_ln)
+        except Exception:
+            _ij = None
+        _ok = _pa.register_lane(_ln, LEDGER_PATH, _ij)
+        _b = list(_pa.restart_admission_blockers(_ln, LEDGER_PATH))
+        if not _ok:
+            _b.append("lane-registry-unwritable")
+        return _b
+    return [str(m) for m, p in ((_read().get("positions") or {}).items()) if isinstance(p, dict) and p.get("lane", _ln) == _ln and p.get("pa_pos_id") and not p.get("pa_account_id")]
+
+
 def _recover_close_intents():
     """Re-drive incomplete close intents once per process, before
     this process's first new close. The account side re-applies
@@ -341,6 +369,16 @@ def _recover_close_intents():
     _RECOVERY_DONE = True
     _ci = _close_intents()
     if _ci is None:
+        # Close-intent journal OFF: no intent exists to freeze (none is claimed). The unbound-position block does not depend on it: it is derived from the
+        # persisted lane ledger in every process, so entries stay blocked while any account-opened position has no bound generation.
+        try:
+            _unb0 = _unresolved_positions()
+        except Exception:
+            _unb0 = ["unreadable-lane-ledger"]
+        if _unb0:
+            _block_entries()
+            logger.error("grad: close-intent journal OFF; open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no intent freeze exists)", ",".join(_unb0))
+            return True
         return False
 
     def account_apply(op):
@@ -351,12 +389,14 @@ def _recover_close_intents():
             ok, why = _pa.write_down(
                 LANE, op.get("mint"), op.get("op_id"),
                 pos_id=op.get("pos_id"), qty=op.get("qty"),
-                reason=op.get("reason") or "recovered")
+                reason=op.get("reason") or "recovered",
+                expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
         else:
             ok, why = _pa.credit(
                 LANE, op.get("mint"), op.get("amount"),
                 op.get("op_id"), pos_id=op.get("pos_id"),
-                qty=op.get("qty"), price_kind=op.get("price_kind"))
+                qty=op.get("qty"), price_kind=op.get("price_kind"),
+                expected_account_id=op.get("expected_account_id"), entry_op_id=op.get("entry_op_id"))
         if not ok and _pa.op_outcome(op.get("op_id")) == "orphan" \
                 and not _pa.pos_ever_existed(
                     pos_id=op.get("pos_id"), lane=LANE,
@@ -396,6 +436,13 @@ def _recover_close_intents():
 
     frozen = _ci.recover_lane(LANE, account_apply, lane_has_close,
                               lane_apply)
+    try:
+        _unb = _unresolved_positions()
+    except Exception:
+        _unb = ["unreadable-lane-ledger"]
+    if _unb:
+        frozen = list(frozen or []) + ["unbound-position:" + m for m in _unb]
+        logger.error("grad: open position(s) with NO bound account generation %s: ENTRIES BLOCKED (no automatic rebinding)", ",".join(_unb))
     if frozen:
         _ENTRY_BLOCKED = True
         logger.error("grad: %d close intent(s) FROZEN - ledgers "
@@ -1037,6 +1084,12 @@ def _ei_recover():
                 raise RuntimeError("lane already holds the mint")
             pos = json.loads(json.dumps(rec["pos"]))
             pos["pa_pos_id"] = pid
+            # RECOVERY adoption: no debit happened in this process and no read-back can prove the ORIGINAL generation (a regenerated account may
+            # reuse the entry op and pos_id). So the position is stored visibly UNBOUND: settlements refuse/freeze, entries block, no rebinding.
+            pos["pa_entry_op"] = rec["op_id"]
+            pos["pa_account_id"] = None
+            pos["pa_binding_failed"] = True
+            _block_entries()
             d["bankroll"] = round(float(d["bankroll"]) - float(rec["stake"]), 6)
             # DAILY-ENTRY ATTRIBUTION (explicit): the original entry incremented the counter of ITS OWN day (rec cand.entry_day, captured by _today() when the record was written)
             # in the same write that never landed. Recovery restores exactly that and never charges a different day: same stored day -> that counter +1; entry day is today but the stored
@@ -1550,6 +1603,14 @@ def _consider_candidate(cand, now):
                 # Pin the open instance so the close can never settle
                 # a later reopen of the same mint.
                 pos["pa_pos_id"] = _pid
+                # GENERATION BINDING from the debit's own entry op under the account lock; None = unproven: stored UNBOUND, settlements refused/frozen,
+                # entries blocked (no automatic rebinding, no compensation).
+                pos["pa_entry_op"] = _op
+                pos["pa_account_id"] = _pa.entry_binding(LANE, mint, _op, _pid)
+                if not pos["pa_account_id"]:
+                    pos["pa_binding_failed"] = True
+                    _block_entries()
+                    logger.error("grad: entry %s debit %s succeeded but its account generation could NOT be proven: position stored UNBOUND, ENTRIES BLOCKED", mint, _pid)
                 _INFLIGHT_OPEN.add(str(_pid))   # account holds it, lane books do not yet: not "unknown" for the marks hook
             d["bankroll"] = round(float(d["bankroll"]) - _stake, 6)
             d["positions"][mint] = pos
@@ -2049,7 +2110,8 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
     # difference and the account then holds exactly the lane's unsold tokens. The lane tally stays in LANE units.
     _lane_qty = qty
     qty = (None if acct_qty is _QTY_NONE else (acct_qty if acct_qty is not None else _acct_qty(pos, leg_key, qty))) if qty is not None else qty
-    ok, why = _pa.credit(LANE, pos["mint"], gross, _op, pos_id=pos["pa_pos_id"], qty=qty, fee=fee, price_kind=kind)
+    ok, why = _pa.credit(LANE, pos["mint"], gross, _op, pos_id=pos["pa_pos_id"], qty=qty, fee=fee, price_kind=kind,
+                         expected_account_id=pos.get("pa_account_id"), entry_op_id=pos.get("pa_entry_op"))
     if not ok:
         # Same convergence rule as the final close: an orphan (the account never held these units, and never did
         # for this position) is a legitimate pre-account position, not a refusal: the leg proceeds and the
@@ -2071,9 +2133,19 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
         if _diverged:
             global _ENTRY_BLOCKED
             _ENTRY_BLOCKED = True
-            _jfail = False
+            _jfail = False; _applied = False
             _prior = pos.get("pending_exit") or {}
             _iid = _prior.get("intent_id") if _prior.get("leg") == leg_key else None
+            if not _iid:   # includes a prior pointer of ANOTHER leg (the pre-existing code would overwrite it, losing its intent_id)
+                _ohd = _obligation_hold(pos)
+                if _ohd is not None:
+                    # a refused replay under an existing hold NEVER opens an intent or freezes one: visible diagnostic only (the hold itself is already recorded by the gate paths)
+                    _note_obligation_hold(pos, _ohd, "tranche_replay:" + str(leg_key))
+                    _pe0 = pos.get("pending_exit")
+                    if not (isinstance(_pe0, dict) and _pe0.get("why")) or _pe0.get("leg") == leg_key:
+                        # only an EMPTY pointer or this leg's own pointer is rewritten; another leg's pointer (and its intent_id) is NEVER clobbered (diagnostic then lives in obligation_hold only)
+                        pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_divergence_held", "detail": str(why)[:200], "ts": time.time()}
+                    return False
             if _prior.get("why") != "tranche_credit_divergence":
                 try:
                     _ci = _close_intents()
@@ -2081,21 +2153,40 @@ def _tranche_credit(pos, leg_key, qty, gross, fee, kind, acct_qty=None):
                         if not _iid:
                             _iid = _ci.begin(LANE, pos["mint"], pos["pa_pos_id"],
                                              [{"kind": "credit", "op_id": _op, "mint": pos["mint"], "amount": gross,
-                                               "qty": qty, "price_kind": kind, "pos_id": pos["pa_pos_id"]}],
+                                               "qty": qty, "price_kind": kind, "pos_id": pos["pa_pos_id"],
+                                               "expected_account_id": pos.get("pa_account_id"), "entry_op_id": pos.get("pa_entry_op")}],
                                              {"realized_usd": round(gross - fee, 6), "close_ts": int(float(pos.get("entry_ts") or 0) * 1000) + ord(str(leg_key)[-1]),   # STABLE: a retry regenerates the same intent id
-                                              "closed_reason": "tranche_leg_" + str(leg_key)})
-                        _ci.freeze(LANE, _iid, "tranche credit refused: debited position absent from account (divergence): %s" % str(why)[:120])
+                                              "closed_reason": "tranche_leg_" + str(leg_key)}, stable_id=True,
+                                             account_id=pos.get("pa_account_id"))
+                        _st = _ci.intent_status(LANE, _iid)
+                        if _st == "applied":
+                            # an APPLIED intent is never frozen: that contradicts a divergence claim, so it is held visibly, not resolved
+                            _applied = True   # contradicts the divergence claim: a distinct, truthful hold (not a journal-write failure)
+                            raise RuntimeError("intent %s is already APPLIED: refusing to freeze it" % _iid)
+                        if _st != "frozen" and not _ci.freeze(LANE, _iid, "tranche credit refused: debited position absent from account (divergence): %s" % str(why)[:120]):
+                            raise RuntimeError("freeze of intent %s was not durable" % _iid)
                         logger.error("grad: tranche credit %s %s FROZEN: debited position absent from the account; "
                                      "ENTRIES BLOCKED until operator resolution", pos["mint"][:12], leg_key)
                 except Exception as _fe:
                     # journal write failed: entries stay blocked in-process; the intent id (if begin landed) is kept so
                     # the retry freezes the SAME intent instead of opening a second one
-                    _jfail = True
+                    if _applied:
+                        _jfail = False
+                        logger.error("grad: divergence claim contradicts an APPLIED close intent (%r); entries blocked, operator must reconcile", _fe)
+                    else:
+                        _jfail = True
                     logger.error("grad: divergence freeze journal write failed (%r); entries blocked, will retry", _fe)
-            pos["pending_exit"] = {"leg": leg_key, "why": ("tranche_credit_refused" if _jfail else "tranche_credit_divergence"),
+            pos["pending_exit"] = {"leg": leg_key, "why": ("tranche_credit_applied_conflict" if _applied else ("tranche_credit_refused" if _jfail else "tranche_credit_divergence")),
                                    "detail": str(why)[:200], "ts": time.time()}
             if _iid:
                 pos["pending_exit"]["intent_id"] = _iid
+            return False
+        if "generation refused" in str(why):
+            # The account refused this leg's settlement for its generation: the leg stays pending (position preserved, nothing booked), entries are blocked in
+            # this process, and the account holds a DURABLE unresolved-refusal marker that blocks every entry across restarts. Nothing is rebound or compensated.
+            _block_entries()
+            pos["pending_exit"] = {"leg": leg_key, "why": "tranche_credit_generation_refused", "detail": str(why)[:200], "ts": time.time()}
+            logger.error("grad: tranche credit %s %s REFUSED for account generation: leg stays pending, ENTRIES BLOCKED (durable account marker)", pos["mint"][:12], leg_key)
             return False
         # a credit larger than the account's remaining units (receipt qty on an earlier leg was smaller than a recompute) is a QTY
         # DIVERGENCE with a specific why, not a generic refusal
@@ -2174,6 +2265,85 @@ def _tranche_receipt(pos, leg_key):
     return r.get(_op)
 
 
+def _obligation_hold(pos, foreign_only=False, include_unknown=True):
+    """READ-ONLY position-keyed hold evidence (never appends to any journal, never mutates the account or lane books). Returns None when nothing holds this position, else
+    {"kind", "known", "marks", "unknown"} where kind is one of: "known_frozen" (a frozen, unapplied, not-superseded close intent of THIS position in the journal: a proven
+    unresolved obligation), "account_marker" (no such intent, but the account's DURABLE unresolved-refusal marker names this lane+position: a generation refusal / orphan lot that
+    nothing has resolved), "unreadable" (a source could not be read: NOT proof of a frozen obligation, reported as unknown). foreign_only=True ignores the position's OWN whole-position
+    close (op ids lane:close:mint:pos and its :wd companion), so the existing finalize refusal/retry semantics are untouched. Evidence is read from the journal and the account marker,
+    never from the lane pointers (pending_exit is overwritten by many writers). include_unknown: True = report any unreadable source; "marker" = report only an unreadable account marker; False = none."""
+    try:
+        pid = pos.get("pa_pos_id"); mint = pos.get("mint")
+        if not pid or not mint:
+            return None
+        _ci = _close_intents(); _pa = _paper_account()
+        if _ci is None and _pa is None:
+            return None
+        cp = "%s:close:%s:%s" % (LANE, mint, pid)
+        def _own(op):   # EXACT ids only: the whole-position close op and its :wd companion
+            return bool(foreign_only) and str(op) in (cp, cp + ":wd")
+        known, marks, unk = [], [], []
+        if _ci is not None:
+            fz = _ci.frozen_for_position(LANE, mint, pid)
+            if fz is None:
+                if include_unknown is True:   # "marker": the journal-unreadable case is left to the existing finalize paths (specific settlement_pending whys)
+                    unk.append("close-intent journal unreadable (not proven frozen)")
+            else:
+                for iid, why, ops in fz:
+                    if ops and all(_own(o) for o in ops):
+                        continue
+                    known.append({"intent_id": iid, "ops": list(ops), "why": str(why)[:120]})
+        if _pa is not None and hasattr(_pa, "unresolved_refusals"):
+            ur = _pa.unresolved_refusals()
+            if ur is None:
+                if include_unknown:
+                    unk.append("unresolved-refusal marker file unreadable (account-wide, not a per-position finding)")
+            else:
+                for r in ur:
+                    if not isinstance(r, dict) or r.get("lane") != LANE or r.get("pos_id") != pid or _own(r.get("op_id")):
+                        continue
+                    marks.append({"op_id": str(r.get("op_id")), "reason": str(r.get("reason"))[:120]})
+        known = sorted(known, key=lambda x: x["intent_id"]); marks = sorted(marks, key=lambda x: (x["op_id"], x["reason"]))
+        if known:
+            kind = "known_frozen"
+        elif marks:
+            kind = "account_marker"
+        elif unk and include_unknown:
+            kind = "unreadable"
+        else:
+            return None
+        return {"kind": kind, "known": known, "marks": marks, "unknown": unk if include_unknown else []}
+    except Exception as e:
+        # FAIL CLOSED: a failure inside the check itself is reported as unreadable under EVERY include_unknown mode (finalize included), never as "no hold"
+        return {"kind": "unreadable", "known": [], "marks": [], "unknown": ["hold check failed: %r" % (e,)]}
+
+
+def _hold_body_on_disk(pos):
+    """The obligation_hold diagnostic body currently PERSISTED for this position, or None when it cannot be established (unreadable/absent). Read-only: parses the ledger file
+    directly (no _read, so a corrupt file is not renamed here); the caller already holds _ledger_lock. Not process state: a restart or another writer is seen as it is on disk."""
+    try:
+        with open(LEDGER_PATH) as _f:
+            _p = (json.load(_f).get("positions") or {}).get(pos.get("mint")) or {}
+        if _p.get("pa_pos_id") != pos.get("pa_pos_id"):
+            return None
+        _h = _p.get("obligation_hold")
+        return {k: _h.get(k) for k in ("kind", "known", "marks", "unknown")} if isinstance(_h, dict) else None
+    except Exception:
+        return None
+
+
+def _note_obligation_hold(pos, hold, where):
+    """Visible diagnostic only. Stored in its own key (pending_exit / settlement_pending are never overwritten), rewritten ONLY when its content changes, and it appends nothing to
+    any journal, so repeated held polls add no rows. The position stays open, no leg is marked done, nothing is sold or booked."""
+    cur = pos.get("obligation_hold") or {}
+    body = {k: hold[k] for k in ("kind", "known", "marks", "unknown")}
+    changed = {k: cur.get(k) for k in body} != body
+    if changed:
+        pos["obligation_hold"] = dict(body, where=where, since=(cur.get("since") if cur.get("kind") == hold["kind"] and cur.get("since") else time.time()))
+        logger.error("grad %s: %s HELD by an unresolved obligation (%s): no sale, no booking, exposure stays open (operator reconciliation)", str(pos.get("mint") or "?")[:16], where, hold["kind"])
+    return changed
+
+
 def _legacy_unreconciled_buyback(pos):
     """READ-ONLY diagnostic: True when a position took a buyback under the pre-reconciliation code. Signature: buyback_used is set
     and the recorded buyback exists, but no leg carries buyback_qty and no buyback_qty_total was recorded. Such a position's lane
@@ -2212,6 +2382,11 @@ def _close_leg(pos, leg_key, exit_price, reason, pkind=None, receipt_kind=None):
     leg = pos["legs"][leg_key]
     if leg["done"]:
         return 0.0
+    if _tranche_receipt(pos, leg_key) is None:   # an APPLIED receipt = bookkeeping replay of an already-durable credit: never held; anything else is a NEW sale
+        _oh = _obligation_hold(pos)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "leg:" + str(leg_key))
+            return 0.0
     if _legacy_unreconciled_buyback(pos):
         # sized over units the shared account never received: any automatic sale would be wrong. Visible operator flag, no mutation.
         if not (isinstance(pos.get("pending_exit"), dict) and pos["pending_exit"].get("why")):
@@ -2330,6 +2505,12 @@ def _close_twap_slice(pos, exit_price):
         n = 0
     if n <= 0:
         return 0.0
+    _done0 = int(((pos.get("twap") or {}).get("done")) or 0)
+    if _done0 < n and _tranche_receipt(pos, "twap%d" % (_done0 + 1)) is None:   # an applied slice receipt = bookkeeping replay, never held; otherwise a NEW slice sale
+        _oh = _obligation_hold(pos)   # BEFORE any mutation of the position (no twap block is created by a held call)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "twap_slice")
+            return 0.0
     tw = pos.setdefault("twap", {"slices": n, "done": 0,
                                  "sold_tokens": 0.0, "sold_usd": 0.0})
     if tw["done"] >= n:
@@ -2453,6 +2634,19 @@ def _close_remaining(pos, exit_price, reason, pkind=None, receipt_kind=None):
             pos["pending_exit"] = {"leg": "remaining", "why": "legacy_unreconciled_buyback", "ts": time.time()}
         logger.error("grad %s: combined exit BLOCKED: legacy unreconciled buyback (operator resolution required)", str(pos.get("mint") or "?")[:16])
         return 0.0
+    _applied_remainder = False
+    if receipt_kind is not None:   # only a VALIDATED applied account receipt for the TWAP remainder is bookkeeping; the caller's reason alone never exempts
+        try:
+            _pa0 = _paper_account(); _rop = "%s:leg:twap_remainder:%s:%s" % (LANE, pos.get("mint"), pos.get("pa_pos_id"))
+            _rr = _pa0.op_receipts([_rop]) if (_pa0 is not None and pos.get("pa_pos_id")) else {}
+            _applied_remainder = (not _rr.get("_unreadable")) and _rr.get(_rop) is not None
+        except Exception:
+            _applied_remainder = False
+    if not _applied_remainder:
+        _oh = _obligation_hold(pos)
+        if _oh is not None:
+            _note_obligation_hold(pos, _oh, "remaining")
+            return 0.0
     _migrate_legacy_tranches(pos)
     if receipt_kind is not None and not pkind:
         pkind = receipt_kind   # reconcile of a credited TWAP remainder: the account RECEIPT's kind (never re-derived from the reason string)
@@ -2979,6 +3173,16 @@ def _finalize(d, mint, pos, closed_reason):
     trade, evaluate the pre-registered verdict. Must be called with
     _ledger_lock held; writes via _write."""
     _recover_close_intents()
+    # OBLIGATION HOLD (foreign unresolved obligations only): another frozen intent or account marker of THIS position (a tranche credit, a different op family) blocks the whole-position
+    # booking. Nothing below runs: no bankroll, no tally, no credit, no close record, no new intent. The position's own close intent/marker is excluded so the existing
+    # refusal/terminal/retry behavior is unchanged. An unreadable source is left to the existing journal-unreadable paths (include_unknown=False), never reported as frozen.
+    _oh = _obligation_hold(pos, foreign_only=True, include_unknown="marker")
+    if _oh is not None:
+        _note_obligation_hold(pos, _oh, "finalize")
+        _mem = pos.get("obligation_hold") or {}
+        if _hold_body_on_disk(pos) != {k: _mem.get(k) for k in ("kind", "known", "marks", "unknown")}:
+            _write(d)   # persist when the diagnostic on DISK differs from the one now held (including one set in memory earlier this poll by _close_remaining); a repeated held poll finds them equal and rewrites nothing
+        return None
     # SETTLEMENT PENDING (crash-recovery / unreadable-journal state). A half-migrated position whose per-leg account
     # receipts cannot be read cannot be SETTLED: the close credits `realized - tally` and the tally is unknowable, so
     # booking either way would invent cash (double credit or lost cash). The ECONOMIC exit has already run (legs sold,
@@ -3188,37 +3392,110 @@ def _finalize(d, mint, pos, closed_reason):
                 _warn_throttled(("settle_pending", mint, _res), "grad: %s SETTLEMENT PENDING (%s): %s residue_qty=%s; position kept open, no cash booked (see recon_health)", mint[:12], closed_reason, _res, _resq)
                 _write(d)
                 return None
+        for _bo in _plan:
+            # GENERATION BINDING: a freshly built plan carries the position's ORIGINAL binding; a plan resumed from a recorded intent keeps its own.
+            _bo.setdefault("expected_account_id", pos.get("pa_account_id"))
+            _bo.setdefault("entry_op_id", pos.get("pa_entry_op"))
         _ci = _close_intents() if _plan else None
         _iid = None
         _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
         if _ci is not None:
             try:
-                _open_ids = {x.get("intent_id") for x in _ci.pending(LANE)}
-            except Exception:
-                _open_ids = set()
-            if _prev_sp.get("intent_id") in _open_ids and _prev_sp.get("plan_sig") == _plan_sig:
-                _iid = _prev_sp["intent_id"]   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
-            else:
-                if _prev_sp.get("intent_id") in _open_ids:
-                    # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
-                    # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
-                    _ci.freeze(LANE, _prev_sp["intent_id"], "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160])
-                _iid = _ci.begin(LANE, mint, _pos_id, _plan,
-                                 {"realized_usd": realized,
-                                  "entry_notional_usd": entry_notional,
-                                  "closed_reason": closed_reason,
-                                  "close_ts": time.time()})
+                _prev_id = _prev_sp.get("intent_id")
+                _chain_moved = False
+                _prev_ev = None
+                if _prev_id:
+                    # FOLLOW the journal's supersede chain to its TIP (raises IntentNotDurable when unreadable or ambiguous: never an empty fallback).
+                    # After a crash the position state may still name an OLD frozen parent although its successor was created, even applied.
+                    _tip, _prev_st, _prev_ev = _ci.chain_tip(LANE, _prev_id)
+                    _chain_moved = _tip != _prev_id
+                    _prev_id = _tip
+                else:
+                    _prev_st = None
+                if _chain_moved and _prev_st == "applied":
+                    # the successor chain already durably APPLIED this settle (the lane state write was lost): reconcile onto the tip FROM ITS DURABLE
+                    # RECORD, never from the current re-price: the recorded settle ops are replayed (idempotent by op id) and the lane books the RECORDED
+                    # realized, entry notional and reason (bankroll corrected from this call's figure to the recorded one), so lane and account agree exactly
+                    _iid = _prev_id
+                    _tci = dict(_prev_ev.get("close_info") or {})
+                    _plan = [dict(_o) for _o in (_prev_ev.get("settle_ops") or [])]
+                    _plan_sig = repr([(o.get("op_id"), o.get("amount"), o.get("qty")) for o in _plan])
+                    if _tci.get("realized_usd") is None:
+                        raise _ci.IntentNotDurable("applied tip %s has no recorded realized_usd: cannot reconcile" % _iid)
+                    _rec_realized = round(float(_tci["realized_usd"]), 6)
+                    d["bankroll"] = round(float(d["bankroll"]) - realized + _rec_realized, 6)
+                    realized = _rec_realized
+                    if _tci.get("entry_notional_usd") is not None:
+                        entry_notional = float(_tci["entry_notional_usd"])
+                    if _tci.get("closed_reason"):
+                        closed_reason = str(_tci["closed_reason"])
+                    pnl = round(realized - entry_notional, 4)
+                elif _prev_st == "open" and ((not _chain_moved and _prev_sp.get("plan_sig") == _plan_sig)
+                                             or (_chain_moved and json.dumps(_prev_ev.get("settle_ops"), sort_keys=True) == json.dumps(_plan, sort_keys=True))):
+                    _iid = _prev_id   # retry of the SAME settle plan: reuse the open intent (stable credit op id, no second intent)
+                else:
+                    if _prev_st == "frozen":
+                        # A frozen LIVE GENERATION REFUSAL is terminal until an operator reconciles: never auto-superseded (that would open a new intent
+                        # and a retry window for an account whose generation could not be proven). Other frozen reasons keep the existing supersede path.
+                        try:
+                            _fz = _ci._state(_ci._read(_ci.journal_path(LANE))[0]).get(_prev_id, {}).get("frozen")
+                        except Exception:
+                            _fz = None
+                        if "generation refusal" in str(_fz or ""):
+                            _block_entries()
+                            raise _ci.IntentNotDurable("frozen intent %s is an unresolved generation refusal: never auto-superseded (operator reconciliation required)" % _prev_id)
+                    if _prev_st in ("open", "frozen") and _prev_ev is not None:
+                        # Changing the op set must not DROP (or re-kind) an op that is already booked in the account: that would evade conflict
+                        # detection (e.g. a booked write-down, then a sale of the written-down units). Unreadable account history cannot prove it.
+                        _newk = {(o.get("op_id"), o.get("kind")) for o in _plan}
+                        _gone = [o.get("op_id") for o in (_prev_ev.get("settle_ops") or []) if (o.get("op_id"), o.get("kind")) not in _newk]
+                        if _gone:
+                            if _pa._journal_read()[1] is not None:
+                                raise _ci.IntentNotDurable("account journal unreadable: cannot prove the dropped op(s) %s were not applied" % _gone)
+                            _booked = [x for x in _gone if _pa.op_outcome(x) == "applied"]
+                            if _booked:
+                                raise _ci.IntentNotDurable("the changed settle plan would DROP op(s) %s that are already APPLIED in the account: refusing (needs reconciliation)" % _booked)
+                    if _prev_st == "open":
+                        # The settle plan CHANGED since the earlier refused attempt: the old open intent must not be lost or left replayable next
+                        # to the new one (same op ids, different amounts). Freeze it visibly (terminal, never rewritten) before opening the new one.
+                        if not _ci.freeze(LANE, _prev_id, "superseded by a changed settle plan (old plan_sig %s)" % str(_prev_sp.get("plan_sig"))[:160]):
+                            raise _ci.IntentNotDurable("superseded intent freeze not durable")
+                    # prev OPEN (frozen just above) or prev FROZEN (an earlier poll froze it and begin then failed or was lost): the replacement
+                    # is opened, or resumed if it already landed, through the explicit supersede of exactly that intent
+                    _iid = _ci.begin(LANE, mint, _pos_id, _plan,
+                                     {"realized_usd": realized,
+                                      "entry_notional_usd": entry_notional,
+                                      "closed_reason": closed_reason,
+                                      "close_ts": time.time()},
+                                     supersedes=(_prev_id if _prev_st in ("open", "frozen") else None),
+                                     account_id=pos.get("pa_account_id"))
+            except _ci.IntentNotDurable as _nd:
+                # FAIL CLOSED: no durable plan, so NO account op. Position stays open, visible, nothing resold, bankroll booking undone;
+                # an earlier open intent (if any) keeps its id/plan_sig so a later poll can still recover or reuse it.
+                logger.error("grad: %s SETTLEMENT PENDING (close_intent_not_durable: %s): no account op without a durable plan; retried next poll", mint[:12], _nd)
+                pos["settlement_pending"] = {"why": "close_intent_not_durable", "closed_reason": closed_reason,
+                                             "since": _prev_sp.get("since") or time.time(), "last_try": time.time(),
+                                             "tries": int(_prev_sp.get("tries") or 0) + 1,
+                                             **{_k: _prev_sp[_k] for _k in ("intent_id", "plan_sig") if _prev_sp.get(_k)}}
+                pos["pending_exit"] = {"leg": "settlement", "why": ("generation_refusal_unresolved" if "unresolved generation refusal" in str(_nd) else "close_intent_not_durable"), "ts": time.time()}
+                if "unresolved generation refusal" in str(_nd):
+                    pos["settlement_pending"]["why"] = "generation_refusal_unresolved"
+                d["bankroll"] = round(float(d["bankroll"]) - realized, 6)
+                _write(d)
+                return None
         _ok, _why = True, ""
         for _sop in _plan:
             if _sop["kind"] == "write_down":
                 _ok, _why = _pa.write_down(
                     LANE, mint, _sop["op_id"], pos_id=_pos_id,
-                    qty=_sop.get("qty"), reason=_sop.get("reason"))
+                    qty=_sop.get("qty"), reason=_sop.get("reason"),
+                    expected_account_id=_sop.get("expected_account_id"), entry_op_id=_sop.get("entry_op_id"))
             else:
                 _ok, _why = _pa.credit(
                     LANE, mint, _sop["amount"], _sop["op_id"],
                     pos_id=_pos_id, qty=_sop.get("qty"),
-                    price_kind=_sop.get("price_kind"))
+                    price_kind=_sop.get("price_kind"),
+                    expected_account_id=_sop.get("expected_account_id"), entry_op_id=_sop.get("entry_op_id"))
             if not _ok:
                 # Orphan tolerance needs POSITIVE evidence of a
                 # pre-account epoch: the account's journal shows
@@ -3245,6 +3522,14 @@ def _finalize(d, mint, pos, closed_reason):
             # close intent open, nothing is sold again on retry, the credit op id is stable (a retry of an applied op is idempotent) and
             # the pending state clears only when the account settle is confirmed on a later poll. The lane bankroll booked above is
             # undone, because no close is recorded.
+            if "generation refused" in str(_why):
+                # LIVE generation refusal: block entries in-process now and freeze the open intent durably (the position stays open and unresolved).
+                _block_entries()
+                try:
+                    if _ci is not None and _iid is not None:
+                        _ci.freeze(LANE, _iid, "live account generation refusal: " + str(_why)[:140])
+                except Exception:
+                    logger.exception("grad: could not freeze intent %s after a live generation refusal", _iid)
             logger.error("grad: %s SETTLEMENT PENDING (account_settle_refused: %s): executed sale kept, position left open, close "
                          "intent open, no close booked; retried next poll", mint[:12], _why)
             pos["settlement_pending"] = {"why": "account_settle_refused", "refusal": str(_why)[:200], "closed_reason": closed_reason,

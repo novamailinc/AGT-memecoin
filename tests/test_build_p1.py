@@ -289,6 +289,10 @@ def _cand(mint="AAA111pump", age_s=60.0, **kw):
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
     import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
+    # The lane-registry MIRROR lives OUTSIDE the account dir (in HOME, next to it): removing only the account dir leaves a surviving mirror, which the
+    # account reads as a LOST primary registry and fail-closes entries. A full reset removes the mirror too (same fix as test_close_intents_grad).
+    _mir = _pa._registry_paths()[1]
+    if os.path.exists(_mir): os.remove(_mir)
 ps = _patch_all()
 G.ensure_ledger()
 opened, _why, _fin = G.consider_candidate(
@@ -357,6 +361,10 @@ class _Feed:
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
     import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
+    # The lane-registry MIRROR lives OUTSIDE the account dir (in HOME, next to it): removing only the account dir leaves a surviving mirror, which the
+    # account reads as a LOST primary registry and fail-closes entries. A full reset removes the mirror too (same fix as test_close_intents_grad).
+    _mir = _pa._registry_paths()[1]
+    if os.path.exists(_mir): os.remove(_mir)
 _FakeKS.halted = set()
 ps = _patch_all()
 G.ensure_ledger()
@@ -385,6 +393,10 @@ class _Dossiers:
 if os.path.exists(G.LEDGER_PATH):
     os.remove(G.LEDGER_PATH)
     import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
+    # The lane-registry MIRROR lives OUTSIDE the account dir (in HOME, next to it): removing only the account dir leaves a surviving mirror, which the
+    # account reads as a LOST primary registry and fail-closes entries. A full reset removes the mirror too (same fix as test_close_intents_grad).
+    _mir = _pa._registry_paths()[1]
+    if os.path.exists(_mir): os.remove(_mir)
 ps = _patch_all()
 G.ensure_ledger()
 with patch.object(G, "_dossiers", _Dossiers):

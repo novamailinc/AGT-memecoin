@@ -35,9 +35,15 @@ class TestNativeSharedCapital:
         entry=entry_plan('scanner','M',1,100.,.02,
                          {'usd_per_sol':100.,'observed_at':now,'source':'fixture'},'entry')
         receipt,_=apply_entry(entry,pa)
+        # Generation binding (2026-11-27): the exit must prove the
+        # generation the entry was debited under (same thread, so the
+        # atomic debit-time capture is still available).
+        bind=pa.entry_binding('scanner','M','entry',receipt['pos_id'])
+        assert bind, 'no entry binding for the applied entry'
         allocation={'ticket':1,'tokens':100.,'basis_sol':.02,'proceeds_sol':.02}
         settle=exit_plan('scanner','M',allocation,receipt['pos_id'],
-                         {'usd_per_sol':150.,'observed_at':now,'source':'fixture'},'exit')
+                         {'usd_per_sol':150.,'observed_at':now,'source':'fixture'},'exit',
+                         expected_account_id=bind, entry_op_id='entry')
         receipt,_=apply_exit(settle,pa)
         assert receipt['realized']==1.
         assert pa.snapshot()['cash']==11.
@@ -104,6 +110,10 @@ class TestNativeSharedCapital:
     @pytest.mark.parametrize('crash',[False,True])
     def test_terminal_refusal_not_reopened_by_later_funding(self, account, crash):
         holder=pa.try_debit_instance('watcher','N',10.,100.,'holder')[2]
+        # Generation binding (2026-11-27): capture it now — the entry
+        # attempt below clears the thread-local debit capture.
+        holder_bind=pa.entry_binding('watcher','N','holder',holder)
+        assert holder_bind, 'no entry binding for the holder debit'
         plan=entry_plan('scanner','M',1,100.,.02,
                         {'usd_per_sol':100.,'observed_at':time.time(),'source':'fixture'},'attempt')
         if crash:
@@ -113,7 +123,8 @@ class TestNativeSharedCapital:
         else:
             assert apply_entry(plan,pa)[0] is None
         assert pa.credit('watcher','N',10.,'release',pos_id=holder,
-                         price_kind='current_price_simulated_fill')[0]
+                         price_kind='current_price_simulated_fill',
+                         expected_account_id=holder_bind, entry_op_id='holder')[0]
         receipt,error=apply_entry(plan,pa)
         assert receipt is None and 'spendable' in error
         assert pa.snapshot()['cash']==10.

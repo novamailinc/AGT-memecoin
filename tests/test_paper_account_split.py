@@ -61,6 +61,10 @@ def main():
     ok, why, pos_id = pa.try_debit("watcher", "M", 2.0, qty=1000.0,
                                    op_id="watcher:buy:M:1")
     check("entry ok", ok)
+    # bb93 generation binding: capture the debit-time binding NOW (the
+    # thread-local holds only the most recent debit).
+    bind_m = pa.entry_binding("watcher", "M", "watcher:buy:M:1",
+                              pos_id)
     snap = pa.snapshot()
     check("spendable reduced by stake",
           abs(snap["cash_spendable"] - 8.0) < 1e-9)
@@ -71,7 +75,9 @@ def main():
                               + snap["cash_estimated"])) < 1e-9)
     # stale-price tranche: proceeds quarantined
     ok, _ = pa.credit("watcher", "M", 1.0, "watcher:sell:M:1",
-                      pos_id=pos_id, qty=500.0, price_kind=STALE)
+                      pos_id=pos_id, qty=500.0, price_kind=STALE,
+                      expected_account_id=bind_m,
+                      entry_op_id="watcher:buy:M:1")
     check("stale credit accepted", ok)
     snap = pa.snapshot()
     check("stale proceeds quarantined",
@@ -85,7 +91,9 @@ def main():
     check("refusal names spendable", "spendable" in why.lower())
     # a verified tranche: proceeds spendable
     ok, _ = pa.credit("watcher", "M", 1.5, "watcher:sell:M:2",
-                      pos_id=pos_id, qty=500.0, price_kind=CUR)
+                      pos_id=pos_id, qty=500.0, price_kind=CUR,
+                      expected_account_id=bind_m,
+                      entry_op_id="watcher:buy:M:1")
     check("verified credit accepted", ok)
     snap = pa.snapshot()
     check("verified proceeds spendable",
@@ -102,12 +110,17 @@ def main():
     ok, _, pid = pa.try_debit("grad", "G", 2.0, qty=100.0,
                               op_id="grad:buy:G:1")
     check("grad entry ok", ok)
+    bind_g = pa.entry_binding("grad", "G", "grad:buy:G:1", pid)
     ok, _ = pa.credit("grad", "G", 1.0, "grad:sell:G:1",
-                      pos_id=pid, qty=50.0)  # no kind: legacy caller
+                      pos_id=pid, qty=50.0,
+                      expected_account_id=bind_g,
+                      entry_op_id="grad:buy:G:1")  # no kind: legacy caller
     check("legacy credit accepted", ok)
     ok, _ = pa.credit("grad", "G", 0.5, "grad:sell:G:2",
                       pos_id=pid, qty=50.0,
-                      price_kind="mixed:stale_price_estimate,x")
+                      price_kind="mixed:stale_price_estimate,x",
+                      expected_account_id=bind_g,
+                      entry_op_id="grad:buy:G:1")
     check("mixed credit accepted", ok)
     snap = pa.snapshot()
     check("unknown-kind credit quarantined",
@@ -121,10 +134,13 @@ def main():
     ok, _, pid = pa.try_debit("watcher", "W", 2.0, qty=100.0,
                               op_id="watcher:buy:W:1")
     check("wd entry ok", ok)
+    bind_w = pa.entry_binding("watcher", "W", "watcher:buy:W:1", pid)
     # a $0-proceeds write-down: net 0 lands in estimated, spendable
     # unchanged (the $2 stake is gone either way)
     ok, _ = pa.credit("watcher", "W", 0.0, "watcher:wd:W:1",
-                      pos_id=pid, qty=100.0, price_kind=WD)
+                      pos_id=pid, qty=100.0, price_kind=WD,
+                      expected_account_id=bind_w,
+                      entry_op_id="watcher:buy:W:1")
     check("write-down credit accepted", ok)
     snap = pa.snapshot()
     check("write-down leaves spendable alone",
@@ -143,8 +159,11 @@ def main():
     ok, _, pid = pa.try_debit("watcher", "L", 2.0, qty=100.0,
                               op_id="watcher:buy:L:1")
     check("legacy entry ok", ok)
+    bind_l = pa.entry_binding("watcher", "L", "watcher:buy:L:1", pid)
     ok, _ = pa.credit("watcher", "L", 1.0, "watcher:sell:L:1",
-                      pos_id=pid, qty=50.0)  # no kind in journal
+                      pos_id=pid, qty=50.0,
+                      expected_account_id=bind_l,
+                      entry_op_id="watcher:buy:L:1")  # no kind in journal
     check("legacy credit ok", ok)
     # strip the buckets from the ledger file: pre-split shape
     lp = pa.LEDGER_PATH
@@ -170,8 +189,11 @@ def main():
     ok, _, pid = pa.try_debit("watcher", "C", 2.0, qty=100.0,
                               op_id="watcher:buy:C:1")
     check("contam entry1 ok", ok)
+    bind_c = pa.entry_binding("watcher", "C", "watcher:buy:C:1", pid)
     ok, _ = pa.credit("watcher", "C", 9.0, "watcher:sell:C:1",
-                      pos_id=pid, qty=100.0)  # kindless -> estimated
+                      pos_id=pid, qty=100.0,
+                      expected_account_id=bind_c,
+                      entry_op_id="watcher:buy:C:1")  # kindless -> estimated
     check("contam credit ok", ok)
     # this debit is only fundable via the kindless credit
     ok, _, _ = pa.try_debit("watcher", "C2", 9.0, qty=10.0,
@@ -233,6 +255,7 @@ def equity_quarantine():
     ok, _, pid = pa.try_debit("watcher", "Q", 2.0, qty=100.0,
                               op_id="watcher:buy:Q:1")
     check("eq entry ok", ok)
+    bind_q = pa.entry_binding("watcher", "Q", "watcher:buy:Q:1", pid)
 
     def marks(qty, value):
         return {"watcher": {"Q": {"value": value, "ts": time.time(),
@@ -246,7 +269,9 @@ def equity_quarantine():
     # stale tranche: $1 estimated proceeds; position halves, mark
     # falls to $1 -> conservative equity drops to 9.0
     ok, _ = pa.credit("watcher", "Q", 1.0, "watcher:sell:Q:1",
-                      pos_id=pid, qty=50.0, price_kind=STALE)
+                      pos_id=pid, qty=50.0, price_kind=STALE,
+                      expected_account_id=bind_q,
+                      entry_op_id="watcher:buy:Q:1")
     check("eq stale credit ok", ok)
     snap = pa.snapshot(marks=marks(50.0, 1.0))
     check("gross equity includes the estimate (diagnostic)",
@@ -280,10 +305,13 @@ def write_down_register():
     ok, _, pid = pa.try_debit("watcher", "Z", 2.0, qty=100.0,
                               op_id="watcher:buy:Z:1")
     check("z entry ok", ok)
+    bind_z = pa.entry_binding("watcher", "Z", "watcher:buy:Z:1", pid)
     before = pa.snapshot()
     ok, why = pa.write_down("watcher", "Z", "watcher:wd:Z:1",
                             pos_id=pid, reason="time_stop_24h_"
-                            "unquotable")
+                            "unquotable",
+                            expected_account_id=bind_z,
+                            entry_op_id="watcher:buy:Z:1")
     check("write-down applies", ok)
     snap = pa.snapshot()
     check("write-down moved no cash",
@@ -302,7 +330,10 @@ def write_down_register():
     check("cost exposure excludes unresolved units",
           abs(snap["cost_exposure"]) < 1e-9)
     ok, _ = pa.write_down("watcher", "Z", "watcher:wd:Z:1",
-                          pos_id=pid, reason="retry")
+                          pos_id=pid,
+                          reason="time_stop_24h_unquotable",
+                          expected_account_id=bind_z,
+                          entry_op_id="watcher:buy:Z:1")
     check("write-down retry idempotent", ok)
     snap2 = pa.snapshot()
     check("retry did not double-register",
@@ -311,8 +342,13 @@ def write_down_register():
     ok, _, pid2 = pa.try_debit("watcher", "Z", 1.0, qty=10.0,
                                op_id="watcher:buy:Z:2")
     check("reopen ok", ok)
+    # STALE pos_id case: the STALE op's own binding (bind_z) + the
+    # stale pos_id, so generation passes and the instance check
+    # below still yields the no-op the test asserts.
     ok, _ = pa.write_down("watcher", "Z", "watcher:wd:Z:9",
-                          pos_id=pid, reason="stale instance")
+                          pos_id=pid, reason="stale instance",
+                          expected_account_id=bind_z,
+                          entry_op_id="watcher:buy:Z:1")
     check("write-down for the old instance is a no-op (target "
           "already unresolved)", ok)
     snap3 = pa.snapshot()
@@ -343,9 +379,12 @@ def partial_write_down_conservation():
     ok, _, pid = pa.try_debit("watcher", "P", 2.0, qty=100.0,
                               op_id="watcher:buy:P:1")
     check("p entry ok", ok)
+    bind_p = pa.entry_binding("watcher", "P", "watcher:buy:P:1", pid)
     spend0 = pa.snapshot()["cash_spendable"]
     ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:1",
-                          pos_id=pid, reason="r1", qty=30.0)
+                          pos_id=pid, reason="r1", qty=30.0,
+                          expected_account_id=bind_p,
+                          entry_op_id="watcher:buy:P:1")
     check("partial wd 1 ok", ok)
     snap = pa.snapshot()
     check("partial wd 1 register (30 units, 0.60 cost)",
@@ -356,17 +395,23 @@ def partial_write_down_conservation():
     check("partial wd 1 leaves remainder open (70 units, 1.40)",
           abs(snap["cost_exposure"] - 1.4) < 1e-6)
     ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:1",
-                          pos_id=pid, reason="r1", qty=30.0)
+                          pos_id=pid, reason="r1", qty=30.0,
+                          expected_account_id=bind_p,
+                          entry_op_id="watcher:buy:P:1")
     check("partial wd retry idempotent", ok)
     snap = pa.snapshot()
     check("retry moved nothing twice",
           abs(float(snap["unresolved"][0]["qty"]) - 30.0) < 1e-6
           and abs(snap["cost_exposure"] - 1.4) < 1e-6)
     ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:2",
-                          pos_id=pid, reason="r2", qty=50.0)
+                          pos_id=pid, reason="r2", qty=50.0,
+                          expected_account_id=bind_p,
+                          entry_op_id="watcher:buy:P:1")
     check("partial wd 2 ok", ok)
     ok, _ = pa.write_down("watcher", "P", "watcher:wd:P:3",
-                          pos_id=pid, reason="r3")  # remainder
+                          pos_id=pid, reason="r3",
+                          expected_account_id=bind_p,
+                          entry_op_id="watcher:buy:P:1")  # remainder
     check("final wd ok", ok)
     snap = pa.snapshot()
     check("CONSERVATION: register holds ALL original units",
@@ -403,6 +448,7 @@ def impairment_hits_conservative_equity():
     ok, _, pid = pa.try_debit("watcher", "I", 2.0, qty=100.0,
                               op_id="watcher:buy:I:1")
     check("i entry ok", ok)
+    bind_i = pa.entry_binding("watcher", "I", "watcher:buy:I:1", pid)
 
     def marks(qty, value):
         return {"watcher": {"I": {"value": value, "ts": time.time(),
@@ -417,7 +463,9 @@ def impairment_hits_conservative_equity():
     # PARTIAL write-down of 50 of 100 units (cost 1.00); the
     # remaining 50 units mark at $1.00 -> conservative equity 9.0
     ok, _ = pa.write_down("watcher", "I", "watcher:wd:I:1",
-                          pos_id=pid, reason="r", qty=50.0)
+                          pos_id=pid, reason="r", qty=50.0,
+                          expected_account_id=bind_i,
+                          entry_op_id="watcher:buy:I:1")
     check("i partial wd ok", ok)
     snap = pa.snapshot(marks=marks(50.0, 1.0))
     check("partial wd: daily loss recognizes impairment at once",
@@ -431,7 +479,9 @@ def impairment_hits_conservative_equity():
     # FULL write-down of the rest: no open positions -> equity is
     # exactly spendable cash (8.0); the full $2 impairment shows
     ok, _ = pa.write_down("watcher", "I", "watcher:wd:I:2",
-                          pos_id=pid, reason="r")
+                          pos_id=pid, reason="r",
+                          expected_account_id=bind_i,
+                          entry_op_id="watcher:buy:I:1")
     check("i full wd ok", ok)
     snap = pa.snapshot()
     check("full wd: daily loss is the full impairment",

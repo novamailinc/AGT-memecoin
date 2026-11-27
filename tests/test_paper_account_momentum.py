@@ -13,6 +13,7 @@ Harness mirrors tests/test_momentum_lane.py. Run:
 python3 tests/test_paper_account_momentum.py
 """
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -20,8 +21,8 @@ import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "daemon", "launch_scanner"))
-import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 sys.path.insert(0, _REPO_ROOT)
+import tests._guard_fixture as _gfb; _gfb.block_network()  # no network in tests
 
 TMPD = tempfile.mkdtemp(prefix="paper-mom-test-")
 os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(
@@ -93,6 +94,20 @@ def runner(mint, **kw):
          "usd_market_cap": 500000.0}
     d.update(kw)
     return d
+
+
+def _journal_credit_op(op_id):
+    """The journaled credit event for one op_id: the exact economics
+    the exact-retry contract compares a retry against."""
+    with open(PA.JOURNAL_PATH) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("event") == "credit" and e.get("op_id") == op_id:
+                return e
+    return None
 
 
 def _reset_lane():
@@ -179,11 +194,33 @@ check("MINT(2) still open at full basis (untouched)",
           for p in snap["lanes"]["momentum"]["positions"]))
 
 before = PA.snapshot()["cash"]
-ok1, _ = PA.credit("momentum", MINT(1), 999.0,
-                   "momentum:leg:a:%s:%s" % (MINT(1), pos["pa_pos_id"]),
-                   pos_id=pos["pa_pos_id"], qty=1.0)
+leg_a_op = "momentum:leg:a:%s:%s" % (MINT(1), pos["pa_pos_id"])
+leg_a_ev = _journal_credit_op(leg_a_op)
+# Exact retry: same economics as the journaled leg-A credit, so the
+# exact-retry contract returns the original outcome, no double
+# credit. The retry carries the entry binding from the lane
+# position's own record (bb93: generation binding is mandatory).
+ok1, _ = PA.credit("momentum", MINT(1), leg_a_ev["proceeds"], leg_a_op,
+                   pos_id=pos["pa_pos_id"], qty=leg_a_ev["qty"],
+                   fee=leg_a_ev["fee"],
+                   price_kind=leg_a_ev["price_kind"],
+                   expected_account_id=pos.get("pa_account_id"),
+                   entry_op_id=pos.get("pa_entry_op"))
 check("tranche op_id retry returns the original outcome",
       ok1 and abs(PA.snapshot()["cash"] - before) < 1e-9)
+
+# A retry with DIFFERENT economics is not an exact retry: the
+# exact-retry contract refuses it (parameter conflict), nothing
+# applies. Runs after the last debit on this account: the refusal
+# marker it records cannot block anything further here.
+ok_bad, why_bad = PA.credit("momentum", MINT(1), 999.0, leg_a_op,
+                            pos_id=pos["pa_pos_id"], qty=1.0,
+                            expected_account_id=pos.get("pa_account_id"),
+                            entry_op_id=pos.get("pa_entry_op"))
+check("tranche op_id retry with different amounts refused "
+      "(parameter conflict)",
+      not ok_bad and "parameter conflict" in why_bad
+      and abs(PA.snapshot()["cash"] - before) < 1e-9)
 
 # ---------------- flag OFF: the lane never touches the account ------
 os.environ.pop("PAPER_ACCOUNT_ENABLED")

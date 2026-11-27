@@ -15,6 +15,7 @@ Harness mirrors tests/test_watcher_lane.py. Run:
 python3 tests/test_paper_account_watcher.py
 """
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -111,6 +112,20 @@ def _reset_account(start="2"):
     importlib.reload(PA)
 
 
+def _journal_credit_op(op_id):
+    """The journaled credit event for one op_id: the exact economics
+    the exact-retry contract compares a retry against."""
+    with open(PA.JOURNAL_PATH) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("event") == "credit" and e.get("op_id") == op_id:
+                return e
+    return None
+
+
 def M(i):
     return "WatchMint%037d" % i
 
@@ -180,12 +195,33 @@ check("M(2) still open at full basis (untouched by M(1)'s close)",
           for p in snap["lanes"]["watcher"]["positions"]))
 
 # Tranche op_id retry returns the ORIGINAL outcome, no double credit.
+# bb93 made settlement generation binding mandatory AND retries exact:
+# the retry must carry the entry binding (from the lane position's own
+# record) and the SAME economics as the journaled leg-A credit.
 before = PA.snapshot()["cash"]
-ok1, _ = PA.credit("watcher", M(1), 999.0,
-                   "watcher:leg:a:%s:%s" % (M(1), pos["pa_pos_id"]),
-                   pos_id=pos["pa_pos_id"], qty=1.0)
+leg_a_op = "watcher:leg:a:%s:%s" % (M(1), pos["pa_pos_id"])
+leg_a_ev = _journal_credit_op(leg_a_op)
+ok1, _ = PA.credit("watcher", M(1), leg_a_ev["proceeds"], leg_a_op,
+                   pos_id=pos["pa_pos_id"], qty=leg_a_ev["qty"],
+                   fee=leg_a_ev["fee"],
+                   price_kind=leg_a_ev["price_kind"],
+                   expected_account_id=pos.get("pa_account_id"),
+                   entry_op_id=pos.get("pa_entry_op"))
 check("tranche op_id retry returns the original outcome",
       ok1 and abs(PA.snapshot()["cash"] - before) < 1e-9)
+
+# A retry with DIFFERENT economics is not an exact retry: the
+# exact-retry contract refuses it (parameter conflict), nothing
+# applies. Runs after the last debit on this account: the refusal
+# marker it records cannot block anything further here.
+ok_bad, why_bad = PA.credit("watcher", M(1), 999.0, leg_a_op,
+                            pos_id=pos["pa_pos_id"], qty=1.0,
+                            expected_account_id=pos.get("pa_account_id"),
+                            entry_op_id=pos.get("pa_entry_op"))
+check("tranche op_id retry with different amounts refused "
+      "(parameter conflict)",
+      not ok_bad and "parameter conflict" in why_bad
+      and abs(PA.snapshot()["cash"] - before) < 1e-9)
 
 # ---------------- watcher_v2 engine instance: same account ----------
 from daemon.launch_scanner import watcher_v2_lane as V2

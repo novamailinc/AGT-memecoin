@@ -327,14 +327,29 @@ for lane, mod, enter in DRIVERS:
     check(PFX + "frozen: still no double settlement",
           abs(PA.snapshot()["cash"] - cash_g - 1.0) < 1e-9
           or not opened_blk)
-    mod._ENTRY_BLOCKED = False   # section isolation
+    # TEST EDIT (disclosed, BB38): the ghost section above deliberately leaves a frozen, UNAPPLIED intent in this lane's journal. Under the intended contract a persisted
+    # frozen intent keeps blocking entries on every recovery pass, so resetting the flag no longer isolates the next section. FIRST, on the UNCHANGED journal, capture that a
+    # fresh recovery pass still blocks and which frozen unapplied intents are the blockers; THEN clear only this lane's journal (labelled) for the orphan/torn fixtures.
+    _e_t, _s_t, _t_t = CI._read(CI.journal_path(lane))
+    _succ_t = {e.get("supersedes") for e in _e_t if e.get("ev") == "intent" and e.get("supersedes")}
+    _blk_t = sorted(i for i, x in CI._state(_e_t).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in _succ_t)
+    mod._RECOVERY_DONE = False
+    _blocked_t = mod._recover_close_intents()
+    print("  %s ghost-frozen journal re-recovery: blocked %r, flag %r, blocking frozen intents %r" % (lane, _blocked_t, mod._ENTRY_BLOCKED, _blk_t))
+    check(PFX + "frozen journal: a fresh recovery pass still BLOCKS (returned %r, flag %r)" % (_blocked_t, mod._ENTRY_BLOCKED), _blocked_t is True and mod._ENTRY_BLOCKED is True)
+    check(PFX + "frozen journal: the blocker is the ghost frozen unapplied intent (%r)" % (_blk_t,),
+          len(_blk_t) >= 1 and any("Ghost%s111111111111111111111111111111" % lane in i for i in _blk_t))
+    _jp_t = CI.journal_path(lane)
+    if os.path.exists(_jp_t): os.remove(_jp_t)   # DISCLOSED TEST SETUP: this lane's journal only, so the orphan/torn sections start without the ghost's frozen intent
+    mod._ENTRY_BLOCKED = False; mod._RECOVERY_DONE = False
+    check(PFX + "isolation: the fresh journal has no intents (%r)" % (_events(lane),), _events(lane) == [] and CI.pending(lane) == [])
 
     # ============ orphan tolerance requires epoch proof ==============
     # An intent whose account op is a provably never-debited orphan
     # (pre-account epoch) converges: account side orphan-proven, lane
     # side already persisted.
     mint = "Orph%s11111111111111111111111111111111" % lane
-    pid = "%s:entry:%s:0" % (lane, mint)
+    pid = "%s/%s#1" % (lane, mint)   # a REAL position-instance id (lane/mint#N, as paper_account assigns): the pre-bb93 fixture used an entry-op id here, which the bb93 gate rightly freezes as "not an account instance"
     iid = CI.begin(lane, mint, pid,
                    [{"kind": "credit",
                      "op_id": "%s:leg:a:%s:%s" % (lane, mint, pid),
@@ -347,6 +362,7 @@ for lane, mod, enter in DRIVERS:
     with mod._ledger_lock():
         d = mod._read()
         d["closes"].append({"mint": mint, "pa_pos_id": pid,
+                            "lane": lane,   # a real close record carries its lane (see _finalize); without it the gate holds it as legacy_lane_missing
                             "realized_usd": 1.5,
                             "closed_reason": "test",
                             "close_ts": time.time()})
@@ -363,9 +379,19 @@ for lane, mod, enter in DRIVERS:
     # A mid-file corrupt record makes history UNKNOWN: with an
     # incomplete intent outstanding, recovery must freeze it (no
     # re-application against suspect history) and block the entry.
+    # TEST EDIT (disclosed, BB38): healthy control so "torn blocks" is not vacuous because of a stale ghost freeze. On the clean journal (ghost cleared, orphan applied) there are
+    # NO frozen unapplied blockers, a fresh recovery pass does not block, and a normal entry is admitted BEFORE the corruption is introduced.
+    _e_h, _s_h, _t_h = CI._read(CI.journal_path(lane))
+    _succ_h = {e.get("supersedes") for e in _e_h if e.get("ev") == "intent" and e.get("supersedes")}
+    _blk_h = [i for i, x in CI._state(_e_h).items() if x["intent"] is not None and not x["applied"] and x["frozen"] is not None and i not in _succ_h]
+    mod._RECOVERY_DONE = False
+    _blocked_h = mod._recover_close_intents()
+    check(PFX + "torn control: before any corruption no frozen blockers (%r) and recovery does not block (returned %r, flag %r, journal status %r)" % (_blk_h, _blocked_h, mod._ENTRY_BLOCKED, _s_h),
+          _blk_h == [] and _blocked_h is False and mod._ENTRY_BLOCKED is False and _s_h is None)
     mint = "Torn%s11111111111111111111111111111111" % lane
     opened, why, _f = enter(mint)
     check(PFX + "fixture: torn-test entry opened", opened)
+    check(PFX + "torn control: the healthy entry was admitted with entries not blocked (opened %r, why %r, flag %r)" % (opened, why, mod._ENTRY_BLOCKED), opened is True and mod._ENTRY_BLOCKED is False)
     jp = CI.journal_path(lane)
     CI.begin(lane, mint, "torn-pos-0",
              [{"kind": "credit", "op_id": "%s:leg:a:%s:torn-pos-0"

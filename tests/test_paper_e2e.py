@@ -296,10 +296,24 @@ check("killswitch risk path recorded the closes under the temp home",
 
 # ---------- 8. op_id retry is a no-op (crash-retry safety) ---------
 before = PA.snapshot()["cash"]
-ok1, _ = PA.credit("watcher", M(1), 999.0,
-                   "watcher:remaining:bc:%s:%s"
-                   % (M(1), pos1["pa_pos_id"]),
-                   pos_id=pos1["pa_pos_id"], qty=1.0)
+_dup_op = ("watcher:remaining:bc:%s:%s"
+           % (M(1), pos1["pa_pos_id"]))
+# bb93: credit() requires the generation binding, and a retry of an
+# applied op must replay the journaled economics EXACTLY (the
+# exact-retry contract refuses a parameter conflict instead of
+# acking it). The binding is the one the lane stored at entry; the
+# economics are read back from the journaled credit event, so the
+# replay is byte-identical to the original settlement.
+_jentries, _jst, _ = PA._journal_read()
+_jc = [e for e in _jentries if e.get("op_id") == _dup_op
+       and e.get("event") == "credit"]
+assert len(_jc) == 1, "setup: remaining:bc credit not journaled once"
+_jc = _jc[0]
+ok1, _ = PA.credit("watcher", M(1), _jc["proceeds"], _dup_op,
+                   pos_id=pos1["pa_pos_id"], qty=_jc["qty"],
+                   fee=_jc["fee"], price_kind=_jc["price_kind"],
+                   expected_account_id=pos1["pa_account_id"],
+                   entry_op_id=pos1["pa_entry_op"])
 check("duplicate tranche op_id does not double-credit",
       ok1 and abs(PA.snapshot()["cash"] - before) < 1e-9)
 

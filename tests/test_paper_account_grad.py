@@ -92,12 +92,25 @@ def _unpatch(ps):
 
 
 def _fresh(price=0.00007):
+    # TRUE section isolation (a fresh process): a new account home +
+    # reloaded paper_account (fresh account, fresh close-intent
+    # journal, fresh lane registry), a fresh grad ledger, and the grad
+    # module globals a restart clears. The old _fresh() only deleted
+    # the grad ledger, so a frozen close intent or an open account lot
+    # from an earlier section blocked every later entry (fail-closed
+    # admission: frozen intent / orphan lot), and the file aborted at
+    # the first section after a freeze. Sections are independent (each
+    # captures its own cash baseline), so a full reset is compatible.
+    os.environ["FOREX_AGENT_HOME"] = tempfile.mkdtemp(prefix="paper-grad-home-")
+    importlib.reload(PA)
     if os.path.exists(G.LEDGER_PATH):
         os.remove(G.LEDGER_PATH)
     FAKE_KS.halted = set()
     FAKE_KS.recorded = []
     ps, m_veto, m_safety = _patch_all(price=price)
     G.ensure_ledger()
+    G._ENTRY_BLOCKED = False; G._RECOVERY_DONE = False
+    G._PENDING_CLOSE_INTENTS.clear()
     return ps, m_veto, m_safety
 
 

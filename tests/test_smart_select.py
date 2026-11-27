@@ -475,6 +475,8 @@ engD.LEDGER_PATH = os.path.join(_tmpD, "smart_select_ledger.json")
 # earlier engine's smart_select positions: "account position the lane books do not know", which the hook fails closed on.
 # Reset the account together with the new lane ledger so the pair is consistent.
 import shutil as _shl; _shl.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
+_mir = _pa._registry_paths()[1]
+if os.path.exists(_mir): os.remove(_mir)  # registry mirror lives in HOME next to the account dir; a surviving mirror fail-closes entries (see test_close_intents_grad)
 engD.ensure_ledger()
 with engD._ledger_lock():
     d = engD._read()
@@ -717,6 +719,25 @@ finally:
 # to `eng` and its ledger, which do not know engD's account positions. Reset the account with the engine switch so the pair
 # is consistent (eng's own ledger positions are re-created by the sections that use them).
 import shutil as _shl2; _shl2.rmtree(_pa.ACCOUNT_DIR, ignore_errors=True)
+_mir2 = _pa._registry_paths()[1]
+if os.path.exists(_mir2): os.remove(_mir2)  # registry mirror lives in HOME next to the account dir; a surviving mirror fail-closes entries (see test_close_intents_grad)
+# The reset above wiped the account, so the pre-reset MINT_P position (opened at "scan: fire+pass opens") is now bound to a dead generation: settling its
+# legs would be generation-refused and the refusal marker would block every later entry in this file. Re-create it fresh against the new account (same
+# entry price 0.001, so the ladder's 4x drive below is unchanged): drop the stale ledger position, then open it again through the normal scan path with
+# a fresh fire (the original fire is deduped as already-seen).
+with eng._ledger_lock():
+    _d = eng._read()
+    _d["positions"].pop(MINT_P, None)
+    eng._write(_d)
+restore = _install_filter_fixture(_pass_index(MINT_P), _PASS_CURVE,
+                                  _FakeSaturation({}))
+try:
+    res = SS.scan_once(eng, signals=[_fire(MINT_P, "TEST", NOW + 10)],
+                       now=NOW + 10)
+    check("ladder setup: MINT_P re-opened fresh after the account reset",
+          res["opened"] == 1)
+finally:
+    restore()
 # ---------------- standard ladder exits ----------------
 # Drive MINT_P to 4x: legs A (2x) and B (3x) fire, leg C peaks 4x.
 px = {"v": 0.004}

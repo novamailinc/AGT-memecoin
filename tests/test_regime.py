@@ -284,6 +284,10 @@ def _reg_fresh(price=0.00007):
         # hook correctly fails closed on. Reset the account WITH the lane so each scenario starts from a consistent pair.
         import shutil as _sh
         _sh.rmtree(_PA.ACCOUNT_DIR, ignore_errors=True)
+        # The lane-registry MIRROR lives OUTSIDE the account dir (in HOME, next to it): removing only the account dir leaves a surviving mirror, which the
+        # account reads as a LOST primary registry and fail-closes entries. A full reset removes the mirror too (same fix as test_close_intents_grad).
+        _mir = _PA._registry_paths()[1]
+        if os.path.exists(_mir): os.remove(_mir)
     _FAKE_KS.halted = set()
     _FAKE_KS.recorded = []
     ps = []

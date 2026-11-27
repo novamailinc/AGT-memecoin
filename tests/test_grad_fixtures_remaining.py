@@ -30,6 +30,47 @@ def check(n, c):
     print(("PASS " if c else "FAIL ") + n)
     if not c: FAILS.append(n)
 
+import logging as _logging_inj
+class _ExpectExc:
+    """Per-site capture of INTENTIONALLY injected exceptions logged (logger.exception) by the real grad poll path. Inside the with-block ONLY, grad's logger stops
+    propagating and a capture handler takes the records that carry exc_info; every ordinary record is forwarded unchanged to the ancestor handlers (warnings stay
+    visible). On exit the handler is removed and propagate restored (finally). The captured exceptions must equal `expected` EXACTLY (count, order, type name, message);
+    a missing expected or any unexpected exception FAILS the check, and unexpected exception records are re-emitted with their full traceback (still visible)."""
+    def __init__(self, label, expected):
+        self.label = label; self.expected = list(expected); self.recs = []
+    def _forward(self, rec):
+        lg = self.logger.parent
+        while lg is not None:
+            for hh in lg.handlers:
+                if rec.levelno >= hh.level: hh.handle(rec)
+            if not lg.propagate: break
+            lg = lg.parent
+    def __enter__(self):
+        outer = self
+        class _H(_logging_inj.Handler):
+            def emit(self, r):
+                if r.exc_info: outer.recs.append(r)
+                else: outer._forward(r)
+        self.logger = globals()["GR"].logger; self.h = _H(); self.prop = self.logger.propagate
+        self.logger.addHandler(self.h); self.logger.propagate = False
+        return self
+    def __exit__(self, et, ev, tb):
+        try:
+            self.logger.removeHandler(self.h)
+        finally:
+            self.logger.propagate = self.prop
+        got = [(r.exc_info[0].__name__, str(r.exc_info[1])) for r in self.recs]
+        exp = list(self.expected); unexpected = []
+        for r, k in zip(self.recs, got):
+            if k in exp: exp.remove(k)
+            else: unexpected.append(r)
+        for r in unexpected: self._forward(r)
+        # the record MESSAGE is the real poll_exits failure line for the expected exception: "grad poll_exits <mint12> failed: <exception text>"
+        msgs_ok = all(r.getMessage().startswith("grad poll_exits ") and r.getMessage().endswith(" failed: " + str(r.exc_info[1])) for r in self.recs)
+        check("%s injected-fault logs captured at this site EXACTLY as expected (count/order/exception type/text, record message prefix+suffix %s): got %r, want %r" % (self.label, msgs_ok, got, self.expected),
+              got == self.expected and not unexpected and not exp and msgs_ok)
+        return False
+
 # containment: any process/thread start is a failure (patched to raise)
 STARTS = []
 def _no(*a, **k):
@@ -115,6 +156,16 @@ def fresh(start="10", max_age="60", impact="2.0"):
     GR.LEDGER_PATH = os.path.join(led, "grad.json"); GR.ensure_ledger()
     GR._demo_mode = lambda: True; GR._demo_filler = lambda F=F: F
     GR._ks = KS(); GR._veto = Veto(); GR.QUOTE_RETRY_GAP_S = 0.0; GR.MAX_OPEN = 50
+    # fresh() simulates a NEW PROCESS (new home, new ledgers, reloaded
+    # account): the grad module globals a restart clears must reset
+    # too. The other four lanes already reset theirs above; grad was
+    # missed, so a refused/blocked scenario poisoned every later
+    # scenario's entry (recovery is skipped as "done" and the stale
+    # _ENTRY_BLOCKED verdict is reused), and a crashed close intent
+    # staged in _PENDING_CLOSE_INTENTS could match a later scenario's
+    # close for the same reused pid (GradMint1pump#1) on its write.
+    GR._ENTRY_BLOCKED = False; GR._RECOVERY_DONE = False
+    GR._PENDING_CLOSE_INTENTS.clear()
     class GSafe:
         def check_token(self, chain, mint, timeout=10): return {"passed": True, "unknown": False, "score": 7, "flags": [], "fails": [], "source": "rugcheck"}
     GR._safety = GSafe()
@@ -926,6 +977,47 @@ check("P7h3 SPOOF: a retry whose reason string says reconciled_credited_leg (no 
 _lh4 = _p7h(None, args=("hard_stop", "current_price_simulated_fill"))
 check("P7h4 OLD unstamped fill, retry current kind, no receipt: kind UNKNOWN not current (%s)" % _lh4.get("exit_price_kind"), _lh4.get("exit_price_kind") == "unknown")
 
+# P7i helper: restate the price_kind of the journaled leg credits in
+# BOTH the account journal and the account ledger ops record. The
+# receipt IS the journaled credit event (op_receipts returns it
+# verbatim), and the account's exact-retry contract checks the journal
+# while the instance check reads the ledger ops — the two must agree,
+# as they do in production. So a receipt that "says STALE" can only be
+# simulated by restating the durable record itself: patching
+# op_receipts to lie about the kind creates a state production can
+# never reach, and the exact-retry contract (correctly) refuses the
+# replay as a "parameter conflict on price_kind". The nonsim remainder
+# has no fill journal, so the credit event is the only durable record
+# of the kind and this restatement is fully consistent.
+def _restate_leg_receipt_kind(PA, kind):
+    _jpath, _lpath = PA.JOURNAL_PATH, PA.LEDGER_PATH
+    _rows = []
+    with open(_jpath) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if not _line:
+                continue
+            _ev = json.loads(_line)
+            if _ev.get("event") == "credit" and str(_ev.get("op_id") or "").startswith("grad:leg:"):
+                if kind is None:
+                    _ev.pop("price_kind", None)
+                else:
+                    _ev["price_kind"] = kind
+            _rows.append(_ev)
+    with open(_jpath, "w") as _f:
+        for _ev in _rows:
+            _f.write(json.dumps(_ev) + "\n")
+    _led = json.load(open(_lpath))
+    for _op, _rec in (_led.get("ops") or {}).items():
+        if str(_op).startswith("grad:leg:") and isinstance(_rec, dict):
+            if kind is None:
+                _rec.pop("price_kind", None)
+            else:
+                _rec["price_kind"] = kind
+    with open(_lpath, "w") as _f:
+        json.dump(_led, _f)
+
+
 # P7i (review G1): TWAP remainder credited (non-sim), lane write lost, reconcile with a STALE-kind receipt. The remainder must be recorded under the
 # receipt's kind (stale), never re-derived from the reconcile reason string.
 for _mode in ("nonsim",):   # sim TWAP variant NOT included: its reconcile route did not reach _close_remaining in my fixture (unverified, open)
@@ -934,6 +1026,7 @@ for _mode in ("nonsim",):   # sim TWAP variant NOT included: its reconcile route
       PAi, Fi, CTi = fresh(start="10"); (go_nonsim if _mode == "nonsim" else go_sim)(); set_twap(3, 1)
       _li = dict(build(PAi, CTi)); _oki, _whyi = _li["grad"](1); assert _oki, _whyi
       gmi = list(GR.open_positions())[0]
+      _pid0 = (GR.open_positions().get(gmi) or {}).get("pa_pos_id")   # DIAG (read only): original pid kept for the probe after a close
       for _ in range(2): GR.poll_exits(price_fn=gpf(1.0))
       _rci, _rwi = PAi.credit, GR._write; _sti = {"armed": True, "credited": False}
       def _cri(*a, **k):
@@ -947,11 +1040,26 @@ for _mode in ("nonsim",):   # sim TWAP variant NOT included: its reconcile route
       try: GR.poll_exits(price_fn=gpf(0.4))
       except Crash: _cri_crashed = True
       finally: PAi.credit, GR._write = _rci, _rwi
-      _roi = PAi.op_receipts
-      PAi.op_receipts = lambda ops: {o: dict(r or {}, price_kind="stale_price_estimate") if r else r for o, r in _roi(ops).items()}
+      _roi = PAi.op_receipts   # real receipt, for the DIAG probes below
+      _restate_leg_receipt_kind(PAi, "stale_price_estimate")
       restart(PAi)
-      try: GR._recover_close_intents(); GR.poll_exits(price_fn=gpf(0.4))
-      finally: PAi.op_receipts = _roi
+      GR._recover_close_intents(); GR.poll_exits(price_fn=gpf(0.4))
+      # DIAGNOSTIC (v8, print only; no assertion, no state change). Each probe is independent so one failure cannot hide the others.
+      def _dg(_lbl, _f):
+          try: print("DIAG P7i %s: %r" % (_lbl, _f()))
+          except Exception as _de: print("DIAG P7i %s: probe failed %s: %s" % (_lbl, type(_de).__name__, _de))
+      _pi = (GR._read().get("positions") or {}).get(gmi) or {}; _pidi = _pi.get("pa_pos_id") or _pid0
+      _ropi = "%s:leg:twap_remainder:%s:%s" % ("grad", gmi, _pidi); _fn = getattr(GR, "_obligation_hold", None)
+      _pv = _pi or {"mint": gmi, "pa_pos_id": _pidi}   # closed at BASE: probe with the original pid/mint
+      _dg("ids mint/pid0/pid_now/open", lambda: (gmi, _pid0, _pi.get("pa_pos_id"), bool(_pi)))
+      _dg("position pending_exit/settlement_pending/obligation_hold/twap", lambda: {k: _pi.get(k) for k in ("pending_exit", "settlement_pending", "obligation_hold", "twap")})
+      _dg("hold finalize-equivalent (foreign_only=True, include_unknown='marker')", lambda: (_fn(_pv, foreign_only=True, include_unknown="marker") if _fn else "n/a (no gate at this commit)"))
+      _dg("hold default (all, include_unknown=True)", lambda: (_fn(_pv) if _fn else "n/a (no gate at this commit)"))
+      _dg("remainder op id", lambda: _ropi)
+      _dg("remainder op receipt (qty/price_kind/proceeds via real op_receipts)", lambda: _roi([_ropi]))
+      _dg("frozen_for_position", lambda: GR._close_intents().frozen_for_position("grad", gmi, _pidi))
+      _dg("journal rows matching mint OR pid (raw, 700 chars)", lambda: [l[:700] for l in open(GR._close_intents().journal_path("grad")).read().splitlines() if gmi in l or (_pidi and _pidi in l)])
+      _dg("unresolved account markers (all, with op ids)", lambda: [dict(r) for r in (PAi.unresolved_refusals() or [])][:8])
       _cl_i = [c for c in (GR._read().get("closes") or []) if c.get("pa_pos_id")]
       _tw_i = (_cl_i[-1].get("twap") or {}) if _cl_i else {}
       _remk = (_tw_i.get("remainder") or {}).get("exit_price_kind")
@@ -1029,7 +1137,8 @@ def _p7o(op_receipts_mode):
         if op_receipts_mode != "none":
             _fb = _f[_bk]; _dq = op_receipts_mode in ("diffqty", "qty101")
             ok, why = PAo.credit(GR.LANE, _po["mint"], _fb["gross_usd"] * (0.98 if _dq else 1.0), "%s:leg:b:%s:%s" % (GR.LANE, _po["mint"], _po["pa_pos_id"]), pos_id=_po["pa_pos_id"],
-                                 qty=GR._acct_qty(_po, "b", _po["tokens"] * _lg["frac"]) * (1.01 if op_receipts_mode in ("qty101", "qtyonly") else (0.99 if _dq else 1.0)), fee=_fb["fee_usd"] + (0.0005 if _dq else 0.0), price_kind="current_price_simulated_fill")
+                                 qty=GR._acct_qty(_po, "b", _po["tokens"] * _lg["frac"]) * (1.01 if op_receipts_mode in ("qty101", "qtyonly") else (0.99 if _dq else 1.0)), fee=_fb["fee_usd"] + (0.0005 if _dq else 0.0), price_kind="current_price_simulated_fill",
+                                 expected_account_id=_po.get("pa_account_id"), entry_op_id=_po.get("pa_entry_op"))
             assert ok, why
         _lg["done"] = False
         for _k in ("exit_price", "realized_usd", "exit_reason", "exit_price_kind", "exit_execution"): _lg.pop(_k, None)
@@ -1080,7 +1189,8 @@ def _p7q(kind_key, mode="diffqty"):
     _fk = _fills_now(Ft); _fkk = [k for k in _fk if _key in k][0]; _fg, _ff = _fk[_fkk]["gross_usd"], _fk[_fkk]["fee_usd"]
     _op = "%s:leg:%s:%s:%s" % (GR.LANE, _key, _pt["mint"], _pt["pa_pos_id"])
     _q = GR._acct_qty(_pt, _key, _tk)
-    ok, why = PAt.credit(GR.LANE, _pt["mint"], _fg * 0.98, _op, pos_id=_pt["pa_pos_id"], qty=_q * 0.99, fee=_ff + 0.0005, price_kind="current_price_simulated_fill")
+    ok, why = PAt.credit(GR.LANE, _pt["mint"], _fg * 0.98, _op, pos_id=_pt["pa_pos_id"], qty=_q * 0.99, fee=_ff + 0.0005, price_kind="current_price_simulated_fill",
+                         expected_account_id=_pt.get("pa_account_id"), entry_op_id=_pt.get("pa_entry_op"))
     assert ok, why
     _c1 = cash(PAt); _nf0 = len(_fk)
     if mode == "incomplete":
@@ -1119,7 +1229,8 @@ def _p7r():
         _f = GR._demo_filler()._locked(lambda j: dict(j["fills"]))
         _bk = [k for k in _f if (":exit:%s:b:" % _po["mint"]) in k or k.endswith(":exit:%s:b" % _po["mint"])][0]
         _op = "%s:leg:b:%s:%s" % (GR.LANE, _po["mint"], _po["pa_pos_id"])
-        ok, why = PAo.credit(GR.LANE, _po["mint"], _f[_bk]["gross_usd"], _op, pos_id=_po["pa_pos_id"], qty=None, fee=_f[_bk]["fee_usd"], price_kind=None)
+        ok, why = PAo.credit(GR.LANE, _po["mint"], _f[_bk]["gross_usd"], _op, pos_id=_po["pa_pos_id"], qty=None, fee=_f[_bk]["fee_usd"], price_kind=None,
+                             expected_account_id=_po.get("pa_account_id"), entry_op_id=_po.get("pa_entry_op"))
         assert ok, why
         _lg["done"] = False
         for _k in ("exit_price", "realized_usd", "exit_reason", "exit_price_kind", "exit_execution"): _lg.pop(_k, None)
@@ -1136,7 +1247,8 @@ _cl0 = GR._close_leg; _cash0 = cash(PAs); _ps0 = copy.deepcopy(GR.open_positions
 def _boom_leg(*a, **k): raise RuntimeError("synthetic poll failure")
 GR._close_leg = _boom_leg
 try:
-    _ret = GR.poll_exits(price_fn=gpf(3.5))   # b/a legs due: _close_leg raises inside the position try
+    with _ExpectExc("P7s", [("RuntimeError", "synthetic poll failure")]):
+        _ret = GR.poll_exits(price_fn=gpf(3.5))   # b/a legs due: _close_leg raises inside the position try
 finally:
     GR._close_leg = _cl0
 _pp = GR.open_positions().get(gms) or {}
@@ -1147,7 +1259,8 @@ _w0 = GR._write
 def _w_boom(dd): raise OSError("disk full")
 GR._close_leg = _boom_leg; GR._write = _w_boom
 try:
-    _ret2 = GR.poll_exits(price_fn=gpf(3.5)); _raised = False
+    with _ExpectExc("P7s2", [("RuntimeError", "synthetic poll failure")]):
+        _ret2 = GR.poll_exits(price_fn=gpf(3.5)); _raised = False
 except Exception:
     _raised = True
 finally:
@@ -1313,17 +1426,25 @@ _dc = GR.diagnose_position(gmc)
 check("P7z5 crash window: a journaled fill with no done leg is reported (extra_fills %s) and the verdict is not consistent (%s)" % ([x["key"] for x in _dc["extra_fills"]], _dc["verdict"]),
       any(x["key"] == "b" and x["why"] == "fill_without_done" for x in _dc["extra_fills"]) and _dc["verdict"] == "pending_crash_window:b" and "G3" in _dc["unavailable_gates"])
 # P7z5b: the evaluable crash-window state is NOT masked by the unavailable G3 (verdict above is pending_crash_window, G3 still reported unavailable).
-# P7za REAL non-instance lane position (entered through the lane's own try_debit): the ACCOUNT silently accepts a retried credit with a different kind/qty/proceeds
-# and keeps the ORIGINAL values; the LANE must reconcile from the original journal receipt, not from the retry.
+# P7za REAL non-instance lane position (entered through the lane's own try_debit): the ACCOUNT refuses a retried credit with a different kind/qty/proceeds
+# (bb93 exact-retry contract: "parameter conflict", never an ack) and keeps the ORIGINAL values; the LANE must reconcile from the original journal receipt, not from the retry.
 PAn, Fn, CTn = fresh(start="10"); go_sim(); _ln = dict(build(PAn, CTn)); _okn, _whn = _ln["grad"](1); assert _okn, _whn
 _gmn = list(GR.open_positions())[0]; sell_ab()
 _pn = GR.open_positions()[_gmn]; _opa = "%s:leg:a:%s:%s" % (GR.LANE, _gmn, _pn["pa_pos_id"]); _orig = PAn.op_receipts([_opa])[_opa]
-_an0 = _tree_bytes(PAn, GR.LEDGER_PATH); _cash0 = cash(PAn)
-_okr, _whr = PAn.credit(GR.LANE, _gmn, float(_orig["proceeds"]) * 2.0, _opa, pos_id=_pn["pa_pos_id"], qty=float(_orig["qty"]) * 0.5, fee=float(_orig["fee"]) + 1.0, price_kind="stale_price_estimate")
-_an1 = _tree_bytes(PAn, GR.LEDGER_PATH)
+_cash0 = cash(PAn)
+_okr, _whr = PAn.credit(GR.LANE, _gmn, float(_orig["proceeds"]) * 2.0, _opa, pos_id=_pn["pa_pos_id"], qty=float(_orig["qty"]) * 0.5, fee=float(_orig["fee"]) + 1.0, price_kind="stale_price_estimate",
+                        expected_account_id=_pn.get("pa_account_id"), entry_op_id=_pn.get("pa_entry_op"))
 _nonins = not (PAn.operation_receipt(_opa)[0] or {}).get("instance")
-check("P7za1 non-instance position (op instance flag %s): the account ACCEPTS a retried credit with different kind/qty/proceeds (%s, %s) and keeps the original values (cash %.6f -> %.6f, account bytes unchanged %s): the account is NOT a guard here" % (not _nonins, _okr, _whr, _cash0, cash(PAn), _an0 == _an1),
-      _nonins and _okr and "retry" in _whr and _an0 == _an1 and _cash0 == cash(PAn))
+# (bb93: the account's exact-retry contract refuses a retried credit
+# whose kind/qty/proceeds differ from the journaled op — instance or
+# not ("parameter conflict", never an ack). The old expectation that a
+# non-instance op is silently accepted is stale: the paper_account
+# tests affirm the refusal for legacy try_debit positions too. The
+# refusal is journaled (the durable marker), but the economics are
+# untouched: cash and the op receipt keep the ORIGINAL values, and the
+# lane reconciles from that receipt (P7za2).)
+check("P7za1 non-instance position (op instance flag %s): the account REFUSES a retried credit with different kind/qty/proceeds (%s, %s) and keeps the original values (cash %.6f -> %.6f, receipt unchanged %s)" % (not _nonins, _okr, _whr, _cash0, cash(PAn), PAn.op_receipts([_opa])[_opa] == _orig),
+      _nonins and not _okr and "parameter conflict" in _whr and _cash0 == cash(PAn) and PAn.op_receipts([_opa])[_opa] == _orig)
 with GR._ledger_lock():
     _d = GR._read(); _lgn = _d["positions"][_gmn]["legs"]["a"]; _lgn["done"] = False
     for _k in ("exit_price", "realized_usd", "exit_reason", "exit_price_kind", "exit_execution"): _lgn.pop(_k, None)
@@ -1543,7 +1664,9 @@ PAu, gmu = make_legacy(); _pu0 = copy.deepcopy(GR.open_positions()[gmu]); _cl1 =
 def _mut_then_boom(pos, leg_key, *a, **k):
     pos["legs"][leg_key]["done"] = True; pos["realized_usd"] = 999.0; raise RuntimeError("boom after partial mutation")
 GR._close_leg = _mut_then_boom
-try: GR.poll_exits(price_fn=gpf(3.5))
+try:
+    with _ExpectExc("P7u", [("RuntimeError", "boom after partial mutation")]):
+        GR.poll_exits(price_fn=gpf(3.5))
 finally: GR._close_leg = _cl1
 _pu = GR.open_positions().get(gmu) or {}
 check("P7u after an exception mid-mutation the PERSISTED position has no half state (legs done %s, realized %.4f want %.4f), marker present (%s), and a later poll writes the same (reloaded)" % ([k for k, v in (_pu.get("legs") or {}).items() if v.get("done")], float(_pu.get("realized_usd") or 0), float(_pu0.get("realized_usd") or 0), (_pu.get("pending_exit") or {}).get("why")),
@@ -1576,7 +1699,9 @@ for _fm in ("read_fails", "write_fails", "position_missing"):
         if _st["armed"] and _fm == "write_fails": raise OSError("restore write failed")
         return _wr0(dd)
     GR._close_leg = _mut_boom2; GR._read = _rd_f; GR._write = _wr_f
-    try: GR.poll_exits(price_fn=gpf(3.5)); _raised = False
+    try:
+        with _ExpectExc("P7v[%s]" % _fm, [("RuntimeError", "boom2 primary")]):
+            GR.poll_exits(price_fn=gpf(3.5)); _raised = False
     except Exception: _raised = True
     finally: GR._close_leg = _cl2; GR._read = _rd0; GR._write = _wr0; GR.logger.removeHandler(_cap)
     _same = open(GR.LEDGER_PATH, "rb").read() == _st["baseline"]; _msgs = " | ".join(_cap.msgs)
@@ -1600,7 +1725,9 @@ if len(_mints) == 2:
         return _cr0(pos, px, reason, *a, **k)
     GR._close_remaining = _cr_sel
     _cashw0 = cash(PAw); _pid2 = GR.open_positions()[_m2]["pa_pos_id"]; _pid1 = GR.open_positions()[_m1]["pa_pos_id"]; _nfw0 = len(_fills_now(Fw))
-    try: GR.poll_exits(price_fn=lambda chain, mint, spot_index=None: float((GR.open_positions().get(mint) or {}).get("entry_price") or 0) * 0.3)
+    try:
+        with _ExpectExc("P7w", [("RuntimeError", "boom first position")]):
+            GR.poll_exits(price_fn=lambda chain, mint, spot_index=None: float((GR.open_positions().get(mint) or {}).get("entry_price") or 0) * 0.3)
     finally: GR._close_remaining = _cr0
     _op2 = GR.open_positions(); _led = GR._read()
     check("P7w first position fail-closed without half state (open %s, realized %.4f want %.4f, marker %s); second CLOSED normally (open %s); exactly one close record persisted (%d)" % (
@@ -1700,7 +1827,8 @@ try:
     check("P7zr1 real ledger, clean cycle: done, the scan ran (gate open), clear_fault says exactly no_fault and wrote NO clear record (%s)" % (_r1c[1].get("blocked"),),
           _r1.get("status") == "done" and _scans == [1] and _r1c[0] is False and _r1c[1].get("blocked") == ["no_fault"] and _ncl == 0)
     GR._persist_poll_failure = lambda d, mint, pos, exc: False; GR._close_leg = _boom_leg; _scans.clear(); _a0 = GR._POLL_ABORTS.get("count", 0)
-    _r2 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(2), now=time.time())
+    with _ExpectExc("P7zr2", [("RuntimeError", "injected leg-close failure")]):
+        _r2 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(2), now=time.time())
     GR._persist_poll_failure = _pf_save; GR._close_leg = _cl_save
     _r3 = _GCY.run_cycle(GR, price_fn=_good_px, scan_fn=lambda: _scans.append(3), now=time.time())
     check("P7zr2 REAL abort path: the poll aborted (count %s -> %s), the cycle recorded a durable fault, the scan was NOT called that cycle (%s) nor in the following CLEAN cycle (%s), exits ran in both (steps %s / %s)"
@@ -1738,7 +1866,9 @@ try:
             _once["credits_at_fail"] = _wal_credits(_pid4); raise OSError("injected lane write failure AFTER the account credit")
         return _wr_save(d_)
     GR._persist_poll_failure = lambda d, mint, pos, exc: False; GR._write = _write_boom; _scans.clear(); _a4 = GR._POLL_ABORTS.get("count", 0)
-    try: _r4 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(4), now=time.time())
+    try:
+        with _ExpectExc("P7zr4", [("OSError", "injected lane write failure AFTER the account credit")]):
+            _r4 = _GCY.run_cycle(GR, price_fn=_hi_px, scan_fn=lambda: _scans.append(4), now=time.time())
     finally: GR._persist_poll_failure = _pf_save; GR._write = _wr_save
     _cr1 = _wal_credits(_pid4); _ap1 = _acct_pos(_pid4); _cash1 = float(PAr._read_json(PAr.LEDGER_PATH)["cash"]); _fk1 = {k for k in _fills_now(GR._demo_filler()) if ":exit:" in k}
     _fills1 = _fills_now(GR._demo_filler()); _newkey = sorted(_fk1 - _fk0)[0] if len(_fk1 - _fk0) == 1 else None; _fill = _fills1.get(_newkey) or {}

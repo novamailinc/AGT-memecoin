@@ -234,8 +234,14 @@ write_health(home, {"alchemy": "ok"})
 pa = fresh(home, enabled=True, providers="alchemy")
 ok, why, pid = debit(pa)
 assert ok, "setup debit failed"
+# bb93: credit() requires the generation binding captured from the
+# entry debit (thread-local holds only the most recent debit, so
+# capture immediately, before any other debit).
+_bind_exit = pa.entry_binding("watcher", "Mint111", "op1", pid)
+assert _bind_exit, "setup: entry binding not captured"
 write_health(home, {"alchemy": "down"})
-res = pa.credit("watcher", "Mint111", 1.5, "op-exit", pos_id=pid)
+res = pa.credit("watcher", "Mint111", 1.5, "op-exit", pos_id=pid,
+                expected_account_id=_bind_exit, entry_op_id="op1")
 check("credit (exit) unaffected when provider goes down",
       res[0] is True)
 

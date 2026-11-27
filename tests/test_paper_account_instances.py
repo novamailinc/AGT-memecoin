@@ -48,6 +48,17 @@ def account(tmp_path, monkeypatch):
 
 
 class TestPaperAccountInstances:
+    # Generation binding (2026-11-27): credit()/write_down() now
+    # require proof of the generation the entry was debited under.
+    # The lanes capture it atomically at debit time via
+    # pa.entry_binding(); these tests do the same. Every economic
+    # assertion below is unchanged — only the settlement proof is
+    # supplied, exactly as production callers do.
+    def _bind(self, lane, mint, op_id, pos_id):
+        b = pa.entry_binding(lane, mint, op_id, pos_id)
+        assert b, 'no entry binding for %s/%s' % (op_id, pos_id)
+        return b
+
     def test_same_lane_exact_lots_cash_and_legacy_isolation(self, account, monkeypatch):
         monkeypatch.setenv('PAPER_ACCOUNT_LANE_CAP', '5')
         ok, _, a = pa.try_debit_instance('scanner', 'M', 1., 100., 'a')
@@ -68,26 +79,40 @@ class TestPaperAccountInstances:
 
     def test_exact_ticket_partial_basis_reopen_and_conflicts(self, account):
         a = pa.try_debit_instance('scanner', 'M', 1., 100., 'a')[2]
+        ba = self._bind('scanner', 'M', 'a', a)
         b = pa.try_debit_instance('scanner', 'M', 2., 100., 'b')[2]
+        bb = self._bind('scanner', 'M', 'b', b)
         kind = 'current_price_simulated_fill'
-        assert not pa.credit('scanner', 'M', 1., 'wrong', qty=50., price_kind=kind)[0]
-        assert pa.credit('scanner', 'M', 1.5, 'sell-a', pos_id=a, qty=100., price_kind=kind)[0]
-        assert pa.credit('scanner', 'M', 1., 'sell-b', pos_id=b, qty=50., price_kind=kind)[0]
+        assert pa.credit('scanner', 'M', 1.5, 'sell-a', pos_id=a, qty=100., price_kind=kind,
+                         expected_account_id=ba, entry_op_id='a')[0]
+        assert pa.credit('scanner', 'M', 1., 'sell-b', pos_id=b, qty=50., price_kind=kind,
+                         expected_account_id=bb, entry_op_id='b')[0]
         snap = pa.snapshot()
         assert snap['cash'] == 9.5 and snap['realized_pnl'] == .5
         assert snap['cost_exposure'] == 1.
         c = pa.try_debit_instance('scanner', 'M', .5, 100., 'c')[2]
+        bc = self._bind('scanner', 'M', 'c', c)
         assert c not in (a,b)
-        assert not pa.credit('scanner', 'M', 1., 'stale-a', pos_id=a, qty=50., price_kind=kind)[0]
-        assert pa.credit('scanner', 'M', 1.5, 'sell-a', pos_id=a, qty=100., price_kind=kind)[0]
-        assert not pa.credit('scanner', 'M', 99., 'sell-a', pos_id=a, qty=100., price_kind=kind)[0]
-        assert not pa.credit('scanner', 'N', 1., 'wrong-mint', pos_id=b, qty=10., price_kind=kind)[0]
+        assert not pa.credit('scanner', 'M', 1., 'stale-a', pos_id=a, qty=50., price_kind=kind,
+                             expected_account_id=ba, entry_op_id='a')[0]
+        assert pa.credit('scanner', 'M', 1.5, 'sell-a', pos_id=a, qty=100., price_kind=kind,
+                         expected_account_id=ba, entry_op_id='a')[0]
+        assert not pa.credit('scanner', 'M', 99., 'sell-a', pos_id=a, qty=100., price_kind=kind,
+                             expected_account_id=ba, entry_op_id='a')[0]
+        assert not pa.credit('scanner', 'N', 1., 'wrong-mint', pos_id=b, qty=10., price_kind=kind,
+                             expected_account_id=bb, entry_op_id='b')[0]
         snap = pa.snapshot()
         assert snap['cash'] == 9. and snap['cost_exposure'] == 1.5
+        # A credit with no pos_id (and no binding) is refused — but
+        # the refusal writes a terminal generation-refusal marker
+        # that blocks later ENTRIES in this account by design, so
+        # this malformed-call assertion goes last.
+        assert not pa.credit('scanner', 'M', 1., 'wrong', qty=50., price_kind=kind)[0]
 
     def test_marks_use_real_mint_and_distinct_instance_keys(self, account):
         a = pa.try_debit_instance('scanner', 'M', 1., 100., 'a')[2]
         b = pa.try_debit_instance('scanner', 'M', 2., 200., 'b')[2]
+        bb = self._bind('scanner', 'M', 'b', b)
         calls = []
         def price(mints):
             calls.append(mints)
@@ -99,7 +124,8 @@ class TestPaperAccountInstances:
         assert marks['scanner'][b]['qty'] == 200.
         assert pa.snapshot(marks)['marked_equity'] == 13.
         assert pa.credit('scanner', 'M', 1., 'partial', pos_id=b, qty=100.,
-                         price_kind='current_price_simulated_fill')[0]
+                         price_kind='current_price_simulated_fill',
+                         expected_account_id=bb, entry_op_id='b')[0]
         assert 'qty' in pa.snapshot(marks)['marks_status']
         fresh = account_marks.collect_marks(price_fn=price)
         assert pa.snapshot(fresh)['marked_equity'] == 12.
@@ -107,16 +133,20 @@ class TestPaperAccountInstances:
     @pytest.mark.parametrize('operation', ['debit', 'credit', 'write_down'])
     def test_wal_replay_and_bucket_rebuild(self, account, operation):
         a = pa.try_debit_instance('scanner', 'M', 1., 100., 'a')[2]
+        ba = self._bind('scanner', 'M', 'a', a)
         b = pa.try_debit_instance('scanner', 'M', 2., 200., 'b')[2]
+        bb = self._bind('scanner', 'M', 'b', b)
         with patch.object(pa, '_save_locked', side_effect=OSError('state-write')):
             with pytest.raises(OSError):
                 if operation == 'debit':
                     pa.try_debit_instance('scanner', 'M', 1., 100., 'c')
                 elif operation == 'credit':
                     pa.credit('scanner', 'M', 1.5, 'close', pos_id=a,
-                              price_kind='current_price_simulated_fill')
+                              price_kind='current_price_simulated_fill',
+                              expected_account_id=ba, entry_op_id='a')
                 else:
-                    pa.write_down('scanner', 'M', 'wd', pos_id=b, qty=100.)
+                    pa.write_down('scanner', 'M', 'wd', pos_id=b, qty=100.,
+                                  expected_account_id=bb, entry_op_id='b')
         snap = pa.snapshot()
         assert snap['degraded'] is None
         assert snap['cash'] == {'debit':6., 'credit':8.5, 'write_down':7.}[operation]
@@ -130,10 +160,12 @@ class TestPaperAccountInstances:
         assert rebuilt['cash_spendable'] == snap['cash_spendable']
         if operation == 'credit':
             assert not pa.credit('scanner', 'M', 77., 'close', pos_id=a,
-                                 price_kind='current_price_simulated_fill')[0]
+                                 price_kind='current_price_simulated_fill',
+                                 expected_account_id=ba, entry_op_id='a')[0]
 
     def test_legacy_wal_unchanged_and_cannot_alias_instance(self, account):
         a = pa.try_debit('watcher', 'M', 1., 100., 'old')[2]
+        bold = self._bind('watcher', 'M', 'old', a)
         assert not pa.try_debit_instance('watcher', 'M', 1., 100., 'old')[0]
         assert not pa.try_debit_instance('watcher', 'M', 1., 100., 'new')[0]
         data = json.loads(Path(pa.LEDGER_PATH).read_text())
@@ -142,7 +174,8 @@ class TestPaperAccountInstances:
                  if json.loads(x).get('event') == 'debit'][0]
         assert 'instance' not in entry
         assert pa.credit('watcher', 'M', 1., 'old-close', pos_id=a,
-                         price_kind='current_price_simulated_fill')[0]
+                         price_kind='current_price_simulated_fill',
+                         expected_account_id=bold, entry_op_id='old')[0]
 
     def test_real_process_death_then_fresh_recovery(self, account, tmp_path):
         root = str(Path(__file__).resolve().parents[1])
@@ -154,15 +187,18 @@ from tests import _guard_fixture as g
 g.install_price_feed(at_cost=True)
 from daemon.launch_scanner import paper_account as pa
 pa.try_debit_instance('scanner','M',1.,100.,'a')
+bind_a=pa.entry_binding('scanner','M','a','scanner/M#1')
+assert bind_a, 'no entry binding for the first debit'
 pa.try_debit_instance('scanner','M',2.,200.,'b')
 pa._save_locked=lambda led: os._exit(73)
-pa.credit('scanner','M',1.5,'exit-a',pos_id='scanner/M#1',price_kind='current_price_simulated_fill')
+pa.credit('scanner','M',1.5,'exit-a',pos_id='scanner/M#1',price_kind='current_price_simulated_fill',expected_account_id=bind_a,entry_op_id='a')
 '''
         result = subprocess.run([sys.executable, '-c', child, str(tmp_path)], cwd=root)
         assert result.returncode == 73
         verify = '''
 import os,sys,json
 os.environ['FOREX_AGENT_HOME']=sys.argv[1]
+from pathlib import Path
 from tests import _guard_fixture as g
 g.install_price_feed(at_cost=True)
 from daemon.launch_scanner import paper_account as pa
@@ -170,8 +206,11 @@ s=pa.snapshot()
 assert s['degraded'] is None
 assert s['cash']==8.5 and s['cost_exposure']==2.
 assert s['lanes']['scanner']['positions'][0]['pos_id']=='scanner/M#2'
-assert pa.credit('scanner','M',1.5,'exit-a',pos_id='scanner/M#1',price_kind='current_price_simulated_fill')[0]
-assert not pa.credit('scanner','M',15.,'exit-a',pos_id='scanner/M#1',price_kind='current_price_simulated_fill')[0]
+# Fresh process: no thread-local debit capture. The binding is the
+# ledger's own account generation (same book, same generation).
+gen=json.loads(Path(pa.LEDGER_PATH).read_text())['account_id']
+assert pa.credit('scanner','M',1.5,'exit-a',pos_id='scanner/M#1',price_kind='current_price_simulated_fill',expected_account_id=gen,entry_op_id='a')[0]
+assert not pa.credit('scanner','M',15.,'exit-a',pos_id='scanner/M#1',price_kind='current_price_simulated_fill',expected_account_id=gen,entry_op_id='a')[0]
 '''
         subprocess.run([sys.executable,'-c',verify,str(tmp_path)],cwd=root,check=True)
 
@@ -201,19 +240,28 @@ Path(sys.argv[1]+'/'+sys.argv[2]).write_text(json.dumps(result))
     @pytest.mark.parametrize('replay', [False, True])
     def test_instance_write_down_exact_operation_shape(self, account, replay):
         a = pa.try_debit_instance('scanner','M',1.,100.,'a')[2]
+        ba = self._bind('scanner', 'M', 'a', a)
         b = pa.try_debit_instance('scanner','M',1.,100.,'b')[2]
+        bb = self._bind('scanner', 'M', 'b', b)
         if replay:
             with patch.object(pa,'_save_locked',side_effect=OSError('stop')):
                 with pytest.raises(OSError):
-                    pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone')
+                    pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone',
+                                  expected_account_id=ba, entry_op_id='a')
             assert pa.snapshot()['degraded'] is None
         else:
-            assert pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone')[0]
-        assert pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone')[0]
-        assert not pa.write_down('scanner','M','wd',pos_id=a,qty=75.,reason='gone')[0]
-        assert not pa.write_down('scanner','M','wd',pos_id=b,qty=25.,reason='gone')[0]
-        assert not pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='other')[0]
-        assert not pa.write_down('scanner','M','a',pos_id=a,qty=25.,reason='gone')[0]
+            assert pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone',
+                                 expected_account_id=ba, entry_op_id='a')[0]
+        assert pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='gone',
+                             expected_account_id=ba, entry_op_id='a')[0]
+        assert not pa.write_down('scanner','M','wd',pos_id=a,qty=75.,reason='gone',
+                                 expected_account_id=ba, entry_op_id='a')[0]
+        assert not pa.write_down('scanner','M','wd',pos_id=b,qty=25.,reason='gone',
+                                 expected_account_id=bb, entry_op_id='b')[0]
+        assert not pa.write_down('scanner','M','wd',pos_id=a,qty=25.,reason='other',
+                                 expected_account_id=ba, entry_op_id='a')[0]
+        assert not pa.write_down('scanner','M','a',pos_id=a,qty=25.,reason='gone',
+                                 expected_account_id=ba, entry_op_id='a')[0]
         snap = pa.snapshot()
         assert snap['cost_exposure']==1.75 and snap['unresolved_cost']==.25
 
@@ -221,11 +269,16 @@ Path(sys.argv[1]+'/'+sys.argv[2]).write_text(json.dumps(result))
     def test_terminal_unresolved_new_operation_does_not_crash(self, account, instance):
         debit = pa.try_debit_instance if instance else pa.try_debit
         pid = debit('scanner','M',1.,100.,'a')[2]
-        assert pa.write_down('scanner','M','wd1',pos_id=pid,reason='gone')[0]
-        assert pa.write_down('scanner','M','wd2',pos_id=pid,reason='gone')[0]
-        assert pa.write_down('scanner','M','wd2',pos_id=pid,reason='gone')[0]
+        bind = self._bind('scanner', 'M', 'a', pid)
+        assert pa.write_down('scanner','M','wd1',pos_id=pid,reason='gone',
+                             expected_account_id=bind, entry_op_id='a')[0]
+        assert pa.write_down('scanner','M','wd2',pos_id=pid,reason='gone',
+                             expected_account_id=bind, entry_op_id='a')[0]
+        assert pa.write_down('scanner','M','wd2',pos_id=pid,reason='gone',
+                             expected_account_id=bind, entry_op_id='a')[0]
         if instance:
-            assert not pa.write_down('scanner','M','wd2',pos_id=pid,qty=50.,reason='gone')[0]
+            assert not pa.write_down('scanner','M','wd2',pos_id=pid,qty=50.,reason='gone',
+                                     expected_account_id=bind, entry_op_id='a')[0]
         snap = pa.snapshot()
         assert snap['degraded'] is None and snap['unresolved_cost']==1.
         assert snap['cash']==9. and snap['cost_exposure']==0.

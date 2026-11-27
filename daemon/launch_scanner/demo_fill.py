@@ -40,6 +40,12 @@ LAMPORTS = 1_000_000_000
 EXECUTION_SOURCE = "jupiter_quote_sim"
 
 
+# Executor refusals PROVEN to happen before any swap executes (sim_executor.py raise sites: balance/route/fee-policy/impact checks) plus tx_failed (landed
+# but reverted: the fee is lost and booked, no token moved). Everything else (confirm_timeout, zero_output, unknown_signature, unlisted) keeps the claim.
+_PROVEN_NO_EXECUTION = frozenset({"sim_insufficient_balance", "jito_not_configured", "fee_policy_required", "no_route", "price_impact_over_cap",
+                                  "bundle_stake_unknown", "fee_uneconomic", "fee_over_cap", "insufficient_funds_for_fee", "insufficient_funds", "tx_failed"})
+
+
 class DemoSkip(Exception):
     def __init__(self, reason, detail=None):
         super().__init__(reason)
@@ -249,9 +255,12 @@ class DemoFiller:
             j["attempts"].append({"op_id": op_id, "side": side, "mint": mint,
                                   "reason": reason, "detail": detail, "ts": self._now()})
             if reason == "confirm_timeout":
+                _prev = j["fills"].get(op_id) or {}
                 j["fills"][op_id] = {"status": "unknown", "op_id": op_id, "side": side, "mint": mint,
                                      "signature": (detail or {}).get("signature"),
                                      "ctx": (detail or {}).get("_ctx"), "detail": detail}
+                if _prev.get("intent"):
+                    j["fills"][op_id]["intent"] = dict(_prev["intent"])   # what the sale was for survives claim -> unknown
         self._locked(f)
 
     # ---- inputs, validated BEFORE any quote --------------------------
@@ -313,10 +322,61 @@ class DemoFiller:
         rec = self.get_fill(op_id)
         if rec is None:
             return None
+        if rec.get("status") == "inflight":
+            # A swap was STARTED for this op id and no fill was ever saved (crash or save failure between execute and save). The sim book is
+            # rebuilt per call, so a blind retry would execute the swap AGAIN: refuse (fail closed, visible); never guess the outcome.
+            raise DemoSkip("unresolved_inflight",
+                           {"op_id": op_id, "why": "swap started, no fill saved (crash or save failure); retry blocked, needs reconciliation"})
         if rec.get("status") == "unknown":
             raise DemoSkip("unresolved_unknown",
                            {"op_id": op_id, "why": "confirm_timeout not reconciled; retry blocked"})
         return rec
+
+    def _mark_inflight(self, op_id, side, mint, meta=None):
+        """ATOMIC check-and-claim under the fill-journal lock, BEFORE the swap executes: when any record already exists for the op id (a filled
+        fill, an inflight claim by another executor, an UNKNOWN) it is returned and NOTHING is claimed, so two concurrent executors of the same op
+        id cannot both execute. Returns None when this caller now owns the claim. Raises (nothing executes) when the claim cannot be written."""
+        def f(j):
+            cur = j["fills"].get(op_id)
+            if cur is not None:
+                return cur
+            # MINT-LEVEL guard: a swap that may have executed for this lane+mint under ANOTHER op id (e.g. a leg sale left inflight, then a combined
+            # remainder exit or a buyback that overlaps the same units) must block every other buy/sell for the mint until it is resolved.
+            _lane = str(op_id).split(":", 1)[0]
+            for _k, _v in j["fills"].items():
+                if _k != op_id and (_v or {}).get("status") in ("inflight", "unknown") and _v.get("mint") == mint and str(_k).split(":", 1)[0] == _lane:
+                    return {"status": _v.get("status"), "op_id": _k, "mint": mint, "mint_guard": True}
+            _c = {"status": "inflight", "op_id": op_id, "side": side, "mint": mint, "ts": self._now()}
+            if meta:
+                _c["intent"] = dict(meta)   # what the sale was FOR survives a crash with the claim itself
+            j["fills"][op_id] = _c
+            return None
+        return self._locked(f)
+
+    def _resolve_claim(self, op_id, cur):
+        """The record that beat this caller to the op id: a filled fill is returned (idempotent), anything unresolved refuses."""
+        if cur.get("status") == "inflight":
+            raise DemoSkip("unresolved_inflight", {"op_id": op_id, "why": "another executor, or a crashed attempt, holds this op id; retry blocked"})
+        if cur.get("status") == "unknown":
+            raise DemoSkip("unresolved_unknown", {"op_id": op_id, "why": "confirm_timeout not reconciled; retry blocked"})
+        return cur
+
+    def fills_by_prefix(self, prefix, suffix=""):
+        """Every journal record (any status) whose op id starts with prefix and ends with suffix: lets a caller enumerate ALL records of one position
+        generation instead of probing candidate keys."""
+        return self._locked(lambda j: {k: dict(v) for k, v in j["fills"].items() if k.startswith(prefix) and k.endswith(suffix)})
+
+    def resolve_inflight(self, op_id, outcome, evidence, operator):
+        """DISABLED. Clearing an unresolved inflight claim needs VERIFIED evidence (an on-chain/receipt proof that the swap never landed) and an
+        authority route; neither exists in this codebase, and a caller-supplied string is not evidence. It refuses unconditionally, so no caller can
+        bypass the claim. The held state stays until a real reconcile (with a signature) settles it."""
+        raise DemoSkip("resolution_disabled", {"op_id": op_id, "why": "no verified-evidence/authority route exists; external resolution is disabled"})
+
+    def _clear_inflight(self, op_id):
+        def f(j):
+            if (j["fills"].get(op_id) or {}).get("status") == "inflight":
+                del j["fills"][op_id]
+        self._locked(f)
 
     def _skip_from(self, op_id, side, mint, exc, fx=None, ctx=None):
         det = dict(getattr(exc, "detail", {}) or {})
@@ -330,7 +390,13 @@ class DemoFiller:
             d["_ctx"] = dict(ctx, px=fx, quote={
                 "requested_at": _q.get("requested_at"), "received_at": _q.get("received_at"),
                 "slippage_bps": _q.get("slippage_bps"), "route": _route_labels(_q.get("quote"))})
+        # The attempt (and, for a landed-failed tx, its booked/owed FEE) is made durable FIRST. If that raises, the claim stays (fail closed) and no
+        # fee evidence is lost; only then is the claim cleared, and only for a reason PROVEN to precede execution (or a reverted tx).
         self._record_attempt(op_id, side, mint, reason, d, fx)
+        # confirm_timeout became an UNKNOWN record inside _record_attempt; zero_output (a landed swap with no measured output), unknown_signature and
+        # any reason not on the list KEEP the INFLIGHT claim: an unknown outcome is never cleared.
+        if reason in _PROVEN_NO_EXECUTION:
+            self._clear_inflight(op_id)
         raise DemoSkip(reason, d)
 
     # ---- buy / sell ---------------------------------------------------
@@ -345,6 +411,9 @@ class DemoFiller:
         if amount <= 0:
             raise DemoSkip("notional_below_fee", {"notional_usd": notional_usd})
         ex = self._executor(amount + total_fee + 1)
+        _cur = self._mark_inflight(op_id, "buy", mint)
+        if _cur is not None:
+            return self._resolve_claim(op_id, _cur)
         try:
             res = ex.execute_swap(SOL_MINT, mint, amount, slippage_bps=slippage_bps,
                                   price_impact_cap_pct=float(impact_cap_pct))
@@ -366,6 +435,9 @@ class DemoFiller:
         if base_units <= 0:
             raise DemoSkip("amount_too_small", {})
         ex = self._executor(total_fee + 1, {mint: base_units})
+        _cur = self._mark_inflight(op_id, "sell", mint, meta)
+        if _cur is not None:
+            return self._resolve_claim(op_id, _cur)
         try:
             res = ex.execute_swap(mint, SOL_MINT, base_units, slippage_bps=slippage_bps,
                                   price_impact_cap_pct=float(impact_cap_pct))
@@ -490,6 +562,8 @@ class DemoFiller:
 
     def _save(self, op_id, fill):
         def f(j):
+            if (j["fills"].get(op_id) or {}).get("status") == "inflight":
+                del j["fills"][op_id]
             j["fills"].setdefault(op_id, fill)
             return j["fills"][op_id]
         return self._locked(f)

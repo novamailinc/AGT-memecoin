@@ -91,6 +91,10 @@ check("first run creates the account at $10.00 default",
 # ---- debit / credit conservation -----------------------------------
 ok, why, pid_a = pa.try_debit("grad", "MINT_A", 1.00, 1.00, "d-a1")
 check("debit $1 ok with a pos_id", ok and pid_a == "grad/MINT_A#1")
+# bb93 generation binding: capture the debit-time binding NOW (the
+# thread-local holds only the most recent debit); every settlement
+# below proves its generation with (account_id, entry op, pos_id).
+bind_a1 = pa.entry_binding("grad", "MINT_A", "d-a1", pid_a)
 ok, why, _ = pa.try_debit("grad", "MINT_A", 1.00, 1.00, "d-a2")
 check("duplicate open mint refused", not ok and "already" in why)
 ok, why, _ = pa.try_debit("ceo", "MINT_B", 9.50, 9.50, "d-b1")
@@ -103,10 +107,13 @@ check("exposure/cash/equity reconcile after debits",
       snap["cash"] == 0.0 and snap["cost_exposure"] == 10.00
       and snap["book_value"] == 10.00)
 
-ok, why = pa.credit("grad", "MINT_A", 2.50, "c-a1", pos_id=pid_a, price_kind="current_price_simulated_fill")
+ok, why = pa.credit("grad", "MINT_A", 2.50, "c-a1", pos_id=pid_a, price_kind="current_price_simulated_fill",
+                     expected_account_id=bind_a1, entry_op_id="d-a1")
 check("credit $2.50 proceeds ok (pos_id pinned)", ok)
-ok, why = pa.credit("grad", "MINT_A", 1.00, "c-aX", price_kind="current_price_simulated_fill")
-check("orphan credit refused + journaled", not ok)
+# NOTE: the orphan-credit case lives at the end of this account's
+# use (below): an unbound settlement is a generation refusal, and
+# _refuse_generation records a terminal marker that blocks later
+# entries in this account, so it cannot sit mid-flow.
 snap = pa.snapshot()
 check("pnl math: +1.50 on grad close",
       snap["cash"] == 2.50 and snap["realized_pnl"] == 1.50
@@ -122,18 +129,22 @@ check("conservation: cash + exposure == start + realized",
 ok, _, pid_a2 = pa.try_debit("grad", "MINT_A", 1.00, 1.00, "d-a3")
 check("reopen after close ok with a NEW pos_id",
       ok and pid_a2 != pid_a and pid_a2 == "grad/MINT_A#4")
-ok, why = pa.credit("grad", "MINT_A", 5.00, "c-stale", pos_id=pid_a, price_kind="current_price_simulated_fill")
+bind_a3 = pa.entry_binding("grad", "MINT_A", "d-a3", pid_a2)
+ok, why = pa.credit("grad", "MINT_A", 5.00, "c-stale", pos_id=pid_a, price_kind="current_price_simulated_fill",
+                     expected_account_id=bind_a1, entry_op_id="d-a1")
 check("stale pos_id credit refused (wrong instance), not applied",
       not ok and "stale pos_id" in why)
 snap = pa.snapshot()
 check("refused stale credit moved no money, position still open",
       snap["cash"] == 1.50 and snap["lanes"]["grad"]["open_count"] == 1)
-ok, why = pa.credit("grad", "MINT_A", 1.00, "c-a4", pos_id=pid_a2, price_kind="current_price_simulated_fill")
+ok, why = pa.credit("grad", "MINT_A", 1.00, "c-a4", pos_id=pid_a2, price_kind="current_price_simulated_fill",
+                     expected_account_id=bind_a3, entry_op_id="d-a3")
 check("current pos_id credit applies", ok)
 
 # ---- op_id: uncertain-response retries ------------------------------
 ok, why, pid_r = pa.try_debit("grad", "RETRY", 0.50, 0.50, "op-r1")
 check("fixture: retry-test debit ok", ok)
+bind_r1 = pa.entry_binding("grad", "RETRY", "op-r1", pid_r)
 snap_before = pa.snapshot()
 ok2, why2, pid_r2 = pa.try_debit("grad", "RETRY", 0.50, 0.50, "op-r1")
 check("same op_id retry returns the original outcome",
@@ -146,9 +157,11 @@ ok, why, _ = pa.try_debit("grad", "RETRY2", 0.25, 0.25, "op-r1")
 check("same op_id, different params -> conflict refused",
       not ok and "op_id" in why)
 # Retry AFTER close + reopen: the old op must not touch instance 2.
-ok, _ = pa.credit("grad", "RETRY", 0.60, "op-c1", pos_id=pid_r, price_kind="current_price_simulated_fill")
+ok, _ = pa.credit("grad", "RETRY", 0.60, "op-c1", pos_id=pid_r, price_kind="current_price_simulated_fill",
+                    expected_account_id=bind_r1, entry_op_id="op-r1")
 ok, _, pid_r3 = pa.try_debit("grad", "RETRY", 0.50, 0.50, "op-r2")
 check("fixture: reopened instance distinct", ok and pid_r3 != pid_r)
+bind_r2 = pa.entry_binding("grad", "RETRY", "op-r2", pid_r3)
 ok2, why2, pid_back = pa.try_debit("grad", "RETRY", 0.50, 0.50,
                                    "op-r1")
 check("uncertain-response retry after reopen returns instance 1 "
@@ -157,11 +170,20 @@ snap = pa.snapshot()
 check("instance 2 untouched by the stale retry",
       snap["lanes"]["grad"]["open_count"] == 1
       and snap["cash"] == round(snap_before["cash"] + 0.60 - 0.50, 6))
-ok, _ = pa.credit("grad", "RETRY", 0.55, "op-c2", pos_id=pid_r3, price_kind="current_price_simulated_fill")
-ok, _ = pa.credit("grad", "RETRY", 0.55, "op-c2", pos_id=pid_r3, price_kind="current_price_simulated_fill")
+ok, _ = pa.credit("grad", "RETRY", 0.55, "op-c2", pos_id=pid_r3, price_kind="current_price_simulated_fill",
+                    expected_account_id=bind_r2, entry_op_id="op-r2")
+ok, _ = pa.credit("grad", "RETRY", 0.55, "op-c2", pos_id=pid_r3, price_kind="current_price_simulated_fill",
+                    expected_account_id=bind_r2, entry_op_id="op-r2")
 snap = pa.snapshot()
 check("credit retry with same op_id does not double-credit",
       ok and snap["cash"] == 2.65)
+
+# ---- orphan credit (moved here: see the note above) ------------------
+# An unbound settlement is a generation refusal, and the refusal
+# marker it records blocks later entries in this account, so this
+# case runs only after the last debit on this account.
+ok, why = pa.credit("grad", "MINT_A", 1.00, "c-aX", price_kind="current_price_simulated_fill")
+check("orphan credit refused + journaled", not ok)
 
 # ---- restart persistence -------------------------------------------
 pa2 = fresh(HOME)  # same home, fresh module state
@@ -289,8 +311,10 @@ HOMEA = tempfile.mkdtemp(prefix="paper-account-partial-")
 paP = fresh(HOMEA, start=10.0)
 ok, _, pidP = paP.try_debit("grad", "EXA", 10.0, 100.0, "p-d1")
 check("fixture: 100 units for $10", ok)
+bind_p1 = paP.entry_binding("grad", "EXA", "p-d1", pidP)
 ok, why = paP.credit("grad", "EXA", 8.00, "p-c1", pos_id=pidP,
-                     qty=40.0, fee=0.08, price_kind="current_price_simulated_fill")
+                     qty=40.0, fee=0.08, price_kind="current_price_simulated_fill",
+                     expected_account_id=bind_p1, entry_op_id="p-d1")
 check("profitable partial sale applies", ok)
 snap = paP.snapshot()
 check("partial math: cash 7.92, remaining basis 6.00, "
@@ -304,7 +328,8 @@ check("position still open after partial (n_closes 0)",
       snap["lanes"]["grad"]["open_count"] == 1
       and snap["lanes"]["grad"]["n_closes"] == 0)
 ok, why = paP.credit("grad", "EXA", 12.00, "p-c2", pos_id=pidP,
-                     fee=0.12, price_kind="current_price_simulated_fill")
+                     fee=0.12, price_kind="current_price_simulated_fill",
+                     expected_account_id=bind_p1, entry_op_id="p-d1")
 check("final close of the remaining 60 units", ok)
 snap = paP.snapshot()
 check("final math: cash 19.80, realized +9.80 total "
@@ -320,14 +345,17 @@ check("conservation across the whole life cycle",
 # close the rest @ gross $3.00 fee $0.03 -> realized -2.03 more.
 HOMEB = tempfile.mkdtemp(prefix="paper-account-partial-b-")
 paQ = fresh(HOMEB, start=10.0)
-paQ.try_debit("grad", "EXB", 10.0, 100.0, "q-d1")
-ok, _ = paQ.credit("grad", "EXB", 3.00, "q-c1", qty=50.0, fee=0.03, price_kind="current_price_simulated_fill")
+ok, _, _pidQ = paQ.try_debit("grad", "EXB", 10.0, 100.0, "q-d1")
+bind_q1 = paQ.entry_binding("grad", "EXB", "q-d1", _pidQ)
+ok, _ = paQ.credit("grad", "EXB", 3.00, "q-c1", pos_id=_pidQ, qty=50.0, fee=0.03, price_kind="current_price_simulated_fill",
+                   expected_account_id=bind_q1, entry_op_id="q-d1")
 snap = paQ.snapshot()
 check("losing partial: cash 2.97, basis 5.00, realized -2.03 "
       "(hand-computed)",
       ok and snap["cash"] == 2.97 and snap["cost_exposure"] == 5.00
       and snap["realized_pnl"] == -2.03)
-ok, _ = paQ.credit("grad", "EXB", 3.00, "q-c2", fee=0.03, price_kind="current_price_simulated_fill")
+ok, _ = paQ.credit("grad", "EXB", 3.00, "q-c2", pos_id=_pidQ, fee=0.03, price_kind="current_price_simulated_fill",
+                   expected_account_id=bind_q1, entry_op_id="q-d1")
 snap = paQ.snapshot()
 check("losing full close: cash 5.94, realized -4.06 total",
       ok and snap["cash"] == 5.94 and snap["realized_pnl"] == -4.06)
@@ -340,8 +368,10 @@ check("conservation for the losing cycle",
 # remaining basis 9.00 on 90 units — never negative.
 HOMEC = tempfile.mkdtemp(prefix="paper-account-partial-c-")
 paR = fresh(HOMEC, start=10.0)
-paR.try_debit("grad", "EXC", 10.0, 100.0, "r-d1")
-ok, _ = paR.credit("grad", "EXC", 20.00, "r-c1", qty=10.0, price_kind="current_price_simulated_fill")
+ok, _, _pidR = paR.try_debit("grad", "EXC", 10.0, 100.0, "r-d1")
+bind_r = paR.entry_binding("grad", "EXC", "r-d1", _pidR)
+ok, _ = paR.credit("grad", "EXC", 20.00, "r-c1", pos_id=_pidR, qty=10.0, price_kind="current_price_simulated_fill",
+                   expected_account_id=bind_r, entry_op_id="r-d1")
 snap = paR.snapshot()
 check("tranche recovering more than the stake: realized +19.00, "
       "remaining basis 9.00 (never negative)",
@@ -356,7 +386,8 @@ ok, why = paR.credit("grad", "EXC", 1.00, "r-c3", qty=999.0, price_kind="current
 check("qty above remaining units refused", not ok)
 ok, why = paR.credit("grad", "EXC", 1.00, "r-c4", qty=-2.0, price_kind="current_price_simulated_fill")
 check("negative qty refused", not ok)
-ok, why = paR.credit("grad", "EXC", 1.00, "r-c5", qty=45.0, price_kind="current_price_simulated_fill")
+ok, why = paR.credit("grad", "EXC", 1.00, "r-c5", pos_id=_pidR, qty=45.0, price_kind="current_price_simulated_fill",
+                     expected_account_id=bind_r, entry_op_id="r-d1")
 check("valid mid partial applies (45 of 90)", ok)
 
 # Example D (a tranche consuming ALL remaining units, qty given):
@@ -367,8 +398,10 @@ check("valid mid partial applies (45 of 90)", ok)
 # must not precede checks against paR.)
 HOMED = tempfile.mkdtemp(prefix="paper-account-partial-d-")
 paD = fresh(HOMED, start=10.0)
-paD.try_debit("grad", "EXD", 10.0, 100.0, "d-d1")
-ok, _ = paD.credit("grad", "EXD", 12.00, "d-c1", qty=100.0, price_kind="current_price_simulated_fill")
+ok, _, _pidD = paD.try_debit("grad", "EXD", 10.0, 100.0, "d-d1")
+bind_d = paD.entry_binding("grad", "EXD", "d-d1", _pidD)
+ok, _ = paD.credit("grad", "EXD", 12.00, "d-c1", pos_id=_pidD, qty=100.0, price_kind="current_price_simulated_fill",
+                   expected_account_id=bind_d, entry_op_id="d-d1")
 snap = paD.snapshot()
 check("tranche consuming all units closes the position "
       "(realized +2.00, nothing open)",
@@ -377,6 +410,12 @@ check("tranche consuming all units closes the position "
       and snap["lanes"]["grad"]["n_closes"] == 1)
 
 # ---- legacy Stage-1 position: no qty -> full close only -------------
+# bb93 generation binding: a settlement must prove its entry op, so
+# the crafted legacy position carries a bound debit op (ledger op +
+# journal debit) for entry op "l-d1"; the position itself stays a
+# qty-less Stage-1 record, so the legacy full-close-only rule below
+# is still what is exercised. An UNBOUND crafted position can no
+# longer settle at all (fail-closed by design).
 HOMELEG = tempfile.mkdtemp(prefix="paper-account-legacy-")
 paL = fresh(HOMELEG, start=10.0)
 with paL._lock():
@@ -386,12 +425,24 @@ with paL._lock():
     paL._lane(led, "grad")["open"]["LEG"] = {
         "stake": 2.0, "ts": time.time(), "pos_id": "grad/LEG#1"}
     led["lanes"]["grad"]["n_entries"] = 1
+    led["ops"]["l-d1"] = {"event": "debit", "lane": "grad",
+                          "mint": "LEG", "pos_id": "grad/LEG#1",
+                          "account_id": led.get("account_id")}
     paL._save_locked(led)
-ok, why = paL.credit("grad", "LEG", 1.00, "l-c1", qty=1.0, price_kind="current_price_simulated_fill")
+paL._journal({"event": "debit", "event_id": "ev#1", "op_id": "l-d1",
+              "lane": "grad", "mint": "LEG", "pos_id": "grad/LEG#1",
+              "account_id": led.get("account_id"), "seq": 1})
+# snapshot() carries no account_id; account_identity() is the
+# reader for it (the ledger file would do as well).
+_bindL = paL.account_identity()
+ok, why = paL.credit("grad", "LEG", 1.00, "l-c1", qty=1.0, price_kind="current_price_simulated_fill",
+                     pos_id="grad/LEG#1",
+                     expected_account_id=_bindL, entry_op_id="l-d1")
 check("partial close on a legacy position refused",
       not ok and "full close only" in why)
 ok, why = paL.credit("grad", "LEG", 3.00, "l-c2",
-                     pos_id="grad/LEG#1", price_kind="current_price_simulated_fill")
+                     pos_id="grad/LEG#1", price_kind="current_price_simulated_fill",
+                     expected_account_id=_bindL, entry_op_id="l-d1")
 check("full close on a legacy position settles vs stake", ok)
 snap = paL.snapshot()
 check("legacy settle math: cash 11.00, realized +1.00",
@@ -437,7 +488,14 @@ with pa8._lock():
     led, healthy, _deg = pa8._load_locked()
     assert healthy
     pre_close = json.loads(json.dumps(led))  # state before close
-ok, _ = pa8.credit("grad", "CRASH1", 3.0, "crash-c1", price_kind="current_price_simulated_fill")
+# The CRASH1 debit (op crash-d1) was applied under pa7; this process
+# holds no thread-local capture for it, so the generation proof is
+# built from the durable record: the ledger's account identity, the
+# journaled debit op, and the open position's pos_id from the view.
+_crash_pid = pa8.snapshot()["lanes"]["grad"]["positions"][0]["pos_id"]
+_bind8 = pa8.account_identity()
+ok, _ = pa8.credit("grad", "CRASH1", 3.0, "crash-c1", pos_id=_crash_pid, price_kind="current_price_simulated_fill",
+                   expected_account_id=_bind8, entry_op_id="crash-d1")
 check("fixture: close settles (cash 11.00)",
       ok and pa8.snapshot()["cash"] == 11.0)
 with open(pa8.LEDGER_PATH, "w") as f:
@@ -461,7 +519,9 @@ check("reconciliation is idempotent across reloads",
 HOME5 = tempfile.mkdtemp(prefix="paper-account-reopen-")
 paA = fresh(HOME5, start=10.0)
 ok, _, pid1 = paA.try_debit("grad", "REOPEN", 2.0, 2.0, "ro-d1")
-ok, _ = paA.credit("grad", "REOPEN", 2.0, "ro-c1", pos_id=pid1, price_kind="current_price_simulated_fill")
+bind_ro1 = paA.entry_binding("grad", "REOPEN", "ro-d1", pid1)
+ok, _ = paA.credit("grad", "REOPEN", 2.0, "ro-c1", pos_id=pid1, price_kind="current_price_simulated_fill",
+                   expected_account_id=bind_ro1, entry_op_id="ro-d1")
 ok, _, pid2 = paA.try_debit("grad", "REOPEN", 2.0, 2.0, "ro-d2")
 check("fixture: reopened instance has a distinct pos_id",
       ok and pid1 != pid2)
@@ -580,12 +640,14 @@ check("journal seq hole (1 -> 5) -> degraded",
 # no duplicate credit.
 HOME10 = tempfile.mkdtemp(prefix="paper-account-concur-")
 paF = fresh(HOME10, start=10.0)
-paF.try_debit("grad", "CC1", 2.0, 2.0, "cc-d1")
+ok, _, _pidF = paF.try_debit("grad", "CC1", 2.0, 2.0, "cc-d1")
+bind_f = paF.entry_binding("grad", "CC1", "cc-d1", _pidF)
 # Crash window again: credit journaled, state save fails.
 paF._save_locked = lambda led: (_ for _ in ()).throw(
     RuntimeError("simulated crash"))
 try:
-    paF.credit("grad", "CC1", 3.0, "cc-c1", price_kind="current_price_simulated_fill")
+    paF.credit("grad", "CC1", 3.0, "cc-c1", pos_id=_pidF, price_kind="current_price_simulated_fill",
+               expected_account_id=bind_f, entry_op_id="cc-d1")
 except RuntimeError:
     pass
 del paF  # state on disk: pre-close ledger, journal holds the close

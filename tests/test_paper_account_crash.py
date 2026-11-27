@@ -118,9 +118,15 @@ sys.path.insert(0, os.environ["AGT_REPO_ROOT"])
 import tests._guard_fixture as _g; _g.block_network()  # block before imports
 import daemon.launch_scanner.paper_account as pa
 _g.set_limits_env(); _g.install_price_feed(at_cost=True)  # mandatory-guard migration (disclosed)
-pa.try_debit("watcher", "S", 1.0, qty=50.0, op_id="watcher:buy:S:1")
-pa.credit("watcher", "S", 1.5, "watcher:sell:S:1", qty=50.0,
-          price_kind="current_price_simulated_fill")
+ok, why, pos = pa.try_debit("watcher", "S", 1.0, qty=50.0, op_id="watcher:buy:S:1")
+assert ok, why
+# bb93: settlement needs the generation binding captured at the debit.
+bind = pa.entry_binding("watcher", "S", "watcher:buy:S:1", pos)
+ok, why = pa.credit("watcher", "S", 1.5, "watcher:sell:S:1", qty=50.0,
+          price_kind="current_price_simulated_fill",
+          expected_account_id=bind, entry_op_id="watcher:buy:S:1",
+          pos_id=pos)
+assert ok, why
 ''', home)
     return r.returncode == 0
 

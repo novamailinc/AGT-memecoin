@@ -169,6 +169,37 @@ def _demo_enter(pa, label, mint, stake):
     return True, why, pid, fill
 
 
+def _exit_binding(pa, label, t, sim):
+    """Generation binding for an exit settlement (bb93: the shared
+    account refuses an unbound credit/write-down). The entry op id is
+    reconstructed from how the trade entered: sim trades entered via
+    _demo_enter, whose debit op is the filler's stable intent id
+    (resumed while the position is open); non-sim trades entered via
+    _account_enter, whose op id is LANE:entry:<label>:<mint>. The
+    account id is the ledger's durable identity. Returns
+    (account_id, entry_op_id), or (None, None) when either cannot be
+    resolved — the caller then fails closed (exit not converged, retry
+    later) and never settles unbound."""
+    try:
+        acct = pa.account_identity()
+    except Exception as e:
+        logger.warning("[%s] exit binding unavailable (account identity): %r", label, e)
+        return None, None
+    if sim:
+        df = _demo_filler()
+        if df is None:
+            logger.warning("[%s] exit binding unavailable (no filler for sim trade %s)", label, t.get("mint"))
+            return None, None
+        try:
+            entry_op = df.intent_id(LANE, t["mint"])
+        except Exception as e:
+            logger.warning("[%s] exit binding unavailable (intent id): %r", label, e)
+            return None, None
+    else:
+        entry_op = "%s:entry:%s:%s" % (LANE, _op_key(label), t["mint"])
+    return acct, entry_op
+
+
 def _demo_exit(pa, label, t):
     """DEMO exit: sell the entry tokens through the quote sim (fixed op per trade: a retry replays the
     original fill) and credit the account with the SIM economics. Returns (converged, net_usd)."""
@@ -182,8 +213,12 @@ def _demo_exit(pa, label, t):
         logger.warning("[%s] demo exit pending %s: %s", label, t["mint"], e.reason)
         return False, 0.0
     op = "%s:exit:%s:%s" % (LANE, _op_key(label), t["mint"])
+    _acct, _entry_op = _exit_binding(pa, label, t, sim=True)
+    if _acct is None:
+        return False, 0.0
     ok, why = pa.credit(LANE, t["mint"], float(fill["gross_usd"]), op, pos_id=t.get("pa_pos_id"),
-                        qty=float(t["tokens"]), fee=float(fill["fee_usd"]))
+                        qty=float(t["tokens"]), fee=float(fill["fee_usd"]),
+                        expected_account_id=_acct, entry_op_id=_entry_op)
     if not ok:
         logger.warning("[%s] account exit refused for %s: %s", label, t["mint"], why)
         return False, 0.0
@@ -197,10 +232,15 @@ def _account_exit(pa, label, t, proceeds, rugged):
     op = "%s:exit:%s:%s" % (LANE, _op_key(label), t["mint"])
     if pa is None:
         return False
+    _acct, _entry_op = _exit_binding(pa, label, t, sim=(t.get("execution_source") == "jupiter_quote_sim"))
+    if _acct is None:
+        return False
     if rugged:
-        ok, why = pa.write_down(LANE, t["mint"], op, pos_id=pid, reason="rugged")
+        ok, why = pa.write_down(LANE, t["mint"], op, pos_id=pid, reason="rugged",
+                                expected_account_id=_acct, entry_op_id=_entry_op)
     else:
-        ok, why = pa.credit(LANE, t["mint"], float(proceeds), op, pos_id=pid)
+        ok, why = pa.credit(LANE, t["mint"], float(proceeds), op, pos_id=pid,
+                            expected_account_id=_acct, entry_op_id=_entry_op)
     if not ok:
         logger.warning("[%s] account exit refused for %s: %s", label, t["mint"], why)
     return bool(ok)
